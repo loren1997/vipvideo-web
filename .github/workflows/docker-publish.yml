@@ -81,7 +81,7 @@ jobs:
             let cookie = '';
             const api = (path, body) => fetch(base + path, {
               method: body === undefined ? 'GET' : 'POST',
-              headers: { ...(cookie ? { Cookie: cookie } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+              headers: { Connection: 'close', ...(cookie ? { Cookie: cookie } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
               ...(body === undefined ? {} : { body: JSON.stringify(body) }),
               signal: AbortSignal.timeout(10000),
             });
@@ -171,7 +171,7 @@ jobs:
           let cookie = '';
           const api = (path, body) => fetch('http://127.0.0.1:3000' + path, {
             method: body === undefined ? 'GET' : 'POST',
-            headers: { ...(cookie ? { Cookie: cookie } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+            headers: { Connection: 'close', ...(cookie ? { Cookie: cookie } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
             ...(body === undefined ? {} : { body: JSON.stringify(body) }),
             signal: AbortSignal.timeout(10000)
           });
