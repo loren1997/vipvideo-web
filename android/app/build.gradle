@@ -1,0 +1,36 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'io.github.loren1997.vipvideoweb'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'io.github.loren1997.vipvideoweb'
+        minSdk 23
+        targetSdk 35
+        versionCode (System.getenv('ANDROID_VERSION_CODE') ?: '1').toInteger()
+        versionName "1.0.${System.getenv('ANDROID_VERSION_CODE') ?: '1'}"
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    if (System.getenv('ANDROID_KEYSTORE_PATH')) {
+        signingConfigs {
+            release {
+                storeFile file(System.getenv('ANDROID_KEYSTORE_PATH'))
+                storePassword System.getenv('ANDROID_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('ANDROID_KEY_ALIAS')
+                keyPassword System.getenv('ANDROID_KEY_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (System.getenv('ANDROID_KEYSTORE_PATH')) signingConfig signingConfigs.release
+        }
+    }
+}
+
