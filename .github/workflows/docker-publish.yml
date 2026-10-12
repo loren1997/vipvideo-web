@@ -125,7 +125,7 @@ jobs:
               }
               console.log(`${platform} image passed runtime checks.`);
             } finally {
-              for (const args of [['logs', name], ['rm', '--force', name], ['volume', 'rm', volume]]) {
+              for (const args of [['logs', name], ['rm', '--force', name], ['image', 'rm', process.env.CI_IMAGE], ['volume', 'rm', volume]]) {
                 const result = spawnSync('docker', args, { stdio: 'inherit' });
                 if (result.status !== 0) {
                   console.error(`Docker cleanup failed: ${args.join(' ')}`);
