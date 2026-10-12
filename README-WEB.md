@@ -29,7 +29,7 @@ docker compose -f docker-compose.yml logs --tail=100 web
 
 本仓库镜像已公开，并通过匿名拉取验证，NAS 无需登录 GitHub。若自行 Fork 或新建发布仓库，首次发布的 GHCR 镜像包默认是私有；仓库所有者需在自己的镜像包设置中完成 **Change visibility → Public**，公开源码不会自动公开镜像。见 [GitHub 包可见性说明](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)。自行改为私有镜像时，NAS 需先登录 GHCR，使用有 `read:packages` 权限的 classic PAT，按 [GHCR 官方认证说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)配置；不要将 PAT 写入 Compose、镜像或仓库。
 
-浏览器访问 `http://NAS的局域网IP:3000`，输入密码后即可浏览内置源的电影、电视剧和动漫，也可在设置页管理或导入其他影视源。需要 Docker Engine 和 Docker Compose v2；建议至少 1 GB 内存。应用不转码，媒体转发时带宽会经过部署主机。容器健康检查由镜像提供，使用非 root 用户运行，数据保存在命名卷中。
+浏览器访问 `http://NAS的局域网IP:3000`，输入密码后即可浏览内置源的电影、电视剧和动漫，也可在设置页管理或导入其他影视源。需要 Docker Engine 和 Docker Compose v2；建议至少 1 GB 内存。镜像包含 FFmpeg，兼容播放和媒体转发会使用部署主机的带宽，软件转码还会使用 CPU。容器健康检查由镜像提供，使用非 root 用户运行，数据保存在命名卷中。
 
 ## 从源码本地构建
 
@@ -58,6 +58,55 @@ docker compose -f compose.yaml logs --tail=100 web
 浏览器访问 `http://部署主机的局域网IP:3000`，输入密码后即可浏览影片。`/health` 用于容器健康检查，不需要登录。Compose 默认在主机的 3000 端口监听；限制局域网访问可使用主机防火墙。已有端口冲突时，只把 Compose 的 `"3000:3000"` 左边改为所需主机端口。
 
 容器使用 `node` 用户（UID/GID 1000），数据写入命名卷 `vipvideo_data`，实际卷名通常带 Compose 项目前缀。默认卷会继承镜像中 `/app/data` 的权限。若在 NAS 中改成绑定宿主目录，需事先让 UID/GID 1000 有读写权限；保留命名卷通常更省事。没有必要把常驻服务改成 root。
+
+## 兼容播放与 Intel 核显
+
+播放器先尝试直连、受限媒体转发和同影片换源；仍无法播放时会尝试“兼容播放”，也可手动点击该按钮。服务端把当前剧集转为浏览器常见的 H.264/AAC HLS，最多 720p，并保留原影片进度。兼容播放每台服务器同时只运行一个任务；其他设备占用时会提示。没有请求达 120 秒后回收任务与临时分片，收藏、进度和配置仍保存在数据卷。
+
+默认 `TRANSCODE_ACCEL=auto`：有权限读写 `/dev/dri/renderD128` 时先尝试 VAAPI，启动阶段初始化或编码失败后改用 CPU；没有设备时直接使用 CPU。软件编码限制为两条线程，解码和滤镜也限制并发；实际 CPU 消耗仍取决于输入编码、分辨率和倍速，高码率或高分辨率输入可能无法实时处理。arm64 镜像提供软件模式，未安装 x86 Intel 驱动。
+
+| 环境变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `TRANSCODE_ENABLED` | `true` | `false` 关闭兼容播放 |
+| `TRANSCODE_ACCEL` | `auto` | `auto` 自动选择，`software` 强制 CPU，`vaapi` 尝试 Intel VAAPI |
+| `FFMPEG_PATH` | `ffmpeg` | FFmpeg 可执行文件路径 |
+| `RENDER_GID` | 留空 | 仅 GPU Compose 配置使用；填写 Ubuntu render 设备的数字 GID |
+
+从源码部署时在 `.env` 设置前三项。直接镜像部署时可在 `docker-compose.yml` 的 `environment` 修改前三项；默认配置无需 GPU，也能启动。
+
+### PVE → Ubuntu Docker 的 i3-8100T
+
+[Intel 处理器规格](https://www.intel.com/content/www/us/en/products/sku/129944/intel-core-i38100t-processor-6m-cache-3-10-ghz/specifications.html)列出 i3-8100T 的 UHD 630 和 Quick Sync。[Intel iHD 驱动](https://github.com/intel/media-driver#supported-platforms)支持 Coffee Lake；amd64 镜像安装 [Debian 的完整 iHD 驱动](https://packages.debian.org/bookworm/intel-media-va-driver-non-free)，包含编码使用的媒体着色器。GPU 可用性还取决于虚拟机的设备直通、内核、驱动和权限，Plex 可硬解并不保证本容器已获得相同权限。
+
+在运行 Docker 的 Ubuntu 虚拟机内检查设备和 GID：
+
+```sh
+ls -l /dev/dri/renderD128
+stat -c '%g' /dev/dri/renderD128
+```
+
+Ubuntu 内没有该设备时，先检查现有 PVE 核显直通和 Ubuntu 的 i915 驱动；在设备就绪前可继续使用软件模式。下载与 `docker-compose.yml` 同目录的 [compose.gpu.yaml](https://raw.githubusercontent.com/loren1997/vipvideo-web/main/compose.gpu.yaml)，在该目录创建或编辑 `.env`，加入 `RENDER_GID=上一步输出的数字`。保留已有密码与其他环境变量。
+
+```sh
+docker compose -f docker-compose.yml -f compose.gpu.yaml up -d
+docker compose -f docker-compose.yml -f compose.gpu.yaml ps
+```
+
+从源码部署时把上面命令的 `docker-compose.yml` 换成 `compose.yaml`，首次启动加入 `--build`。GPU 配置仅映射 `/dev/dri` 并补充数字组；服务继续以 `node` 用户运行。无需 `privileged`、root 或放宽设备为所有人可写。升级和重启时继续使用相同的两个 `-f` 文件。
+
+可在容器内运行两秒合成画面检查硬件编码；命令无窗口、无音频，也不生成影片文件：
+
+```sh
+docker compose -f docker-compose.yml -f compose.gpu.yaml exec -T web \
+  ffmpeg -nostdin -hide_banner -loglevel warning -filter_threads 2 \
+  -init_hw_device vaapi=va:/dev/dri/renderD128 -filter_hw_device va \
+  -f lavfi -i testsrc2=size=1280x720:rate=25 -t 2 \
+  -vf format=nv12,hwupload -c:v h264_vaapi -f null -
+```
+
+命令失败时保留错误输出，检查 GID、设备权限和 iHD 驱动；应用的 `auto` 模式仍会回退软件转码。播放时会显示当前兼容模式。
+
+跳转或修改倍速会重新建立兼容流。FFmpeg 的 `readrate` 只控制输入读取节奏，输出时间戳保持原速度，由浏览器完成倍速播放；直播兼容播放固定为 1 倍且不提供跳转。临时 HLS 只保留约一分钟的滑动窗口，长时间暂停后恢复或跳到窗口外需重新建立任务。第三方解析网页、DRM 内容和无法读取的源不支持兼容转码。
 
 ## 配置影视源与播放
 
@@ -251,7 +300,7 @@ docker buildx build --platform linux/amd64,linux/arm64 --tag vipvideo-web:local 
 
 `.github/workflows/docker-publish.yml` 在 `main` 推送、`v*` 标签推送或手动触发时运行。使用 Node.js 24 安装依赖并运行模块/接口测试，再构建双平台镜像，以仓库路径的小写形式推送到 GHCR 的唯一 CI 标签。全部运行检查成功后才为同一个多平台 digest 更新 `latest`，标签触发时也更新小写版本标签。构建或运行检查失败不会更新 `latest` 或版本标签；新任务会取消同一仓库尚未完成的旧发布，避免旧构建晚完成覆盖新发布。
 
-发布使用仓库自动提供的 `GITHUB_TOKEN`，只授予读取代码和写入 Packages 的权限，不需要额外发布密钥。工作流按本次构建的 digest 顺序拉取并运行 amd64、arm64 容器，验证健康接口、未登录限制和登录；arm64 通过 QEMU 实际运行。amd64 还写入样例收藏/进度并重建容器，确认会话及数据在同一卷保留。随后使用实际 NAS Compose 文件的临时副本启动独立项目，确认 Docker 健康状态为 `healthy`，并按本文流程停机备份、修改进度、恢复，再确认原会话、收藏和进度恢复。临时副本仅替换待验收镜像、样例密码和本机端口绑定，结束后清理测试项目及测试卷。只使用临时样例密码与测试卷，验收断言不依赖第三方源成功；启动后的自动维护可能在后台探测默认接口及直播清单，不保存媒体文件。
+发布使用仓库自动提供的 `GITHUB_TOKEN`，只授予读取代码和写入 Packages 的权限，不需要额外发布密钥。工作流按本次构建的 digest 顺序拉取并运行 amd64、arm64 容器，验证健康接口、未登录限制和登录；arm64 通过 QEMU 实际运行。两种架构还在容器内生成短合成 MPEG-4/AC3 MP4 与 HLS，经过实际媒体代理和转码服务，再用 FFprobe 检查输出 H.264/AAC、跳转位置与停止后清理；测试源仅保存在容器 `/tmp`，不修改生产公网地址校验。amd64 还写入样例收藏/进度并重建容器，确认会话及数据在同一卷保留。随后使用实际 NAS Compose 文件的临时副本启动独立项目，确认 Docker 健康状态为 `healthy`，并按本文流程停机备份、修改进度、恢复，再确认原会话、收藏和进度恢复。临时副本仅替换待验收镜像、样例密码和本机端口绑定，结束后清理测试项目及测试卷。只使用临时样例密码与测试卷，验收断言不依赖第三方源成功；启动后的自动维护可能在后台探测默认接口及直播清单，不保存媒体文件。
 
 首次部署前，确认 [发布工作流](https://github.com/loren1997/vipvideo-web/actions/workflows/docker-publish.yml) 已成功完成双平台运行检查。本仓库镜像已可匿名拉取；自行 Fork 的发布仓库仍需配置自己的包可见性。工作流不修改 GitHub 包可见性，也不保存家庭访问密码。
 
@@ -265,4 +314,4 @@ docker buildx build --platform linux/amd64,linux/arm64 --tag vipvideo-web:local 
 
 Dockerfile 以 Node.js 24 为目标。本机未安装 Docker，双平台镜像在 GitHub Actions 中构建并运行：amd64 与 arm64 检查登录和接口，amd64 还检查容器重建后的会话、收藏和进度；arm64 通过 QEMU 运行。工作流同时验收实际 NAS Compose 文件的启动、Docker 健康状态与停机备份恢复。公开 `latest` 的匿名拉取及两种架构清单已验证。未在实际 NAS 硬件上验收，部署后请检查 `docker compose -f docker-compose.yml ps` 的健康状态，并在你的网络中验证第三方影视源。
 
-没有增加多用户、下载、转码或穿透服务部署。安卓客户端由 CI 编译及 Lint，再由维护者本地签名并验签；实际手机 / 电视的遥控、硬件解码和外网切换仍需真机验证。
+没有增加多用户、下载或穿透服务部署。转码服务的容器内合成媒体检查由 CI 执行；PVE/Ubuntu 的 UHD 630 VAAPI、长影片负载和真实 NAS 上的多人使用尚未验收。安卓客户端由 CI 编译及 Lint，再由维护者本地签名并验签；实际手机 / 电视的遥控、硬件解码和外网切换仍需真机验证。

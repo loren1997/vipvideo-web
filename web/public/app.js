@@ -61,6 +61,7 @@ async function api(path, options = {}) {
     method: options.method || 'GET', credentials: 'same-origin', signal: AbortSignal.timeout(options.timeoutMs || 45000),
     headers: { Accept: 'application/json', ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
     ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+    ...(options.keepalive ? { keepalive: true } : {}),
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -459,7 +460,80 @@ function selectionFor(data, reference = {}) {
 }
 
 function playPosition(current) {
-  return current?.video?.readyState >= 1 ? current.video.currentTime : current?.position || 0;
+  if (current?.transcodeLoading || (current?.transcoded && !current.transcodeReady)) return current.position || 0;
+  return current?.video?.readyState >= 1 ? (current.transcoded ? current.startPosition || 0 : 0) + current.video.currentTime : current?.position || 0;
+}
+
+function playDuration(current) {
+  const duration = current?.transcoded ? current.originalDuration : current?.video?.duration;
+  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+}
+
+function historyRecord(current) {
+  return { ...fieldsOf(current.detail), line: current.line || 0, episode: current.episode || 0, url: current.originalUrl || current.url, mode: current.mode, ...(current.mode === 'parser' ? { parser: current.parser || '' } : { position: playPosition(current), duration: playDuration(current) }) };
+}
+
+function stopTranscode(id, keepalive = false) {
+  if (!id) return Promise.resolve();
+  return api('/api/transcode/stop', { method: 'POST', body: { id }, keepalive }).catch(error => console.warn('兼容播放任务停止失败', error.message));
+}
+
+function compatibilityLabel(current) {
+  return current.acceleration === 'vaapi' ? '硬件兼容播放' : '软件兼容播放';
+}
+
+async function startCompatibility(current, position = playPosition(current), automatic = false) {
+  if (player !== current || !(current.catalog || current.live) || !['hls', 'mp4'].includes(current.originalType || current.type)) return;
+  if (automatic && current.flow?.transcodeTried) return;
+  if (automatic) current.flow.transcodeTried = true;
+  if (!current.transcodePromise) current.request = ++playVersion;
+  if (current.catalog && !current.preferences) {
+    current.preferences = normalizePreferences(await (current.detail.preferencesPromise ||= api(`/api/player/preferences?${new URLSearchParams({ key: current.detail.key })}`).catch(error => { console.warn('播放偏好读取失败', error.message); return defaultPreferences; })));
+    if (player !== current) return;
+  }
+  const duration = playDuration(current);
+  let target = current.live ? 0 : Math.max(0, Math.min(86400, Number(position) || 0));
+  if (duration > 0) target = Math.min(target, Math.max(0, duration - 1));
+  current.preferences ||= { ...defaultPreferences };
+  if (current.catalog && target === 0 && !current.introHandled) target = Math.max(target, current.preferences.introSeconds);
+  if (duration > 0) target = Math.min(target, Math.max(0, duration - 1));
+  current.pendingTranscodePosition = target;
+  if (current.transcodePromise) return current.transcodePromise;
+  current.transcodePromise = (async () => {
+    while (player === current && current.pendingTranscodePosition !== undefined) {
+      const requested = current.pendingTranscodePosition; delete current.pendingTranscodePosition;
+      const request = current.request, stamp = current.stamp;
+      const valid = () => player === current && current.request === request && playVersion === request && routeVersion === stamp;
+      current.position = requested; current.transcodeLoading = true; current.recovering = true; current.failed = false;
+      clearTimeout(current.loadTimer); clearInterval(current.danmakuTimer); current.danmakuTimer = null;
+      if (current.video) current.video.pause();
+      current.note.textContent = '正在准备兼容播放，首次启动可能需要约 20 秒…'; current.note.className = 'player-note';
+      if (current.compatibilityButton) current.compatibilityButton.disabled = true;
+      try {
+        const body = current.live ? { liveId: current.channel.id, line: current.line, position: 0, speed: 1 } : { ...playbackSelection(current.detail, current.line, current.episode), id: String(current.detail.id), position: requested, speed: current.preferences.speed };
+        const job = await api('/api/transcode/start', { method: 'POST', body, timeoutMs: 35000 });
+        if (!valid()) { await stopTranscode(job.id, true); return; }
+        if (!job.id || !mediaUrl(job.url) || job.type !== 'hls') { await stopTranscode(job.id, true); throw new Error('兼容播放服务返回了无效的播放任务。'); }
+        current.originalUrl ||= current.url; current.originalType ||= current.type;
+        Object.assign(current, { transcodeId: job.id, transcoded: true, transcodeReady: false, startPosition: Number(job.startPosition) || 0, originalDuration: Number.isFinite(job.duration) && job.duration > 0 ? job.duration : 0, acceleration: job.acceleration, url: job.url, type: 'hls', usedProxy: false, started: true, position: Number(job.startPosition) || 0, introHandled: true, failed: false, recovering: false });
+        current.transcodeLoading = false;
+        if (current.pendingTranscodePosition !== undefined) continue;
+        if (current.video) { resetDanmaku(current); loadMedia(current, `正在连接${compatibilityLabel(current)}…`); }
+        else mountPlayer(current);
+        if (current.proxyButton) current.proxyButton.disabled = true;
+        if (current.compatibilityButton) current.compatibilityButton.textContent = '重新兼容播放';
+      } catch (error) {
+        if (!valid()) { console.warn('离开播放器后兼容任务启动失败', error.message); return; }
+        delete current.pendingTranscodePosition; current.failed = true; current.recovering = false;
+        current.note.textContent = error.status === 409 ? '兼容播放正被另一台设备使用，请稍后再试。' : `兼容播放未启动：${error.message}`;
+        current.note.className = 'player-note error-message'; console.warn('兼容播放启动失败', error.message);
+      } finally {
+        current.transcodeLoading = false;
+        if (player === current && current.compatibilityButton) current.compatibilityButton.disabled = false;
+      }
+    }
+  })().finally(() => { current.transcodePromise = null; });
+  return current.transcodePromise;
 }
 
 async function withVerificationSlot(work) {
@@ -543,7 +617,7 @@ function verifyOptions(data, candidates) {
 }
 
 function reportPlayback(current, status) {
-  if (player !== current || !current.catalog || current.playabilityReported === status) return;
+  if (player !== current || !current.catalog || current.transcoded || current.playabilityReported === status) return;
   current.playabilityReported = status;
   const key = playbackKey(current.detail, current.line, current.episode);
   const entry = playabilityCache.get(key) || {};
@@ -789,7 +863,7 @@ function preferredLiveLine(channel, tried = new Set()) {
 }
 
 function reportLive(current, status) {
-  if (player !== current || current.liveReported === status) return;
+  if (player !== current || current.transcoded || current.liveReported === status) return;
   current.liveReported = status;
   current.channel.streams[current.line].status = status;
   if (status === 'error') {
@@ -823,7 +897,9 @@ async function startLiveChannel(channel, line, stamp, flow = { tried: new Set() 
     Object.assign(current, playback, { started: true }); mountPlayer(current);
   } catch (error) {
     if (stamp !== routeVersion || request !== playVersion || player !== current) return;
-    current.note = node('p', error.message, 'player-note error-message'); host.replaceChildren(current.note); void recoverLive(current);
+    current.note = node('p', error.message, 'player-note error-message'); host.replaceChildren(current.note);
+    if (['hls', 'mp4'].includes(current.type)) host.append(button('兼容播放', () => void startCompatibility(current)));
+    void recoverLive(current);
   }
 }
 
@@ -838,6 +914,7 @@ async function recoverLive(current) {
   reportLive(current, 'error');
   const next = preferredLiveLine(current.channel, current.flow.tried);
   if (current.flow.tried.size < 3 && next >= 0) { await startLiveChannel(current.channel, next, current.stamp, current.flow); return; }
+  if (!current.flow.transcodeTried && ['hls', 'mp4'].includes(current.type)) { current.recovering = false; await startCompatibility(current, 0, true); return; }
   current.failed = true; current.recovering = false;
   current.note.textContent = '当前频道暂时无法播放。请切换线路或选择其他频道。'; current.note.className = 'player-note error-message';
 }
@@ -884,7 +961,9 @@ async function startEpisode(data, line, episode, position = 0, flow = { tried: n
   } catch (error) {
     if (stamp !== routeVersion || request !== playVersion || player !== current) return;
     const note = node('p', error.message, 'player-note error-message'); current.note = note;
-    host.replaceChildren(note); void recoverPlayback(current);
+    host.replaceChildren(note);
+    if (['hls', 'mp4'].includes(current.type)) host.append(button('兼容播放', () => void startCompatibility(current)));
+    void recoverPlayback(current);
   }
 }
 
@@ -894,9 +973,11 @@ function normalizePreferences(value = {}) {
 
 function seekVideo(current, seconds) {
   if (player !== current || !current.video || current.live) return;
-  const video = current.video;
-  if (!Number.isFinite(video.duration) || video.duration <= 0) return;
-  video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + seconds));
+  const duration = playDuration(current);
+  const position = Math.max(0, playPosition(current) + seconds);
+  if (current.transcoded) { void startCompatibility(current, duration ? Math.min(duration - 1, position) : position); return; }
+  if (!duration) return;
+  current.video.currentTime = Math.min(duration, position);
 }
 
 function playerPreferences(current, host) {
@@ -940,13 +1021,13 @@ function clearDanmaku(current) {
 function resetDanmaku(current) {
   if (!current.danmaku) return;
   clearDanmaku(current); current.danmaku.shown.clear();
-  const index = current.danmaku.comments.findIndex(comment => comment.time >= current.video.currentTime - 0.25);
+  const index = current.danmaku.comments.findIndex(comment => comment.time >= playPosition(current) - 0.25);
   current.danmaku.cursor = index < 0 ? current.danmaku.comments.length : index;
 }
 
 function drawDanmaku(current) {
   if (player !== current || !current.preferences?.danmakuEnabled || current.video.paused || !current.danmaku) return;
-  const state = current.danmaku, time = current.video.currentTime;
+  const state = current.danmaku, time = playPosition(current);
   while (state.cursor < state.comments.length && state.comments[state.cursor].time <= time) {
     const comment = state.comments[state.cursor++];
     if (comment.time < time - 1 || state.shown.has(comment.id) || state.active.size >= 12) continue;
@@ -975,7 +1056,7 @@ async function loadDanmaku(current) {
       const result = await api(`/api/danmaku?${new URLSearchParams({ key: current.detail.key, episode: current.episodeName })}`);
       if (player !== current || !current.preferences.danmakuEnabled) return;
       current.danmaku.comments = (result.comments || []).filter(comment => typeof comment.text === 'string' && Number.isFinite(comment.time) && comment.time >= 0).map(comment => ({ ...comment, id: String(comment.id), text: comment.text.slice(0, 200) })).sort((first, second) => first.time - second.time);
-      const index = current.danmaku.comments.findIndex(comment => comment.time >= current.video.currentTime - 1);
+      const index = current.danmaku.comments.findIndex(comment => comment.time >= playPosition(current) - 1);
       current.danmaku.cursor = index < 0 ? current.danmaku.comments.length : index;
       current.danmakuStatus.textContent = (result.errors || []).map(error => typeof error === 'string' ? error : error.error || error.message || '弹幕来源暂不可用').join('；'); drawDanmaku(current);
     } catch (error) { if (player === current) current.danmakuStatus.textContent = `弹幕暂时不可用：${error.message}`; }
@@ -995,7 +1076,7 @@ function mountDanmaku(current, surface, host) {
     event.preventDefault(); const text = input.value.trim(); if (!text || player !== current || !current.preferences.danmakuEnabled) return;
     send.disabled = true;
     try {
-      await api('/api/danmaku', { method: 'POST', body: { key: current.detail.key, episode: current.episodeName, time: current.video.currentTime, text } });
+      await api('/api/danmaku', { method: 'POST', body: { key: current.detail.key, episode: current.episodeName, time: playPosition(current), text } });
       if (player !== current) return;
       input.value = ''; await loadDanmaku(current);
     } catch (error) { if (player === current) current.danmakuStatus.textContent = `弹幕未发送：${error.message}`; }
@@ -1076,26 +1157,48 @@ function mountPlayer(current) {
   const rates = [...new Set([0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, current.preferences.speed])].sort((first, second) => first - second);
   for (const rate of rates) { const option = node('option', `${rate}×`); option.value = rate; speed.append(option); }
   speed.value = String(current.preferences.speed); video.playbackRate = current.preferences.speed;
-  speed.addEventListener('change', () => { current.preferences.speed = Number(speed.value); video.playbackRate = current.preferences.speed; });
+  speed.disabled = Boolean(current.live);
+  speed.addEventListener('change', () => {
+    const position = playPosition(current); current.preferences.speed = Number(speed.value); video.playbackRate = current.preferences.speed;
+    if (current.transcoded) void startCompatibility(current, position);
+  });
   const full = button('全屏', async () => {
     try { if (video.requestFullscreen) await video.requestFullscreen(); else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else notify('当前浏览器不支持全屏。'); }
     catch (error) { notify(error.message, true); }
   });
   toolbar.append(backward, forward, speed, full);
+  if (current.catalog || current.live) {
+    current.compatibilityButton = button(current.transcoded ? '重新兼容播放' : '兼容播放', () => void startCompatibility(current));
+    current.compatibilityButton.title = '原始线路无法解码或有画面无声音时，通过服务器转换为兼容格式'; toolbar.append(current.compatibilityButton);
+  }
   if (current.catalog) {
     const next = button('下一集 →', () => void nextEpisode(current)); next.disabled = !current.detail.lines[current.line]?.episodes[current.episode + 1]; toolbar.append(next);
     playerPreferences(current, host); mountDanmaku(current, surface, host);
   }
   if (current.proxyUrl) {
     const proxy = button('兼容转发', () => {
+      if (current.transcoded) return;
       current.request = ++playVersion; current.flow = { tried: new Set([current.live ? current.line : current.detail.source]) }; current.failed = false; current.recovering = false;
       current.position = current.live ? 0 : playPosition(current); current.usedProxy = !current.usedProxy;
       proxy.textContent = current.usedProxy ? '切回直连' : '兼容转发'; proxy.classList.toggle('selected', current.usedProxy); loadMedia(current);
     }); proxy.title = '跨域或直连失败时，尝试服务器受限转发'; current.proxyButton = proxy; toolbar.append(proxy);
   }
-  toolbar.append(externalLink('原链接 ↗', current.url));
+  toolbar.append(externalLink('原链接 ↗', current.originalUrl || current.url));
+  const clock = node('div', undefined, 'player-clock');
+  const clockText = node('span'); const timeline = node('input'); timeline.type = 'range'; timeline.min = '0'; timeline.step = '1'; timeline.setAttribute('aria-label', '原片进度');
+  clock.append(clockText, timeline); host.insertBefore(clock, current.note);
+  const updateClock = () => {
+    const duration = playDuration(current), position = playPosition(current);
+    clockText.textContent = `${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${formatTime(position)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
+    timeline.hidden = !current.transcoded || current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
+    timeline.max = String(Math.max(0, duration - 1)); if (document.activeElement !== timeline) timeline.value = String(position);
+  };
+  timeline.addEventListener('change', () => { if (player === current && current.transcoded) void startCompatibility(current, Number(timeline.value)); });
+  current.updateClock = updateClock;
   video.addEventListener('loadedmetadata', () => {
     if (player !== current) return;
+    video.playbackRate = current.preferences.speed;
+    if (current.transcoded) { updateClock(); return; }
     if (current.position > 0) {
       try { video.currentTime = Number.isFinite(video.duration) ? Math.min(current.position, Math.max(0, video.duration - 1)) : current.position; }
       catch { notify('当前线路无法跳转到保存的时间，请手动选择进度。'); }
@@ -1106,15 +1209,25 @@ function mountPlayer(current) {
       if (current.preferences.introSeconds > 0) video.currentTime = Math.min(current.preferences.introSeconds, Math.max(0, video.duration - 1));
     }
   });
-  video.addEventListener('pause', () => { if (player === current) { void saveHistory(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
+  video.addEventListener('pause', () => { if (player === current) { if (current.transcoded && !current.transcodeLoading) current.pausedAt = Date.now(); void saveHistory(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
+  video.addEventListener('play', () => {
+    if (player !== current || !current.transcoded || current.transcodeLoading) return;
+    if (current.pausedAt && Date.now() - current.pausedAt >= 120000 && !current.expiryRecovered) {
+      current.expiryRecovered = true; void startCompatibility(current, playPosition(current));
+    }
+    current.pausedAt = 0;
+  });
   video.addEventListener('ended', () => { if (player === current) { void saveHistory(current); if (current.catalog && current.preferences.autoNext && !current.nextPending) { current.nextPending = true; void nextEpisode(current); } } });
-  video.addEventListener('loadeddata', () => { if (player === current) { clearTimeout(current.loadTimer); if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); } });
-  video.addEventListener('playing', () => { if (player === current) { clearTimeout(current.loadTimer); note.textContent = current.live ? `正在直播 · ${current.detail.title}` : `${current.episodeName || current.detail.title} · 进度每 10 秒自动保存`; note.className = 'player-note'; current.overlay?.classList.remove('paused'); if (current.catalog) { startDanmakuSync(current); drawDanmaku(current); } } });
+  video.addEventListener('loadeddata', () => { if (player === current) { clearTimeout(current.loadTimer); if (current.transcoded) current.transcodeReady = true; if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); updateClock(); resetDanmaku(current); } });
+  video.addEventListener('playing', () => { if (player === current) { clearTimeout(current.loadTimer); note.textContent = `${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${current.live ? `正在直播 · ${current.detail.title}` : `${current.episodeName || current.detail.title} · 进度每 10 秒自动保存`}`; note.className = 'player-note'; current.overlay?.classList.remove('paused'); if (current.catalog) { startDanmakuSync(current); drawDanmaku(current); } } });
   video.addEventListener('timeupdate', () => {
-    if (player !== current || !current.catalog) return;
+    if (player !== current) return;
+    updateClock();
+    if (!current.catalog) return;
     drawDanmaku(current);
     const outro = current.preferences.outroSeconds;
-    if (!video.paused && current.preferences.autoNext && outro > 0 && Number.isFinite(video.duration) && video.currentTime >= video.duration - outro && !current.nextPending && current.detail.lines[current.line]?.episodes[current.episode + 1]) {
+    const duration = playDuration(current);
+    if (!video.paused && current.preferences.autoNext && outro > 0 && duration > 0 && playPosition(current) >= duration - outro && !current.nextPending && current.detail.lines[current.line]?.episodes[current.episode + 1]) {
       current.nextPending = true; void nextEpisode(current);
     }
   });
@@ -1127,12 +1240,18 @@ function mountPlayer(current) {
       void api('/api/config').then(next => { if (player === current) applyConfig(next); }).catch(error => notify(`显示设置未同步：${error.message}`, true));
     }
   }, 10000);
-  loadMedia(current); void saveHistory(current);
+  loadMedia(current); updateClock(); void saveHistory(current);
 }
 
 function playbackError(current) {
   if (player !== current || current.failed) return;
   clearTimeout(current.loadTimer);
+  if (current.transcodeLoading) return;
+  if (current.transcoded) {
+    current.position = playPosition(current); current.failed = true;
+    current.note.textContent = '兼容播放中断，请点击“重新兼容播放”重试。'; current.note.className = 'player-note error-message';
+    void stopTranscode(current.transcodeId); current.transcodeId = null; return;
+  }
   if (current.catalog) void recoverPlayback(current);
   else if (current.live) void recoverLive(current);
   else { current.note.textContent = '当前地址无法播放，请更换链接或打开原链接。'; current.note.className = 'player-note error-message'; }
@@ -1154,6 +1273,7 @@ async function recoverPlayback(current) {
   if (player !== current || request !== playVersion || current.stamp !== routeVersion) return;
   const candidate = current.flow.tried.size < 3 ? candidates.find(item => !current.flow.tried.has(item.source)) : null;
   if (candidate) { await switchSource(current.detail, candidate, current.flow); return; }
+  if (!current.flow.transcodeTried && ['hls', 'mp4'].includes(current.type)) { current.recovering = false; await startCompatibility(current, current.position, true); return; }
   current.failed = true; current.recovering = false;
   current.note.textContent = '自动尝试已结束。请手动切换影视源、线路或剧集，也可以打开原链接。'; current.note.className = 'player-note error-message';
 }
@@ -1176,7 +1296,7 @@ function loadMedia(current, message = '正在连接播放地址…') {
   const video = current.video;
   current.loadTimer = setTimeout(() => { if (player === current && generation === current.mediaVersion && video.readyState < 2) playbackError(current); }, 15000);
   if (current.type === 'hls' && window.Hls?.isSupported()) {
-    hls = new window.Hls(); hls.loadSource(url); hls.attachMedia(video);
+    hls = new window.Hls(current.transcoded ? { startPosition: 0 } : {}); hls.loadSource(url); hls.attachMedia(video);
     hls.on(window.Hls.Events.ERROR, (_event, data) => { if (player === current && generation === current.mediaVersion && data.fatal) playbackError(current); });
     hls.on(window.Hls.Events.MANIFEST_PARSED, () => { if (player === current && generation === current.mediaVersion) attemptPlay(current, generation); });
   } else if (current.type === 'hls' && !video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -1192,7 +1312,7 @@ async function nextEpisode(current) {
 
 function saveHistory(current) {
   if (current.live || current.started === false) return Promise.resolve();
-  const record = { ...fieldsOf(current.detail), line: current.line || 0, episode: current.episode || 0, url: current.url, mode: current.mode, ...(current.mode === 'parser' ? { parser: current.parser || '' } : { position: current.video?.currentTime || current.position || 0, duration: Number.isFinite(current.video?.duration) ? current.video.duration : 0 }) };
+  const record = historyRecord(current);
   library.history = [record, ...library.history.filter(item => item.key !== record.key)];
   const saved = historyQueue.catch(() => {}).then(() => api('/api/history', { method: 'POST', body: record }));
   historyQueue = saved;
@@ -1210,7 +1330,7 @@ function stopPlayer(invalidate = true) {
   if (hls) { hls.destroy(); hls = null; }
   if (current.video) { current.video.pause(); current.video.removeAttribute('src'); current.video.load(); }
   if (current.frame) current.frame.src = 'about:blank';
-  return save;
+  return Promise.all([save, stopTranscode(current.transcodeId, true)]);
 }
 
 function openLink(url, resume = false) {
@@ -1439,9 +1559,16 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 window.addEventListener('pagehide', () => {
-  if (!player || player.live || player.started === false) return;
+  if (!player) return;
   const current = player;
-  const record = { ...fieldsOf(current.detail), line: current.line || 0, episode: current.episode || 0, url: current.url, mode: current.mode, ...(current.mode === 'parser' ? { parser: current.parser || '' } : { position: current.video?.currentTime || current.position || 0, duration: Number.isFinite(current.video?.duration) ? current.video.duration : 0 }) };
+  playVersion++; player = null;
+  clearInterval(current.timer); clearInterval(current.danmakuTimer); clearTimeout(current.loadTimer); clearDanmaku(current);
+  if (hls) { hls.destroy(); hls = null; }
+  current.video?.pause();
+  void stopTranscode(current.transcodeId, true); current.transcodeId = null;
+  if (current.live || current.started === false) return;
+  const record = historyRecord(current);
   void fetch('/api/history', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(record), keepalive: true }).catch(error => console.warn('离开页面时未能保存观看记录', error));
 });
+window.addEventListener('pageshow', event => { if (event.persisted && !$('#app-view')?.hidden) void renderRoute(); });
 void boot().catch(error => { $('#login-view').hidden = false; $('#login-error').textContent = error.message; });

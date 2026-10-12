@@ -1,0 +1,8 @@
+services:
+  web:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID:?请先在 Ubuntu 执行 stat -c %g /dev/dri/renderD128 并在 .env 设置 RENDER_GID}"
+    environment:
+      LIBVA_DRIVER_NAME: iHD

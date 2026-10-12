@@ -2,7 +2,22 @@ FROM node:24-bookworm-slim
 
 ENV NODE_ENV=production \
     PORT=3000 \
-    DATA_DIR=/app/data
+    DATA_DIR=/app/data \
+    TRANSCODE_ENABLED=true \
+    TRANSCODE_ACCEL=auto \
+    FFMPEG_PATH=ffmpeg
+
+# Coffee Lake 的完整 H.264 编码功能需要含媒体着色器的 iHD 驱动。
+RUN set -eu; \
+    if [ "$(dpkg --print-architecture)" = amd64 ]; then \
+      sed -i 's/Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates ffmpeg; \
+    if [ "$(dpkg --print-architecture)" = amd64 ]; then \
+      apt-get install -y --no-install-recommends intel-media-va-driver-non-free; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --chown=node:node web/package.json web/package-lock.json ./

@@ -69,6 +69,7 @@ jobs:
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import { execFileSync, spawnSync } from 'node:child_process';
+          import { readFileSync } from 'node:fs';
           import { setTimeout as wait } from 'node:timers/promises';
 
           const base = 'http://127.0.0.1:3000';
@@ -110,6 +111,14 @@ jobs:
               assert.match(setCookie, /HttpOnly/);
               cookie = setCookie.split(';')[0];
               assert.equal((await api('/api/config')).status, 200);
+              const smoke = spawnSync('docker', ['exec', '-i', name, 'node', '--input-type=module'], {
+                input: readFileSync('web/test/transcode-smoke.mjs', 'utf8'),
+                encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024,
+              });
+              if (smoke.stdout) process.stdout.write(smoke.stdout);
+              if (smoke.stderr) process.stderr.write(smoke.stderr);
+              if (smoke.error) throw smoke.error;
+              assert.equal(smoke.status, 0, `${platform} FFmpeg smoke failed`);
               if (architecture === 'amd64') {
                 const record = { key: 'ci-fixture-film', title: 'CI 持久化样例', type: 'movie' };
                 assert.equal((await api('/api/favorites', record)).status, 200);

@@ -38,13 +38,14 @@ const doomed = fixture('有限重试', 'series', 'doomed', '国产剧', '全2集
 const slow = fixture('慢响应', 'series', 'slow', '国产剧', '全2集');
 const hlsPriority = fixture('HLS选择样例', 'series', 'hls-priority', '国产剧', '全2集');
 const controlsFilm = fixture('播放器样例', 'series', 'controls', '国产剧', '全2集');
+const compatibilityFilm = fixture('兼容播放样例', 'series', 'compatibility', '国产剧', '全2集', ['first']);
 const verifiedFilm = fixture('可播放验证样例', 'series', 'verified', '国产剧', '全2集', ['first', 'second', 'third']);
 const adult = fixture('限制级样例', 'movie', 'adult', '限制级', '样例');
 adult.category = 'adult'; adult.items.forEach(item => { item.category = 'adult'; });
 const categoryBoundary = fixture('分类边界样例', 'movie', 'category-normal', '剧情片', '样例');
 const categoryAdult = { ...categoryBoundary.items[0], source: 'third', id: 'category-adult', category: 'adult', typeName: '限制级' };
 const mixedCategory = { ...categoryBoundary, category: 'adult', typeName: '限制级', items: [...categoryBoundary.items, categoryAdult] };
-const groups = [{ ...summary, items }, movie, moviePage2, anime, variety, broken, badDetail, doomed, slow, hlsPriority, controlsFilm, verifiedFilm, adult, mixedCategory];
+const groups = [{ ...summary, items }, movie, moviePage2, anime, variety, broken, badDetail, doomed, slow, hlsPriority, controlsFilm, compatibilityFilm, verifiedFilm, adult, mixedCategory];
 let delayAdultDetail = false;
 const catalogRequests = [];
 const maintenance = { probeCount: 0, updateCount: 0, discoverCount: 0, statusReads: 0, checkedAt: 0, updatedAt: 0 };
@@ -52,6 +53,9 @@ const liveRequests = [];
 let liveFailures = [];
 const liveReports = [], danmakuRequests = [], playerRequests = [];
 const playabilityRequests = [], playabilityReports = [], playableResults = new Map();
+const transcodeStarts = [], transcodeStops = [];
+let transcodeMode = 'disabled', transcodeDuration = 1200, transcodeAcceleration = 'software', holdTranscode = false, releaseTranscode;
+let holdCandidateSearch = false, releaseCandidateSearch;
 let probeActive = 0, probeMax = 0, holdVerifiedProbe = false, releaseVerifiedProbes = [];
 const preferences = new Map(), bindings = new Map(), comments = new Map();
 const episodeKey = (film, episode) => JSON.stringify([film, episode]);
@@ -97,7 +101,7 @@ const catalog = {
     if (id === 'adult' && config.showAdult !== true) throw Object.assign(new Error('三级内容已隐藏，请先在设置中开启显示。'), { status: 403 });
     if (id === 'adult' && delayAdultDetail) await new Promise(ok => setTimeout(ok, 700));
     const metadata = id === 'category-normal' || id === 'category-adult' ? { ...categoryBoundary, category: 'adult', typeName: '限制级' } : groups.find(group => group.items.some(item => item.source === source && item.id === id)) || { ...summary, items };
-    const failed = id === 'doomed' || ['broken', 'hls-priority'].includes(id) && source === 'first';
+    const failed = ['doomed', 'compatibility'].includes(id) || ['broken', 'hls-priority'].includes(id) && source === 'first';
     const numbers = ['broken', 'controls'].includes(id) && source === 'second' ? [2, 1] : [1, 2];
     return { ...metadata, source, id, description: '固定浏览器测试影片。', lines: [
       { name: '原始网页', episodes: [1, 2].map(number => ({ name: `第${number}集`, type: 'page', url: `https://video.example/watch/${id}-${number}` })) },
@@ -134,6 +138,7 @@ try {
     await value.route('**/*', async route => {
       const url = route.request().url();
       const parsed = new URL(url);
+      if (parsed.origin === base && parsed.pathname === '/api/search' && holdCandidateSearch && parsed.searchParams.get('q') === broken.title) await new Promise(ok => { releaseCandidateSearch = ok; });
       if (realServices && parsed.origin === base && ['/api/player/preferences', '/api/danmaku', '/api/danmaku/binding'].includes(parsed.pathname)) return route.continue();
       if (parsed.origin === base && parsed.pathname === '/api/config' && route.request().method() === 'PUT') savedConfigBodies.push(route.request().postDataJSON());
       if (fixtureImportWarnings && parsed.origin === base && parsed.pathname === '/api/config/import') {
@@ -142,6 +147,19 @@ try {
         return route.fulfill({ response, json: { ...await response.json(), importWarnings: ['不支持的蜘蛛源样例已跳过。', '文字提示 <img src=x onerror=alert(1)>'] } });
       }
       if (url.startsWith(base + '/api/playback?')) playerRequests.push(url);
+      if (parsed.origin === base && parsed.pathname === '/api/transcode/status') return route.fulfill({ json: { available: true, enabled: transcodeMode !== 'disabled', acceleration: transcodeAcceleration, running: 0 } });
+      if (parsed.origin === base && parsed.pathname === '/api/transcode/stop') { transcodeStops.push(route.request().postDataJSON()); return route.fulfill({ json: { ok: true } }); }
+      if (parsed.origin === base && parsed.pathname === '/api/transcode/start') {
+        const body = route.request().postDataJSON(); transcodeStarts.push(body);
+        if (transcodeMode === 'busy') return route.fulfill({ status: 409, json: { error: '兼容任务已被另一会话占用' } });
+        if (transcodeMode === 'disabled') return route.fulfill({ status: 503, json: { error: '自动尝试已结束；兼容转码未启用' } });
+        if (holdTranscode) await new Promise(ok => { releaseTranscode = ok; });
+        assert.ok(body.liveId ? body.position === 0 && body.speed === 1 : typeof body.id === 'string' && Number.isInteger(body.line) && Number.isInteger(body.episode) && body.position >= 0 && body.position <= 86400);
+        const id = `fixture-${transcodeStarts.length}`;
+        return route.fulfill({ json: { id, url: `/api/transcode/${id}/index.m3u8`, type: 'hls', transcoded: true, startPosition: body.position, duration: transcodeDuration, acceleration: transcodeAcceleration } });
+      }
+      // 原生静音WAV只验证转码契约与媒体事件；FFmpeg实际HLS由独立转码集成测试覆盖。
+      if (parsed.origin === base && /^\/api\/transcode\/fixture-\d+\/index\.(?:m3u8|mp4)$/.test(parsed.pathname)) return route.fulfill({ status: 200, contentType: 'audio/wav', body: media, headers: { 'Accept-Ranges': 'bytes' } });
       if (parsed.origin === base && parsed.pathname === '/api/playability/report') {
         const body = route.request().postDataJSON(); playabilityReports.push(body);
         playableResults.set(JSON.stringify([body.source, body.id, body.line, body.episode]), body.status === 'ok');
@@ -783,6 +801,145 @@ try {
   await real.value.close();
   console.log('PASS 实际服务器路由保存偏好、家庭弹幕POST/GET、集名CID绑定保存清除与非法集数拒绝');
 
+  transcodeMode = 'enabled';
+  preferences.set(compatibilityFilm.key, { introSeconds: 60, outroSeconds: 10, autoNext: true, speed: 1, danmakuEnabled: true });
+  comments.set(episodeKey(compatibilityFilm.key, '第1集'), [{ id: 'offset-comment', time: 62, text: '原片六十二秒样例', origin: 'family' }]);
+  const compat = await context({ width: 1440, height: 1000 }); const cp = compat.page;
+  // 此适配器仅将固定任务URL交给原生WAV媒体事件；真实HLS解码由独立Hls.js/FFmpeg验收覆盖。
+  await cp.evaluate(() => {
+    const realHls = window.Hls;
+    window.Hls = class FixtureHls {
+      static Events = realHls.Events;
+      static isSupported() { return true; }
+      loadSource(url) { this.url = url; }
+      attachMedia(video) { video.src = this.url.replace(/(\/api\/transcode\/fixture-\d+\/index)\.m3u8$/, '$1.mp4'); }
+      on(event, callback) { if (event === realHls.Events.MANIFEST_PARSED) queueMicrotask(() => callback(event)); }
+      destroy() {}
+    };
+  });
+  const searchCompat = async title => {
+    await cp.locator('nav a[href="#search"]').click(); await cp.getByLabel('影片名称', { exact: true }).fill(title);
+    await cp.getByRole('button', { name: '搜索', exact: true }).click(); await cp.getByRole('button', { name: `播放 ${title}`, exact: true }).click();
+  };
+  const decodedCompat = async () => !await cp.locator('.player-note').textContent().then(value => value.includes('正在准备兼容播放')).catch(() => true) && cp.locator('video').evaluate((video, id) => video.readyState >= 2 && video.currentSrc.includes(`/api/transcode/${id}/`), `fixture-${transcodeStarts.length}`).catch(() => false);
+  const compatStart = transcodeStarts.length;
+  await searchCompat(compatibilityFilm.title);
+  try { await until(decodedCompat, '直连/代理失败后自动兼容播放', 20000); }
+  catch (error) { console.error('COMPAT_DEBUG', JSON.stringify({ starts: transcodeStarts.slice(compatStart), stops: transcodeStops, note: await cp.locator('.player-note').textContent(), video: await cp.locator('video').evaluate(video => ({ src: video.currentSrc, ready: video.readyState, error: video.error?.message, time: video.currentTime })).catch(() => null) })); throw error; }
+  assert.equal(transcodeStarts.length, compatStart + 1, '自动转码仅一次');
+  assert.equal(transcodeStarts.at(-1).position, 60, '首个兼容任务直接跳过片头');
+  assert.equal(transcodeStarts.at(-1).speed, 1);
+  assert.ok(playabilityReports.some(value => value.id === 'compatibility' && value.status === 'error'), '原流全部失败仍允许受限转码');
+  const originalReports = playabilityReports.length;
+  await cp.locator('video').evaluate(async video => { video.pause(); video.currentTime = 2; await video.play(); video.dispatchEvent(new Event('timeupdate')); });
+  await cp.getByText('原片六十二秒样例', { exact: true }).waitFor();
+  await cp.getByLabel('家庭弹幕', { exact: true }).fill('兼容原片时间'); await cp.getByRole('button', { name: '发送弹幕', exact: true }).click();
+  await until(() => comments.get(episodeKey(compatibilityFilm.key, '第1集')).some(value => value.text === '兼容原片时间' && value.time >= 62 && value.time < 65), '兼容弹幕按原片绝对时间');
+  await cp.locator('video').evaluate(video => video.pause());
+  await until(() => app.store.list('history').some(value => value.key === compatibilityFilm.key && value.position >= 62 && value.duration === 1200), '兼容保存原片进度和总时长');
+  assert.match(await cp.locator('.player-clock').textContent(), /软件兼容播放/);
+  assert.equal(playabilityReports.length, originalReports, '转码成功不报告原始URL可播');
+  await cp.screenshot({ path: join(output, 'desktop-compatible-player.png'), fullPage: true });
+  await cp.setViewportSize({ width: 390, height: 844 });
+  assert.ok(await cp.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '手机兼容播放控件不能横向溢出');
+  await cp.screenshot({ path: join(output, 'mobile-compatible-player.png'), fullPage: true });
+  await cp.setViewportSize({ width: 1440, height: 1000 });
+  await cp.getByRole('button', { name: '快进 10 秒', exact: true }).click(); await until(decodedCompat, '兼容快进重新启动');
+  assert.ok(transcodeStarts.at(-1).position >= 72 && transcodeStarts.at(-1).position < 75, '快进使用offset+当前时间');
+  await cp.locator('video').evaluate(video => video.pause());
+  await cp.getByRole('button', { name: '快退 10 秒', exact: true }).click(); await until(decodedCompat, '兼容快退重新启动');
+  assert.ok(transcodeStarts.at(-1).position >= 62 && transcodeStarts.at(-1).position < 66);
+  await cp.locator('video').evaluate(video => video.pause());
+  await cp.getByLabel('播放速度', { exact: true }).selectOption('3'); await until(decodedCompat, '兼容倍速按原片位置重启');
+  assert.equal(transcodeStarts.at(-1).speed, 3); assert.equal(await cp.locator('video').evaluate(video => video.playbackRate), 3);
+  await cp.getByLabel('原片进度', { exact: true }).fill('100'); await cp.getByLabel('原片进度', { exact: true }).dispatchEvent('change'); await until(decodedCompat, '原片进度条重新定位');
+  assert.equal(transcodeStarts.at(-1).position, 100);
+  await cp.locator('video').evaluate(video => { video.currentTime = 4; video.pause(); });
+  await until(() => app.store.list('history').some(value => value.key === compatibilityFilm.key && value.position >= 104 && value.position < 108), '原生控件relative seek不重复加offset');
+  const stoppedJob = await cp.locator('video').evaluate(video => new URL(video.currentSrc).pathname.split('/')[3]);
+  await cp.locator('nav a[href="#home"]').click(); await until(() => transcodeStops.some(value => value.id === stoppedJob), '离开兼容播放器停止任务');
+  await cp.getByRole('button', { name: `继续观看 ${compatibilityFilm.title}`, exact: true }).click(); await until(decodedCompat, '兼容影片续播');
+  assert.ok(transcodeStarts.at(-1).position >= 104, '续播不从片段4秒开始');
+  console.log('PASS 兼容自动回退仅一次、原片offset进度/总时长/弹幕/原生seek/续播、片头和3倍速、原流状态隔离');
+
+  await cp.locator('nav a[href="#home"]').click();
+  transcodeAcceleration = 'vaapi'; transcodeDuration = null;
+  await searchCompat(controlsFilm.title); await until(() => cp.locator('video').evaluate(video => video.readyState >= 2).catch(() => false), '正常影片手动兼容前');
+  await cp.locator('video').evaluate(video => { video.currentTime = 8; video.pause(); });
+  const manualReports = playabilityReports.length;
+  await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await until(decodedCompat, '手动硬件兼容播放');
+  assert.ok(transcodeStarts.at(-1).position >= 8 && transcodeStarts.at(-1).position < 10);
+  assert.match(await cp.locator('.player-clock').textContent(), /硬件兼容播放.*总时长未知/);
+  assert.equal(await cp.getByLabel('原片进度', { exact: true }).isVisible(), false);
+  await cp.getByLabel('自动下一集', { exact: true }).check(); await cp.getByLabel('跳过片尾（秒）', { exact: true }).fill('10');
+  const unknownEpisode = transcodeStarts.at(-1).episode;
+  await cp.locator('video').evaluate(async video => { video.currentTime = 25; await video.play(); video.dispatchEvent(new Event('timeupdate')); }); await cp.waitForTimeout(150); await cp.locator('video').evaluate(video => video.pause());
+  assert.equal(transcodeStarts.at(-1).episode, unknownEpisode, '未知总时长不能把HLS窗口当片尾');
+  await until(() => app.store.list('history').some(value => value.key === controlsFilm.key && value.duration === 0 && value.position >= 33), '未知原片时长保存0');
+  assert.equal(playabilityReports.length, manualReports, '手动兼容不更新原流可播状态');
+  await cp.locator('#source-row').getByRole('button', { name: '第二源', exact: true }).click();
+  await until(() => cp.locator('video').evaluate(video => video.readyState >= 1 && video.currentSrc.includes('controls-second')).catch(() => false), '兼容后仍可按集名手动换源');
+  assert.ok(app.store.list('history').some(value => value.key === controlsFilm.key && value.source === 'second'), '换源恢复正常线路记录');
+  console.log('PASS 手动硬件兼容、未知时长不跳片尾/不误保存HLS窗口、按集名换源与任务清理');
+
+  await cp.locator('video').evaluate(video => video.pause());
+  transcodeMode = 'busy'; const busyCount = transcodeStarts.length;
+  await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await cp.getByText('兼容播放正被另一台设备使用，请稍后再试。', { exact: true }).waitFor();
+  await cp.waitForTimeout(150); assert.equal(transcodeStarts.length, busyCount + 1, '409不自动重复任务');
+  transcodeMode = 'enabled'; holdTranscode = true; const pendingStart = transcodeStarts.length;
+  await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await until(() => transcodeStarts.length > pendingStart && releaseTranscode, '兼容启动请求在途');
+  await cp.locator('nav a[href="#home"]').click(); holdTranscode = false; releaseTranscode(); releaseTranscode = null;
+  await until(() => transcodeStops.some(value => value.id === `fixture-${transcodeStarts.length}`), '取消旧启动响应也停止任务');
+  assert.equal(await cp.locator('video').count(), 0, '旧转码请求不能接管首页');
+  await searchCompat(movie.title); await until(() => cp.locator('video').evaluate(video => video.readyState >= 1).catch(() => false), 'pagehide兼容样例');
+  await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await until(decodedCompat, 'pagehide前任务');
+  const pagehideJob = `fixture-${transcodeStarts.length}`; await cp.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+  await until(() => transcodeStops.some(value => value.id === pagehideJob), 'pagehide keepalive停止兼容任务');
+  await searchCompat(movie.title); await until(() => cp.locator('video').evaluate(video => video.readyState >= 1).catch(() => false), '过期恢复样例');
+  await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await until(decodedCompat, '过期恢复前任务');
+  await cp.clock.install(); await cp.locator('video').evaluate(video => video.pause());
+  const expiryCount = transcodeStarts.length; await cp.clock.fastForward(120001);
+  await cp.locator('video').evaluate(video => { void video.play().catch(() => {}); });
+  await until(() => transcodeStarts.length === expiryCount + 1 && decodedCompat(), '暂停超时只恢复一次兼容任务');
+  await cp.locator('video').evaluate(video => video.pause()); await cp.clock.fastForward(120001);
+  await cp.locator('video').evaluate(video => { void video.play().catch(() => {}); }); await cp.waitForTimeout(150);
+  assert.equal(transcodeStarts.length, expiryCount + 1, '过期恢复不能无限自动重启');
+  await cp.locator('video').evaluate(video => video.pause());
+  await cp.request.delete(`${base}/api/history?${new URLSearchParams({ key: broken.key })}`);
+  await cp.locator('nav a[href="#home"]').click(); await cp.getByRole('button', { name: '电视剧', exact: true }).click();
+  playableResults.delete(JSON.stringify(['first', 'broken', 1, 0])); playableResults.delete(JSON.stringify(['first', 'broken', 2, 0]));
+  holdCandidateSearch = true; const pendingFallbackRequests = playerRequests.length;
+  await cp.getByRole('button', { name: `播放 ${broken.title}`, exact: true }).click();
+  await until(async () => releaseCandidateSearch && (await cp.locator('.player-note').textContent()).includes('正在查找其他影视源'), '旧自动换源搜索等待中');
+  await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await until(decodedCompat, '旧搜索等待时手动兼容');
+  holdCandidateSearch = false; releaseCandidateSearch(); releaseCandidateSearch = null;
+  await cp.waitForTimeout(250); assert.equal(await decodedCompat(), true, '旧自动换源响应不能接管兼容播放器');
+  assert.equal(playerRequests.slice(pendingFallbackRequests).some(url => new URL(url).searchParams.get('source') === 'second'), false, '旧换源请求已失效');
+  console.log('PASS 兼容占用409不循环、导航取消在途任务、pagehide停止、暂停过期单次恢复与旧响应隔离');
+
+  await cp.locator('nav a[href="#home"]').click(); await cp.getByRole('button', { name: '电视直播', exact: true }).click();
+  const beforeLiveDecode = liveReports.length;
+  await cp.getByRole('button', { name: '播放频道 测试电视一', exact: true }).click();
+  await until(async () => liveReports.length > beforeLiveDecode && await cp.locator('video').evaluate(video => video.readyState >= 2).catch(() => false), '直播手动兼容前');
+  const liveRecordCount = app.store.list('history').length, liveReportCount = liveReports.length;
+  await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await until(decodedCompat, '直播手动兼容播放');
+  assert.deepEqual(transcodeStarts.at(-1), { liveId: 'test-tv-one', line: 1, position: 0, speed: 1 });
+  assert.equal(await cp.getByLabel('播放速度', { exact: true }).isDisabled(), true);
+  assert.equal(await cp.getByRole('button', { name: '快进 10 秒', exact: true }).isDisabled(), true);
+  assert.equal(await cp.locator('.danmaku-form').count(), 0);
+  assert.equal(liveReports.length, liveReportCount, '转码成功不更新直播原流可播状态');
+  assert.equal(app.store.list('history').length, liveRecordCount, '兼容直播不写影视续播记录');
+  channels[1].streams[0].url = 'https://fixtures.example/fail-live-two.m3u8'; channels[1].streams[0].type = 'hls'; channels[1].streams[0].status = 'ok';
+  const liveFallbackCount = transcodeStarts.length;
+  await cp.locator('.channel-button').filter({ hasText: '测试电视二' }).click(); await until(() => transcodeStarts.length === liveFallbackCount + 1 && decodedCompat(), '直播直连和代理均失败后兼容');
+  assert.deepEqual(transcodeStarts.at(-1), { liveId: 'test-tv-two', line: 0, position: 0, speed: 1 });
+  assert.ok(liveReports.some(value => value.id === 'test-tv-two' && value.status === 'error'));
+  assert.equal(app.store.list('history').length, liveRecordCount);
+  const logoutJob = `fixture-${transcodeStarts.length}`; await cp.locator('#logout').click(); await cp.locator('#login-view').waitFor({ state: 'visible' });
+  await until(() => transcodeStops.some(value => value.id === logoutJob), '退出登录停止直播兼容任务');
+  await compat.value.close(); transcodeDuration = 1200; transcodeAcceleration = 'software'; transcodeMode = 'disabled';
+  console.log('PASS 直播手动/最后兼容回退、稳定线路编号与0起点1倍速、原流状态隔离、无影视进度/弹幕、退出停止');
+
   await page.locator('nav a[href="#settings"]').click();
   const parsers = page.locator('.settings-section').filter({ has: page.getByRole('heading', { name: '解析线路', exact: true }) });
   await parsers.getByRole('button', { name: '＋ 添加', exact: true }).click();
@@ -862,6 +1019,7 @@ try {
   }
 } finally {
   releaseMovieRatings?.();
+  releaseTranscode?.(); releaseCandidateSearch?.();
   for (const release of releaseVerifiedProbes.splice(0)) release();
   await browser?.close(); await app.close(); await rm(directory, { recursive: true, force: true });
 }

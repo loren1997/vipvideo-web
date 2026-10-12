@@ -24,6 +24,7 @@ async function running(t, options = {}) {
   const open = async () => {
     app = createApp({ password: 'service-test-password', dataDir, initialConfig: empty, catalog, maintenance, live,
       discovery: { status: () => ({ running: false, lastDiscovery: 0, candidates: [] }), discover: async () => {}, stop: () => {} },
+      transcoder: { status: () => ({ available: false, enabled: false, running: false }), close: () => {} },
       ratings: { async get() { return ratingResult; } }, ...options });
     await new Promise(done => app.server.listen(0, '127.0.0.1', done));
     base = `http://127.0.0.1:${app.server.address().port}`;
@@ -58,6 +59,7 @@ test('new service endpoints require authentication before reading request JSON o
   for (const [path, method] of [
     ['/api/sources/status', 'GET'], ['/api/sources/probe', 'POST'], ['/api/sources/update', 'POST'],
     ['/api/sources/discover', 'POST'], ['/api/live/probe', 'POST'], ['/api/playability?source=demo&id=1', 'GET'], ['/api/playability/report', 'POST'],
+    ['/api/transcode/status','GET'], ['/api/transcode/start','POST'], ['/api/transcode/stop','POST'], ['/api/transcode/task/index.m3u8','GET'],
     ['/api/live/playback?id=trusted-channel', 'GET'], ['/api/live/report', 'POST'], ['/api/ratings?source=demo&id=1', 'GET'],
     ['/api/player/preferences?key=film', 'GET'], ['/api/player/preferences', 'PUT'],
     ['/api/danmaku?key=film&episode=0', 'GET'], ['/api/danmaku', 'POST'],
@@ -78,6 +80,7 @@ test('all new write routes reject cross-site requests and allow same-origin main
   const cookie = await instance.login();
   for (const [path, method] of [['/api/sources/probe','POST'], ['/api/sources/update','POST'], ['/api/live/report','POST'],
     ['/api/sources/discover','POST'], ['/api/live/probe','POST'], ['/api/playability/report','POST'],
+    ['/api/transcode/start','POST'], ['/api/transcode/stop','POST'],
     ['/api/player/preferences','PUT'], ['/api/danmaku','POST'], ['/api/danmaku/binding','PUT']]) {
     assert.equal((await instance.call(path, {}, cookie, method, { Origin: 'https://other.example' })).status, 403, path);
     assert.equal((await instance.call(path, {}, cookie, method, { 'Sec-Fetch-Site': 'cross-site' })).status, 403, path);
@@ -85,6 +88,64 @@ test('all new write routes reject cross-site requests and allow same-origin main
   assert.equal(calls, 0);
   assert.equal((await instance.call('/api/sources/probe', {}, cookie, 'POST', { Origin: instance.base })).status, 200);
   assert.equal(calls, 1);
+});
+
+test('compatibility playback status, trusted selection, assets and stop use the authenticated service contract', async t => {
+  const calls=[];
+  const initialConfig={...configured,sources:[{id:'demo',name:'可信源',api:'https://api.example/vod',enabled:true}]};
+  const result={id:'safe-task',url:'/api/transcode/safe-task/index.m3u8',type:'hls',transcoded:true,startPosition:37,duration:300,acceleration:'software'};
+  const serviceStatus={available:true,enabled:true,acceleration:'auto',running:false};
+  const instance=await running(t,{initialConfig,transcoder:{status:async()=>serviceStatus,
+    async start(input){calls.push(input);assert.equal(input.valid(),true);return result;},
+    async cancel(id,owner){assert.match(owner,/^[a-f\d]{64}$/);calls.push({id});return true;},
+    async serve(req,res,id,file){calls.push({id,file,method:req.method});res.end('#EXTM3U');},close:()=>{},
+  }}),cookie=await instance.login();
+  assert.deepEqual(await(await instance.call('/api/transcode/status',undefined,cookie)).json(),serviceStatus);
+  const started=await instance.call('/api/transcode/start',{source:'demo',id:'1',line:0,episode:0,position:37,speed:1.5,url:'http://127.0.0.1/untrusted'},cookie);
+  assert.equal(started.status,200);
+  assert.deepEqual(await started.json(),result);
+  assert.equal(calls[0].episode,movie.lines[0].episodes[0]);assert.equal(calls[0].position,37);assert.equal(calls[0].speed,1.5);
+  assert.match(calls[0].owner,/^[a-f\d]{64}$/);
+  const liveStarted=await instance.call('/api/transcode/start',{liveId:'trusted-channel',line:1,url:'file:///etc/passwd'},cookie);
+  assert.equal(liveStarted.status,200);assert.equal(calls[1].episode,stream);
+  assert.equal(await(await instance.call(result.url,undefined,cookie)).text(),'#EXTM3U');
+  assert.deepEqual(await(await instance.call('/api/transcode/stop',{id:result.id},cookie)).json(),{stopped:true});
+  instance.app.store.setConfig({...initialConfig,sources:[]});assert.equal(calls[0].valid(),false);
+});
+
+test('compatibility playback rejects unconfigured URLs, pages and invalid indices, positions or rates before spawning', async t => {
+  let starts=0;
+  const initialConfig={...configured,sources:[{id:'demo',name:'可信源',api:'https://api.example/vod',enabled:true}]};
+  const instance=await running(t,{initialConfig,transcoder:{async start(){starts++;},close:()=>{}}}),cookie=await instance.login();
+  const base={source:'demo',id:'1',line:0,episode:0,position:0,speed:1};
+  const invalid=[{url:stream.url},{...base,source:'unknown'},{...base,line:999},{...base,line:'0'},{...base,episode:-1},
+    ...[-1,86401,Infinity,'20'].map(position=>({...base,position})),...['1',4,0].map(speed=>({...base,speed})),
+    {liveId:'missing',line:0},{liveId:'trusted-channel',line:1,position:20},{liveId:'trusted-channel',speed:2}];
+  for(const body of invalid)assert.equal((await instance.call('/api/transcode/start',body,cookie)).status,400,JSON.stringify(body));
+  const page={...movie,lines:[{name:'网页',episodes:[{name:'正片',url:'https://parser.example/watch',type:'page'}]}]};
+  const pageInstance=await running(t,{initialConfig,catalog:{...catalog,detail:async()=>page},transcoder:{async start(){starts++;},close:()=>{}}});
+  assert.equal((await pageInstance.call('/api/transcode/start',base,await pageInstance.login())).status,400);
+  assert.equal(starts,0);
+});
+
+test('pending compatibility playback respects configuration, adult visibility and logout changes', async t => {
+  for(const stage of ['detail','adult','logout'])await t.test(stage,async sub=>{
+    const entered=deferred(),release=deferred();let starts=0,cancelled=0;
+    const initialConfig={...empty,showAdult:true,sources:[{id:'demo',name:'可信源',api:'https://api.example/vod',enabled:true}]};
+    const instance=await running(sub,{initialConfig,catalog:{...catalog,async detail(){
+      if(stage==='detail'){entered.resolve();await release.promise;}
+      return stage==='adult'?{...movie,category:'adult'}:movie;
+    }},transcoder:{async start(){starts++;entered.resolve();await release.promise;return{id:'pending'};},
+      async cancel(id){assert.equal(id,'pending');cancelled++;return true;},close:()=>{}}});
+    const cookie=await instance.login(),pending=instance.call('/api/transcode/start',{source:'demo',id:'1'},cookie);
+    try{
+      await entered.promise;
+      if(stage==='logout')assert.equal((await instance.call('/api/auth/logout',{},cookie)).status,200);
+      else instance.app.store.setConfig(stage==='detail'?{...initialConfig,sources:[]}:{...initialConfig,showAdult:false});
+    }finally{release.resolve();}
+    assert.equal((await pending).status,stage==='adult'?403:409);
+    assert.equal(starts,stage==='detail'?0:1);assert.equal(cancelled,stage==='detail'?0:1);
+  });
 });
 
 test('source status, probe and update combine trusted service results and refresh configured live sources', async t => {

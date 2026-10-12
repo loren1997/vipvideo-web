@@ -15,6 +15,7 @@ import { createDanmaku } from './lib/danmaku.mjs';
 import { createPlayability } from './lib/playability.mjs';
 import { createSourceDiscovery } from './lib/source-discovery.mjs';
 import { repairImport } from './lib/import-repair.mjs';
+import { createTranscoder } from './lib/transcode.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const defaults = JSON.parse(readFileSync(resolve(root, 'defaults.json'), 'utf8'));
@@ -45,7 +46,7 @@ function tokenFrom(req) {
 
 export function createApp({ password = process.env.APP_PASSWORD, dataDir = process.env.DATA_DIR ?? resolve(root, 'data'),
   catalog = createCatalog(), media = createMedia(), initialConfig = defaults, cookieSecure = process.env.COOKIE_SECURE === 'true',
-  logger = console, maintenance, live, ratings, danmaku, playability, discovery } = {}) {
+  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder } = {}) {
   if (typeof password !== 'string' || password.length < 8 || password.length > 1024) throw new Error('APP_PASSWORD 必须设置，且长度为 8–1024 个字符');
   const initial = validateConfig(initialConfig);
   const store = createStore(dataDir, initial);
@@ -65,6 +66,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const liveService = live ?? createLive({ store, logger, playability: playabilityService });
   const ratingService = ratings ?? createRatings({ store });
   const danmakuService = danmaku ?? createDanmaku({ store });
+  const transcodeService = transcoder ?? createTranscoder({ media, logger });
   const salt = store.meta('password-salt') ?? randomBytes(16).toString('hex');
   const passwordHash = scryptSync(password, salt, 32);
   if (store.meta('password-hash') !== passwordHash.toString('hex')) store.clearSessions();
@@ -141,6 +143,47 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         }
         if (path === '/api/config/presets' && method === 'GET') {
           return json(res, 200, { api_site: Object.fromEntries(initial.sources.map(({ id, name, api }) => [id, { name, api }])) });
+        }
+        if (path === '/api/transcode/status' && method === 'GET') return json(res, 200, await transcodeService.status());
+        if (path === '/api/transcode/stop' && method === 'POST') {
+          const body = await readBody(req);
+          return json(res, 200, { stopped: await transcodeService.cancel(text(body?.id, '转码任务标识', 200), hashToken(token)) });
+        }
+        const transcodeAsset = /^\/api\/transcode\/([^/]+)\/([^/]+)$/.exec(path);
+        if (transcodeAsset && ['GET', 'HEAD'].includes(method)) return await transcodeService.serve(req, res, transcodeAsset[1], transcodeAsset[2]);
+        if (path === '/api/transcode/start' && method === 'POST') {
+          const body = await readBody(req);
+          const line = body?.line === undefined ? 0 : body.line, episode = body?.episode === undefined ? 0 : body.episode;
+          const position = body?.position === undefined ? 0 : body.position, speed = body?.speed === undefined ? 1 : body.speed;
+          if (!Number.isSafeInteger(line) || !Number.isSafeInteger(episode) || line < 0 || episode < 0 ||
+              typeof position !== 'number' || !Number.isFinite(position) || position < 0 || position > 86400 ||
+              ![0.5, 0.75, 1, 1.25, 1.5, 2, 3].includes(speed)) throw badRequest('转码线路、进度或倍速不正确');
+          const snapshot = store.config(), owner = hashToken(token);
+          let selected, category, unchanged;
+          if (body?.liveId !== undefined) {
+            const result = await liveService.list(snapshot);
+            const channel = result.channels.find(item => item.id === text(body.liveId, '频道标识', 200));
+            selected = channel?.streams[line];
+            unchanged = () => JSON.stringify(snapshot.liveSources) === JSON.stringify(store.config().liveSources);
+            if (position !== 0 || speed !== 1) throw badRequest('直播兼容播放不支持跳转或倍速');
+          } else {
+            const source = snapshot.sources.find(item => item.id === body?.source && item.enabled !== false);
+            if (!source) throw badRequest('请选择启用的影视源');
+            const detail = await catalog.detail(snapshot, source.id, text(body?.id, '影片标识', 200));
+            category = detail.category; ensureVisible(category);
+            selected = detail.lines[line]?.episodes[episode];
+            unchanged = () => store.config().sources.some(item => item.id === source.id && item.api === source.api && item.enabled !== false);
+          }
+          if (!selected || !['hls', 'mp4'].includes(selected.type)) throw badRequest('请选择有效的 HLS / MP4 媒体');
+          if (!unchanged()) throw Object.assign(new Error('播放源已修改，请刷新后重试'), { status: 409 });
+          const valid = () => store.authenticated(owner) && unchanged() && (category !== 'adult' || store.config().showAdult === true);
+          const result = await transcodeService.start({ episode: selected, position, speed, owner, valid });
+          if (!valid()) {
+            await transcodeService.cancel(result.id, owner);
+            ensureVisible(category);
+            throw Object.assign(new Error('播放配置或会话已变更，请刷新后重试'), { status: 409 });
+          }
+          return json(res, 200, result);
         }
         if (path === '/api/sources/status' && method === 'GET') return json(res, 200, { ...sourceService.status(), liveSources: liveService.status?.(store.config()) ?? [], discovery: discoveryService.status() });
         if (path === '/api/sources/discover' && method === 'POST') {
@@ -305,7 +348,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   server.on('clientError', (_error, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
   return {
     server, store, maintenance: sourceService, live: liveService, discovery: discoveryService,
-    async close() { await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
+    async close() { await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.(), transcodeService.close?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
   };
 }
 
