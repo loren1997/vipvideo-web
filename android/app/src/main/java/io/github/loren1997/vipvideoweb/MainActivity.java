@@ -387,7 +387,7 @@ public final class MainActivity extends Activity {
         (function(){
           if(window.__vipTvFocus)return;window.__vipTvFocus=true;document.documentElement.dataset.tv='true';
           var style=document.createElement('style');style.textContent=':focus{outline:3px solid #67e8f9!important;outline-offset:3px!important}';document.head.appendChild(style);
-          document.addEventListener('keydown',function(e){
+          window.addEventListener('keydown',function(e){
             if(e.defaultPrevented)return;
             var current=document.activeElement;
             if(e.key==='Enter'&&current&&current.matches('input[type="checkbox"],input[type="radio"],input[type="button"],input[type="submit"]')){e.preventDefault();current.click();return;}
@@ -401,7 +401,7 @@ public final class MainActivity extends Activity {
             var r=current.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2,best=null,score=Infinity;
             candidates.forEach(function(v){if(v===current)return;var b=v.getBoundingClientRect(),dx=b.left+b.width/2-x,dy=b.top+b.height/2-y,p=e.key==='ArrowRight'?dx:e.key==='ArrowLeft'?-dx:e.key==='ArrowDown'?dy:-dy,c=e.key==='ArrowRight'||e.key==='ArrowLeft'?Math.abs(dy):Math.abs(dx);if(p>3&&p+c*2<score){score=p+c*2;best=v}});
             if(best){e.preventDefault();best.focus();best.scrollIntoView({block:'nearest',inline:'nearest'});}
-          },true);
+          });
         })();
         """;
 }
