@@ -46,8 +46,10 @@ try {
   const originalDuration = Number(original.format.duration);
   await writeFile(join(fixtures, 'key.bin'), randomBytes(16));
   await writeFile(join(fixtures, 'key.info'), `https://fixtures.example/key.bin?signature=key\n${join(fixtures, 'key.bin')}\n`);
-  run(executable, ['-nostdin', '-hide_banner', '-loglevel', 'warning', '-i', input,
-    '-c', 'copy', '-f', 'hls', '-hls_time', '2', '-hls_list_size', '0',
+  // MP4 的 MPEG-4 初始化头不能直接复制进独立 TS；MPEG-2 在关键帧重复序列头。
+  run(executable, ['-nostdin', '-hide_banner', '-loglevel', 'warning', '-threads', '2', '-filter_threads', '2', '-i', input,
+    '-c:v', 'mpeg2video', '-q:v', '5', '-g', '50', '-threads', '2', '-c:a', 'copy',
+    '-f', 'hls', '-hls_time', '2', '-hls_list_size', '0',
     '-hls_key_info_file', join(fixtures, 'key.info'),
     '-hls_segment_filename', join(fixtures, 'input%03d.ts'), join(fixtures, 'source.m3u8')]);
   await writeFile(join(fixtures, 'master.m3u8'), '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000\nsource.m3u8?signature=playlist&part=1\n');
