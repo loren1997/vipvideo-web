@@ -23,7 +23,7 @@ docker compose -f docker-compose.yml ps
 docker compose -f docker-compose.yml logs --tail=100 web
 ```
 
-首次向 GHCR 发布的镜像包默认是私有，公开 GitHub 仓库不会自动允许匿名拉取。仓库所有者需打开 [vipvideo-web 镜像包设置](https://github.com/users/loren1997/packages/container/vipvideo-web/settings)，在 **Change visibility → Public** 完成一次设置；若已经 Public，无需重复操作。见 [GitHub 包可见性说明](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)。自行改为私有镜像时，NAS 需先登录 GHCR，使用有 `read:packages` 权限的 classic PAT，按 [GHCR 官方认证说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)配置；不要将 PAT 写入 Compose、镜像或仓库。
+本仓库镜像已公开，并通过匿名拉取验证，NAS 无需登录 GitHub。若自行 Fork 或新建发布仓库，首次发布的 GHCR 镜像包默认是私有；仓库所有者需在自己的镜像包设置中完成 **Change visibility → Public**，公开源码不会自动公开镜像。见 [GitHub 包可见性说明](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)。自行改为私有镜像时，NAS 需先登录 GHCR，使用有 `read:packages` 权限的 classic PAT，按 [GHCR 官方认证说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)配置；不要将 PAT 写入 Compose、镜像或仓库。
 
 浏览器访问 `http://NAS的局域网IP:3000`，输入密码后在设置页自行导入影视源。需要 Docker Engine 和 Docker Compose v2；建议至少 1 GB 内存。应用不转码，媒体转发时带宽会经过部署主机。容器健康检查由镜像提供，使用非 root 用户运行，数据保存在命名卷中。
 
@@ -183,9 +183,9 @@ docker buildx build --platform linux/amd64,linux/arm64 --tag vipvideo-web:local 
 
 `.github/workflows/docker-publish.yml` 在 `main` 推送、`v*` 标签推送或手动触发时运行。使用 Node.js 24 安装依赖并运行模块/接口测试，再构建双平台镜像，以仓库路径的小写形式推送到 GHCR 的唯一 CI 标签。全部运行检查成功后才为同一个多平台 digest 更新 `latest`，标签触发时也更新小写版本标签。构建或运行检查失败不会更新 `latest` 或版本标签；新任务会取消同一仓库尚未完成的旧发布，避免旧构建晚完成覆盖新发布。
 
-发布使用仓库自动提供的 `GITHUB_TOKEN`，只授予读取代码和写入 Packages 的权限，不需要额外发布密钥。工作流按本次构建的 digest 顺序拉取并运行 amd64、arm64 容器，验证健康检查、未登录限制和登录；arm64 通过 QEMU 实际运行。amd64 还写入样例收藏/进度并重建容器，确认会话及数据在同一卷保留。只用临时样例密码和空影视源，不请求第三方媒体。
+发布使用仓库自动提供的 `GITHUB_TOKEN`，只授予读取代码和写入 Packages 的权限，不需要额外发布密钥。工作流按本次构建的 digest 顺序拉取并运行 amd64、arm64 容器，验证健康接口、未登录限制和登录；arm64 通过 QEMU 实际运行。amd64 还写入样例收藏/进度并重建容器，确认会话及数据在同一卷保留。随后使用实际 NAS Compose 文件的临时副本启动独立项目，确认 Docker 健康状态为 `healthy`，并按本文流程停机备份、修改进度、恢复，再确认原会话、收藏和进度恢复。临时副本仅替换待验收镜像、样例密码和本机端口绑定，结束后清理测试项目及测试卷。只用临时样例密码和空影视源，不请求第三方媒体。
 
-首次部署前，确认 [发布工作流](https://github.com/loren1997/vipvideo-web/actions/workflows/docker-publish.yml) 已成功完成双平台运行检查，并按前述步骤将 [镜像包](https://github.com/users/loren1997/packages/container/vipvideo-web/settings) 设为 Public，让 NAS 可匿名拉取。工作流不修改 GitHub 包可见性，也不保存家庭访问密码。
+首次部署前，确认 [发布工作流](https://github.com/loren1997/vipvideo-web/actions/workflows/docker-publish.yml) 已成功完成双平台运行检查。本仓库镜像已可匿名拉取；自行 Fork 的发布仓库仍需配置自己的包可见性。工作流不修改 GitHub 包可见性，也不保存家庭访问密码。
 
 ## 验证与已知范围
 
@@ -193,6 +193,6 @@ docker buildx build --platform linux/amd64,linux/arm64 --tag vipvideo-web:local 
 
 两个 Node.js 版本的 `npm run test:browser` 均通过无界面 Chrome 验收，包括手机和电脑布局、跨会话同步、10 秒自动保存进度、解析线路编辑与包含查询参数的链接嵌入，以及清空观看记录后保留收藏。验收使用固定样例数据和静音 WAV 测试 HTML 媒体事件，未验证真实第三方视频 CDN 的播放可用性。
 
-Dockerfile 以 Node.js 24 为目标。本机未安装 Docker，尚未运行镜像构建、Compose、真实容器重建或 NAS 双架构验收。部署后需检查 `docker compose -f docker-compose.yml ps` 的健康状态，验证登录、导入、搜索、选集、真实媒体，以及重建容器后的收藏/进度保留。
+Dockerfile 以 Node.js 24 为目标。本机未安装 Docker，双平台镜像已在 GitHub Actions 中实际构建并运行通过：amd64 与 arm64 的登录和接口检查通过，amd64 容器重建后会话、收藏和进度保留；arm64 通过 QEMU 运行。工作流同时验收实际 NAS Compose 文件的启动、Docker 健康状态与停机备份恢复。公开 `latest` 的匿名拉取及两种架构清单已验证。未在实际 NAS 硬件及真实第三方媒体上验收，部署后请检查 `docker compose -f docker-compose.yml ps` 的健康状态并验证所导入影视源的播放。
 
 没有增加多用户、直播频道管理、下载、弹幕或转码。

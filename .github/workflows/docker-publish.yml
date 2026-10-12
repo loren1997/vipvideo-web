@@ -135,6 +135,89 @@ jobs:
             }
           }
           NODE
+      - name: Check Compose health and backup restore
+        env:
+          CI_IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFileSync, spawnSync } from 'node:child_process';
+          import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          const password = 'ci-compose-fixture-password';
+          let config = readFileSync('docker-compose.yml', 'utf8');
+          for (const [pattern, replacement] of [
+            [/^    image: [^\r\n]+/gm, `    image: ${process.env.CI_IMAGE}`],
+            [/^      APP_PASSWORD: ""(?=\r?$)/gm, `      APP_PASSWORD: "${password}"`],
+            [/^      - "3000:3000"(?=\r?$)/gm, '      - "127.0.0.1:3000:3000"']
+          ]) {
+            assert.equal([...config.matchAll(pattern)].length, 1, `Expected one Compose replacement: ${pattern}`);
+            config = config.replace(pattern, replacement);
+          }
+          const directory = mkdtempSync(join(process.env.RUNNER_TEMP, 'vipvideo-compose-'));
+          const file = join(directory, 'docker-compose.yml');
+          const backup = join(directory, 'backup');
+          const project = `vipvideo-compose-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`;
+          const prefix = ['compose', '-p', project, '-f', file];
+          const compose = (...args) => execFileSync('docker', [...prefix, ...args], { stdio: 'inherit' });
+          const start = () => {
+            compose('up', '-d', '--wait', '--wait-timeout', '120');
+            const container = execFileSync('docker', [...prefix, 'ps', '-q', 'web'], { encoding: 'utf8' }).trim();
+            assert.ok(container, 'Compose must start the web container');
+            assert.equal(execFileSync('docker', ['inspect', '--format', '{{.State.Health.Status}}', container], { encoding: 'utf8' }).trim(), 'healthy');
+          };
+          let cookie = '';
+          const api = (path, body) => fetch('http://127.0.0.1:3000' + path, {
+            method: body === undefined ? 'GET' : 'POST',
+            headers: { ...(cookie ? { Cookie: cookie } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            signal: AbortSignal.timeout(10000)
+          });
+          const record = { key: 'ci-compose-fixture', title: 'CI 备份恢复样例', type: 'movie' };
+          const checkState = async position => {
+            const response = await api('/api/state');
+            assert.equal(response.status, 200, 'The original session must remain valid');
+            const state = await response.json();
+            assert.equal(state.favorites.find(item => item.key === record.key)?.title, record.title);
+            assert.equal(state.history.find(item => item.key === record.key)?.position, position);
+          };
+          try {
+            writeFileSync(file, config);
+            start();
+            const login = await api('/api/auth/login', { password });
+            assert.equal(login.status, 200);
+            assert.match(login.headers.get('set-cookie'), /HttpOnly/);
+            cookie = login.headers.get('set-cookie').split(';')[0];
+            assert.equal((await api('/api/favorites', record)).status, 200);
+            assert.equal((await api('/api/history', { ...record, position: 83, duration: 100 })).status, 200);
+            await checkState(83);
+
+            compose('stop', 'web');
+            compose('cp', 'web:/app/data', backup);
+            assert.ok(existsSync(join(backup, 'app.sqlite')), 'The stopped backup must contain app.sqlite');
+            start();
+            assert.equal((await api('/api/history', { ...record, position: 19, duration: 100 })).status, 200);
+            await checkState(19);
+
+            compose('stop', 'web');
+            compose('run', '--rm', '--no-deps', '--user', '0', '--entrypoint', 'sh', '--volume', `${backup}:/restore:ro`, 'web', '-c',
+              'test -f /restore/app.sqlite && find /app/data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && cp -a /restore/. /app/data/ && chown -R 1000:1000 /app/data');
+            start();
+            await checkState(83);
+            console.log('Compose health, stopped backup, and restore passed');
+          } finally {
+            for (const args of [['logs', '--no-color', 'web'], ['down', '--volumes', '--remove-orphans']]) {
+              const result = spawnSync('docker', [...prefix, ...args], { stdio: 'inherit' });
+              if (result.status !== 0) {
+                console.error(`Compose cleanup failed: ${args.join(' ')}`);
+                process.exitCode = 1;
+              }
+            }
+            rmSync(directory, { recursive: true, force: true });
+          }
+          NODE
       - name: Promote tested manifest to release tags
         env:
           CI_IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
