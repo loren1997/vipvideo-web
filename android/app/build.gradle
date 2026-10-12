@@ -1,5 +1,7 @@
 plugins { id 'com.android.application' }
 
+def appVersionCode = (System.getenv('ANDROID_VERSION_CODE') ?: '1').toInteger()
+
 android {
     namespace 'io.github.loren1997.vipvideoweb'
     compileSdk 35
@@ -9,8 +11,8 @@ android {
         applicationId 'io.github.loren1997.vipvideoweb'
         minSdk 23
         targetSdk 35
-        versionCode (System.getenv('ANDROID_VERSION_CODE') ?: '1').toInteger()
-        versionName "1.0.${System.getenv('ANDROID_VERSION_CODE') ?: '1'}"
+        versionCode appVersionCode
+        versionName "1.0.${appVersionCode}"
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -33,4 +35,3 @@ android {
         }
     }
 }
-
