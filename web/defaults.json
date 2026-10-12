@@ -1,5 +1,25 @@
 {
-  "sources": [],
+  "showAdult": false,
+  "sources": [
+    {
+      "id": "ikun",
+      "name": "爱坤资源",
+      "api": "https://ikunzyapi.com/api.php/provide/vod/from/ikm3u8/",
+      "enabled": true
+    },
+    {
+      "id": "baofeng",
+      "name": "暴风资源",
+      "api": "https://bfzyapi.com/api.php/provide/vod",
+      "enabled": true
+    },
+    {
+      "id": "haohua",
+      "name": "豪华资源",
+      "api": "https://hhzyapi.com/api.php/provide/vod",
+      "enabled": true
+    }
+  ],
   "platforms": [
     {
       "id": "vip-platform-1",

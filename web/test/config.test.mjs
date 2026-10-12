@@ -23,6 +23,17 @@ test('imports and settings reject unsafe, duplicate or malformed inputs', () => 
   assert.throws(() => validateConfig({ ...config(), sources: [{ ...config().sources[0], enabled: 'false' }] }), { status: 400 });
 });
 
+test('adult visibility defaults off, is strictly boolean and survives source-only imports', () => {
+  assert.equal(validateConfig(config()).showAdult, false);
+  const current = { ...config(), showAdult: true };
+  assert.equal(validateConfig(current).showAdult, true);
+  for (const showAdult of ['false', 1, null, {}]) assert.throws(() => validateConfig({ ...config(), showAdult }), { status: 400 });
+  assert.equal(importConfig(current, { api_site: {} }).showAdult, true);
+  assert.equal(importConfig(current, { platformlist: [], list: [] }).showAdult, true);
+  assert.equal(importConfig(current, config()).showAdult, true);
+  assert.equal(importConfig(current, { ...config(), showAdult: false }).showAdult, false);
+});
+
 test('VipVideo platform/line config is compatible and keeps original-address mode', () => {
   const result = importConfig({ sources: [], platforms: [], parsers: [] }, {
     platformlist: [{ name: '视频', url: 'https://example.com', category: 'video' }],
@@ -35,6 +46,8 @@ test('VipVideo platform/line config is compatible and keeps original-address mod
 
 test('progress validates numbers, caps to duration and supports link-only history', () => {
   const base = { key: 'film', title: '影片', source: 'site', id: '42', year: 2025, type: 'movie' };
+  assert.equal(validateRecord({ ...base, category: 'adult' }, true).category, 'adult');
+  assert.throws(() => validateRecord({ ...base, category: 'unknown' }, true), { status: 400 });
   assert.equal(validateRecord({ ...base, duration: 100, position: 105 }, true).position, 100);
   for (const position of [-1, Infinity, '10', NaN]) assert.throws(() => validateRecord({ ...base, position }, true), { status: 400 });
   assert.throws(() => validateRecord({ ...base, episode: 1.5 }, true), { status: 400 });

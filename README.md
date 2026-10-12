@@ -1,10 +1,13 @@
 # VipVideo Web 播放器（Docker / NAS）
 
-项目仓库：[loren1997/vipvideo-web](https://github.com/loren1997/vipvideo-web)。在原 VipVideo 上新增了家庭共享 Web 播放器，支持聚合搜索、选集、换源、收藏与续播。
+项目仓库：[loren1997/vipvideo-web](https://github.com/loren1997/vipvideo-web)。在原 VipVideo 上新增了家庭共享 Web 播放器，首页直接浏览电影、电视剧与动漫，点开自动选集播放，支持故障换源、手动换源、聚合搜索、收藏与续播。内置爱坤、暴风和豪华三个经过接口及 HLS 抽样检查的影视源。
+
+另有默认隐藏的“三级”分类，在设置中控制显示；相关影片与普通分类分开，隐藏会保留收藏和观看进度。
+
 NAS [直接下载 docker-compose.yml](https://raw.githubusercontent.com/loren1997/vipvideo-web/main/docker-compose.yml)，填写访问密码后使用 `ghcr.io/loren1997/vipvideo-web:latest` 部署；本地源码构建使用 [compose.yaml](compose.yaml)。
 完整配置、部署和备份方法见 [README-WEB.md](README-WEB.md)。
 
-首次部署前，查看 [镜像发布 Actions](https://github.com/loren1997/vipvideo-web/actions/workflows/docker-publish.yml) 是否通过，并确认 [镜像包设置](https://github.com/users/loren1997/packages/container/vipvideo-web/settings) 已设为 Public。
+首次部署前，查看 [镜像发布 Actions](https://github.com/loren1997/vipvideo-web/actions/workflows/docker-publish.yml) 是否通过。本仓库镜像已公开，NAS 无需登录 GitHub。
 
 ---
 

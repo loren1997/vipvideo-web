@@ -40,7 +40,13 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   catalog = createCatalog(), media = createMedia(), initialConfig = defaults, cookieSecure = process.env.COOKIE_SECURE === 'true',
   logger = console } = {}) {
   if (typeof password !== 'string' || password.length < 8 || password.length > 1024) throw new Error('APP_PASSWORD 必须设置，且长度为 8–1024 个字符');
-  const store = createStore(dataDir, validateConfig(initialConfig));
+  const initial = validateConfig(initialConfig);
+  const store = createStore(dataDir, initial);
+  if (!store.meta('builtin-sources-v1')) {
+    const current = store.config();
+    if (!current.sources.length && initial.sources.length) store.setConfig({ ...current, sources: initial.sources });
+    store.setMeta('builtin-sources-v1', '1');
+  }
   const salt = store.meta('password-salt') ?? randomBytes(16).toString('hex');
   const passwordHash = scryptSync(password, salt, 32);
   if (store.meta('password-hash') !== passwordHash.toString('hex')) store.clearSessions();
@@ -49,6 +55,15 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const attempts = new Map();
   const publicDir = resolve(root, 'public');
   const cookie = (value, age) => `vipvideo_session=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${age}${cookieSecure ? '; Secure' : ''}`;
+  const visibleEntries = (kind) => {
+    const rows = store.list(kind);
+    return store.config().showAdult === true ? rows : rows.filter(row => row.category !== 'adult');
+  };
+  const ensureVisible = (category) => {
+    if (category === 'adult' && store.config().showAdult !== true) {
+      throw Object.assign(new Error('三级内容已隐藏，请先在设置中开启显示'), { status: 403 });
+    }
+  };
 
   const server = http.createServer(async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -104,26 +119,51 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           const body = await readBody(req);
           return json(res, 200, store.setConfig(importConfig(store.config(), body?.config)));
         }
+        if (path === '/api/config/presets' && method === 'GET') {
+          return json(res, 200, { api_site: Object.fromEntries(initial.sources.map(({ id, name, api }) => [id, { name, api }])) });
+        }
+        if (path === '/api/browse' && method === 'GET') {
+          const category = url.searchParams.get('category') ?? 'movie';
+          const result = await catalog.browse(store.config(), {
+            category,
+            page: url.searchParams.get('page') ?? '1',
+            source: url.searchParams.get('source') ?? undefined,
+          });
+          ensureVisible(category);
+          return json(res, 200, result);
+        }
         if (path === '/api/search' && method === 'GET') {
           const q = url.searchParams.get('q')?.trim();
           if (!q || q.length > 100) throw badRequest('请输入 1–100 字的搜索内容');
-          return json(res, 200, await catalog.search(store.config(), q));
+          const result = await catalog.search(store.config(), q);
+          if (store.config().showAdult !== true) {
+            result.groups = result.groups.flatMap(group => {
+              const items = group.items.filter(item => item.category !== 'adult');
+              if (!items.length) return [];
+              const { source, id, ...fields } = items[0];
+              return [{ ...group, ...fields, category: fields.category, items }];
+            });
+          }
+          return json(res, 200, result);
         }
         if (path === '/api/detail' && method === 'GET') {
-          return json(res, 200, await catalog.detail(store.config(), url.searchParams.get('source'), url.searchParams.get('id')));
+          const detail = await catalog.detail(store.config(), url.searchParams.get('source'), url.searchParams.get('id'));
+          ensureVisible(detail.category);
+          return json(res, 200, detail);
         }
         if (path === '/api/playback' && method === 'GET') {
           const line = Number(url.searchParams.get('line') ?? 0);
           const episode = Number(url.searchParams.get('episode') ?? 0);
           if (!Number.isSafeInteger(line) || !Number.isSafeInteger(episode) || line < 0 || episode < 0) throw badRequest('播放线路或剧集不正确');
           const detail = await catalog.detail(store.config(), url.searchParams.get('source'), url.searchParams.get('id'));
+          ensureVisible(detail.category);
           return json(res, 200, media.playback(detail, line, episode));
         }
         if (path === '/api/media' && ['GET', 'HEAD'].includes(method)) return await media.serve(req, res, url.searchParams.get('token'));
-        if (path === '/api/state' && method === 'GET') return json(res, 200, { favorites: store.list('favorites'), history: store.list('history') });
+        if (path === '/api/state' && method === 'GET') return json(res, 200, { favorites: visibleEntries('favorites'), history: visibleEntries('history') });
         for (const kind of ['favorites', 'history']) {
           if (path !== `/api/${kind}`) continue;
-          if (method === 'GET') return json(res, 200, store.list(kind));
+          if (method === 'GET') return json(res, 200, visibleEntries(kind));
           if (method === 'POST') return json(res, 200, store.save(kind, validateRecord(await readBody(req), kind === 'history')));
           if (method === 'DELETE') {
             const key = url.searchParams.get('key');

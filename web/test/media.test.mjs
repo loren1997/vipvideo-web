@@ -106,13 +106,34 @@ test('never exposes upstream HTML or scripts as executable same-origin content',
   assert.equal(await result.text(), '<script>stealCookies()</script>');
 });
 
-test('rejects HLS Range requests while retaining segment Range support', async t => {
-  let calls = 0;
-  const media = createMedia({ request: async () => { calls++; return response('#EXTM3U\n', 206, { 'content-type': 'application/vnd.apple.mpegurl' }); } });
+test('known HLS manifests ignore valid Range and rewrite the full playlist; segments keep Range', async t => {
+  const calls = [];
+  const media = createMedia({ request: async (url, options) => {
+    calls.push({ url: String(url), range: options.headers.range });
+    if (String(url).endsWith('part.ts')) return response('2345', 206, { 'content-type': 'video/mp2t', 'content-range': 'bytes 2-5/10' });
+    return response('#EXTM3U\n#EXTINF:4,\npart.ts\n', 200, { 'content-type': 'application/vnd.apple.mpegurl', 'accept-ranges': 'bytes' });
+  } });
   const base = await serverFor(t, media);
   const hls = media.playback(detail('https://cdn.example/list.m3u8'), 0, 0);
-  assert.equal((await fetch(base + hls.proxyUrl, { headers: { range: 'bytes=0-10' } })).status, 400);
-  assert.equal(calls, 0);
+  assert.equal((await fetch(base + hls.proxyUrl, { headers: { range: 'bytes=9-2' } })).status, 400);
+  assert.equal(calls.length, 0);
+  const playlist = await fetch(base + hls.proxyUrl, { headers: { range: 'bytes=0-10' } });
+  assert.equal(playlist.status, 200);
+  assert.equal(calls[0].range, undefined);
+  assert.equal(playlist.headers.get('accept-ranges'), 'none');
+  assert.equal(playlist.headers.get('content-range'), null);
+  const child = (await playlist.text()).split('\n').find(line => line.startsWith('/api/media?token='));
+  assert.ok(child, 'The complete playlist must retain a signed segment URL');
+  const segment = await fetch(base + child, { headers: { range: 'bytes=2-5' } });
+  assert.equal(segment.status, 206);
+  assert.equal(segment.headers.get('content-range'), 'bytes 2-5/10');
+  assert.equal(await segment.text(), '2345');
+  assert.equal(calls[1].range, 'bytes=2-5');
+});
+
+test('a partial response discovered to be HLS is never rewritten or forwarded as a playlist', async t => {
+  const media = createMedia({ request: async () => response('#EXTM3U\n', 206, { 'content-type': 'application/vnd.apple.mpegurl' }) });
+  const base = await serverFor(t, media);
   const misleading = media.playback(detail('https://cdn.example/video.mp4', 'mp4'), 0, 0);
   assert.equal((await fetch(base + misleading.proxyUrl, { headers: { range: 'bytes=0-10' } })).status, 502);
 });

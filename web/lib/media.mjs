@@ -58,7 +58,6 @@ export function createMedia({ request = networkRequest, secret = randomBytes(32)
       const data = verify(token);
       const headers = {};
       if (req.headers.range) {
-        if (data.type === 'hls') throw failure('HLS 清单不支持 Range 请求，请重新加载', 400);
         const range = req.headers.range;
         const ranges = typeof range === 'string' && range.startsWith('bytes=') ? range.slice(6).split(',') : [];
         if (!ranges.length || range.length > 200 || ranges.some(value => {
@@ -66,7 +65,7 @@ export function createMedia({ request = networkRequest, secret = randomBytes(32)
           const [start, end] = value.split('-');
           return [start, end].some(bound => bound && !Number.isSafeInteger(Number(bound))) || (start && end && Number(start) > Number(end));
         })) throw failure('Range 请求格式无效', 400);
-        headers.range = req.headers.range;
+        if (data.type !== 'hls') headers.range = req.headers.range;
       }
       if (!['GET', 'HEAD'].includes(req.method || 'GET')) throw failure('不支持的媒体请求方法', 400);
       const upstream = await request(data.url, { headers, method: req.method || 'GET', timeout: 8000 });
@@ -82,6 +81,7 @@ export function createMedia({ request = networkRequest, secret = randomBytes(32)
         if (manifest && upstream.statusCode === 206) throw failure('HLS 清单必须完整返回，请重新加载', 502);
         res.setHeader('X-Content-Type-Options', 'nosniff');
         res.setHeader('Cache-Control', 'private, no-store');
+        if (manifest) res.setHeader('Accept-Ranges', 'none');
         if (manifest && upstream.statusCode === 200 && req.method !== 'HEAD') {
           const text = await readText(upstream, 2 * 1024 * 1024);
           const body = rewriteManifest(text, finalUrl, data.expires);
@@ -96,6 +96,7 @@ export function createMedia({ request = networkRequest, secret = randomBytes(32)
         const contentType = String(upstream.headers['content-type'] || '');
         res.setHeader('Content-Type', manifest ? 'application/vnd.apple.mpegurl' : /^(?:video\/|audio\/|application\/(?:octet-stream|mp4)(?:;|$)|multipart\/byteranges(?:;|$))/i.test(contentType) ? contentType : 'application/octet-stream');
         for (const header of ['content-length', 'content-range', 'accept-ranges', 'content-encoding', 'etag', 'last-modified']) {
+          if (manifest && ['content-range', 'accept-ranges'].includes(header)) continue;
           if (upstream.headers[header] !== undefined) res.setHeader(header, upstream.headers[header]);
         }
         if (req.method === 'HEAD' || upstream.statusCode === 304 || upstream.statusCode === 416) { upstream.destroy(); res.end(); return; }

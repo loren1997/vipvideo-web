@@ -23,7 +23,8 @@ function address(value, label, allowEmpty = false) {
 
 export function validateConfig(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw badRequest('配置必须是 JSON 对象');
-  const result = {};
+  if (input.showAdult !== undefined && typeof input.showAdult !== 'boolean') throw badRequest('三级分类显示设置必须是布尔值');
+  const result = { showAdult: input.showAdult === true };
   for (const kind of ['sources', 'platforms', 'parsers']) {
     const entries = input[kind];
     if (!Array.isArray(entries) || entries.length > 200) throw badRequest(`${kind}必须是数组，且不超过 200 项`);
@@ -64,7 +65,7 @@ export function importConfig(current, input) {
     };
   } else incoming = input;
   const validated = validateConfig(incoming);
-  const merged = {};
+  const merged = { showAdult: Object.hasOwn(incoming, 'showAdult') ? validated.showAdult : current.showAdult === true };
   for (const kind of ['sources', 'platforms', 'parsers']) {
     const rows = new Map(current[kind].map((row) => [row.id, row]));
     for (const row of validated[kind]) rows.set(row.id, row);
@@ -84,6 +85,10 @@ export function validateRecord(input, history = false) {
     type: ['movie', 'series', 'link'].includes(input.type) ? input.type : 'link',
     poster: input.poster ? address(input.poster, '海报') : '',
   };
+  if (input.category !== undefined) {
+    if (!['movie', 'tv', 'anime', 'adult', 'variety'].includes(input.category)) throw badRequest('影片分类格式不正确');
+    row.category = input.category;
+  }
   if (input.url) row.url = address(input.url, '播放链接');
   if (history) {
     row.mode = input.mode === 'parser' ? 'parser' : 'direct';

@@ -4,12 +4,59 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../server.mjs';
+import { createStore } from '../lib/store.mjs';
 
-const empty = { sources: [], platforms: [], parsers: [] };
+const empty = { showAdult: false, sources: [], platforms: [], parsers: [] };
 const detail = { key: 'film', source: 'demo', id: '1', title: '测试影片', year: '2025', type: 'movie', poster: '', description: '简介',
   lines: [{ name: '线路', episodes: [{ name: '正片', url: 'https://media.example/video.m3u8?token=abc', type: 'hls' }] }] };
 const catalog = { async search() { return { groups: [{ ...detail, items: [{ source: 'demo', id: '1' }] }], failedSources: [] }; },
   async detail() { return detail; } };
+
+test('browse passes category, page and selected source to the configured catalog', async (t) => {
+  let received;
+  const { call, login } = await running(t, { catalog: { ...catalog, async browse(config, options) {
+    received = { config, options };
+    return { category: options.category, page: Number(options.page), groups: [], failedSources: [], hasMore: false };
+  } } });
+  const cookie = await login();
+  const response = await call('/api/browse?category=anime&page=2&source=demo', undefined, cookie);
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).page, 2);
+  assert.deepEqual(received, { config: empty, options: { category: 'anime', page: '2', source: 'demo' } });
+});
+
+test('builtin source presets can be merged without deleting customized sources', async (t) => {
+  const builtin = { id: 'builtin', name: '内置样例', api: 'https://example.com/builtin' };
+  const custom = { id: 'custom', name: '自定义样例', api: 'https://example.com/custom' };
+  const { call, login } = await running(t, { initialConfig: { ...empty, sources: [builtin] } });
+  const cookie = await login();
+  assert.equal((await call('/api/config', { ...empty, sources: [custom] }, cookie, 'PUT')).status, 200);
+  const presets = await (await call('/api/config/presets', undefined, cookie)).json();
+  assert.deepEqual(presets, { api_site: { builtin: { name: builtin.name, api: builtin.api } } });
+  const response = await call('/api/config/import', { config: presets }, cookie);
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).sources.map(item => item.id), ['custom', 'builtin']);
+});
+
+test('upgrading an empty legacy config seeds sources once and preserves later user changes', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vipvideo-upgrade-'));
+  const legacy = createStore(dataDir, empty);
+  legacy.close();
+  const seeded = { ...empty, sources: [{ id: 'builtin', name: '内置样例', api: 'https://example.com/api' }] };
+  let app;
+  t.after(async () => { if (app) await app.close(); await rm(dataDir, { recursive: true, force: true }); });
+  app = createApp({ password: 'test-password', dataDir, initialConfig: seeded, catalog });
+  assert.equal(app.store.config().sources[0].id, 'builtin');
+  app.store.setConfig(empty);
+  await app.close(); app = null;
+  app = createApp({ password: 'test-password', dataDir, initialConfig: seeded, catalog });
+  assert.deepEqual(app.store.config().sources, []);
+  app.store.setConfig({ ...empty, sources: [{ id: 'custom', name: '自定义', api: 'https://example.com/custom' }] });
+  app.store.setMeta('builtin-sources-v1', '');
+  await app.close(); app = null;
+  app = createApp({ password: 'test-password', dataDir, initialConfig: seeded, catalog });
+  assert.equal(app.store.config().sources[0].id, 'custom');
+});
 
 async function running(t, options = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'vipvideo-test-'));
@@ -31,7 +78,7 @@ async function running(t, options = {}) {
 
 test('authentication protects all data and proxy endpoints; logout revokes cookie', async (t) => {
   const { call, login } = await running(t);
-  for (const path of ['/api/config', '/api/search?q=film', '/api/detail?source=demo&id=1', '/api/state', '/api/media?token=anything']) {
+  for (const path of ['/api/config', '/api/config/presets', '/api/browse?category=movie', '/api/search?q=film', '/api/detail?source=demo&id=1', '/api/state', '/api/media?token=anything']) {
     assert.equal((await call(path)).status, 401);
   }
   assert.equal((await call('/health')).status, 200);
@@ -73,6 +120,65 @@ test('config import is atomic; collections sync and last saved position wins', a
   assert.equal((await call('/api/history?key=film', undefined, cookie, 'DELETE')).status, 200);
   state = await (await call('/api/state', undefined, cookie)).json();
   assert.equal(state.history.length, 1); assert.equal(state.history[0].mode, 'parser');
+});
+
+test('hiding adult records applies to every collection endpoint and preserves them for later', async (t) => {
+  const { app, call, login } = await running(t);
+  const cookie = await login();
+  const limited = { ...detail, key: 'limited-fixture', title: '限制级样例', category: 'adult' };
+  for (const kind of ['favorites', 'history']) {
+    assert.equal((await call(`/api/${kind}`, { ...detail, category: 'movie' }, cookie)).status, 200);
+    assert.equal((await call(`/api/${kind}`, { ...limited, position: 42 }, cookie)).status, 200);
+    assert.deepEqual((await (await call(`/api/${kind}`, undefined, cookie)).json()).map(row => row.key), ['film']);
+    assert.equal(app.store.list(kind).length, 2);
+  }
+  let state = await (await call('/api/state', undefined, cookie)).json();
+  assert.equal(state.favorites.length, 1); assert.equal(state.history.length, 1);
+  assert.equal((await call('/api/config', { ...empty, showAdult: true }, cookie, 'PUT')).status, 200);
+  state = await (await call('/api/state', undefined, cookie)).json();
+  assert.equal(state.favorites.length, 2); assert.equal(state.history.find(row => row.key === limited.key).position, 42);
+  assert.equal((await call('/api/config/import', { config: { api_site: {} } }, cookie)).status, 200);
+  assert.equal((await (await call('/api/config', undefined, cookie)).json()).showAdult, true);
+  assert.equal((await call('/api/config', empty, cookie, 'PUT')).status, 200);
+  for (const kind of ['favorites', 'history']) {
+    assert.deepEqual((await (await call(`/api/${kind}`, undefined, cookie)).json()).map(row => row.key), ['film']);
+    assert.equal(app.store.list(kind).length, 2);
+  }
+});
+
+test('closing adult visibility during an upstream request rechecks every response before returning', async (t) => {
+  const limited = { ...detail, key: 'limited-fixture', title: '限制级样例', category: 'adult' };
+  const normal = { ...detail, source: 'normal', category: 'movie' };
+  for (const path of ['/api/browse?category=adult', '/api/search?q=fixture', '/api/detail?source=demo&id=1', '/api/playback?source=demo&id=1']) {
+    let started, release;
+    const pendingSource = new Promise(resolve => { release = resolve; });
+    const sourceStarted = new Promise(resolve => { started = resolve; });
+    const pause = async () => { started(); await pendingSource; };
+    const mixed = { ...limited, key: normal.key, items: [limited, normal] };
+    const blockedCatalog = {
+      async browse() { await pause(); return { category: 'adult', page: 1, groups: [mixed], failedSources: [], hasMore: false }; },
+      async search() { await pause(); return { groups: [{ ...limited, items: [limited] }, mixed], failedSources: [] }; },
+      async detail() { await pause(); return limited; },
+    };
+    const { call, login } = await running(t, { initialConfig: { ...empty, showAdult: true }, catalog: blockedCatalog });
+    const cookie = await login();
+    const pending = call(path, undefined, cookie);
+    await sourceStarted;
+    assert.equal((await call('/api/config', empty, cookie, 'PUT')).status, 200);
+    release();
+    const response = await pending;
+    if (path.includes('/search')) {
+      assert.equal(response.status, 200);
+      const result = await response.json();
+      assert.equal(result.groups.length, 1);
+      assert.equal(result.groups[0].category, 'movie');
+      assert.equal(result.groups[0].title, normal.title);
+      assert.deepEqual(result.groups[0].items.map(item => item.source), ['normal']);
+    } else {
+      assert.equal(response.status, 403, path);
+      assert.match((await response.json()).error, /三级内容已隐藏/);
+    }
+  }
 });
 
 test('SQLite survives close/reopen; changed password revokes previous sessions', async (t) => {
