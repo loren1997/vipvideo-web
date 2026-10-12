@@ -1,0 +1,7 @@
+#EXTM3U
+#EXTINF:-1 tvg-id="CCTV1.cn" group-title="央视",CCTV-1 综合
+https://liveplay-srs.voc.com.cn/hls/tv/134_180adf.m3u8
+#EXTINF:-1 tvg-id="CGTN.cn" group-title="新闻·教育",CGTN 英语新闻
+https://english-livebkali.cgtn.com/live/encgtn.m3u8
+#EXTINF:-1 tvg-id="HebeiTV.cn" group-title="卫视",河北卫视
+https://event.pull.hebtv.com/live/live101.m3u8

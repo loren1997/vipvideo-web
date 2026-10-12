@@ -1,6 +1,6 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const content = $('#content');
-let config = { platforms: [], parsers: [], sources: [], showAdult: false };
+let config = { platforms: [], parsers: [], sources: [], subscriptions: [], liveSources: [], showAdult: false };
 let library = { favorites: [], history: [] };
 let lastSearch = { q: '', groups: [] };
 let browseGroups = [];
@@ -13,6 +13,12 @@ let routeVersion = 0;
 let playVersion = 0;
 let toastTimer;
 let historyQueue = Promise.resolve();
+let importWarnings = [];
+const defaultPreferences = { introSeconds: 0, outroSeconds: 0, autoNext: true, speed: 1, danmakuEnabled: true };
+const sourceSuccess = new Map();
+const playabilityCache = new Map();
+let verificationActive = 0;
+const verificationQueue = [];
 
 function node(tag, text, className) {
   const element = document.createElement(tag);
@@ -50,8 +56,9 @@ function notify(message, error = false) {
 }
 
 async function api(path, options = {}) {
+  const sourcesAtRequest = /^\/api\/(?:search|browse)\?/.test(path) ? JSON.stringify(config.sources) : null;
   const response = await fetch(path, {
-    method: options.method || 'GET', credentials: 'same-origin', signal: AbortSignal.timeout(45000),
+    method: options.method || 'GET', credentials: 'same-origin', signal: AbortSignal.timeout(options.timeoutMs || 45000),
     headers: { Accept: 'application/json', ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
     ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
   });
@@ -63,6 +70,11 @@ async function api(path, options = {}) {
     error.adultHidden = response.status === 403 && error.message.includes('三级内容已隐藏');
     if (error.adultHidden) applyConfig(await api('/api/config'));
     throw error;
+  }
+  if (sourcesAtRequest !== null && sourcesAtRequest === JSON.stringify(config.sources)) {
+    const failed = new Set((data.failedSources || []).map(source => source.source));
+    for (const source of failed) sourceSuccess.delete(source);
+    for (const group of data.groups || []) for (const item of group.items || []) if (!failed.has(item.source)) sourceSuccess.set(item.source, Date.now());
   }
   return data;
 }
@@ -125,13 +137,22 @@ function leaveAdultScreen() {
 
 function applyConfig(next) {
   const changed = Boolean(config.showAdult) !== Boolean(next.showAdult);
+  const sourcesChanged = JSON.stringify(config.sources) !== JSON.stringify(next.sources);
+  if (sourcesChanged || changed) { sourceSuccess.clear(); playabilityCache.clear(); }
   const adultScreen = detail?.category === 'adult' || detailTarget?.category === 'adult' || openingItem?.category === 'adult' || location.hash.startsWith('#home?') && new URLSearchParams(location.hash.split('?')[1]).get('category') === 'adult';
   config = next;
   if (changed) {
     browseGroups = []; lastSearch = { q: '', groups: [] }; openingItem = null;
     if (!config.showAdult && adultScreen) { leaveAdultScreen(); return true; }
   }
+  if (sourcesChanged && player?.detail === detail && detail) { detail.verification = null; renderSources(detail, detail.candidates || []); renderEpisodes(detail); }
   return false;
+}
+
+function acceptImport(next) {
+  importWarnings = (Array.isArray(next.importWarnings) ? next.importWarnings : []).filter(message => typeof message === 'string');
+  const { importWarnings: _warnings, ...accepted } = next;
+  applyConfig(accepted);
 }
 
 function openItem(item, resume = false) {
@@ -159,6 +180,9 @@ function card(item, options = {}) {
     cover.append(image);
   }
   cover.append(node('span', item.title, 'poster-fallback'));
+  if (item.douban?.id && Number.isFinite(item.douban.score) && item.douban.score >= 0 && item.douban.score <= 10) {
+    const badge = node('span', `豆瓣 ${item.douban.score.toFixed(1)}`, 'rating-badge'); badge.title = '豆瓣评分由影视源提供，可能存在更新延迟。'; cover.append(badge);
+  }
   cover.append(node('span', options.resume ? `继续 · ${formatTime(item.position || 0)}` : item.remarks || `${item.year || '年份未知'} · ${item.typeName || typeLabel(item.type)}`, 'poster-tag'));
   if (item.duration > 0 && options.resume) {
     const progress = node('progress'); progress.max = item.duration; progress.value = item.position || 0;
@@ -198,7 +222,7 @@ async function addPresets(element) {
   element.disabled = true;
   try {
     const presets = await api('/api/config/presets');
-    applyConfig(await api('/api/config/import', { method: 'POST', body: { config: presets } }));
+    acceptImport(await api('/api/config/import', { method: 'POST', body: { config: presets } }));
     updateSourceStatus(); await renderRoute(); notify('内置影视源已添加，原有自定义源已保留');
   } catch (error) { notify(`添加失败：${error.message}`, true); }
   finally { element.disabled = false; }
@@ -225,29 +249,41 @@ function mergeGroups(previous, incoming) {
   return [...groups.values()];
 }
 
-function failuresList(sources) {
+function failuresList(sources, label = '影视源') {
   if (!sources?.length) return null;
   const failures = node('details', undefined, 'failure-list');
-  failures.append(node('summary', `${sources.length} 个影视源未返回内容，其他来源不受影响`));
+  failures.append(node('summary', `${sources.length} 个${label}未返回内容，其他来源不受影响`));
   for (const source of sources) failures.append(node('p', `${source.name || source.source}：${source.error}`));
   return failures;
+}
+
+function categoryTabs(category, selectedSource = '') {
+  const tabs = node('div', undefined, 'category-tabs'); tabs.setAttribute('aria-label', '影视分类');
+  const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺·栏目', live: '电视直播', ...(config.showAdult === true ? { adult: '三级' } : {}) };
+  for (const [id, name] of Object.entries(categories)) {
+    const tab = button(name, () => id === 'live' ? goto('live') : goto('home', { category: id, ...(selectedSource ? { source: selectedSource } : {}) }), `button${id === category ? ' selected' : ''}`);
+    tab.setAttribute('aria-pressed', String(id === category)); tabs.append(tab);
+  }
+  return tabs;
 }
 
 async function renderHome(category = 'movie', selectedSource = '', stamp = routeVersion) {
   const page = document.createDocumentFragment();
   const catalog = section('发现好故事', '选一部，直接开始看');
   const controls = node('div', undefined, 'browse-controls');
-  const tabs = node('div', undefined, 'category-tabs'); tabs.setAttribute('aria-label', '影视分类');
-  const categories = { movie: '电影', tv: '电视剧', anime: '动漫', ...(config.showAdult === true ? { adult: '三级' } : {}) };
+  const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺·栏目', ...(config.showAdult === true ? { adult: '三级' } : {}) };
   if (!categories[category]) category = 'movie';
-  for (const [id, name] of Object.entries(categories)) {
-    const tab = button(name, () => goto('home', { category: id, ...(selectedSource ? { source: selectedSource } : {}) }), `button${id === category ? ' selected' : ''}`);
-    tab.setAttribute('aria-pressed', String(id === category)); tabs.append(tab);
-  }
+  const tabs = categoryTabs(category, selectedSource);
   const select = node('select'); select.setAttribute('aria-label', '浏览影视源');
   const all = node('option', '全部影视源'); all.value = ''; select.append(all);
-  for (const source of config.sources.filter(source => source.enabled !== false)) { const option = node('option', source.name); option.value = source.id; select.append(option); }
-  select.value = selectedSource;
+  function updateSourceChoices() {
+    select.replaceChildren(all);
+    for (const source of config.sources.filter(source => source.enabled !== false && Date.now() - (sourceSuccess.get(source.id) || 0) < 5 * 60 * 1000)) {
+      const option = node('option', source.name); option.value = source.id; select.append(option);
+    }
+    select.value = [...select.options].some(option => option.value === selectedSource) ? selectedSource : '';
+  }
+  updateSourceChoices();
   select.addEventListener('change', () => goto('home', { category, ...(select.value ? { source: select.value } : {}) }));
   controls.append(tabs, select); catalog.append(controls);
   const listing = node('div'); listing.id = 'browse-results'; catalog.append(listing);
@@ -283,6 +319,7 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
     try {
       const result = await api(`/api/browse?${new URLSearchParams({ category, page: nextPage, ...(selectedSource ? { source: selectedSource } : {}) })}`);
       if (stamp !== routeVersion) return;
+      updateSourceChoices();
       const incoming = (result.groups || []).filter(group => category === 'adult' ? group.category === 'adult' : group.category !== 'adult').map(group => ({ ...group, items: group.items.filter(item => category === 'adult' ? item.category === 'adult' : item.category !== 'adult') }));
       groups = mergeGroups(groups, incoming.filter(group => group.items.length)); browseGroups = mergeGroups(browseGroups, groups);
       listing.replaceChildren(); const failures = failuresList(result.failedSources); if (failures) listing.append(failures);
@@ -291,6 +328,7 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
     } catch (error) {
       if (stamp !== routeVersion) return;
       if (error.adultHidden) { leaveAdultScreen(); return; }
+      if (selectedSource) { sourceSuccess.delete(selectedSource); updateSourceChoices(); }
       if (nextPage === 1) listing.replaceChildren(empty('分类内容暂时不可用', error.message, button('重新加载', () => void loadPage())));
       else { more.textContent = '重试加载更多'; notify(error.message, true); }
     } finally { more.disabled = false; }
@@ -414,7 +452,7 @@ function selectionFor(data, reference = {}) {
   const choices = [];
   data.lines.forEach((line, index) => {
     const episode = reference.episodeName ? matchEpisode(line, reference.episodeName, reference.episode || 0) : line.episodes[reference.episode || 0] ? reference.episode || 0 : -1;
-    if (episode >= 0) choices.push({ line: index, episode, direct: line.episodes[episode].type !== 'page', preferred: reference.source === data.source && index === reference.line || line.name === reference.lineName });
+    if (episode >= 0 && ['hls', 'mp4'].includes(line.episodes[episode].type)) choices.push({ line: index, episode, direct: true, preferred: reference.source === data.source && index === reference.line || line.name === reference.lineName });
   });
   choices.sort((a, b) => Number(b.direct) - Number(a.direct) || Number(b.preferred) - Number(a.preferred));
   return choices[0] || null;
@@ -422,6 +460,102 @@ function selectionFor(data, reference = {}) {
 
 function playPosition(current) {
   return current?.video?.readyState >= 1 ? current.video.currentTime : current?.position || 0;
+}
+
+async function withVerificationSlot(work) {
+  if (verificationActive < 2) verificationActive++;
+  else await new Promise(resolve => verificationQueue.push(resolve));
+  try { return await work(); }
+  finally { const next = verificationQueue.shift(); if (next) next(); else verificationActive--; }
+}
+
+function playbackSelection(data, line, episode) {
+  return { source: data.source, id: data.id, line, episode };
+}
+
+function playbackKey(data, line, episode) {
+  return JSON.stringify([config.sources.find(item => item.id === data.source)?.api, data.source, data.id, line, episode, data.lines[line]?.episodes[episode]?.url]);
+}
+
+function checkSelection(data, line, episode, valid = () => true) {
+  const selected = data.lines[line]?.episodes[episode];
+  if (!selected || !['hls', 'mp4'].includes(selected.type)) return Promise.resolve({ playable: false, error: '这条线路没有可直接播放的视频' });
+  const key = playbackKey(data, line, episode);
+  const cached = playabilityCache.get(key);
+  if (cached && cached.expires > Date.now()) return cached.promise || Promise.resolve(cached.result);
+  const entry = { expires: Infinity };
+  const work = async () => {
+    if (!valid()) { entry.expires = 0; entry.promise = null; return { playable: false, cancelled: true }; }
+    let result;
+    try { result = await api(`/api/playability?${new URLSearchParams(playbackSelection(data, line, episode))}`, { timeoutMs: 25000 }); }
+    catch (error) { result = { playable: false, error: error.message }; }
+    if (entry.reported) return entry.result;
+    entry.result = result; entry.expires = Date.now() + (result.playable ? 300000 : 60000); entry.promise = null;
+    return result;
+  };
+  entry.promise = withVerificationSlot(work);
+  playabilityCache.set(key, entry);
+  if (playabilityCache.size > 2000) playabilityCache.delete(playabilityCache.keys().next().value);
+  return entry.promise;
+}
+
+function verificationReference(data) {
+  if (player?.detail === data) return player;
+  return data.selectionReference || { source: data.source, line: data.selectedLine, episode: 0, episodeName: data.lines[data.selectedLine]?.episodes[0]?.name };
+}
+
+function verifyOptions(data, candidates) {
+  const reference = verificationReference(data);
+  const choices = sourceCandidates(data, candidates);
+  if (!choices.some(item => item.source === data.source && String(item.id) === String(data.id))) choices.unshift(data);
+  const signature = JSON.stringify([playVersion, config.sources, reference.episodeName, reference.episode, choices.map(item => [item.source, item.id])]);
+  if (data.verification?.signature === signature) return;
+  const state = { signature, sources: new Map(), lines: new Map(), pending: choices.length };
+  const stamp = routeVersion, request = playVersion;
+  data.verification = state;
+  const valid = () => detail === data && data.verification === state && stamp === routeVersion && request === playVersion;
+  for (const candidate of choices) void (async () => {
+    if (!valid()) return;
+    try {
+      const own = candidate.source === data.source && String(candidate.id) === String(data.id);
+      const item = own ? data : await withVerificationSlot(() => valid() ? api(`/api/detail?${new URLSearchParams({ source: candidate.source, id: candidate.id })}`, { timeoutMs: 10000 }) : null);
+      if (!valid() || item.key !== data.key || item.year !== data.year || item.type !== data.type || !sameContentCategory(data, item)) return;
+      const preferred = selectionFor(item, reference);
+      const indexes = item.lines.map((_line, index) => index).sort((first, second) => Number(second === preferred?.line) - Number(first === preferred?.line));
+      for (const line of indexes) {
+        const episode = matchEpisode(item.lines[line], reference.episodeName, reference.episode || 0);
+        if (episode < 0 || !valid()) continue;
+        const result = await checkSelection(item, line, episode, valid);
+        if (!valid()) return;
+        if (result.playable) {
+          state.sources.set(`${candidate.source}:${candidate.id}`, candidate);
+          if (own) state.lines.set(line, episode);
+          renderSources(data, data.candidates || candidates); renderEpisodes(data);
+          if (!own) break;
+        }
+      }
+    } catch (error) { if (valid()) console.warn('候选线路验证失败', error.message); }
+    finally {
+      state.pending--;
+      if (valid()) { renderSources(data, data.candidates || candidates); renderEpisodes(data); }
+    }
+  })();
+}
+
+function reportPlayback(current, status) {
+  if (player !== current || !current.catalog || current.playabilityReported === status) return;
+  current.playabilityReported = status;
+  const key = playbackKey(current.detail, current.line, current.episode);
+  const entry = playabilityCache.get(key) || {};
+  entry.reported = true; entry.promise = null; entry.result = { playable: status === 'ok', checkedAt: Date.now() }; entry.expires = Date.now() + (status === 'ok' ? 300000 : 60000);
+  playabilityCache.set(key, entry);
+  if (status === 'error') {
+    const state = current.detail.verification;
+    state?.lines.delete(current.line);
+    if (!state?.lines.size) state?.sources.delete(`${current.detail.source}:${current.detail.id}`);
+    renderSources(current.detail, current.detail.candidates || []); renderEpisodes(current.detail);
+  }
+  void api('/api/playability/report', { method: 'POST', body: { ...playbackSelection(current.detail, current.line, current.episode), status } }).catch(error => console.warn('影片线路结果未同步', error.message));
 }
 
 async function openDetail(source, id, stamp) {
@@ -468,6 +602,7 @@ function renderDetail(data, candidates) {
   if (posterUrl) { const image = node('img', undefined, 'detail-poster'); image.src = posterUrl; image.alt = ''; image.referrerPolicy = 'no-referrer'; image.addEventListener('error', () => image.remove(), { once: true }); summary.append(image); }
   const info = node('div', undefined, 'detail-info');
   info.append(node('h2', data.title), node('p', `${data.year || '年份未知'} · ${data.typeName || typeLabel(data.type)} · ${sourceName(data.source)}`, 'meta'));
+  const ratings = node('div', '正在读取评分…', 'film-ratings'); ratings.setAttribute('aria-live', 'polite'); info.append(ratings);
   if (data.description) info.append(node('p', data.description, 'detail-description'));
   const actions = node('div', undefined, 'detail-actions');
   const history = library.history.find(record => record.key === data.key && record.source === data.source && sameContentCategory(data, record));
@@ -487,6 +622,27 @@ function renderDetail(data, candidates) {
   const sources = node('div', undefined, 'source-row'); sources.id = 'source-row';
   content.replaceChildren(summary, layout, sources);
   renderEpisodes(data); renderSources(data, candidates);
+  void renderRatings(data, ratings);
+}
+
+async function renderRatings(data, host) {
+  const searchUrl = `https://search.douban.com/movie/subject_search?${new URLSearchParams({ search_text: data.title, cat: '1002' })}`;
+  try {
+    const result = await (data.ratingsPromise ||= api(`/api/ratings?${new URLSearchParams({ source: data.source, id: data.id })}`));
+    if (detail !== data || !host.isConnected) return;
+    host.replaceChildren();
+    const scores = node('div', undefined, 'rating-scores');
+    const value = result.douban;
+    const valid = Number.isFinite(value?.score) && value.score >= 0 && value.score <= 10;
+    const badge = valid && httpUrl(value.url) ? externalLink(`豆瓣 ${value.score.toFixed(1)}`, value.url, 'rating-score') : node('span', valid ? `豆瓣 ${value.score.toFixed(1)}` : '暂无豆瓣评分', 'rating-score');
+    if (valid && Number.isFinite(value.votes) && value.votes > 0) badge.title = `${Math.floor(value.votes).toLocaleString('zh-CN')} 人评分`;
+    scores.append(badge); if (!valid) scores.append(externalLink('在豆瓣查找 ↗', searchUrl, 'rating-search'));
+    host.append(scores);
+    if (valid) host.append(node('small', value.attribution || '豆瓣评分由影视源提供，可能存在更新延迟。', 'rating-attribution'));
+    if (result.errors?.length) host.append(node('small', result.errors.map(error => typeof error === 'string' ? error : error.error || error.message || '评分来源暂时不可用').join('；'), 'muted'));
+  } catch (error) {
+    if (detail === data && host.isConnected) host.replaceChildren(node('span', `暂无豆瓣评分：${error.message}`, 'muted'), externalLink('在豆瓣查找 ↗', searchUrl, 'rating-search'));
+  }
 }
 
 function updateFavoriteButton(data, element) {
@@ -510,8 +666,12 @@ function renderEpisodes(data) {
   const panel = $('#episodes'); if (!panel) return;
   panel.replaceChildren(node('h3', '播放线路与选集'));
   if (!data.lines.length) { panel.append(node('p', '这个来源暂时没有播放线路。', 'muted')); return; }
+  const verified = data.verification?.lines || new Map();
+  if (!verified.size) { panel.append(node('p', data.verification?.pending ? '正在验证当前剧集的可播放线路…' : '当前剧集暂无已验证可播放线路。', 'muted')); return; }
+  if (!verified.has(data.selectedLine)) data.selectedLine = verified.keys().next().value;
   const tabs = node('div', undefined, 'line-tabs');
   data.lines.forEach((line, index) => {
+    if (!verified.has(index)) return;
     const tab = button(line.name || `线路 ${index + 1}`, () => {
       const old = player;
       data.selectedLine = index; renderEpisodes(data);
@@ -542,15 +702,17 @@ function matchEpisode(line, name, index) {
 function renderSources(data, candidates) {
   const row = $('#source-row'); if (!row) return;
   data.candidates = candidates;
+  verifyOptions(data, candidates);
   row.replaceChildren(node('span', '切换影视源', 'meta'));
-  const unique = sourceCandidates(data, candidates);
-  if (!unique.some(item => item.source === data.source && String(item.id) === String(data.id))) unique.unshift(data);
+  const unique = [...data.verification.sources.values()];
   for (const candidate of unique) {
     const selected = candidate.source === data.source && String(candidate.id) === String(data.id);
     const item = button(sourceName(candidate.source), () => void switchSource(data, candidate), `button${selected ? ' selected' : ''}`);
     item.disabled = selected; item.setAttribute('aria-pressed', String(selected)); row.append(item);
   }
-  if (unique.length === 1) row.append(button('查找其他来源', () => goto('search', { q: data.title }), 'button subtle'));
+  if (data.verification.pending) row.append(node('span', '正在验证可播放来源…', 'muted'));
+  else if (!unique.length) row.append(node('span', '暂无已验证可播放来源', 'muted'));
+  if (unique.length <= 1) row.append(button('查找其他来源', () => goto('search', { q: data.title }), 'button subtle'));
 }
 
 async function switchSource(oldDetail, candidate, flow = { tried: new Set() }) {
@@ -576,6 +738,110 @@ async function switchSource(oldDetail, candidate, flow = { tried: new Set() }) {
   }
 }
 
+async function renderLive(params, stamp) {
+  const page = section('电视直播', '选择频道，即刻播放');
+  const controls = node('div', undefined, 'browse-controls'); controls.append(categoryTabs('live'));
+  const refresh = button('刷新频道', () => void loadChannels(true), 'button small'); controls.append(refresh); page.append(controls);
+  const feedback = node('div'); page.append(feedback);
+  const layout = node('div', undefined, 'watch-layout live-layout');
+  const watch = node('div');
+  const host = node('div', undefined, 'player-host'); host.id = 'player-host';
+  host.append(empty('选择一个频道', '支持在播放时手动切换频道线路。'));
+  const lines = node('div', undefined, 'source-row'); lines.id = 'live-lines'; watch.append(host, lines);
+  const panel = node('aside', undefined, 'episode-panel channel-panel'); panel.append(node('h3', '频道'));
+  const group = node('select'); group.setAttribute('aria-label', '频道分组');
+  const list = node('div', undefined, 'channel-list'); panel.append(group, list); layout.append(watch, panel); page.append(layout); content.replaceChildren(page);
+  let channels = [], loadingVersion = 0;
+  function drawChannels() {
+    list.replaceChildren();
+    for (const channel of channels.filter(item => item.streams.some(stream => stream.status === 'ok') && (!group.value || item.group === group.value))) {
+      const selectedChannel = player?.live && player.channel.id === channel.id;
+      const item = button(channel.name, () => void startLiveChannel(channel, preferredLiveLine(channel), stamp), `button channel-button${selectedChannel ? ' selected' : ''}`); item.dataset.channel = channel.id;
+      item.setAttribute('aria-label', `播放频道 ${channel.name}`); item.setAttribute('aria-pressed', String(player?.live && player.channel.id === channel.id)); list.append(item);
+    }
+    if (!list.childElementCount) list.append(node('p', '没有可用频道。', 'muted'));
+  }
+  group.addEventListener('change', drawChannels);
+  async function loadChannels(force = false) {
+    const request = ++loadingVersion; refresh.disabled = true; feedback.replaceChildren(node('p', '正在探测可播放频道…', 'muted'));
+    try {
+      const result = await api('/api/live/probe', { method: 'POST', body: {}, timeoutMs: 150000 });
+      if (stamp !== routeVersion || request !== loadingVersion) return;
+      channels = (result.channels || []).filter(channel => channel.streams?.some(stream => stream.status === 'ok')); feedback.replaceChildren();
+      const failures = failuresList(result.failedSources, '直播源');
+      if (failures) { failures.open = result.failedSources.some(source => source.stale); feedback.append(failures); }
+      if (!channels.length) feedback.append(empty('暂无已验证可播放频道', '可继续刷新，探测下一批线路；也可以在资源设置中添加 M3U 直播源。', button('添加直播源', () => goto('settings'), 'button primary')));
+      const selected = group.value; group.replaceChildren(); const all = node('option', '全部频道'); all.value = ''; group.append(all);
+      for (const name of [...new Set(channels.map(channel => channel.group).filter(Boolean))]) { const option = node('option', name); option.value = name; group.append(option); }
+      group.value = [...group.options].some(option => option.value === selected) ? selected : ''; drawChannels();
+      if (!force && params.get('id')) {
+        const channel = channels.find(item => item.id === params.get('id'));
+        if (channel) void startLiveChannel(channel, params.has('line') ? Number(params.get('line')) || 0 : preferredLiveLine(channel), stamp);
+      }
+    } catch (error) { if (stamp === routeVersion && request === loadingVersion) feedback.replaceChildren(empty('频道暂时不可用', error.message, button('重试', () => void loadChannels()))); }
+    finally { if (stamp === routeVersion && request === loadingVersion) refresh.disabled = false; }
+  }
+  await loadChannels();
+}
+
+function preferredLiveLine(channel, tried = new Set()) {
+  return channel.streams.findIndex((stream, index) => stream.status === 'ok' && !tried.has(index));
+}
+
+function reportLive(current, status) {
+  if (player !== current || current.liveReported === status) return;
+  current.liveReported = status;
+  current.channel.streams[current.line].status = status;
+  if (status === 'error') {
+    $(`#live-lines button[data-line="${current.line}"]`)?.remove();
+    if (!current.channel.streams.some(stream => stream.status === 'ok')) document.querySelectorAll('.channel-button').forEach(item => { if (item.dataset.channel === current.channel.id) item.remove(); });
+  }
+  void api('/api/live/report', { method: 'POST', body: { id: current.channel.id, line: current.line, status } }).catch(error => console.warn('直播线路结果未同步', error.message));
+}
+
+async function startLiveChannel(channel, line, stamp, flow = { tried: new Set() }) {
+  if (stamp !== routeVersion) return;
+  const selected = channel.streams[line]; if (!selected || selected.status !== 'ok') return notify('这个频道暂时没有已验证可播放线路。', true);
+  const request = ++playVersion; void stopPlayer(false);
+  const current = { live: true, catalog: false, channel, line, flow, request, stamp, started: false, position: 0, mode: 'direct', detail: { title: channel.name, source: 'live', id: channel.id }, url: selected.url, type: selected.type };
+  flow.tried.add(line); player = current;
+  const host = $('#player-host'); if (!host) return;
+  host.replaceChildren(node('div', `正在连接 ${channel.name}…`, 'loading'));
+  const choices = $('#live-lines'); choices.replaceChildren(node('span', '频道线路', 'meta'));
+  channel.streams.forEach((stream, index) => {
+    if (stream.status !== 'ok') return;
+    const name = stream.name || `线路 ${index + 1}`;
+    const item = button(name, () => void startLiveChannel(channel, index, stamp), `button${index === line ? ' selected' : ''}`);
+    item.setAttribute('aria-label', name); item.dataset.line = index; item.append(node('span', '可用', 'line-status'));
+    item.disabled = index === line; item.setAttribute('aria-pressed', String(index === line)); choices.append(item);
+  });
+  document.querySelectorAll('.channel-button').forEach(item => { const selectedChannel = item.dataset.channel === channel.id; item.setAttribute('aria-pressed', String(selectedChannel)); item.classList.toggle('selected', selectedChannel); });
+  history.replaceState(null, '', `#live?${new URLSearchParams({ id: channel.id, line })}`);
+  try {
+    const playback = await api(`/api/live/playback?${new URLSearchParams({ id: channel.id, line })}`);
+    if (stamp !== routeVersion || request !== playVersion || player !== current) return;
+    Object.assign(current, playback, { started: true }); mountPlayer(current);
+  } catch (error) {
+    if (stamp !== routeVersion || request !== playVersion || player !== current) return;
+    current.note = node('p', error.message, 'player-note error-message'); host.replaceChildren(current.note); void recoverLive(current);
+  }
+}
+
+async function recoverLive(current) {
+  if (player !== current || current.recovering || current.failed || current.stamp !== routeVersion || current.request !== playVersion) return;
+  current.recovering = true;
+  if (current.proxyUrl && !current.usedProxy && current.video) {
+    current.usedProxy = true; current.recovering = false;
+    if (current.proxyButton) { current.proxyButton.textContent = '切回直连'; current.proxyButton.classList.add('selected'); }
+    loadMedia(current, '直连失败，正在尝试兼容转发…'); return;
+  }
+  reportLive(current, 'error');
+  const next = preferredLiveLine(current.channel, current.flow.tried);
+  if (current.flow.tried.size < 3 && next >= 0) { await startLiveChannel(current.channel, next, current.stamp, current.flow); return; }
+  current.failed = true; current.recovering = false;
+  current.note.textContent = '当前频道暂时无法播放。请切换线路或选择其他频道。'; current.note.className = 'player-note error-message';
+}
+
 function formatTime(seconds) {
   const value = Math.floor(Number(seconds) || 0);
   const hours = Math.floor(value / 3600);
@@ -583,7 +849,7 @@ function formatTime(seconds) {
 }
 
 async function startEpisode(data, line, episode, position = 0, flow = { tried: new Set() }) {
-  const selected = data.lines[line]?.episodes[episode];
+  let selected = data.lines[line]?.episodes[episode];
   if (!selected) return notify('当前剧集不可用，请重新选集。', true);
   const request = ++playVersion;
   const stamp = routeVersion;
@@ -592,17 +858,185 @@ async function startEpisode(data, line, episode, position = 0, flow = { tried: n
   flow.tried.add(data.source);
   const current = { detail: data, line, episode, episodeName: selected.name, url: selected.url, type: selected.type, position, mode: 'direct', catalog: true, flow, request, stamp, started: false };
   player = current;
+  data.selectionReference = current;
+  renderSources(data, data.candidates || []); renderEpisodes(data);
   try {
-    const playback = await api(`/api/playback?${new URLSearchParams({ source: data.source, id: data.id, line, episode })}`);
+    const valid = () => stamp === routeVersion && request === playVersion && player === current;
+    const choices = [{ line, episode }, ...data.lines.map((candidate, index) => ({ line: index, episode: matchEpisode(candidate, selected.name, episode) })).filter(candidate => candidate.line !== line && candidate.episode >= 0)];
+    let verified = false, failure;
+    for (const choice of choices) {
+      const result = await checkSelection(data, choice.line, choice.episode, valid);
+      if (!valid()) return;
+      if (!result.playable) { failure = result.error; continue; }
+      ({ line, episode } = choice); selected = data.lines[line].episodes[episode];
+      Object.assign(current, { line, episode, episodeName: selected.name, url: selected.url, type: selected.type });
+      verified = true; break;
+    }
+    if (!verified) throw new Error(failure || '当前剧集暂无已验证可播放线路');
+    const [playback, preferences] = await Promise.all([
+      api(`/api/playback?${new URLSearchParams({ source: data.source, id: data.id, line, episode })}`),
+      (data.preferencesPromise ||= api(`/api/player/preferences?${new URLSearchParams({ key: data.key })}`).catch(error => { console.warn('播放偏好读取失败', error.message); return defaultPreferences; })),
+    ]);
     if (stamp !== routeVersion || request !== playVersion || player !== current) return;
     data.selectedLine = line;
-    Object.assign(current, playback, { url: playback.url || selected.url, type: playback.type || selected.type, started: true });
-    mountPlayer(current); renderEpisodes(data);
+    Object.assign(current, playback, { url: playback.url || selected.url, type: playback.type || selected.type, started: true, preferences: normalizePreferences(preferences) });
+    mountPlayer(current); renderSources(data, data.candidates || []); renderEpisodes(data);
   } catch (error) {
     if (stamp !== routeVersion || request !== playVersion || player !== current) return;
     const note = node('p', error.message, 'player-note error-message'); current.note = note;
     host.replaceChildren(note); void recoverPlayback(current);
   }
+}
+
+function normalizePreferences(value = {}) {
+  return { introSeconds: Math.max(0, Math.min(600, Number(value.introSeconds) || 0)), outroSeconds: Math.max(0, Math.min(600, Number(value.outroSeconds) || 0)), autoNext: value.autoNext !== false, speed: Number.isFinite(value.speed) && value.speed >= 0.5 && value.speed <= 3 ? value.speed : 1, danmakuEnabled: value.danmakuEnabled !== false };
+}
+
+function seekVideo(current, seconds) {
+  if (player !== current || !current.video || current.live) return;
+  const video = current.video;
+  if (!Number.isFinite(video.duration) || video.duration <= 0) return;
+  video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + seconds));
+}
+
+function playerPreferences(current, host) {
+  const prefs = current.preferences;
+  const panel = node('div', undefined, 'player-preferences');
+  const numbers = {};
+  for (const [key, title] of [['introSeconds', '跳过片头（秒）'], ['outroSeconds', '跳过片尾（秒）']]) {
+    const label = node('label', title); const input = node('input'); input.type = 'number'; input.min = '0'; input.max = '600'; input.step = '1'; input.value = prefs[key]; input.setAttribute('aria-label', title); label.append(input); panel.append(label); numbers[key] = input;
+    input.addEventListener('input', () => { if (input.validity.valid && input.value !== '') prefs[key] = Number(input.value); });
+  }
+  for (const [key, title] of [['autoNext', '自动下一集'], ['danmakuEnabled', '显示弹幕']]) {
+    const label = node('label', title, 'player-option'); const input = node('input'); input.type = 'checkbox'; input.checked = prefs[key]; input.setAttribute('aria-label', title); label.prepend(input); panel.append(label);
+    input.addEventListener('change', () => {
+      prefs[key] = input.checked;
+      if (key === 'danmakuEnabled') {
+        if (!input.checked) { clearDanmaku(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; }
+        else { void loadDanmaku(current); startDanmakuSync(current); }
+        if (current.danmakuForm) current.danmakuForm.hidden = !input.checked;
+      }
+    });
+  }
+  const save = button('保存播放偏好', async () => {
+    if (player !== current) return;
+    for (const input of Object.values(numbers)) if (!input.reportValidity() || input.value === '') return;
+    save.disabled = true;
+    try {
+      const result = await api('/api/player/preferences', { method: 'PUT', body: { key: current.detail.key, ...prefs } });
+      if (player !== current) return;
+      Object.assign(prefs, normalizePreferences(result)); current.detail.preferencesPromise = Promise.resolve({ ...prefs }); notify('本影片播放偏好已保存');
+    } catch (error) { if (player === current) notify(`偏好未保存：${error.message}`, true); }
+    finally { if (player === current) save.disabled = false; }
+  }, 'button small');
+  panel.append(save, node('small', '片头片尾默认不跳过；片尾跳过仅在自动下一集开启时生效。', 'muted')); host.insertBefore(panel, current.note);
+}
+
+function clearDanmaku(current) {
+  for (const text of current.danmaku?.active.keys() || []) clearTimeout(text.cleanupTimer);
+  current.overlay?.replaceChildren(); current.danmaku?.active.clear();
+}
+
+function resetDanmaku(current) {
+  if (!current.danmaku) return;
+  clearDanmaku(current); current.danmaku.shown.clear();
+  const index = current.danmaku.comments.findIndex(comment => comment.time >= current.video.currentTime - 0.25);
+  current.danmaku.cursor = index < 0 ? current.danmaku.comments.length : index;
+}
+
+function drawDanmaku(current) {
+  if (player !== current || !current.preferences?.danmakuEnabled || current.video.paused || !current.danmaku) return;
+  const state = current.danmaku, time = current.video.currentTime;
+  while (state.cursor < state.comments.length && state.comments[state.cursor].time <= time) {
+    const comment = state.comments[state.cursor++];
+    if (comment.time < time - 1 || state.shown.has(comment.id) || state.active.size >= 12) continue;
+    const lanes = Math.max(1, Math.min(12, Math.floor((current.overlay.clientHeight - 48) / 24)));
+    const lane = Array.from({ length: lanes }, (_value, index) => index).find(index => ![...state.active.values()].includes(index));
+    if (lane === undefined) continue;
+    const text = node('span', comment.text, 'danmaku-comment'); text.style.top = `${8 + lane * 24}px`;
+    if (/^#[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(comment.color || '')) text.style.color = comment.color;
+    current.overlay.append(text); text.style.setProperty('--distance', `${-(current.overlay.clientWidth + text.scrollWidth + 20)}px`);
+    state.active.set(text, lane); state.shown.add(comment.id);
+    const remove = () => { clearTimeout(text.cleanupTimer); state.active.delete(text); text.remove(); };
+    text.cleanupTimer = setTimeout(remove, 8500); text.addEventListener('animationend', remove, { once: true });
+  }
+}
+
+function startDanmakuSync(current) {
+  if (current.danmakuTimer || player !== current || current.video.paused || !current.preferences?.danmakuEnabled) return;
+  current.danmakuTimer = setInterval(() => { if (player === current && !current.video.paused) void loadDanmaku(current); }, 20000);
+}
+
+async function loadDanmaku(current) {
+  if (player !== current || !current.preferences?.danmakuEnabled || !current.danmaku) return;
+  if (current.danmaku.loading) return current.danmaku.loading;
+  current.danmaku.loading = (async () => {
+    try {
+      const result = await api(`/api/danmaku?${new URLSearchParams({ key: current.detail.key, episode: current.episodeName })}`);
+      if (player !== current || !current.preferences.danmakuEnabled) return;
+      current.danmaku.comments = (result.comments || []).filter(comment => typeof comment.text === 'string' && Number.isFinite(comment.time) && comment.time >= 0).map(comment => ({ ...comment, id: String(comment.id), text: comment.text.slice(0, 200) })).sort((first, second) => first.time - second.time);
+      const index = current.danmaku.comments.findIndex(comment => comment.time >= current.video.currentTime - 1);
+      current.danmaku.cursor = index < 0 ? current.danmaku.comments.length : index;
+      current.danmakuStatus.textContent = (result.errors || []).map(error => typeof error === 'string' ? error : error.error || error.message || '弹幕来源暂不可用').join('；'); drawDanmaku(current);
+    } catch (error) { if (player === current) current.danmakuStatus.textContent = `弹幕暂时不可用：${error.message}`; }
+    finally { current.danmaku.loading = null; }
+  })();
+  return current.danmaku.loading;
+}
+
+function mountDanmaku(current, surface, host) {
+  current.overlay = node('div', undefined, 'danmaku-overlay'); current.overlay.setAttribute('aria-hidden', 'true'); surface.append(current.overlay);
+  current.danmaku = { comments: [], cursor: 0, active: new Map(), shown: new Set(), loading: null };
+  const form = node('form', undefined, 'danmaku-form'); current.danmakuForm = form; form.hidden = !current.preferences.danmakuEnabled;
+  const input = node('input'); input.maxLength = 200; input.placeholder = '发一句家庭弹幕'; input.setAttribute('aria-label', '家庭弹幕'); input.autocomplete = 'off';
+  const send = node('button', '发送弹幕', 'button small'); send.type = 'submit'; form.append(input, send);
+  current.danmakuStatus = node('small', undefined, 'danmaku-status muted'); host.insertBefore(form, current.note); host.insertBefore(current.danmakuStatus, current.note);
+  form.addEventListener('submit', async event => {
+    event.preventDefault(); const text = input.value.trim(); if (!text || player !== current || !current.preferences.danmakuEnabled) return;
+    send.disabled = true;
+    try {
+      await api('/api/danmaku', { method: 'POST', body: { key: current.detail.key, episode: current.episodeName, time: current.video.currentTime, text } });
+      if (player !== current) return;
+      input.value = ''; await loadDanmaku(current);
+    } catch (error) { if (player === current) current.danmakuStatus.textContent = `弹幕未发送：${error.message}`; }
+    finally { if (player === current) send.disabled = false; }
+  });
+  current.video.addEventListener('seeking', () => resetDanmaku(current));
+  mountDanmakuBinding(current, host);
+  void loadDanmaku(current);
+}
+
+function mountDanmakuBinding(current, host) {
+  const panel = node('details', undefined, 'danmaku-binding'); panel.append(node('summary', '绑定本集外部弹幕'));
+  panel.append(node('p', '请选择对应同一影片、同一集的版本；使用官方 B 站 XML 或明确分 P 的视频链接。家庭弹幕只保存在此播放器服务中。', 'muted'));
+  const form = node('form', undefined, 'binding-form');
+  const url = node('input'); url.type = 'url'; url.placeholder = 'https://comment.bilibili.com/123.xml 或 B 站视频链接'; url.setAttribute('aria-label', '外部弹幕链接'); url.autocomplete = 'off';
+  const label = node('label', '偏移（秒）'); const offset = node('input'); offset.type = 'number'; offset.min = '-600'; offset.max = '600'; offset.step = '0.1'; offset.value = '0'; offset.setAttribute('aria-label', '弹幕时间偏移（秒）'); label.append(offset);
+  const save = node('button', '保存本集弹幕绑定', 'button small'); save.type = 'submit';
+  const clear = button('清除本集弹幕绑定', () => void writeBinding(true), 'button subtle small');
+  const status = node('p', undefined, 'binding-status muted'); form.append(url, label, save, clear); panel.append(form, status); host.insertBefore(panel, current.note);
+  let edited = false; url.addEventListener('input', () => { edited = true; }); offset.addEventListener('input', () => { edited = true; });
+  void api(`/api/danmaku/binding?${new URLSearchParams({ key: current.detail.key, episode: current.episodeName })}`).then(value => {
+    if (player !== current || edited) return;
+    url.value = value.url || ''; offset.value = Number.isFinite(value.offset) ? String(value.offset) : '0';
+  }).catch(error => { if (player === current) status.textContent = `绑定读取失败：${error.message}`; });
+  async function writeBinding(remove = false) {
+    if (player !== current || !remove && (!form.reportValidity() || offset.value === '')) return;
+    const value = remove ? '' : url.value.trim();
+    if (value && !httpUrl(value)) { status.textContent = '请输入有效的官方 B 站链接。'; return; }
+    save.disabled = true; clear.disabled = true; edited = true;
+    try {
+      const result = await api('/api/danmaku/binding', { method: 'PUT', body: { key: current.detail.key, episode: current.episodeName, url: value, offset: remove ? 0 : Number(offset.value) } });
+      if (player !== current) return;
+      url.value = result.url ?? value; offset.value = String(result.offset ?? (remove ? 0 : Number(offset.value)));
+      status.textContent = remove ? '本集外部弹幕已清除。' : '本集外部弹幕绑定已保存。';
+      await current.danmaku.loading;
+      if (player !== current) return;
+      resetDanmaku(current); await loadDanmaku(current);
+    } catch (error) { if (player === current) status.textContent = `绑定未保存：${error.message}`; }
+    finally { if (player === current) { save.disabled = false; clear.disabled = false; } }
+  }
+  form.addEventListener('submit', event => { event.preventDefault(); void writeBinding(); });
 }
 
 function parserUrl(parser, original) {
@@ -616,6 +1050,7 @@ function mountPlayer(current) {
   const toolbar = node('div', undefined, 'player-toolbar');
   const note = node('p', undefined, 'player-note'); current.note = note;
   host.append(surface, toolbar, note);
+  current.preferences ||= { ...defaultPreferences };
   if (current.type === 'page') {
     current.mode = 'parser';
     const frame = node('iframe'); frame.title = '第三方视频解析播放器'; frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-presentation'); frame.allow = 'fullscreen; autoplay; encrypted-media; picture-in-picture'; frame.referrerPolicy = 'no-referrer'; frame.allowFullscreen = true; current.frame = frame;
@@ -635,21 +1070,26 @@ function mountPlayer(current) {
     update(); return;
   }
   const video = node('video'); video.controls = true; video.playsInline = true; video.preload = 'metadata'; video.setAttribute('aria-label', `${current.detail.title} ${current.episodeName || ''}`); current.video = video; surface.append(video);
+  const backward = button('−10 秒', () => seekVideo(current, -10)); backward.setAttribute('aria-label', '快退 10 秒'); backward.disabled = Boolean(current.live);
+  const forward = button('+10 秒', () => seekVideo(current, 10)); forward.setAttribute('aria-label', '快进 10 秒'); forward.disabled = Boolean(current.live);
   const speed = node('select'); speed.setAttribute('aria-label', '播放速度');
-  for (const rate of [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]) { const option = node('option', `${rate}×`); option.value = rate; speed.append(option); }
-  speed.value = '1'; speed.addEventListener('change', () => { video.playbackRate = Number(speed.value); });
+  const rates = [...new Set([0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, current.preferences.speed])].sort((first, second) => first - second);
+  for (const rate of rates) { const option = node('option', `${rate}×`); option.value = rate; speed.append(option); }
+  speed.value = String(current.preferences.speed); video.playbackRate = current.preferences.speed;
+  speed.addEventListener('change', () => { current.preferences.speed = Number(speed.value); video.playbackRate = current.preferences.speed; });
   const full = button('全屏', async () => {
     try { if (video.requestFullscreen) await video.requestFullscreen(); else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else notify('当前浏览器不支持全屏。'); }
     catch (error) { notify(error.message, true); }
   });
-  toolbar.append(speed, full);
+  toolbar.append(backward, forward, speed, full);
   if (current.catalog) {
     const next = button('下一集 →', () => void nextEpisode(current)); next.disabled = !current.detail.lines[current.line]?.episodes[current.episode + 1]; toolbar.append(next);
+    playerPreferences(current, host); mountDanmaku(current, surface, host);
   }
   if (current.proxyUrl) {
     const proxy = button('兼容转发', () => {
-      current.request = ++playVersion; current.flow = { tried: new Set([current.detail.source]) }; current.failed = false; current.recovering = false;
-      current.position = playPosition(current); current.usedProxy = !current.usedProxy;
+      current.request = ++playVersion; current.flow = { tried: new Set([current.live ? current.line : current.detail.source]) }; current.failed = false; current.recovering = false;
+      current.position = current.live ? 0 : playPosition(current); current.usedProxy = !current.usedProxy;
       proxy.textContent = current.usedProxy ? '切回直连' : '兼容转发'; proxy.classList.toggle('selected', current.usedProxy); loadMedia(current);
     }); proxy.title = '跨域或直连失败时，尝试服务器受限转发'; current.proxyButton = proxy; toolbar.append(proxy);
   }
@@ -660,15 +1100,27 @@ function mountPlayer(current) {
       try { video.currentTime = Number.isFinite(video.duration) ? Math.min(current.position, Math.max(0, video.duration - 1)) : current.position; }
       catch { notify('当前线路无法跳转到保存的时间，请手动选择进度。'); }
       current.position = 0;
+      current.introHandled = true;
+    } else if (current.catalog && !current.introHandled && Number.isFinite(video.duration)) {
+      current.introHandled = true;
+      if (current.preferences.introSeconds > 0) video.currentTime = Math.min(current.preferences.introSeconds, Math.max(0, video.duration - 1));
     }
   });
-  video.addEventListener('pause', () => { if (player === current) void saveHistory(current); });
-  video.addEventListener('ended', () => { if (player === current) { void saveHistory(current); void nextEpisode(current); } });
-  video.addEventListener('loadeddata', () => { if (player === current) clearTimeout(current.loadTimer); });
-  video.addEventListener('playing', () => { if (player === current) { clearTimeout(current.loadTimer); note.textContent = `${current.episodeName || current.detail.title} · 进度每 10 秒自动保存`; note.className = 'player-note'; } });
+  video.addEventListener('pause', () => { if (player === current) { void saveHistory(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
+  video.addEventListener('ended', () => { if (player === current) { void saveHistory(current); if (current.catalog && current.preferences.autoNext && !current.nextPending) { current.nextPending = true; void nextEpisode(current); } } });
+  video.addEventListener('loadeddata', () => { if (player === current) { clearTimeout(current.loadTimer); if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); } });
+  video.addEventListener('playing', () => { if (player === current) { clearTimeout(current.loadTimer); note.textContent = current.live ? `正在直播 · ${current.detail.title}` : `${current.episodeName || current.detail.title} · 进度每 10 秒自动保存`; note.className = 'player-note'; current.overlay?.classList.remove('paused'); if (current.catalog) { startDanmakuSync(current); drawDanmaku(current); } } });
+  video.addEventListener('timeupdate', () => {
+    if (player !== current || !current.catalog) return;
+    drawDanmaku(current);
+    const outro = current.preferences.outroSeconds;
+    if (!video.paused && current.preferences.autoNext && outro > 0 && Number.isFinite(video.duration) && video.currentTime >= video.duration - outro && !current.nextPending && current.detail.lines[current.line]?.episodes[current.episode + 1]) {
+      current.nextPending = true; void nextEpisode(current);
+    }
+  });
   video.addEventListener('waiting', () => { if (player === current) note.textContent = '正在缓冲…'; });
   video.addEventListener('error', () => { if (player === current && video.error) playbackError(current); });
-  current.timer = setInterval(() => {
+  if (!current.live) current.timer = setInterval(() => {
     if (player !== current || video.paused) return;
     void saveHistory(current);
     if (current.detail.category === 'adult') {
@@ -682,6 +1134,7 @@ function playbackError(current) {
   if (player !== current || current.failed) return;
   clearTimeout(current.loadTimer);
   if (current.catalog) void recoverPlayback(current);
+  else if (current.live) void recoverLive(current);
   else { current.note.textContent = '当前地址无法播放，请更换链接或打开原链接。'; current.note.className = 'player-note error-message'; }
 }
 
@@ -694,6 +1147,7 @@ async function recoverPlayback(current) {
     if (current.proxyButton) { current.proxyButton.textContent = '切回直连'; current.proxyButton.classList.add('selected'); }
     loadMedia(current, '直连失败，正在尝试兼容转发…'); return;
   }
+  if (current.started) reportPlayback(current, 'error');
   current.note.textContent = '当前地址无法播放，正在查找其他影视源…';
   const request = current.request;
   const candidates = await loadCandidates(current.detail, current.stamp);
@@ -737,7 +1191,7 @@ async function nextEpisode(current) {
 }
 
 function saveHistory(current) {
-  if (current.started === false) return Promise.resolve();
+  if (current.live || current.started === false) return Promise.resolve();
   const record = { ...fieldsOf(current.detail), line: current.line || 0, episode: current.episode || 0, url: current.url, mode: current.mode, ...(current.mode === 'parser' ? { parser: current.parser || '' } : { position: current.video?.currentTime || current.position || 0, duration: Number.isFinite(current.video?.duration) ? current.video.duration : 0 }) };
   library.history = [record, ...library.history.filter(item => item.key !== record.key)];
   const saved = historyQueue.catch(() => {}).then(() => api('/api/history', { method: 'POST', body: record }));
@@ -751,6 +1205,7 @@ function stopPlayer(invalidate = true) {
   if (!current) return Promise.resolve();
   const save = saveHistory(current);
   clearInterval(current.timer);
+  clearInterval(current.danmakuTimer); clearDanmaku(current);
   clearTimeout(current.loadTimer);
   if (hls) { hls.destroy(); hls = null; }
   if (current.video) { current.video.pause(); current.video.removeAttribute('src'); current.video.load(); }
@@ -770,18 +1225,73 @@ function openLink(url, resume = false) {
   mountPlayer(player);
 }
 
+function formatDate(value) {
+  if (!value) return '尚未运行';
+  const date = new Date(value); return Number.isFinite(date.getTime()) ? date.toLocaleString('zh-CN', { hour12: false }) : '尚未运行';
+}
+
+function maintenancePanel(stamp) {
+  const panel = node('section', undefined, 'settings-section'); panel.append(node('h2', '影视源维护'), node('p', '服务端每 30 分钟检测影视接口并刷新直播列表，轮换抽样最多 20 条直播线路；每 6 小时更新启用的订阅，每 15 分钟尝试发现公开的新订阅。检测通过不代表所有内容都能播放，播放器只展示当前已验证可用的选项。修改配置后请先保存，再手动更新或发现订阅。', 'muted'));
+  const actions = node('div', undefined, 'settings-actions');
+  const status = node('div', '正在读取维护状态…', 'maintenance-status'); status.setAttribute('aria-live', 'polite');
+  let version = 0;
+  function drawState(data) {
+    status.replaceChildren();
+    const running = typeof data.running === 'object' && data.running ? Object.values(data.running).some(Boolean) : Boolean(data.running);
+    status.append(node('p', `${running ? '维护任务正在运行 · ' : ''}最近检测：${formatDate(data.lastProbe)} · 最近订阅更新：${formatDate(data.lastUpdate)}`, 'maintenance-summary'));
+    if (data.discovery) {
+      const found = data.discovery.candidates || [];
+      status.append(node('p', `${data.discovery.running ? '正在发现新订阅 · ' : ''}最近发现：${formatDate(data.discovery.lastDiscovery)} · 新增 ${found.filter(item => item.added).length} 个订阅`, 'maintenance-summary'));
+      for (const item of found.filter(item => item.added || item.error)) status.append(node('p', `${item.name || item.url}：${item.added ? '已加入订阅' : item.error}`, item.error ? 'maintenance-error' : 'muted'));
+    }
+    for (const [key, title] of [['sources', '接口检测'], ['subscriptions', '订阅更新'], ['liveSources', '直播源列表']]) {
+      const rows = data[key] || []; if (!rows.length) continue;
+      status.append(node('h3', title)); const list = node('div', undefined, 'maintenance-list');
+      for (const item of rows) {
+        const row = node('div', undefined, 'maintenance-row');
+        const state = item.status || (item.enabled === false ? 'disabled' : 'unknown');
+        const caption = { ok: '可用', error: '失败', disabled: '已停用', unknown: '未检测' }[state] || '未检测';
+        const label = node('span', caption, `maintenance-state state-${['ok', 'error', 'disabled', 'unknown'].includes(state) ? state : 'unknown'}`);
+        row.append(node('strong', item.name || item.id), label, node('small', `${Number.isFinite(item.latencyMs) ? `${item.latencyMs} ms · ` : ''}${formatDate(key === 'subscriptions' ? item.lastUpdate || item.checkedAt : item.checkedAt)}`, 'muted'));
+        if (item.error) row.append(node('p', item.error, 'maintenance-error')); list.append(row);
+      }
+      status.append(list);
+    }
+    if (!(data.sources?.length || data.subscriptions?.length || data.liveSources?.length)) status.append(node('p', '添加影视源、直播源或订阅后，可在这里检测和更新。', 'muted'));
+  }
+  async function run(action) {
+    const request = ++version; probe.disabled = true; update.disabled = true; discover.disabled = true;
+    status.replaceChildren(node('p', action === 'probe' ? '正在检测影视源，请稍候…' : action === 'update' ? '正在更新订阅，请稍候…' : action === 'discover' ? '正在发现并验证新订阅，请稍候…' : '正在读取维护状态…', 'muted'));
+    try {
+      const data = await api(action ? `/api/sources/${action}` : '/api/sources/status', action ? { method: 'POST', body: {}, timeoutMs: 150000 } : {});
+      if (stamp !== routeVersion || request !== version || !status.isConnected) return;
+      drawState(data);
+      if (['update', 'discover'].includes(action)) {
+        const latest = await api('/api/config');
+        if (stamp !== routeVersion || request !== version || !status.isConnected) return;
+        applyConfig(latest); updateSourceStatus(); renderSettings(); notify(action === 'discover' ? '订阅发现已完成，配置已刷新' : '订阅更新已完成，源配置已刷新');
+      }
+    } catch (error) { if (stamp === routeVersion && request === version && status.isConnected) status.replaceChildren(node('p', `维护状态读取失败：${error.message}`, 'error-message')); }
+    finally { if (stamp === routeVersion && request === version) { probe.disabled = !((config.sources || []).length || (config.liveSources || []).length); update.disabled = ![...(config.subscriptions || []), ...(config.liveSources || [])].some(item => item.enabled !== false); discover.disabled = false; } }
+  }
+  const probe = button('立即检测影视源', () => void run('probe'), 'button small');
+  const update = button('立即更新订阅', () => void run('update'), 'button small');
+  const discover = button('发现新订阅', () => void run('discover'), 'button small');
+  actions.append(probe, update, discover); panel.append(actions, status); void run(); return panel;
+}
+
 function renderSettings() {
-  const draft = structuredClone(config);
+  const draft = structuredClone({ subscriptions: [], liveSources: [], ...config });
   const page = document.createDocumentFragment();
   const tools = node('div', undefined, 'settings-actions');
   const save = button('保存全部设置', async () => {
     try {
-      for (const kind of ['platforms', 'parsers', 'sources']) {
+      for (const kind of ['platforms', 'parsers', 'sources', 'subscriptions', 'liveSources']) {
         const ids = new Set();
         for (const item of draft[kind]) {
           if (!item.id.trim() || !item.name.trim()) throw new Error('每项都需要填写标识和名称。');
           if (ids.has(item.id)) throw new Error(`标识重复：${item.id}`); ids.add(item.id);
-          if (!(kind === 'parsers' && item.url === '') && !httpUrl(item.api || item.url)) throw new Error(`${item.name} 的地址必须是有效的 HTTP 或 HTTPS URL。`);
+          if (!(kind === 'parsers' && item.url === '') && !(item.api || item.url || '').trim()) throw new Error(`${item.name} 的地址不能为空。`);
         }
       }
       save.disabled = true; applyConfig(await api('/api/config', { method: 'PUT', body: draft })); updateSourceStatus(); renderSettings(); notify('资源设置已保存');
@@ -799,7 +1309,7 @@ function renderSettings() {
   const adultLabel = node('label', '显示“三级”分类', 'display-option');
   const adultCheckbox = node('input'); adultCheckbox.type = 'checkbox'; adultCheckbox.checked = draft.showAdult === true; adultCheckbox.setAttribute('aria-label', '显示“三级”分类'); adultCheckbox.addEventListener('change', () => { draft.showAdult = adultCheckbox.checked; });
   adultLabel.prepend(adultCheckbox); display.append(adultLabel, node('p', '敏感电影、电视剧和动漫集中到该分类。关闭后，相关搜索、收藏和观看记录会隐藏，重新开启后恢复显示。此设置由家庭内所有设备共用。', 'muted')); page.append(display);
-  const importer = node('section', undefined, 'settings-section'); importer.append(node('h2', '导入资源配置'), node('p', '支持 MoonTV / KatelyaTV 的 api_site JSON，以及本应用导出的配置。按标识合并；请只导入可信的公开资源。', 'muted'));
+  const importer = node('section', undefined, 'settings-section'); importer.append(node('h2', '导入资源配置'), node('p', '支持 MoonTV / KatelyaTV 的 api_site 等影视源 JSON，以及本应用导出的配置。服务端校正常见配置格式和地址，按标识合并。', 'muted'));
   const file = node('input', undefined, 'import-file'); file.type = 'file'; file.accept = '.json,application/json'; file.setAttribute('aria-label', '选择配置 JSON 文件');
   const json = node('textarea', undefined, 'config-json'); json.rows = 5; json.spellcheck = false; json.setAttribute('aria-label', '配置 JSON'); json.placeholder = '{"api_site":{"example":{"name":"示例影视源","api":"https://example.com/api.php/provide/vod/"}}}';
   file.addEventListener('change', async () => {
@@ -807,13 +1317,21 @@ function renderSettings() {
     catch (error) { notify(error.message, true); }
   });
   const importButton = button('校验并导入', async () => {
-    try { importButton.disabled = true; applyConfig(await api('/api/config/import', { method: 'POST', body: { config: JSON.parse(json.value) } })); updateSourceStatus(); renderSettings(); notify('资源配置已导入'); }
+    try { importButton.disabled = true; acceptImport(await api('/api/config/import', { method: 'POST', body: { config: json.value } })); updateSourceStatus(); renderSettings(); notify(importWarnings.length ? `资源配置已导入，有 ${importWarnings.length} 条导入提示` : '资源配置已导入'); }
     catch (error) { notify(`导入失败：${error.message}`, true); }
     finally { importButton.disabled = false; }
   }, 'button');
   const importActions = node('div', undefined, 'settings-actions'); importActions.append(importButton, presetButton());
-  importer.append(file, json, importActions); page.append(importer);
-  const descriptions = { sources: ['影视源', '填写 AppleCMS JSON 接口；搜索时只查询启用的源。', 'api'], platforms: ['平台入口', '首页展示的视频平台链接，不作为聚合搜索源。', 'url'], parsers: ['解析线路', '填写带 ?url= 等参数的视频解析地址前缀，也支持 {url} 占位符。', 'url'] };
+  importer.append(file, json, importActions);
+  if (importWarnings.length) {
+    const warnings = node('div', undefined, 'notice import-warnings'); warnings.setAttribute('role', 'status');
+    warnings.append(node('h3', `上次成功导入的提示（${importWarnings.length} 条）`));
+    for (const message of importWarnings) warnings.append(node('p', message));
+    importer.append(warnings);
+  }
+  page.append(importer);
+  page.append(maintenancePanel(routeVersion));
+  const descriptions = { sources: ['影视源', '填写 AppleCMS JSON 接口；搜索时只查询启用的源。', 'api'], subscriptions: ['影视源订阅', '填写 api_site JSON 配置订阅地址，按源标识合并。启用后服务端每 6 小时更新，也可立即手动更新。', 'url'], liveSources: ['电视直播源', '填写 M3U / M3U8 频道列表地址；频道及线路由服务端读取，播放时可手动切换。', 'url'], platforms: ['平台入口', '首页展示的视频平台链接，不作为聚合搜索源。', 'url'], parsers: ['解析线路', '填写带 ?url= 等参数的视频解析地址前缀，也支持 {url} 占位符。', 'url'] };
   for (const [kind, [title, description, urlKey]] of Object.entries(descriptions)) {
     const panel = node('section', undefined, 'settings-section');
     const heading = node('div', undefined, 'section-heading'); heading.append(node('h2', title), button('＋ 添加', () => { draft[kind].push({ id: `${kind.slice(0, -1)}-${Date.now()}`, name: '', [urlKey]: '', enabled: true, ...(kind === 'platforms' ? { category: '视频' } : {}) }); drawRows(); }, 'button small'));
@@ -846,9 +1364,9 @@ async function renderRoute() {
   if ($('#app-view').hidden) return;
   const stamp = ++routeVersion; void stopPlayer(); detail = null; detailTarget = null;
   const [view, rawQuery = ''] = location.hash.slice(1).split('?'); const params = new URLSearchParams(rawQuery);
-  const titles = { home: '首页', search: '搜索影片', favorites: '我的收藏', history: '观看记录', settings: '资源设置', detail: '影片详情', link: '链接播放' };
+  const titles = { home: '首页', search: '搜索影片', favorites: '我的收藏', history: '观看记录', settings: '资源设置', detail: '影片详情', link: '链接播放', live: '电视直播' };
   const selectedView = titles[view] ? view : 'home'; $('#page-title').textContent = titles[selectedView]; document.title = `${titles[selectedView]} · 映家`;
-  document.querySelectorAll('nav a').forEach(link => { const active = link.dataset.view === selectedView; link.classList.toggle('active', active); if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
+  document.querySelectorAll('nav a').forEach(link => { const active = link.dataset.view === (selectedView === 'live' ? 'home' : selectedView); link.classList.toggle('active', active); if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
   content.setAttribute('aria-busy', 'true');
   content.replaceChildren(node('div', '正在加载…', 'loading'));
   try {
@@ -868,6 +1386,7 @@ async function renderRoute() {
     else if (selectedView === 'search') await renderSearch(params.get('q') || '', stamp);
     else if (selectedView === 'detail') await openDetail(params.get('source') || '', params.get('id') || '', stamp);
     else if (selectedView === 'link') openLink(params.get('url') || '', params.get('resume') === '1');
+    else if (selectedView === 'live') await renderLive(params, stamp);
   } catch (error) {
     if (stamp !== routeVersion) return;
     if (error.adultHidden) leaveAdultScreen();
@@ -898,6 +1417,16 @@ $('#logout').addEventListener('click', async () => {
   catch (error) { notify(error.message, true); }
 });
 window.addEventListener('hashchange', () => void renderRoute());
+window.addEventListener('keydown', event => {
+  const current = player, target = event.target;
+  if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || !current?.video || !(target instanceof Element) || !$('#player-host')?.contains(target) || target.matches('input,textarea,select') || target.closest('[contenteditable="true"]')) return;
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); seekVideo(current, event.key === 'ArrowRight' ? 10 : -10); }
+  else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+    const controls = [...$('#player-host').querySelectorAll('button,a[href],video[controls],select,input')].filter(element => !element.disabled && element.getClientRects().length);
+    const index = controls.indexOf(target), direction = event.key === 'ArrowDown' ? 1 : -1;
+    if (controls.length) { event.preventDefault(); controls[(index + direction + controls.length) % controls.length].focus(); }
+  }
+});
 $('.skip-link').addEventListener('click', event => { event.preventDefault(); content.focus({ preventScroll: true }); });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden && player) void saveHistory(player);
@@ -910,7 +1439,7 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 window.addEventListener('pagehide', () => {
-  if (!player || player.started === false) return;
+  if (!player || player.live || player.started === false) return;
   const current = player;
   const record = { ...fieldsOf(current.detail), line: current.line || 0, episode: current.episode || 0, url: current.url, mode: current.mode, ...(current.mode === 'parser' ? { parser: current.parser || '' } : { position: current.video?.currentTime || current.position || 0, duration: Number.isFinite(current.video?.duration) ? current.video.duration : 0 }) };
   void fetch('/api/history', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(record), keepalive: true }).catch(error => console.warn('离开页面时未能保存观看记录', error));

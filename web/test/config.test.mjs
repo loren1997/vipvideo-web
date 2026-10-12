@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { importConfig, validateConfig, validateRecord } from '../lib/config.mjs';
+import { importConfig, validateConfig, validateRecord, validatePlayerPreferences } from '../lib/config.mjs';
 
 const config = () => ({ sources: [{ id: 'old', name: '旧源', api: 'https://example.com/api', enabled: false }],
   platforms: [{ id: 'home', name: '入口', url: 'https://example.com/', category: 'video', enabled: true }], parsers: [] });
@@ -32,6 +32,30 @@ test('adult visibility defaults off, is strictly boolean and survives source-onl
   assert.equal(importConfig(current, { platformlist: [], list: [] }).showAdult, true);
   assert.equal(importConfig(current, config()).showAdult, true);
   assert.equal(importConfig(current, { ...config(), showAdult: false }).showAdult, false);
+});
+
+test('subscriptions and live sources validate separately and survive a source-only import', () => {
+  const subscription = { id: 'feed', name: '源订阅', url: 'https://example.com/config.json', enabled: false };
+  const live = { id: 'tv', name: '直播', url: 'https://example.com/cn.m3u', enabled: true };
+  const current = validateConfig({ ...config(), subscriptions: [subscription], liveSources: [live] });
+  const result = importConfig(current, { api_site: {} });
+  assert.deepEqual(result.subscriptions, [subscription]);
+  assert.deepEqual(result.liveSources, [live]);
+  assert.deepEqual(validateConfig(config()).subscriptions, []);
+  for (const kind of ['subscriptions', 'liveSources']) {
+    for (const value of [null, {}, Array(21).fill(subscription), [{ ...subscription, enabled: 'false' }], [{ ...subscription, id: '__proto__' }]]) {
+      assert.throws(() => validateConfig({ ...config(), [kind]: value }), { status: 400 });
+    }
+    assert.throws(() => validateConfig({ ...config(), [kind]: [{ ...subscription, url: 'http://127.0.0.1/list' }] }), { status: 403 });
+  }
+});
+
+test('player preferences enforce meaningful durations, speeds and boolean switches', () => {
+  assert.deepEqual(validatePlayerPreferences({ key: 'film' }), { key: 'film', introSeconds: 0, outroSeconds: 0, autoNext: true, danmakuEnabled: true, speed: 1 });
+  assert.equal(validatePlayerPreferences({ key: 'film', speed: 3, introSeconds: 90, outroSeconds: 120 }).speed, 3);
+  for (const input of [{ introSeconds: -1 }, { outroSeconds: 601 }, { introSeconds: 1.5 }, { outroSeconds: '30' }, { autoNext: 'false' }, { danmakuEnabled: null }, { speed: 9 }, { speed: '2' }]) {
+    assert.throws(() => validatePlayerPreferences({ key: 'film', ...input }), { status: 400 });
+  }
 });
 
 test('VipVideo platform/line config is compatible and keeps original-address mode', () => {

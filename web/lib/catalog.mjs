@@ -8,6 +8,7 @@ const ROOT_NAMES = {
   movie: /^(?:全部)?(?:电影|电影片|影片|movies?|films?)(?:频道)?$/i,
   tv: /^(?:全部)?(?:电视剧|连续剧|剧集|电视|tv|series)(?:频道)?$/i,
   anime: /^(?:全部)?(?:动漫|动漫片|动画|动画片|anime|animation)(?:频道)?$/i,
+  variety: /^(?:全部)?(?:综艺|综艺片|电视节目|电视栏目|栏目|variety)(?:频道)?$/i,
   adult: /^(?:三级|三級|限制级|限制級|成人|伦理|倫理|情色|福利|R18|18禁)(?:内容|频道)?$/i,
 };
 
@@ -23,7 +24,7 @@ function adultVideo(video) {
 function inferCategory(value, includeAdult = true) {
   const name = String(value || '').normalize('NFKC').replace(/\s+/g, '');
   if (includeAdult && adultCategory(name)) return 'adult';
-  if (/综艺|晚会|真人秀|脱口秀|variety/i.test(name)) return 'variety';
+  if (ROOT_NAMES.variety.test(name) || /综艺|栏目|晚会|真人秀|脱口秀|variety/i.test(name)) return 'variety';
   if (/动漫|动画|番剧|卡通|anime|animation/i.test(name)) return 'anime';
   if (ROOT_NAMES.tv.test(name) || /电视剧|连续剧|剧集|短剧|微剧|(?:国产|大陆|内地|欧美|海外|日韩|港台|香港|台湾|日本|韩国|泰国|日|韩|泰|港|台|美)剧/i.test(name)) return 'tv';
   if (/电影|影片|(?:动作|喜剧|爱情|科幻|恐怖|惊悚|战争|剧情|犯罪|悬疑|奇幻|冒险|灾难|记录|纪录|伦理|家庭|传记|历史|歌舞|青春|武侠|古装|其他)片/i.test(name) || ROOT_NAMES.movie.test(name)) return 'movie';
@@ -100,11 +101,15 @@ function metadata(video, source, categoryHint) {
   const remarks = String(video.vod_remarks ?? '');
   const inferredCategory = inferCategory(typeName, false);
   const category = adultVideo(video) || categoryHint === 'adult' ? 'adult' : categoryHint || inferredCategory;
-  const type = lines.some(line => line.episodes.length > 1) || /电视剧|连续剧|剧集|综艺|动漫|动画剧|短剧/.test(typeName) || inferredCategory === 'tv' || (inferredCategory === 'anime' && !/电影|动画片/.test(typeName)) ? 'series' : 'movie';
+  const type = lines.some(line => line.episodes.length > 1) || /电视剧|连续剧|剧集|综艺|动漫|动画剧|短剧/.test(typeName) || inferredCategory === 'tv' || inferredCategory === 'variety' || (inferredCategory === 'anime' && !/电影|动画片/.test(typeName)) ? 'series' : 'movie';
   const normalizedTitle = title.normalize('NFKC').toLowerCase().replace(/\s+/g, '');
   let poster = '';
   try { if (video.vod_pic) poster = validateUrl(video.vod_pic).href; } catch { /* 无效海报不妨碍影片搜索。 */ }
-  return { key: JSON.stringify([normalizedTitle, year, type]), source: source.id, id: String(video.vod_id), title, year, type, poster, typeName, remarks, ...(category ? { category } : {}), lines };
+  const douban = {};
+  if (/^[1-9]\d{0,11}$/.test(String(video.vod_douban_id ?? ''))) douban.id = String(video.vod_douban_id);
+  const score = Number(video.vod_douban_score);
+  if (String(video.vod_douban_score ?? '').trim() && Number.isFinite(score) && score > 0 && score <= 10) douban.score = score;
+  return { key: JSON.stringify([normalizedTitle, year, type]), source: source.id, id: String(video.vod_id), title, year, type, poster, typeName, remarks, ...(category ? { category } : {}), ...(Object.keys(douban).length ? { douban } : {}), lines };
 }
 
 function aggregate(results, category) {
@@ -121,6 +126,7 @@ function aggregate(results, category) {
       if (item.category === 'adult') group.category = 'adult';
       if (!group.items.some(existing => existing.source === item.source && existing.id === item.id)) group.items.push({ ...fields, source, id });
       for (const field of ['poster', 'typeName', 'remarks']) if (!group[field] && item[field]) group[field] = item[field];
+      if (!group.douban?.score && item.douban?.score) group.douban = item.douban;
     }
   }
   return { groups: [...groups.values()], failedSources };
@@ -266,7 +272,7 @@ export function createCatalog({ request = networkRequest } = {}) {
     },
 
     async browse(config, { category = 'movie', page = 1, source: sourceId } = {}) {
-      if (typeof category !== 'string' || !Object.hasOwn(ROOT_NAMES, category)) throw failure('分类必须为 movie、tv、anime 或 adult', 400);
+      if (typeof category !== 'string' || !Object.hasOwn(ROOT_NAMES, category)) throw failure('分类必须为 movie、tv、anime、variety 或 adult', 400);
       if (category === 'adult' && config.showAdult !== true) throw failure('三级内容已隐藏，请先在设置中开启显示', 403);
       if (!((typeof page === 'number' && Number.isInteger(page)) || (typeof page === 'string' && /^[1-9]\d{0,2}$/.test(page))) || Number(page) < 1 || Number(page) > 100) throw failure('页码必须为 1 到 100 的整数', 400);
       page = Number(page);

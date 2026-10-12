@@ -5,9 +5,16 @@ import { stat } from 'node:fs/promises';
 import { dirname, resolve, sep, extname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createStore } from './lib/store.mjs';
-import { validateConfig, importConfig, validateRecord, badRequest } from './lib/config.mjs';
+import { validateConfig, importConfig, validateRecord, validatePlayerPreferences, text, badRequest } from './lib/config.mjs';
 import { createCatalog } from './lib/catalog.mjs';
 import { createMedia } from './lib/media.mjs';
+import { createSourceMaintenance } from './lib/source-maintenance.mjs';
+import { createLive } from './lib/live.mjs';
+import { createRatings } from './lib/ratings.mjs';
+import { createDanmaku } from './lib/danmaku.mjs';
+import { createPlayability } from './lib/playability.mjs';
+import { createSourceDiscovery } from './lib/source-discovery.mjs';
+import { repairImport } from './lib/import-repair.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const defaults = JSON.parse(readFileSync(resolve(root, 'defaults.json'), 'utf8'));
@@ -38,7 +45,7 @@ function tokenFrom(req) {
 
 export function createApp({ password = process.env.APP_PASSWORD, dataDir = process.env.DATA_DIR ?? resolve(root, 'data'),
   catalog = createCatalog(), media = createMedia(), initialConfig = defaults, cookieSecure = process.env.COOKIE_SECURE === 'true',
-  logger = console } = {}) {
+  logger = console, maintenance, live, ratings, danmaku, playability, discovery } = {}) {
   if (typeof password !== 'string' || password.length < 8 || password.length > 1024) throw new Error('APP_PASSWORD 必须设置，且长度为 8–1024 个字符');
   const initial = validateConfig(initialConfig);
   const store = createStore(dataDir, initial);
@@ -47,6 +54,17 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
     if (!current.sources.length && initial.sources.length) store.setConfig({ ...current, sources: initial.sources });
     store.setMeta('builtin-sources-v1', '1');
   }
+  if (!store.meta('source-services-v1')) {
+    const current = store.config();
+    store.setConfig(validateConfig({ ...current, subscriptions: current.subscriptions ?? initial.subscriptions, liveSources: current.liveSources ?? initial.liveSources }));
+    store.setMeta('source-services-v1', '1');
+  }
+  const sourceService = maintenance ?? createSourceMaintenance({ store, catalog, initialSources: initial.sources, logger });
+  const playabilityService = playability ?? createPlayability();
+  const discoveryService = discovery ?? createSourceDiscovery({ store, maintenance: sourceService, playability: playabilityService, logger });
+  const liveService = live ?? createLive({ store, logger, playability: playabilityService });
+  const ratingService = ratings ?? createRatings({ store });
+  const danmakuService = danmaku ?? createDanmaku({ store });
   const salt = store.meta('password-salt') ?? randomBytes(16).toString('hex');
   const passwordHash = scryptSync(password, salt, 32);
   if (store.meta('password-hash') !== passwordHash.toString('hex')) store.clearSessions();
@@ -117,11 +135,78 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         if (path === '/api/config' && method === 'PUT') return json(res, 200, store.setConfig(validateConfig(await readBody(req))));
         if (path === '/api/config/import' && method === 'POST') {
           const body = await readBody(req);
-          return json(res, 200, store.setConfig(importConfig(store.config(), body?.config)));
+          const { config, warnings } = repairImport(body?.config);
+          const result = store.setConfig(importConfig(store.config(), config));
+          return json(res, 200, { ...result, ...(warnings.length ? { importWarnings: warnings } : {}) });
         }
         if (path === '/api/config/presets' && method === 'GET') {
           return json(res, 200, { api_site: Object.fromEntries(initial.sources.map(({ id, name, api }) => [id, { name, api }])) });
         }
+        if (path === '/api/sources/status' && method === 'GET') return json(res, 200, { ...sourceService.status(), liveSources: liveService.status?.(store.config()) ?? [], discovery: discoveryService.status() });
+        if (path === '/api/sources/discover' && method === 'POST') {
+          await readBody(req);
+          await discoveryService.discover();
+          await liveService.probe?.(store.config());
+          return json(res, 200, { ...sourceService.status(), liveSources: liveService.status?.(store.config()) ?? [], discovery: discoveryService.status() });
+        }
+        if (path === '/api/sources/probe' && method === 'POST') {
+          await readBody(req);
+          const result = await sourceService.probe();
+          await liveService.probe?.(store.config());
+          return json(res, 200, { ...result, liveSources: liveService.status?.(store.config()) ?? [], discovery: discoveryService.status() });
+        }
+        if (path === '/api/sources/update' && method === 'POST') {
+          await readBody(req);
+          const result = await sourceService.update();
+          await liveService.list(store.config(), { refresh: true });
+          return json(res, 200, { ...result, liveSources: liveService.status?.(store.config()) ?? [], discovery: discoveryService.status() });
+        }
+        if (path === '/api/live' && method === 'GET') return json(res, 200, await liveService.list(store.config(), { refresh: url.searchParams.get('refresh') === '1' }));
+        if (path === '/api/live/probe' && method === 'POST') {
+          await readBody(req);
+          await liveService.probe?.(store.config());
+          return json(res, 200, await liveService.list(store.config()));
+        }
+        if (path === '/api/live/playback' && method === 'GET') {
+          const snapshot = store.config();
+          const result = await liveService.list(snapshot);
+          if (JSON.stringify(snapshot.liveSources) !== JSON.stringify(store.config().liveSources)) throw Object.assign(new Error('直播源已修改，请刷新频道列表'), { status: 409 });
+          const channel = result.channels.find(item => item.id === url.searchParams.get('id'));
+          const line = Number(url.searchParams.get('line') ?? 0);
+          if (!channel || !Number.isSafeInteger(line) || line < 0 || !channel.streams[line]) throw badRequest('请选择有效的频道和线路');
+          return json(res, 200, media.playback({ lines: [{ episodes: [channel.streams[line]] }] }, 0, 0));
+        }
+        if (path === '/api/live/report' && method === 'POST') {
+          const body = await readBody(req);
+          const snapshot = store.config();
+          const result = await liveService.list(snapshot);
+          if (JSON.stringify(snapshot.liveSources) !== JSON.stringify(store.config().liveSources)) throw Object.assign(new Error('直播源已修改，请刷新频道列表'), { status: 409 });
+          const stream = result.channels.find(channel => channel.id === body?.id)?.streams[body?.line];
+          if (!stream || !Number.isSafeInteger(body.line) || !['ok', 'error'].includes(body.status)) throw badRequest('频道播放报告格式不正确');
+          liveService.report?.(stream.url, body.status);
+          return json(res, 200, { ok: true });
+        }
+        if (path === '/api/ratings' && method === 'GET') {
+          const detail = await catalog.detail(store.config(), url.searchParams.get('source'), url.searchParams.get('id'));
+          ensureVisible(detail.category);
+          const result = await ratingService.get(detail);
+          ensureVisible(detail.category);
+          return json(res, 200, result);
+        }
+        if (path === '/api/player/preferences' && method === 'GET') {
+          const key = text(url.searchParams.get('key'), '影片标识', 8192);
+          return json(res, 200, store.get('player-preferences', key) ?? validatePlayerPreferences({ key }));
+        }
+        if (path === '/api/player/preferences' && method === 'PUT') {
+          return json(res, 200, store.save('player-preferences', validatePlayerPreferences(await readBody(req))));
+        }
+        if (['/api/danmaku', '/api/danmaku/binding'].includes(path) && method === 'GET') {
+          const episode = url.searchParams.get('episode') ?? '0';
+          const value = { key: url.searchParams.get('key'), episode: /^-?\d+(?:\.\d+)?$/.test(episode) ? Number(episode) : episode };
+          return json(res, 200, path.endsWith('/binding') ? danmakuService.binding(value) : await danmakuService.list(value));
+        }
+        if (path === '/api/danmaku' && method === 'POST') return json(res, 200, danmakuService.send(await readBody(req)));
+        if (path === '/api/danmaku/binding' && method === 'PUT') return json(res, 200, await danmakuService.bind(await readBody(req)));
         if (path === '/api/browse' && method === 'GET') {
           const category = url.searchParams.get('category') ?? 'movie';
           const result = await catalog.browse(store.config(), {
@@ -158,6 +243,24 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           const detail = await catalog.detail(store.config(), url.searchParams.get('source'), url.searchParams.get('id'));
           ensureVisible(detail.category);
           return json(res, 200, media.playback(detail, line, episode));
+        }
+        if ((path === '/api/playability' && method === 'GET') || (path === '/api/playability/report' && method === 'POST')) {
+          const body = method === 'POST' ? await readBody(req) : Object.fromEntries(url.searchParams);
+          const line = Number(body?.line ?? 0), episode = Number(body?.episode ?? 0);
+          if (!Number.isSafeInteger(line) || !Number.isSafeInteger(episode) || line < 0 || episode < 0) throw badRequest('播放线路或剧集不正确');
+          const snapshot = store.config();
+          const source = snapshot.sources.find(item => item.id === body?.source && item.enabled !== false);
+          if (!source) throw badRequest('请选择启用的影视源');
+          const detail = await catalog.detail(snapshot, body?.source, body?.id);
+          ensureVisible(detail.category);
+          const selected = detail.lines[line]?.episodes[episode];
+          if (!selected || method === 'POST' && !['ok', 'error'].includes(body?.status)) throw badRequest('请选择有效的影片、剧集和播放状态');
+          if (!store.config().sources.some(item => item.id === source.id && item.api === source.api && item.enabled !== false)) throw Object.assign(new Error('影视源已修改，请刷新影片'), { status: 409 });
+          const result = method === 'POST' ? playabilityService.report(selected, body.status === 'ok') : await playabilityService.check(selected);
+          ensureVisible(detail.category);
+          const currentSource = store.config().sources.find(item => item.id === source.id && item.enabled !== false);
+          if (!currentSource || currentSource.api !== source.api) throw Object.assign(new Error('影视源已修改，请刷新影片'), { status: 409 });
+          return json(res, 200, result);
         }
         if (path === '/api/media' && ['GET', 'HEAD'].includes(method)) return await media.serve(req, res, url.searchParams.get('token'));
         if (path === '/api/state' && method === 'GET') return json(res, 200, { favorites: visibleEntries('favorites'), history: visibleEntries('history') });
@@ -201,8 +304,8 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   server.headersTimeout = 10_000;
   server.on('clientError', (_error, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
   return {
-    server, store,
-    async close() { if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
+    server, store, maintenance: sourceService, live: liveService, discovery: discoveryService,
+    async close() { await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
   };
 }
 
@@ -211,7 +314,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     const port = Number(process.env.PORT ?? 3000);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT 必须是 1–65535 的整数');
     const app = createApp();
-    app.server.listen(port, '0.0.0.0', () => console.log(`VipVideo Web 正在监听端口 ${port}`));
+    app.server.listen(port, '0.0.0.0', () => { app.maintenance.start(); app.live.start?.(); app.discovery.start(); console.log(`VipVideo Web 正在监听端口 ${port}`); });
     app.server.on('error', (error) => { console.error(error); process.exitCode = 1; app.store.close(); });
     let stopping = false;
     for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {

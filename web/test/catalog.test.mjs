@@ -24,6 +24,23 @@ test('aggregates matching title/year/type with all sources while preserving quer
   assert.equal(calls[0].options.timeout, 8000);
 });
 
+test('variety and television programs remain series and only explicit valid Douban fields become ratings', async () => {
+  const single = { sources: [config.sources[0]] };
+  const catalog = createCatalog({ request: async url => {
+    if (url.searchParams.get('ac') === 'list') return response([], { class: [{ type_id: 3, type_name: '电视节目' }] });
+    return response([video(1, '栏目样例', '2025', { type_id: 3, type_name: '电视节目', vod_douban_id: '1234567', vod_douban_score: '8.4', vod_score: '9.9' }),
+      video(2, '待评分样例', '2025', { type_id: 3, type_name: '电视节目', vod_douban_score: '0.0', vod_score: '9.9' })]);
+  } });
+  const browse = await catalog.browse(single, { category: 'variety' });
+  assert.equal(browse.groups[0].category, 'variety');
+  assert.equal(browse.groups[0].type, 'series');
+  assert.deepEqual(browse.groups[0].douban, { id: '1234567', score: 8.4 });
+  assert.equal(browse.groups[1].douban, undefined);
+  const detail = await catalog.detail(single, 'a', '1');
+  assert.equal(detail.key, browse.groups[0].key);
+  assert.deepEqual(detail.douban, browse.groups[0].douban);
+});
+
 test('preserves every line, episode and URL query when reading detail', async () => {
   const catalog = createCatalog({ request: async url => {
     assert.equal(url.searchParams.get('ids'), '7');
@@ -209,7 +226,7 @@ test('uses real type names when class is absent and rejects unidentifiable mixed
 test('validates browse category, strict page strings, and disabled or missing sources', async () => {
   let calls = 0;
   const catalog = createCatalog({ request: async () => { calls++; return response([]); } });
-  for (const category of ['', 'series', 'variety', null, {}, ['movie']]) await assert.rejects(catalog.browse(config, { category }), { status: 400 });
+  for (const category of ['', 'series', 'live', null, {}, ['movie']]) await assert.rejects(catalog.browse(config, { category }), { status: 400 });
   for (const page of ['', '01', ' 1', '1.0', '1e0', '101', 0, -1, 101, 1.5, NaN, null, {}, [1]]) await assert.rejects(catalog.browse(config, { page }), { status: 400 });
   for (const source of ['', 'missing', null]) await assert.rejects(catalog.browse(config, { source }), { status: 400 });
   await assert.rejects(catalog.browse({ sources: [{ ...config.sources[0], enabled: false }] }, { source: 'a' }), { status: 400 });

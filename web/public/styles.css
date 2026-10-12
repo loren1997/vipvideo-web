@@ -73,11 +73,11 @@ main { min-height:calc(100vh - 220px); }
 .card-title { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:14px; margin:10px 0 2px; font-weight:600; }
 .card-meta { color:#8293a9; font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .browse-controls { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-bottom:21px; }
-.category-tabs { display:flex; gap:8px; }
+.category-tabs { display:flex; flex-wrap:wrap; gap:8px; }
 .category-tabs .button { padding:8px 20px; }
 .browse-controls select { padding:8px 12px; font-size:12px; max-width:220px; }
 .load-more { margin:23px auto 0; display:flex; min-width:150px; }
-@media(max-width:640px) { .browse-controls { gap:12px; } .category-tabs { flex:1; } .category-tabs .button { flex:1; padding:8px 14px; } .browse-controls select { max-width:none; width:100%; } }
+@media(max-width:640px) { .browse-controls { gap:12px; } .category-tabs { flex:1; width:100%; } .category-tabs .button { flex:1 0 28%; padding:8px 10px; } .browse-controls select { max-width:none; width:100%; } }
 .card-delete { border:1px solid #ffffff33; background:#111927cc; color:#fff; border-radius:50%; width:28px; height:28px; position:absolute; top:8px; right:8px; font-size:18px; z-index:2; }
 .media-card progress { position:absolute; bottom:0; left:0; width:100%; height:3px; border:0; background:#253044; appearance:none; }
 progress::-webkit-progress-bar { background:#253044; }
@@ -148,6 +148,51 @@ input[type=checkbox] { accent-color:var(--accent); width:16px; height:16px; padd
 .error-message { color:var(--danger); font-size:12px; margin-top:10px; }
 .settings-note { font-size:12px; color:var(--muted); margin:10px 0 20px; }
 .display-option { display:flex; align-items:center; gap:9px; margin:15px 0 9px; color:var(--text); font-size:14px; }
+.rating-badge { position:absolute; top:8px; right:8px; background:#193c2ce8; color:#b8efca; border:1px solid #54856970; border-radius:4px; padding:2px 6px; font-size:10px; }
+.film-ratings { margin:10px 0; font-size:12px; }
+.rating-scores { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+.rating-score { border:1px solid #42634e; background:#20372c; color:#b8efca; border-radius:5px; padding:3px 9px; }
+a.rating-score:hover { background:#2a4939; }
+.rating-search { color:var(--accent); font-size:12px; }
+.rating-attribution { display:block; color:var(--muted); font-size:10px; margin-top:6px; }
+.film-ratings > .muted { display:block; margin-top:5px; font-size:11px; }
+.channel-panel select { width:100%; padding:8px 10px; margin-bottom:12px; }
+.channel-list { display:flex; flex-direction:column; gap:7px; max-height:480px; overflow:auto; }
+.channel-button { width:100%; text-align:left; overflow-wrap:anywhere; }
+.maintenance-status { margin-top:18px; }
+.maintenance-summary { font-size:12px; color:var(--muted); margin-bottom:15px; overflow-wrap:anywhere; }
+.maintenance-status h3 { margin:15px 0 9px; }
+.maintenance-list { display:flex; flex-direction:column; gap:8px; }
+.maintenance-row { display:grid; grid-template-columns:minmax(100px,1fr) auto minmax(140px,1.1fr); align-items:center; gap:8px 14px; padding:11px 13px; border:1px solid var(--line); border-radius:7px; background:#141c29; }
+.maintenance-row strong { font-size:12px; overflow-wrap:anywhere; }
+.maintenance-row small { font-size:11px; overflow-wrap:anywhere; }
+.maintenance-state { font-size:11px; border-radius:4px; padding:2px 7px; background:#293141; color:#a8b5c7; white-space:nowrap; }
+.maintenance-state.state-ok { background:#213c30; color:#a9e5c5; }
+.maintenance-state.state-error { background:#492d32; color:#f1afb8; }
+.maintenance-error { grid-column:1/-1; color:var(--danger); font-size:11px; overflow-wrap:anywhere; }
+.line-status { margin-left:7px; font-size:10px; color:var(--muted); }
+.player-preferences { display:flex; flex-wrap:wrap; align-items:center; gap:10px 15px; padding:13px; border:1px solid var(--line); background:var(--surface); border-radius:8px; margin:0 0 12px; font-size:11px; }
+.player-preferences label { display:flex; align-items:center; gap:7px; }
+.player-preferences input[type=number] { width:70px; padding:6px 8px; min-height:32px; font-size:12px; }
+.player-preferences > small { flex-basis:100%; font-size:10px; }
+.danmaku-form { display:flex; gap:9px; margin-bottom:7px; }
+.danmaku-form input { flex:1; min-width:0; padding:8px 11px; font-size:12px; }
+.danmaku-form .button { flex-shrink:0; }
+.danmaku-status { display:block; font-size:10px; margin-bottom:7px; overflow-wrap:anywhere; }
+.danmaku-binding { border:1px solid var(--line); border-radius:8px; padding:10px 13px; margin:10px 0 12px; font-size:12px; background:var(--surface); }
+.danmaku-binding summary { cursor:pointer; color:#c4d3e5; }
+.danmaku-binding > p { font-size:11px; margin-top:10px; }
+.binding-form { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:11px; }
+.binding-form > input { flex-basis:100%; width:100%; padding:8px 10px; font-size:12px; }
+.binding-form label { display:flex; gap:9px; align-items:center; font-size:11px; }
+.binding-form input[type=number] { width:90px; padding:6px 9px; font-size:12px; }
+.binding-status { overflow-wrap:anywhere; font-size:11px; }
+.danmaku-overlay { position:absolute; inset:0; overflow:hidden; pointer-events:none; z-index:2; }
+.danmaku-comment { position:absolute; left:100%; white-space:nowrap; max-width:none; font-size:16px; font-weight:600; color:#fff; text-shadow:0 1px 3px #000,1px 0 2px #000,-1px 0 2px #000; animation:danmaku-slide 8s linear forwards; will-change:transform; }
+.danmaku-overlay.paused .danmaku-comment { animation-play-state:paused; }
+@keyframes danmaku-slide { to { transform:translateX(var(--distance)); } }
+.player-host :focus-visible,.channel-panel :focus-visible { outline:3px solid var(--accent); outline-offset:4px; box-shadow:0 0 0 7px #58d9bd22; }
+@media(max-width:640px) { .maintenance-row { grid-template-columns:minmax(0,1fr) auto; } .maintenance-row small { grid-column:1/-1; } .channel-list { max-height:300px; } }
 .login-view { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:25px; background:radial-gradient(ellipse at 50% 30%,#203840 0,transparent 58%); }
 .login-card { width:390px; background:#171f2c; border:1px solid #33424f; box-shadow:0 25px 70px #0003; border-radius:16px; padding:35px; }
 .login-card .brand-mark { width:45px; height:45px; margin-bottom:25px; }

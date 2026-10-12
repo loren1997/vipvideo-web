@@ -4,8 +4,12 @@
 
 另有默认隐藏的“三级”分类，在设置中控制显示；相关影片与普通分类分开，隐藏会保留收藏和观看进度。
 
+现支持综艺 / 电视节目、电视直播、影视源订阅更新与定期探测。每 15 分钟有界发现公开目录、GitHub 仓库 / forks 和 Bing RSS 中的候选，验证通过才添加订阅；已有配置及用户删除、停用、改址会保留。播放器换源和直播线路只展示近期探测通过的项目，真实播放失败后移除；抽样探测不保证所有内容或设备解码可用。
+
+配置粘贴可修复缺少协议、Markdown / GitHub 文件链接及 JSONC，兼容 `api_site` 数组和 TVBox type 1 JSON 接口；脚本 / XML 会跳过并提示，内网和危险地址仍拒绝。播放器增加快进快退、跳片头片尾、自动下一集及家庭 / 外部弹幕；豆瓣评分使用源提供的数据或公开接口，无需申请凭证。Android 手机与电视客户端的安装和连接方法见 [README-ANDROID.md](README-ANDROID.md)。
+
 NAS [直接下载 docker-compose.yml](https://raw.githubusercontent.com/loren1997/vipvideo-web/main/docker-compose.yml)，填写访问密码后使用 `ghcr.io/loren1997/vipvideo-web:latest` 部署；本地源码构建使用 [compose.yaml](compose.yaml)。
-完整配置、部署和备份方法见 [README-WEB.md](README-WEB.md)。
+完整配置、部署、停机备份恢复及固定镜像 / 回滚方法见 [README-WEB.md](README-WEB.md)。来源、许可证与版权声明见 [web/NOTICE.md](web/NOTICE.md) 和 [LICENSE](LICENSE)。
 
 首次部署前，查看 [镜像发布 Actions](https://github.com/loren1997/vipvideo-web/actions/workflows/docker-publish.yml) 是否通过。本仓库镜像已公开，NAS 无需登录 GitHub。
 

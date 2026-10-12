@@ -399,5 +399,33 @@
       "url": "https://www.gai4.com/?url=",
       "enabled": true
     }
+  ],
+  "subscriptions": [
+    {
+      "id": "builtin-presets",
+      "name": "内置影视源订阅",
+      "url": "https://raw.githubusercontent.com/loren1997/vipvideo-web/main/web/source-presets.json",
+      "enabled": true
+    },
+    {
+      "id": "moontv-public",
+      "name": "MoonTV 公开源订阅",
+      "url": "https://raw.githubusercontent.com/Stardm0/MoonTV/main/config.json",
+      "enabled": true
+    }
+  ],
+  "liveSources": [
+    {
+      "id": "live-presets",
+      "name": "精选电视直播",
+      "url": "https://raw.githubusercontent.com/loren1997/vipvideo-web/main/web/live-presets.m3u",
+      "enabled": true
+    },
+    {
+      "id": "iptv-cn",
+      "name": "IPTV-org 中国频道",
+      "url": "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/cn.m3u",
+      "enabled": true
+    }
   ]
 }

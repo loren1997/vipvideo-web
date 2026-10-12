@@ -1,0 +1,7 @@
+{
+  "api_site": {
+    "ikun": { "name": "爱坤资源", "api": "https://ikunzyapi.com/api.php/provide/vod/from/ikm3u8/" },
+    "baofeng": { "name": "暴风资源", "api": "https://bfzyapi.com/api.php/provide/vod" },
+    "haohua": { "name": "豪华资源", "api": "https://hhzyapi.com/api.php/provide/vod" }
+  }
+}

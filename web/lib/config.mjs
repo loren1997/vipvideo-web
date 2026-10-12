@@ -1,5 +1,6 @@
 import { isIP } from 'node:net';
 import { validateUrl, isPublicAddress } from './network.mjs';
+import { repairAddress, repairImport } from './import-repair.mjs';
 
 export function badRequest(message) {
   return Object.assign(new Error(message), { status: 400 });
@@ -13,8 +14,9 @@ export function text(value, label, max = 200, required = true) {
 }
 
 function address(value, label, allowEmpty = false) {
-  const raw = text(value, label, 4096, !allowEmpty);
-  if (!raw && allowEmpty) return '';
+  const original = text(value, label, 4096, !allowEmpty);
+  if (!original && allowEmpty) return '';
+  const raw = repairAddress(original);
   const url = validateUrl(raw.replaceAll('{url}', 'placeholder'));
   const host = url.hostname.replace(/^\[|\]$/g, '');
   if (isIP(host) && !isPublicAddress(host)) throw badRequest(`${label}不能使用内网地址`);
@@ -25,14 +27,17 @@ export function validateConfig(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw badRequest('配置必须是 JSON 对象');
   if (input.showAdult !== undefined && typeof input.showAdult !== 'boolean') throw badRequest('三级分类显示设置必须是布尔值');
   const result = { showAdult: input.showAdult === true };
-  for (const kind of ['sources', 'platforms', 'parsers']) {
-    const entries = input[kind];
-    if (!Array.isArray(entries) || entries.length > 200) throw badRequest(`${kind}必须是数组，且不超过 200 项`);
+  for (const kind of ['sources', 'platforms', 'parsers', 'subscriptions', 'liveSources']) {
+    const optional = kind === 'subscriptions' || kind === 'liveSources';
+    const entries = input[kind] === undefined ? (optional ? [] : undefined) : input[kind];
+    const limit = optional ? 20 : 200;
+    if (!Array.isArray(entries) || entries.length > limit) throw badRequest(`${kind}必须是数组，且不超过 ${limit} 项`);
     const ids = new Set();
     result[kind] = entries.map((entry) => {
       if (!entry || typeof entry !== 'object') throw badRequest('配置项格式不正确');
       if (entry.enabled !== undefined && typeof entry.enabled !== 'boolean') throw badRequest('启用状态必须是布尔值');
       const id = text(entry.id, '标识');
+      if (['__proto__', 'constructor', 'prototype'].includes(id)) throw badRequest('标识不能使用保留名称');
       if (ids.has(id)) throw badRequest(`重复标识：${id}`);
       ids.add(id);
       const row = { id, name: text(entry.name, '名称'), enabled: entry.enabled !== false };
@@ -45,7 +50,26 @@ export function validateConfig(input) {
   return result;
 }
 
+export function validatePlayerPreferences(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw badRequest('播放偏好格式不正确');
+  const row = { key: text(input.key, '影片标识', 8192) };
+  for (const field of ['introSeconds', 'outroSeconds']) {
+    const value = input[field] === undefined ? 0 : input[field];
+    if (!Number.isInteger(value) || value < 0 || value > 600) throw badRequest('片头片尾秒数必须为 0–600 的整数');
+    row[field] = value;
+  }
+  for (const field of ['autoNext', 'danmakuEnabled']) {
+    const value = input[field] === undefined ? true : input[field];
+    if (typeof value !== 'boolean') throw badRequest('播放开关必须是布尔值');
+    row[field] = value;
+  }
+  row.speed = input.speed === undefined ? 1 : input.speed;
+  if (![0.5, 0.75, 1, 1.25, 1.5, 2, 3].includes(row.speed)) throw badRequest('播放速度不受支持');
+  return row;
+}
+
 export function importConfig(current, input) {
+  input = repairImport(input).config;
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw badRequest('导入内容必须是 JSON 对象');
   let incoming;
   if (Object.hasOwn(input, 'api_site')) {
@@ -66,8 +90,8 @@ export function importConfig(current, input) {
   } else incoming = input;
   const validated = validateConfig(incoming);
   const merged = { showAdult: Object.hasOwn(incoming, 'showAdult') ? validated.showAdult : current.showAdult === true };
-  for (const kind of ['sources', 'platforms', 'parsers']) {
-    const rows = new Map(current[kind].map((row) => [row.id, row]));
+  for (const kind of ['sources', 'platforms', 'parsers', 'subscriptions', 'liveSources']) {
+    const rows = new Map((current[kind] ?? []).map((row) => [row.id, row]));
     for (const row of validated[kind]) rows.set(row.id, row);
     merged[kind] = [...rows.values()];
   }

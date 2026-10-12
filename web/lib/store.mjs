@@ -27,12 +27,18 @@ export function createStore(directory, defaults) {
       return db.prepare('SELECT data,updated FROM entries WHERE kind=? ORDER BY updated DESC,rowid DESC').all(kind)
         .map(({ data, updated }) => ({ ...JSON.parse(data), updated }));
     },
+    get(kind, key) {
+      const row = db.prepare('SELECT data,updated FROM entries WHERE kind=? AND key=?').get(kind, key);
+      return row ? { ...JSON.parse(row.data), updated: row.updated } : undefined;
+    },
     save(kind, row) {
       const updated = Date.now();
       db.prepare('INSERT INTO entries VALUES (?,?,?,?) ON CONFLICT(kind,key) DO UPDATE SET data=excluded.data,updated=excluded.updated')
         .run(kind, row.key, JSON.stringify(row), updated);
       if (kind === 'history') db.prepare(`DELETE FROM entries WHERE kind='history' AND key NOT IN
         (SELECT key FROM entries WHERE kind='history' ORDER BY updated DESC,rowid DESC LIMIT 200)`).run();
+      if (kind === 'player-preferences') db.prepare(`DELETE FROM entries WHERE kind='player-preferences' AND key NOT IN
+        (SELECT key FROM entries WHERE kind='player-preferences' ORDER BY updated DESC,rowid DESC LIMIT 500)`).run();
       return { ...row, updated };
     },
     remove(kind, key) {

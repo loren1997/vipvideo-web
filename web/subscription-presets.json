@@ -1,0 +1,18 @@
+{
+  "subscriptions": [
+    {
+      "name": "LunaTV-config 常规影视订阅",
+      "url": "https://raw.githubusercontent.com/hafrey1/LunaTV-config/main/jin18.json"
+    }
+  ],
+  "liveSources": [
+    {
+      "name": "vbskycn IPv4 中文直播",
+      "url": "https://raw.githubusercontent.com/vbskycn/iptv/master/tv/iptv4.m3u"
+    },
+    {
+      "name": "TVBox 公开直播汇总",
+      "url": "https://raw.githubusercontent.com/JianghaoPi/my-tvbox-sources/main/output/live.m3u"
+    }
+  ]
+}

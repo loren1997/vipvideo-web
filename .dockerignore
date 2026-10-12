@@ -7,4 +7,5 @@ web/data/
 web/test/
 web/test-results/
 web/playwright-report/
+web/.test-output/
 web/*.log

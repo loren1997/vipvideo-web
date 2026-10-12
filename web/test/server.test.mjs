@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createApp } from '../server.mjs';
 import { createStore } from '../lib/store.mjs';
 
-const empty = { showAdult: false, sources: [], platforms: [], parsers: [] };
+const empty = { showAdult: false, sources: [], platforms: [], parsers: [], subscriptions: [], liveSources: [] };
 const detail = { key: 'film', source: 'demo', id: '1', title: '测试影片', year: '2025', type: 'movie', poster: '', description: '简介',
   lines: [{ name: '线路', episodes: [{ name: '正片', url: 'https://media.example/video.m3u8?token=abc', type: 'hls' }] }] };
 const catalog = { async search() { return { groups: [{ ...detail, items: [{ source: 'demo', id: '1' }] }], failedSources: [] }; },
