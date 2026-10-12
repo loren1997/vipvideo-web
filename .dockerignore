@@ -1,0 +1,10 @@
+**
+!web/
+!web/**
+!LICENSE
+web/node_modules/
+web/data/
+web/test/
+web/test-results/
+web/playwright-report/
+web/*.log

@@ -1,0 +1,16 @@
+{
+  "name": "vipvideo-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "VipVideo 家庭 Web 播放器",
+  "license": "MIT",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test --test-reporter=tap --test-concurrency=1 test/*.test.mjs",
+    "test:browser": "node test/browser.mjs"
+  },
+  "dependencies": { "hls.js": "1.6.16" },
+  "devDependencies": { "playwright": "1.62.1" }
+}

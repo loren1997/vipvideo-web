@@ -1,0 +1,20 @@
+name: vipvideo-web
+
+services:
+  web:
+    image: ghcr.io/loren1997/vipvideo-web:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # 必填：改为至少 16 位随机密码；留空时服务拒绝启动。
+      APP_PASSWORD: ""
+      PORT: "3000"
+      DATA_DIR: /app/data
+      COOKIE_SECURE: "false"
+    volumes:
+      - vipvideo_data:/app/data
+    stop_grace_period: 20s
+
+volumes:
+  vipvideo_data:

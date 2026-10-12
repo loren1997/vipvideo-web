@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#10151f">
+    <meta name="description" content="家庭共享的影视搜索与播放器">
+    <title>映家 · VipVideo Web</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script defer src="/vendor/hls.min.js"></script>
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#content">跳到内容</a>
+    <section id="login-view" class="login-view" hidden aria-labelledby="login-title">
+      <form id="login-form" class="login-card">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <p class="eyebrow">VIPVIDEO WEB</p>
+        <h1 id="login-title">欢迎回到映家</h1>
+        <p class="muted">一个家庭，一起收藏，一起继续看。</p>
+        <label for="password">家庭访问密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+        <button class="button primary" type="submit">进入播放器 <span aria-hidden="true">→</span></button>
+        <p id="login-error" class="error-message" role="alert"></p>
+      </form>
+    </section>
+    <div id="app-view" class="app-shell" hidden>
+      <aside class="sidebar">
+        <a class="brand" href="#home" aria-label="映家首页"><span class="brand-mark" aria-hidden="true"></span><span>映家<small>VIPVIDEO WEB</small></span></a>
+        <p class="nav-caption">我的影院</p>
+        <nav aria-label="主导航">
+          <a href="#home" data-view="home"><span aria-hidden="true">⌂</span>首页</a>
+          <a href="#search" data-view="search"><span aria-hidden="true">⌕</span>搜索影片</a>
+          <a href="#favorites" data-view="favorites"><span aria-hidden="true">☆</span>我的收藏</a>
+          <a href="#history" data-view="history"><span aria-hidden="true">◷</span>观看记录</a>
+          <a href="#settings" data-view="settings"><span aria-hidden="true">⚙</span>资源设置</a>
+        </nav>
+        <div class="sidebar-foot"><span class="connection-dot" aria-hidden="true"></span>家庭共享影院<small>进度与收藏在设备间同步</small></div>
+      </aside>
+      <div class="workspace">
+        <header class="topbar"><div><p class="eyebrow">YOUR EVERYDAY CINEMA</p><h1 id="page-title">首页</h1></div><div class="topbar-actions"><span id="source-status" class="status-pill">准备中</span><button id="logout" class="button subtle" type="button">退出</button></div></header>
+        <main id="content" tabindex="-1" aria-busy="true"><div class="loading">正在准备家庭影院…</div></main>
+        <footer class="page-footer"><span>映家 · 基于 VipVideo</span><span>独立部署 · 家庭共享</span></footer>
+      </div>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

@@ -1,0 +1,106 @@
+{
+  "name": "VipVideo",
+  "version": "1.1.7",
+  "description": "VipVideo",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --publish never",
+    "build:mac": "electron-builder --mac --arm64 --publish never",
+    "build:mac:all": "electron-builder --mac --x64 --arm64 --publish never",
+    "build:win": "electron-builder --win --publish never",
+    "build:linux": "electron-builder --linux --publish never"
+  },
+  "build": {
+    "appId": "com.lhl.vipvideo",
+    "productName": "VipVideo",
+    "icon": "build/icons/icon.icns",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "build/icons/icon.icns",
+      "compression": "maximum",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "defaultArch": "x64",
+      "icon": "build/icons/icon.ico",
+      "publisherName": "lihongli",
+      "compression": "maximum"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "rpm",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icons/icon.png",
+      "category": "Utility",
+      "compression": "maximum"
+    },
+    "files": [
+      "main.js",
+      "renderer.js",
+      "preload.js",
+      "child_preload.js",
+      "webview-preload.js",
+      "vipWindow.js",
+      "vipUI.js",
+      "speedTest.js",
+      "speedHistory.js",
+      "index.html",
+      "history.html",
+      "styles.css",
+      "vlist.json",
+      "images/**",
+      "package.json",
+      "!node_modules",
+      "!**/{dist,build,out,docs}",
+      "!**/{test-parsers.js,parser-test.log,parser-test-results.json,build.sh,build-electron-optimized.sh}",
+      "!**/{.DS_Store,.git,.gitignore,yarn.lock}"
+    ],
+    "npmRebuild": false,
+    "nodeGypRebuild": false,
+    "buildDependenciesFromSource": true,
+    "asar": true,
+    "compression": "maximum"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "44.4.5",
+    "electron-builder": "^23.0.2"
+  },
+  "dependencies": {}
+}
