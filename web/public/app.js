@@ -1221,6 +1221,20 @@ function mountQuark(current) {
     state.ready = data; result.replaceChildren(node('p', `${data.name || '当前集'}：${data.status === 'ready' ? '已准备好' : data.status === 'pending' ? '正在准备' : '准备未完成'}${data.saved ? ' · 已转存' : ''}`, 'muted'));
     if (data.status === 'ready' && data.assetId) { const play = button(current.quarkAsset === data.assetId ? '正在夸克播放' : '夸克播放', () => void playQuark(current, data.assetId), 'button primary small'); play.disabled = current.quarkAsset === data.assetId; result.append(play); }
     if (data.reason) result.append(node('p', data.reason, 'muted'));
+    if (data.code === 'QUARK_FOLDER_MISSING' && state.selection) {
+      result.append(node('p', '恢复会新建专用目录，保留旧文件与转存记录；旧目录中的文件不再自动清理。', 'muted'));
+      const repair = button('恢复专用目录并重试', async () => {
+        if (!valid()) return;
+        const selection = state.selection, version = ++state.version;
+        clearTimeout(current.quarkTimer); repair.disabled = true; transfer.disabled = true; feedback.textContent = '正在恢复夸克专用目录…';
+        try {
+          await api('/api/quark/folder/repair', { method: 'POST', body: {}, timeoutMs: 60000 });
+          if (valid() && version === state.version) await prepare(selection.resource, selection.file, false);
+        } catch (error) { if (valid() && version === state.version) feedback.textContent = `目录恢复未完成：${error.message}`; }
+        finally { if (valid() && version === state.version) { repair.disabled = false; transfer.disabled = !state.files.some(file => file.id === fileSelect.value); } }
+      }, 'button primary small');
+      result.append(repair);
+    }
     if (data.status === 'pending' && state.selection) result.append(button('刷新准备状态', () => void prepare(state.selection.resource, state.selection.file), 'button small'));
   }
   async function prepare(resource, file, automatic = false, remaining = 11) {
@@ -1930,7 +1944,7 @@ function quarkSettingsPanel(stamp) {
     searchStatus.hidden = !next.searchPool; searchStatus.textContent = next.searchPool ? `自动备用搜索接口：可用 ${next.searchPool.healthy} 个 / 待验证 ${next.searchPool.pending} 个 / 暂不可用 ${next.searchPool.suspended} 个` : '';
     const dailyBytes = next.maxDailyBytes ?? 3_000_000_000_000;
     limit.textContent = `每日转存上限：${next.maxDailyTransfers ?? 100} 次 / ${dailyBytes >= 1e12 ? `${(dailyBytes / 1e12).toFixed(1)} TB` : fileSize(dailyBytes)}。转存保留源文件画质，不会自动提升分辨率。`;
-    disconnect.disabled = !next.account?.connected; cleanup.disabled = !next.account?.connected;
+    disconnect.disabled = !next.account?.connected; cleanup.disabled = !next.account?.connected; repair.disabled = !next.account?.connected || !next.enabled;
   }
   async function load() {
     const request = ++version;
@@ -1959,7 +1973,14 @@ function quarkSettingsPanel(stamp) {
     catch (error) { if (stamp === routeVersion) status.textContent = `清理未完成：${error.message}`; }
     finally { if (stamp === routeVersion && panel.isConnected) cleanup.disabled = !data?.account?.connected; }
   }, 'button small');
-  const limit = node('p', undefined, 'muted'); actions.append(save, disconnect, cleanup, button('刷新夸克状态', () => void load(), 'button small')); panel.append(limit); void load(); return panel;
+  const repair = button('恢复专用目录', async () => {
+    repair.disabled = true;
+    try { const next = await api('/api/quark/folder/repair', { method: 'POST', body: {}, timeoutMs: 60000 }); if (stamp !== routeVersion || !panel.isConnected) return; draw(next); notify('专用目录已就绪，可返回影片重试转存'); }
+    catch (error) { if (stamp === routeVersion && panel.isConnected) status.textContent = `目录恢复未完成：${error.message}`; }
+    finally { if (stamp === routeVersion && panel.isConnected) repair.disabled = !data?.account?.connected || !data?.enabled; }
+  }, 'button small'); repair.disabled = true;
+  const limit = node('p', undefined, 'muted'); actions.append(save, disconnect, cleanup, repair, button('刷新夸克状态', () => void load(), 'button small'));
+  panel.append(node('p', '确认原专用目录缺失后，可恢复目录继续转存；旧文件与额度记录保留，旧目录不再自动清理。', 'muted'), limit); void load(); return panel;
 }
 
 function renderSettings() {

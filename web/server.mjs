@@ -191,6 +191,13 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         if (path === '/api/quark/cleanup' && method === 'POST') {
           await readBody(req); return json(res, 200, await quarkService.cleanup());
         }
+        if (path === '/api/quark/folder/repair' && method === 'POST') {
+          const input = await readBody(req);
+          if (!input || Array.isArray(input) || typeof input !== 'object' || Object.keys(input).length) throw badRequest('恢复目录请求应为空对象');
+          const valid = () => { requireSession(hashToken(token)); return true; };
+          valid(); const result = await quarkService.repairFolder({ valid }); valid(); cloudMedia.invalidate();
+          return json(res, 200, { ...result, searchPool: searchPool.status() });
+        }
         if (['/api/quark/resources', '/api/quark/files'].includes(path) && method === 'GET') {
           const input = Object.fromEntries(url.searchParams), selected = await cloudSelection(input, hashToken(token));
           if (input.web !== undefined && input.web !== '1') throw badRequest('公开网页搜索选项无效');

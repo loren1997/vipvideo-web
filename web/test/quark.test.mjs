@@ -33,7 +33,7 @@ async function fixture(t, extra = {}) {
       const rows = parent === '0' ? [userFolder, ...(state.folders.has(account) ? [state.folders.get(account)] : [])] : parent === 'user-folder' ? [userFile] : state.files.filter(file => file.pdir_fid === parent && file.account === account);
       return Object.assign(reply({ list: rows.slice((page - 1) * size, page * size) }), { });
     }
-    if (path === '/file' && options.method === 'POST') { assert.equal(body.pdir_fid, '0'); assert.match(body.file_name, /^VipVideo-[a-f0-9]{32}$/); const folder = { fid: 'app-folder-' + account, file_name: body.file_name, file: false, pdir_fid: '0' }; state.folders.set(account, folder); return reply({ fid: folder.fid }); }
+    if (path === '/file' && options.method === 'POST') { assert.equal(body.pdir_fid, '0'); assert.match(body.file_name, /^VipVideo-[a-f0-9]{32}(?:-[a-f0-9]{32})?$/); const count = state.calls.filter(row => row.path === '/file' && row.options.method === 'POST' && row.account === account).length; const folder = { fid: 'app-folder-' + account + (count > 1 ? '-' + count : ''), file_name: body.file_name, file: false, pdir_fid: '0' }; state.folders.set(account, folder); return reply({ fid: folder.fid }); }
     if (path === '/share/sharepage/token') return reply({ stoken: 'synthetic-share-token' });
     if (path === '/share/sharepage/detail') return reply({ list: state.source });
     if (path === '/share/sharepage/save') {
@@ -78,6 +78,158 @@ test('managed mkdir waits for indexed visibility without repeating creation or t
   assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
   const folder = Object.values(JSON.parse(metadata.get('quark-registry-v1')).folders)[0];
   assert.equal(folder.fid, 'app-folder-A'); assert.equal(folder.mkdirStarted, undefined);
+});
+
+test('reliable totals keep scanning short directory pages until a registered folder on page three is verified', async t => {
+  const { service, state, connect, save, select } = await fixture(t); await connect(); await save(); let pages = 0;
+  state.beforeRequest = call => {
+    if (call.path !== '/file/sort' || new URL(call.value).searchParams.get('pdir_fid') !== '0') return;
+    const page = ++pages, rows = Array.from({ length: 50 }, (_, index) => page === 3 && index === 49 ? state.folders.get('A') : { fid: `other-${page}-${index}`, file_name: 'user-directory', file: false, pdir_fid: '0' });
+    return Object.assign(Readable.from([JSON.stringify({ code: 0, data: { list: rows }, metadata: { _total: 150 } })]), { statusCode: 200, headers: {} });
+  };
+  assert.equal((await service.prepare(detail, { ...await select(), line: 0, episode: 0 })).status, 'ready');
+  assert.equal(pages, 3); assert.equal(state.saved, 1);
+});
+
+test('repairing a confirmed missing directory creates a new managed namespace and retains old assets and daily quota', async t => {
+  const { service, state, metadata, connect, save, select } = await fixture(t); await connect(); const first = await save();
+  const before = JSON.parse(metadata.get('quark-registry-v1')), account = Object.keys(before.folders)[0], oldFolder = before.folders[account];
+  state.folders.delete('A');
+  const missing = await service.prepare(detail, { ...await select(), line: 0, episode: 0 });
+  assert.equal(missing.status, 'error'); assert.equal(missing.code, 'QUARK_FOLDER_MISSING');
+  await service.repairFolder();
+  const after = JSON.parse(metadata.get('quark-registry-v1')), folder = after.folders[account];
+  assert.match(folder.name, new RegExp('^' + oldFolder.name + '-[a-f0-9]{32}$')); assert.notEqual(folder.fid, oldFolder.fid);
+  assert.equal(folder.retired.length, 1); assert.equal(folder.retired[0].fid, oldFolder.fid); assert.equal(folder.retired[0].name, oldFolder.name);
+  assert.deepEqual(after.assets, before.assets); assert.equal(state.saved, 1);
+  assert.equal((await service.settings()).managedFiles, 0);
+  await assert.rejects(service.playback(first.assetId), /目录|登记/);
+  for (const input of [{ maxDailyTransfers: 1 }, { maxDailyBytes: before.assets[0].size }]) {
+    await service.configure(input);
+    assert.match((await service.prepare(detail, { ...await select(), line: 0, episode: 0 })).reason, /每日转存数量或容量上限/);
+    assert.equal(state.saved, 1); await service.configure({ maxDailyTransfers: 100, maxDailyBytes: DAILY_BYTES });
+  }
+  const replacement = await service.prepare(detail, { ...await select(), line: 0, episode: 0 });
+  assert.equal(replacement.status, 'ready'); assert.notEqual(replacement.assetId, first.assetId); assert.equal(state.saved, 2);
+  await service.repairFolder(); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 2);
+  assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+});
+
+test('repair is serialized and initializes an unregistered account only once', async t => {
+  const { service, state, connect } = await fixture(t); await connect();
+  await Promise.all([service.repairFolder(), service.repairFolder(), service.repairFolder()]);
+  assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+  assert.equal(state.saved, 0); assert.deepEqual(state.deletes, []);
+});
+
+test('pending repair survives restart and confirms the same journal without a second mkdir', async t => {
+  const { service, options, state, metadata, connect, save } = await fixture(t); await connect(); await save(); state.folders.delete('A'); let invisible = true;
+  state.beforeRequest = call => call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') === '0' && state.folders.has('A') && invisible ? reply({ list: [] }) : undefined;
+  await assert.rejects(service.repairFolder(), /专用目录暂未可见/);
+  const before = JSON.parse(metadata.get('quark-registry-v1')), account = Object.keys(before.folders)[0];
+  assert.equal(before.folders[account].mkdirStarted, true); assert.equal(before.folders[account].retired.length, 1);
+  await service.stop(); const restored = createQuark(options); t.after(() => restored.stop()); invisible = false;
+  await restored.repairFolder(); const after = JSON.parse(metadata.get('quark-registry-v1'));
+  assert.equal(after.folders[account].name, before.folders[account].name); assert.equal(after.folders[account].fid, before.folders[account].fid);
+  assert.equal(after.folders[account].mkdirStarted, undefined); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 2);
+  assert.equal(state.saved, 1); assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+});
+
+test('repair authorization and account guards cancel before mkdir and preserve a pre-send journal for retry', async t => {
+  for (const mode of ['revoked-before-proof', 'revoked-after-journal', 'account-cleared', 'stopped']) await t.test(mode, async t => {
+    const { service, state, metadata, connect, save } = await fixture(t); await connect(); await save(); state.folders.delete('A');
+    const before = metadata.get('quark-registry-v1'); let valid = true, reads = 0;
+    state.beforeRequest = async call => {
+      if (call.path !== '/file/sort' || new URL(call.value).searchParams.get('pdir_fid') !== '0') return;
+      reads++;
+      if (mode === 'account-cleared') await service.clearAccount();
+      else if (mode === 'stopped') void service.stop();
+      else if (reads === (mode === 'revoked-after-journal' ? 2 : 1)) valid = false;
+    };
+    await assert.rejects(service.repairFolder({ valid: () => valid }), /授权|账号已变更|正在关闭/);
+    assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+    if (mode !== 'revoked-after-journal') assert.equal(metadata.get('quark-registry-v1'), before);
+    else {
+      const journal = Object.values(JSON.parse(metadata.get('quark-registry-v1')).folders)[0];
+      assert.equal(journal.fid, undefined); assert.equal(journal.mkdirStarted, undefined); assert.equal(journal.retired.length, 1);
+      state.beforeRequest = null; await service.repairFolder();
+      assert.equal(Object.values(JSON.parse(metadata.get('quark-registry-v1')).folders)[0].name, journal.name);
+      assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 2);
+    }
+    assert.equal(state.saved, 1); assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+  });
+});
+
+test('repair refuses conflicting names, renamed fids, malformed pagination and an exhausted history without replacing registration', async t => {
+  for (const mode of ['renamed', 'same-name-other-fid', 'empty-short-page', 'changed-total', 'duplicate-page-fid', 'contradictory-total', 'history-full', 'history-invalid']) await t.test(mode, async t => {
+    const { service, options, state, metadata, connect, save } = await fixture(t); await connect(); await save();
+    const registry = JSON.parse(metadata.get('quark-registry-v1')), account = Object.keys(registry.folders)[0], folder = registry.folders[account];
+    if (mode === 'history-full') folder.retired = Array.from({ length: 16 }, (_, index) => ({ name: folder.name + '-' + index.toString(16).padStart(32, '0'), fid: 'old-history-' + index, createdAt: state.clock, retiredAt: state.clock }));
+    if (mode === 'history-invalid') folder.retired = [{ name: 'unrelated-directory', fid: 'old-history' }];
+    metadata.set('quark-registry-v1', JSON.stringify(registry)); await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+    if (mode === 'renamed') state.folders.get('A').file_name = 'user-renamed-directory';
+    if (mode === 'same-name-other-fid') state.folders.get('A').fid = 'unknown-directory';
+    if (mode.startsWith('history-')) state.folders.delete('A');
+    if (['empty-short-page', 'changed-total', 'duplicate-page-fid', 'contradictory-total'].includes(mode)) state.beforeRequest = call => {
+      if (call.path !== '/file/sort' || new URL(call.value).searchParams.get('pdir_fid') !== '0') return;
+      const page = Number(new URL(call.value).searchParams.get('_page'));
+      const rows = mode === 'empty-short-page' && page === 2 ? [] : Array.from({ length: 50 }, (_, index) => ({ fid: mode === 'duplicate-page-fid' && page === 2 && index === 0 ? 'private-1-0' : `private-${page}-${index}`, file_name: 'private-directory', file: false, pdir_fid: '0' }));
+      const total = mode === 'contradictory-total' ? 49 : mode === 'changed-total' && page === 2 ? 151 : 150;
+      return Object.assign(Readable.from([JSON.stringify({ code: 0, data: { list: rows }, metadata: { _total: total } })]), { statusCode: 200, headers: {} });
+    };
+    const before = metadata.get('quark-registry-v1');
+    await assert.rejects(restored.repairFolder(), cause => cause.status === 409 && cause.code === undefined);
+    assert.equal(metadata.get('quark-registry-v1'), before); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+    assert.equal(state.saved, 1); assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+  });
+});
+
+test('a new repair directory cannot claim a retired fid and preserves the conflicting pending journal across restart', async t => {
+  const { service, options, state, metadata, connect, save } = await fixture(t); await connect(); await save();
+  const old = state.folders.get('A'); state.folders.delete('A');
+  state.beforeRequest = call => {
+    if (call.path !== '/file' || call.options.method !== 'POST') return;
+    state.folders.set('A', { ...old, file_name: call.body.file_name }); return reply({ fid: old.fid });
+  };
+  await assert.rejects(service.repairFolder(), /历史记录冲突/);
+  const journal = Object.values(JSON.parse(metadata.get('quark-registry-v1')).folders)[0]; assert.equal(journal.fid, undefined); assert.equal(journal.mkdirStarted, true);
+  await service.stop(); const restored = createQuark(options); t.after(() => restored.stop()); state.beforeRequest = null;
+  await assert.rejects(restored.repairFolder(), /无法确认/); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 2);
+  assert.equal(Object.values(JSON.parse(metadata.get('quark-registry-v1')).folders)[0].name, journal.name);
+  assert.equal(state.saved, 1); assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+});
+
+test('pending repair fids colliding with another account active or retired registration remain unclaimed after restart', async t => {
+  for (const mode of ['active', 'retired']) await t.test(mode, async t => {
+    const { service, options, state, metadata, connect, save } = await fixture(t); await connect(); await save();
+    const registry = JSON.parse(metadata.get('quark-registry-v1')), account = Object.keys(registry.folders)[0], folder = registry.folders[account]; folder.mkdirStarted = true;
+    registry.folders['f'.repeat(64)] = mode === 'active' ? { ...folder, mkdirStarted: false } : { name: folder.name + '-' + 'a'.repeat(32), fid: 'other-active', retired: [{ name: folder.name, fid: folder.fid }] };
+    metadata.set('quark-registry-v1', JSON.stringify(registry)); await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+    const before = metadata.get('quark-registry-v1'); await assert.rejects(restored.repairFolder(), /无法确认/);
+    assert.equal(metadata.get('quark-registry-v1'), before); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+    assert.equal(state.saved, 1); assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+  });
+});
+
+test('rotated Cookie identity reconnects a suffixed active directory with its retired quota history while cleanup excludes retired assets', async t => {
+  const { service, options, state, metadata, connect, save, select } = await fixture(t);
+  state.beforeRequest = call => call.path === '/config' ? reply({}) : undefined; await connect({ cleanupEnabled: true, retentionDays: 1 }); await save();
+  state.folders.delete('A'); await service.repairFolder();
+  const active = await service.prepare(detail, { ...await select(), line: 0, episode: 0 }); assert.equal(active.status, 'ready');
+  const before = JSON.parse(metadata.get('quark-registry-v1')), oldAccount = Object.keys(before.folders)[0], old = before.assets[0];
+  old.status = 'purging'; old.watchedAt = old.lastActivity = state.clock - 2 * DAY;
+  old.deleteIntent = { account: oldAccount, parent: old.parent, fid: old.fid, at: state.clock - DAY };
+  await connect({ cookie: COOKIE.replace('synthetic-account-A-secret', 'synthetic-account-A-repaired-rotated') });
+  const account = JSON.parse(metadata.get('quark-settings-v1')).account.id;
+  metadata.set('quark-registry-v1', JSON.stringify(before)); await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+  const shareId = (await restored.resources(detail)).resources[0].id, fileId = (await restored.files(detail, { shareId, line: 0, episode: 0 })).files[0].id;
+  assert.equal((await restored.prepare(detail, { shareId, fileId, line: 0, episode: 0 })).assetId, active.assetId);
+  const after = JSON.parse(metadata.get('quark-registry-v1')); assert.equal(after.folders[oldAccount], undefined); assert.deepEqual(after.folders[account], before.folders[oldAccount]);
+  assert.ok(after.assets.every(asset => asset.account === account)); assert.equal(after.assets[0].deleteIntent.account, account);
+  for (let index = 0; index < 2; index++) for (const field of ['parent', 'day', 'size', 'createdAt']) assert.equal(after.assets[index][field], before.assets[index][field]);
+  assert.equal((await restored.settings()).managedFiles, 1); assert.equal((await restored.cleanup()).checked, 0);
+  await assert.rejects(restored.playback(old.id), /当前专用目录/);
+  assert.equal(state.saved, 2); assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
 });
 
 test('invisible managed mkdir stops at three confirmation reads and recovers later without creating another folder', async t => {
@@ -132,7 +284,7 @@ test('missing, renamed and conflicting registered folders report safe reasons wi
     else if (mode === 'renamed') state.folders.get('A').file_name = 'user-renamed-private-directory';
     else state.beforeRequest = call => call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') === '0' ? reply({ list: [state.folders.get('A'), state.folders.get('A')] }) : undefined;
     const result = await service.prepare(detail, { ...await select(), line: 0, episode: 0 });
-    assert.equal(result.status, 'error'); assert.match(result.reason, mode === 'conflicting' ? /目录记录冲突/ : /已登记目录未找到或已改名、移动/);
+    assert.equal(result.status, 'error'); assert.match(result.reason, mode === 'conflicting' ? /目录记录冲突/ : mode === 'missing' ? /可恢复专用目录/ : /已登记目录未找到或已改名、移动/);
     assert.ok(!result.reason.includes('private-directory'));
     assert.equal(state.saved, 1); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
     assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);

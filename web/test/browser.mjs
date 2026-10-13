@@ -90,6 +90,7 @@ const quarkRequests = [], quarkProgress = [], quarkAssets = new Map();
 let quarkCookie = '', quarkMode = 'matched', holdQuarkResources = false, releaseQuarkResources;
 let quarkChoicesFixture = false, quarkFilesFixture = 'matched';
 let holdQuarkPrepare = false, releaseQuarkPrepare, holdQuarkPlayback = false, releaseQuarkPlayback, quarkPendingChecks = 0;
+let quarkFolderRepairFails = false, holdQuarkFolderRepair = false, releaseQuarkFolderRepair;
 const heldQuarkFileReads = new Map();
 const quarkSettings = { configured: false, enabled: false, autoSave: true, cleanupEnabled: true, retentionDays: 7, maxDailyTransfers: 10, maxDailyBytes: 3_000_000_000_000, searchApi: '', account: { connected: false, label: '' }, managedFiles: 0, lastCleanup: 0, lastError: '', searchPool: { enabled: true, discovering: false, lastDiscovery: 0, lastHealth: 0, healthy: 2, pending: 1, suspended: 1, candidates: [] } };
 const episodeKey = (film, episode) => JSON.stringify([film, episode]);
@@ -242,6 +243,12 @@ try {
         }
         if (parsed.pathname === '/api/quark/account') { assert.equal(method, 'DELETE'); quarkCookie = ''; quarkSettings.configured = false; quarkSettings.account = { connected: false, label: '' }; return route.fulfill({ json: { ok: true } }); }
         if (parsed.pathname === '/api/quark/cleanup') { assert.deepEqual(body, {}); quarkSettings.lastCleanup = Date.now(); return route.fulfill({ json: { removed: 0, failed: 0 } }); }
+        if (parsed.pathname === '/api/quark/folder/repair') {
+          assert.equal(method, 'POST'); assert.deepEqual(body, {});
+          if (holdQuarkFolderRepair) await new Promise(ok => { releaseQuarkFolderRepair = ok; });
+          if (quarkFolderRepairFails) return route.fulfill({ status: 503, json: { error: '固定目录恢复失败，请重试' } });
+          quarkMode = 'matched'; return route.fulfill({ json: quarkSettings });
+        }
         if (parsed.pathname === '/api/quark/resources') {
           if (holdQuarkResources) await new Promise(ok => { releaseQuarkResources = ok; });
           if (parsed.searchParams.get('web') === '1') return route.fulfill({ json: { resources: [
@@ -271,6 +278,7 @@ try {
           if (body.auto) assert.equal(body.fileId, `file-${body.episode + 1}`, '自动仅转当前选中的单集');
           if (holdQuarkPrepare) await new Promise(ok => { releaseQuarkPrepare = ok; });
           if (quarkMode === 'prepare-error') return route.fulfill({ json: { status: 'error', reason: '固定专用目录错误，未转存' } });
+          if (quarkMode === 'folder-missing') return route.fulfill({ json: { status: 'error', code: 'QUARK_FOLDER_MISSING', reason: '已登记目录未找到，需恢复专用目录' } });
           const assetId = `${body.shareId}-${body.fileId}`;
           const seen = quarkAssets.has(assetId); quarkAssets.set(assetId, { body, name: `网盘样例第${body.episode + 1}集.mp4` }); quarkSettings.managedFiles = quarkAssets.size;
           return route.fulfill({ json: { assetId, name: quarkAssets.get(assetId).name, status: quarkMode === 'pending-forever' || quarkMode === 'pending' && ++quarkPendingChecks === 1 ? 'pending' : 'ready', saved: !seen } });
@@ -661,7 +669,28 @@ try {
     }
     const decoded = (p, fragment) => until(() => p.locator('video').evaluate((video, fragment) => video.readyState >= 2 && video.currentSrc.includes(fragment), fragment).catch(() => false), `自动切换媒体 ${fragment}`);
     try {
-      let p = await open('pending'); await decoded(p, 'quark-first-1'); await p.getByRole('button', { name: '刷新准备状态', exact: true }).waitFor();
+      let p = await open('folder-missing'); await decoded(p, 'quark-first-1');
+      const recover = () => p.getByRole('button', { name: '恢复专用目录并重试', exact: true });
+      await recover().waitFor(); await p.locator('#quark-resources').getByText(/保留旧文件与转存记录/).waitFor();
+      const beforeRepair = count('/api/quark/folder/repair'), beforePrepare = count('/api/quark/prepare');
+      quarkFolderRepairFails = true; await recover().click();
+      await p.locator('#quark-resources').getByText('目录恢复未完成：固定目录恢复失败，请重试', { exact: true }).waitFor();
+      await until(() => recover().isEnabled(), '恢复失败仍可重试'); await decoded(p, 'quark-first-1');
+      assert.equal(count('/api/quark/folder/repair'), beforeRepair + 1); assert.equal(count('/api/quark/prepare'), beforePrepare);
+      quarkFolderRepairFails = false; await recover().click(); await decoded(p, '/api/quark/media/share-fixture-file-1');
+      assert.equal(count('/api/quark/folder/repair'), beforeRepair + 2); assert.equal(count('/api/quark/prepare'), beforePrepare + 1);
+      const retried = quarkRequests.filter(request => request.path === '/api/quark/prepare').at(-1).body;
+      assert.deepEqual({ shareId: retried.shareId, fileId: retried.fileId, episode: retried.episode, auto: retried.auto }, { shareId: 'share-fixture', fileId: 'file-1', episode: 0, auto: false }, '恢复后手动重试当前选中单集并自动播放');
+      assert.equal(await recover().count(), 0);
+
+      p = await open('folder-missing'); await recover().waitFor(); holdQuarkFolderRepair = true; await recover().click();
+      await until(() => Boolean(releaseQuarkFolderRepair), '目录恢复请求等待中');
+      const cancelledPrepare = count('/api/quark/prepare'), cancelledPlay = count('/api/quark/playback');
+      await p.locator('nav a[href="#home"]').click(); holdQuarkFolderRepair = false; releaseQuarkFolderRepair(); releaseQuarkFolderRepair = null;
+      await p.waitForTimeout(150); assert.equal(count('/api/quark/prepare'), cancelledPrepare); assert.equal(count('/api/quark/playback'), cancelledPlay);
+      console.log('PASS 夸克目录丢失恢复入口、保留旧文件提示、失败可重试、手动重试当前单集后自动播放、离页取消后续转存');
+
+      p = await open('pending'); await decoded(p, 'quark-first-1'); await p.getByRole('button', { name: '刷新准备状态', exact: true }).waitFor();
       await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 7; }); const initial = count('/api/quark/prepare');
       await p.evaluate(() => { const original = HTMLMediaElement.prototype.play; window.restoreCloudPlay = () => { HTMLMediaElement.prototype.play = original; }; HTMLMediaElement.prototype.play = function () { return this.src.includes('/api/quark/') ? Promise.reject(new DOMException('fixture', 'NotAllowedError')) : original.call(this); }; });
       await p.clock.fastForward(4999); assert.equal(count('/api/quark/prepare'), initial, '等待5秒再检查，不密集轮询');
@@ -707,7 +736,8 @@ try {
       console.log('PASS 夸克pending每5秒最多12次/超时手动继续、自动切换保留进度/禁止自动播放可点击、返回原线不反切、换文件/换源/导航/迟到URL取消、明确失败保留普通播放');
     } finally {
       holdQuarkPrepare = false; holdQuarkPlayback = false; releaseQuarkPrepare?.(); releaseQuarkPlayback?.(); releaseQuarkPrepare = null; releaseQuarkPlayback = null;
-      quarkMode = 'matched'; Object.assign(quarkSettings, settingsBefore); await isolated?.value.close();
+      quarkMode = 'matched'; quarkFolderRepairFails = false; holdQuarkFolderRepair = false; releaseQuarkFolderRepair?.(); releaseQuarkFolderRepair = null;
+      Object.assign(quarkSettings, settingsBefore); await isolated?.value.close();
     }
   }
 
@@ -716,6 +746,7 @@ try {
     try {
       isolated = await context({ width: 1440, height: 1000 }, true, false, '#settings'); const p = isolated.page; await openSettingsSection(p, '夸克网盘');
       await p.getByLabel('夸克账号 Cookie', { exact: true }).waitFor(); await until(() => p.getByLabel('夸克账号 Cookie', { exact: true }).isEnabled(), '账号设置加载完成');
+      assert.equal(await p.getByRole('button', { name: '恢复专用目录', exact: true }).isDisabled(), true, '未连接账号不允许恢复目录');
       assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).inputValue(), ''); assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).getAttribute('type'), 'password'); assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).getAttribute('autocomplete'), 'off');
       await p.getByText('自动备用搜索接口：可用 2 个 / 待验证 1 个 / 暂不可用 1 个', { exact: true }).waitFor();
       const dailyTransfers = p.getByLabel('每日最多转存次数', { exact: true }); assert.equal(await dailyTransfers.inputValue(), String(quarkSettings.maxDailyTransfers)); assert.equal(await dailyTransfers.getAttribute('min'), '1'); assert.equal(await dailyTransfers.getAttribute('max'), '100');
@@ -726,6 +757,10 @@ try {
       assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).inputValue(), 'quark-fixture-secret-cookie'); assert.equal(await p.getByLabel('夸克看完后保留天数', { exact: true }).inputValue(), '3'); await dailyTransfers.fill('100');
       await p.getByRole('button', { name: '保存夸克设置', exact: true }).click(); await until(async () => quarkSettings.configured && await p.getByLabel('夸克账号 Cookie', { exact: true }).inputValue() === '', '保存账号后凭证清空');
       assert.equal(quarkSettings.maxDailyTransfers, 100); assert.equal(await dailyTransfers.inputValue(), '100'); await p.getByText(/每日转存上限：100 次 \/ 3\.0 TB/).waitFor(); assert.equal(await p.getByText(/每日转存上限：.*20\.0 GiB/).count(), 0);
+      const repairsBefore = quarkRequests.filter(request => request.path === '/api/quark/folder/repair').length;
+      await p.getByRole('button', { name: '恢复专用目录', exact: true }).click();
+      await p.locator('#toast').getByText('专用目录已就绪，可返回影片重试转存', { exact: true }).waitFor();
+      assert.equal(quarkRequests.filter(request => request.path === '/api/quark/folder/repair').length, repairsBefore + 1);
       const exposed = await (await p.request.get(base + '/api/quark/settings')).text(); assert.equal(exposed.includes('quark-fixture-secret-cookie'), false); assert.equal((await (await p.request.get(base + '/api/config')).text()).includes('quark-fixture-secret-cookie'), false, '配置导出数据不包含独立账号凭证');
       assert.equal(quarkSettings.retentionDays, 3); const cleanupBefore = quarkRequests.filter(request => request.path === '/api/quark/cleanup').length;
       await p.getByRole('button', { name: '清理到期已看完文件', exact: true }).click(); await until(() => quarkSettings.lastCleanup > 0, '仅调用受限到期清理接口'); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/cleanup').length, cleanupBefore + 1);

@@ -114,7 +114,9 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     store.setMeta('quark-transfer-bytes-3tb-v1', '1');
   }
   const savedRegistry = parse('quark-registry-v1', {});
-  const folders = Object.fromEntries(Object.entries(savedRegistry.folders || {}).filter(([account, folder]) => /^[a-f0-9]{64}$/.test(account) && folder?.name === 'VipVideo-' + config.installId && (!folder.fid || validFid(folder.fid))));
+  const folderName = value => typeof value === 'string' && new RegExp('^VipVideo-' + config.installId + '(?:-[a-f0-9]{32})?$').test(value);
+  const validHistory = folder => folder.retired === undefined || Array.isArray(folder.retired) && folder.retired.length <= 16 && folder.retired.every(entry => entry && folderName(entry.name) && validFid(entry.fid) && entry.fid !== folder.fid && entry.retired === undefined) && new Set(folder.retired.map(entry => entry.fid)).size === folder.retired.length;
+  const folders = Object.fromEntries(Object.entries(savedRegistry.folders || {}).filter(([account, folder]) => /^[a-f0-9]{64}$/.test(account) && folderName(folder?.name) && (!folder.fid || validFid(folder.fid))).map(([account, folder]) => [account, { ...folder, ...(!validHistory(folder) ? { invalidHistory: true } : {}) }]));
   const registry = { folders, assets: Array.isArray(savedRegistry.assets) ? savedRegistry.assets.filter(asset => /^[a-f0-9]{32}$/.test(asset.id || '') && /^[a-f0-9]{64}$/.test(asset.account || '') && asset.managed === true && validFid(asset.parent) && typeof asset.name === 'string' && Number.isSafeInteger(asset.size) && asset.size > 0 && asset.size <= 100 * GIB && ['saving', 'ready', 'recycling', 'purging', 'deleted'].includes(asset.status) && (asset.status === 'saving' || validFid(asset.fid))).slice(0, 1000) : [], lastCleanup: savedRegistry.lastCleanup || null };
   const shares = new Map(), candidates = new Map(), searches = new Map(), searchFlights = new Map(), prepareFlights = new Map();
   let cookie = '', loaded = false, unlocking, key, epoch = 0, active = 0, tail = Promise.resolve(), timer, started = false, stopped = false, stopPromise, lastError = '';
@@ -209,7 +211,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   };
   const auth = (context, path, options = {}) => { current(context); return api(path, { ...options, credentials: context.cookie, guard: () => current(context) }); };
   const publicAsset = (asset, reused = false) => ({ assetId: asset.id, name: asset.name, category: asset.category || '', status: asset.status === 'ready' ? 'ready' : 'pending', saved: asset.status === 'ready', reused, ...(asset.status === 'ready' ? {} : { reason: asset.task ? '转存任务仍在处理，请稍后重试' : '上次转存响应不确定，为避免重复转存请稍后检查专用目录' }) });
-  const findAsset = (assetId, context) => { const asset = registry.assets.find(value => value.id === assetId && value.account === context.account && value.managed === true); if (!asset) throw failure('未找到已登记的夸克视频', 404); return asset; };
+  const findAsset = (assetId, context) => { const asset = registry.assets.find(value => value.id === assetId && value.account === context.account && value.managed === true); if (!asset) throw failure('未找到已登记的夸克视频', 404); if (asset.parent !== registry.folders[context.account]?.fid) throw failure('视频不在当前专用目录，已停止操作', 409); return asset; };
   function searchUrl(value) {
     if (value === SIDECAR && searchRequest !== networkRequest) return value;
     try { const url = validateUrl(value); if (!url.hostname.includes('.') && !url.hostname.includes(':')) throw failure('公开搜索地址必须是公网域名或地址', 400); return url.href; }
@@ -217,7 +219,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   }
   async function settings() {
     const value = await unlock();
-    return { ...Object.fromEntries(Object.keys(defaults).map(field => [field, config[field]])), searchApi: config.searchApi || defaultSearchApi, configured: !!value, account: { connected: !!value, label: value ? '已连接账号' : '未连接' }, managedFiles: registry.assets.filter(asset => asset.account === config.account?.id && asset.status !== 'deleted').length, lastCleanup: registry.lastCleanup, lastError };
+    return { ...Object.fromEntries(Object.keys(defaults).map(field => [field, config[field]])), searchApi: config.searchApi || defaultSearchApi, configured: !!value, account: { connected: !!value, label: value ? '已连接账号' : '未连接' }, managedFiles: registry.assets.filter(asset => asset.account === config.account?.id && asset.parent === registry.folders[config.account?.id]?.fid && asset.status !== 'deleted').length, lastCleanup: registry.lastCleanup, lastError };
   }
   function schedule() {
     clearTimeout(timer); timer = undefined;
@@ -346,13 +348,18 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     return { files: output, truncated, ambiguous: truncated || output.filter(file => file.match).length !== 1 };
   }
   async function ownList(context, parent) {
-    const output = []; let complete = false;
+    const output = [], seen = new Set(); let complete = false, expectedTotal;
     for (let page = 1; page <= 6; page++) {
       const result = await auth(context, '/file/sort', { query: { pdir_fid: parent, _page: String(page), _size: '100', _fetch_total: '1', fetch_all_file: '1', _sort: 'file_type:asc,updated_at:desc' } }); current(context);
       if (!Array.isArray(result.data?.list) || result.data.list.length > 100) throw failure('无法可靠核验夸克文件目录');
+      if (result.data.list.some(row => validFid(row.fid) && seen.has(row.fid))) throw failure('夸克目录分页包含重复记录，已停止操作', 409);
+      for (const row of result.data.list) if (validFid(row.fid)) seen.add(row.fid);
       output.push(...result.data.list);
-      const total = Number(result.metadata?._total);
-      if (result.data.list.length < 100 || Number.isSafeInteger(total) && total >= output.length && total <= page * 100) { complete = true; break; }
+      const rawTotal = result.metadata?._total, total = rawTotal === undefined ? undefined : Number(rawTotal);
+      if (total !== undefined && (!(typeof rawTotal === 'number' || typeof rawTotal === 'string' && /^\d+$/.test(rawTotal)) || !Number.isSafeInteger(total) || total < output.length || expectedTotal !== undefined && total !== expectedTotal || !result.data.list.length && total > output.length)) throw failure('夸克目录分页数量不一致，已停止操作', 409);
+      if (expectedTotal !== undefined && total === undefined) throw failure('夸克目录分页总数缺失，已停止操作', 409);
+      expectedTotal = total;
+      if (total === output.length || total === undefined && result.data.list.length < 100) { complete = true; break; }
     }
     return { list: output, complete };
   }
@@ -360,17 +367,21 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     current(context);
     let folder = registry.folders[context.account];
     if (!folder) folder = { name: 'VipVideo-' + config.installId, createdAt: now() };
+    if (folder.invalidHistory || !validHistory(folder)) throw failure('夸克专用目录历史超过16项或记录无效，已停止操作', 409);
+    const availableFid = fid => !(folder.retired || []).some(entry => entry.fid === fid) && !Object.entries(registry.folders).some(([account, entry]) => account !== context.account && (entry.fid === fid || Array.isArray(entry.retired) && entry.retired.some(old => old.fid === fid)));
     const root = await ownList(context, '0'); current(context);
     const matches = root.list.filter(row => directory(row) && row.file_name === folder.name && (!folder.fid || row.fid === folder.fid) && (!row.pdir_fid || row.pdir_fid === '0'));
-    if (matches.length === 1 && validFid(matches[0].fid) && (folder.fid || folder.mkdirStarted && !Object.entries(registry.folders).some(([account, entry]) => account !== context.account && entry.fid === matches[0].fid))) { folder.fid = matches[0].fid; delete folder.mkdirStarted; persist(); return folder; }
-    if (!folder.fid && !folder.mkdirStarted && root.complete && matches.length === 1 && (matches[0].pdir_fid === '0' || matches[0].pdir_fid === 0) && !registry.assets.some(asset => asset.account === context.account)) {
-      const previous = Object.entries(registry.folders).filter(([account, entry]) => account !== context.account && entry.name === folder.name && validFid(entry.fid) && !entry.mkdirStarted);
-      if (previous.length === 1 && previous[0][1].fid === matches[0].fid) {
+    if (matches.length === 1 && validFid(matches[0].fid) && (folder.fid && !folder.mkdirStarted || folder.mkdirStarted && availableFid(matches[0].fid))) { folder.fid = matches[0].fid; delete folder.mkdirStarted; persist(); return folder; }
+    if (!folder.fid && !folder.mkdirStarted && !(folder.retired?.length) && root.complete && !registry.assets.some(asset => asset.account === context.account)) {
+      const previous = Object.entries(registry.folders).filter(([account, entry]) => account !== context.account && folderName(entry.name) && validFid(entry.fid) && !entry.mkdirStarted);
+      const proved = previous.length === 1 && !previous[0][1].invalidHistory && validHistory(previous[0][1]) && root.list.filter(row => row.fid === previous[0][1].fid && row.file_name === previous[0][1].name && directory(row) && (row.pdir_fid === '0' || row.pdir_fid === 0));
+      if (proved && proved.length === 1 && root.list.filter(row => row.file_name === previous[0][1].name).length === 1) {
         current(context);
         const [account, entry] = previous[0]; folder = { ...entry };
-        for (const asset of registry.assets) if (asset.account === account && asset.parent === folder.fid) {
+        const parents = new Set([folder.fid, ...(folder.retired || []).map(old => old.fid)]);
+        for (const asset of registry.assets) if (asset.account === account && parents.has(asset.parent)) {
           asset.account = context.account;
-          if (asset.deleteIntent?.account === account && asset.deleteIntent.parent === folder.fid && asset.deleteIntent.fid === asset.fid) asset.deleteIntent.account = context.account;
+          if (asset.deleteIntent?.account === account && asset.deleteIntent.parent === asset.parent && asset.deleteIntent.fid === asset.fid) asset.deleteIntent.account = context.account;
         }
         delete registry.folders[account]; registry.folders[context.account] = folder; persist(); return folder;
       }
@@ -380,21 +391,39 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         : matches.length > 1 ? '目录记录冲突，已停止操作'
           : folder.fid ? '已登记目录未找到或已改名、移动，请在夸克恢复原目录后重试'
             : matches.length ? '存在同名但未登记的目录，已停止操作' : '目录登记不完整，已停止操作';
-      throw failure('无法确认本应用专用夸克目录：' + reason, 409);
+      const cause = failure('无法确认本应用专用夸克目录：' + reason, 409);
+      if (root.complete && folder.fid && !folder.mkdirStarted && !root.list.some(row => row.fid === folder.fid || row.file_name === folder.name)) { cause.code = 'QUARK_FOLDER_MISSING'; cause.message = '已登记目录未找到，可恢复专用目录后重试'; }
+      throw cause;
     }
     if (!registry.folders[context.account]) { registry.folders[context.account] = folder; persist(); }
     if (!folder.mkdirStarted) {
       const created = await auth(context, '/file', { method: 'POST', body: { pdir_fid: '0', file_name: folder.name, dir_path: '', dir_init_lock: false }, beforeSend: () => { current(context); folder.mkdirStarted = true; persist(); } }); current(context);
-      if (created.data?.fid !== undefined) { if (!validFid(created.data.fid)) throw failure('无法核验夸克创建目录的响应', 409); folder.fid = created.data.fid; persist(); }
+      if (created.data?.fid !== undefined) { if (!validFid(created.data.fid) || !availableFid(created.data.fid)) throw failure('无法核验夸克创建目录的响应，目录标识与历史记录冲突', 409); folder.fid = created.data.fid; persist(); }
     }
     // Quark can acknowledge mkdir before its directory listing is updated; retry reads, never creation.
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt) await new Promise(resolve => setTimeout(resolve, attempt * 500)); current(context);
       const confirmed = await ownList(context, '0'), rows = confirmed.list.filter(row => directory(row) && row.file_name === folder.name && (!folder.fid || row.fid === folder.fid) && (!row.pdir_fid || row.pdir_fid === '0'));
-      if (rows.length === 1 && validFid(rows[0].fid)) { folder.fid = rows[0].fid; delete folder.mkdirStarted; persist(); return folder; }
+      if (rows.length === 1 && validFid(rows[0].fid) && availableFid(rows[0].fid)) { folder.fid = rows[0].fid; delete folder.mkdirStarted; persist(); return folder; }
       if (rows.length) throw failure('无法确认本应用专用夸克目录：创建后的目录记录冲突，已停止操作', 409);
     }
     throw failure('夸克专用目录暂未可见，请稍后重试', 409);
+  }
+  async function repairFolder(options = {}) {
+    return serialize(async () => {
+      const context = await snapshot(); context.valid = typeof options?.valid === 'function' ? options.valid : undefined; current(context);
+      const folder = registry.folders[context.account];
+      if (folder?.fid && !folder.mkdirStarted) {
+        try { await ownedFolder(context); }
+        catch (cause) {
+          current(context); if (cause.code !== 'QUARK_FOLDER_MISSING') throw cause;
+          if ((folder.retired || []).length >= 16) throw failure('专用目录恢复历史已达16项，请先人工核验，已停止操作', 409);
+          registry.folders[context.account] = { name: 'VipVideo-' + config.installId + '-' + id(), createdAt: now(), retired: [...(folder.retired || []), { name: folder.name, fid: folder.fid, createdAt: folder.createdAt, retiredAt: now() }] };
+          persist(); await ownedFolder(context, true);
+        }
+      } else await ownedFolder(context, true);
+      current(context); lastError = ''; return settings();
+    });
   }
   async function ownedFile(context, asset) {
     const folder = await ownedFolder(context); if (folder.fid !== asset.parent) throw failure('视频不在本应用专用目录，已停止操作', 409);
@@ -433,14 +462,14 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         if (!validFid(file.fid) || typeof file.token !== 'string' || !file.token || file.token.length > 4096 || !Number.isSafeInteger(file.size) || file.size <= 0 || file.size > 100 * GIB) throw failure('视频大小或分享凭证无法核验，已停止转存', 400);
         const resource = shares.get(file.share); if (!resource || resource.detail !== info.key || resource.expires <= now()) throw failure('分享资源已过期，请重新搜索', 404);
         if (registry.assets.length >= 1000 && !registry.folders[context.account]?.fid) await ownedFolder(context);
-        const source = hash(resource.pwdId + ':' + file.fid), existing = registry.assets.find(asset => asset.account === context.account && asset.source === source && asset.status !== 'deleted');
+        const source = hash(resource.pwdId + ':' + file.fid), existing = registry.assets.find(asset => asset.account === context.account && asset.parent === registry.folders[context.account]?.fid && asset.source === source && asset.status !== 'deleted');
         if (existing) { if (detail.category === 'adult' || !existing.category) { existing.category = name(detail.category).slice(0, 32); persist(); } if (existing.status === 'ready') { await ownedFile(context, existing); return publicAsset(existing, true); } return resume(context, existing); }
         const day = new Date(now()).toISOString().slice(0, 10), retained = registry.assets.filter(asset => asset.status !== 'deleted' || asset.day === day);
         if (retained.length !== registry.assets.length) { registry.assets = retained; persist(); }
         const today = registry.assets.filter(asset => asset.account === context.account && asset.day === day && asset.status !== 'queued');
         if (today.length >= config.maxDailyTransfers || today.reduce((sum, asset) => sum + asset.size, 0) + file.size > config.maxDailyBytes || registry.assets.length >= 1000) throw failure('已达到本应用每日转存数量或容量上限', 429);
         const folder = await ownedFolder(context, true); current(context);
-        const reconnected = registry.assets.find(asset => asset.account === context.account && asset.source === source && asset.status !== 'deleted');
+        const reconnected = registry.assets.find(asset => asset.account === context.account && asset.parent === folder.fid && asset.source === source && asset.status !== 'deleted');
         if (reconnected) { if (detail.category === 'adult' || !reconnected.category) { reconnected.category = name(detail.category).slice(0, 32); persist(); } if (reconnected.status === 'ready') { await ownedFile(context, reconnected); return publicAsset(reconnected, true); } return resume(context, reconnected); }
         const reconnectedToday = registry.assets.filter(asset => asset.account === context.account && asset.day === day && asset.status !== 'queued');
         if (reconnectedToday.length >= config.maxDailyTransfers || reconnectedToday.reduce((sum, asset) => sum + asset.size, 0) + file.size > config.maxDailyBytes || registry.assets.length >= 1000) throw failure('已达到本应用每日转存数量或容量上限', 429);
@@ -450,7 +479,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         const result = await auth(context, '/share/sharepage/save', { method: 'POST', body: { fid_list: [file.fid], fid_token_list: [file.token], to_pdir_fid: folder.fid, pwd_id: resource.pwdId, stoken: file.stoken, pdir_fid: file.parent, scene: 'link' }, beforeSend: () => { current(context); asset.status = 'saving'; persist(); } });
         if (validFid(result.data?.task_id)) { asset.task = result.data.task_id; persist(); }
         current(context); return resume(context, asset);
-      } catch (cause) { if (queuedAsset?.status === 'queued') { registry.assets = registry.assets.filter(asset => asset !== queuedAsset); persist(); } return { status: 'error', saved: false, reason: error(cause) }; }
+      } catch (cause) { if (queuedAsset?.status === 'queued') { registry.assets = registry.assets.filter(asset => asset !== queuedAsset); persist(); } return { status: 'error', saved: false, reason: error(cause), ...(cause.code === 'QUARK_FOLDER_MISSING' ? { code: 'QUARK_FOLDER_MISSING' } : {}) }; }
     }).finally(() => prepareFlights.delete(key));
     prepareFlights.set(key, job); return job;
   }
@@ -503,8 +532,8 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       if (!config.cleanupEnabled || !config.enabled || !config.account) return result;
       try {
         const context = await snapshot();
-        if (await verify(context.cookie) !== context.account) throw failure('夸克账号身份变化，已停止清理', 409); current(context); await ownedFolder(context);
-        const eligible = registry.assets.filter(asset => asset.account === context.account && asset.managed && asset.watchedAt > 0 && now() - Math.max(asset.watchedAt, asset.lastActivity || 0) >= config.retentionDays * DAY && !(asset.leaseUntil > now()) && ['ready', 'recycling', 'purging'].includes(asset.status)).slice(0, 5);
+        if (await verify(context.cookie) !== context.account) throw failure('夸克账号身份变化，已停止清理', 409); current(context); const folder = await ownedFolder(context);
+        const eligible = registry.assets.filter(asset => asset.account === context.account && asset.parent === folder.fid && asset.managed && asset.watchedAt > 0 && now() - Math.max(asset.watchedAt, asset.lastActivity || 0) >= config.retentionDays * DAY && !(asset.leaseUntil > now()) && ['ready', 'recycling', 'purging'].includes(asset.status)).slice(0, 5);
         for (const asset of eligible) {
           result.checked++;
           try {
@@ -550,5 +579,5 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     stopPromise = (async () => { await Promise.allSettled([...jobs]); await tail; })();
     return stopPromise;
   };
-  return { settings: track(settings), configure: track(configure), clearAccount: track(clearAccount), resources: track(resources), files: track(files), prepare: track(prepare), playback: track(playback), progress: track(progress), cleanup: track(cleanup), start, stop };
+  return { settings: track(settings), configure: track(configure), clearAccount: track(clearAccount), resources: track(resources), files: track(files), prepare: track(prepare), playback: track(playback), progress: track(progress), repairFolder: track(repairFolder), cleanup: track(cleanup), start, stop };
 }

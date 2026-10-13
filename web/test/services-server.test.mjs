@@ -90,6 +90,32 @@ test('all new write routes reject cross-site requests and allow same-origin main
   assert.equal(calls, 1);
 });
 
+test('Quark folder recovery requires login, same origin and an empty body, then invalidates existing media leases', async t => {
+  let repairs = 0, invalidations = 0, retainedValid;
+  const settings = { configured: true, enabled: true, managedFiles: 2 };
+  const poolStatus = { healthy: 1 };
+  const instance = await running(t, {
+    quark: { async repairFolder({ valid }) { assert.equal(valid(), true); retainedValid = valid; repairs++; return settings; } },
+    quarkMedia: { invalidate() { invalidations++; } },
+    quarkSearchPool: { status: () => poolStatus },
+  });
+  const path = '/api/quark/folder/repair';
+  assert.equal((await instance.call(path, {})).status, 401);
+  const cookie = await instance.login();
+  for (const headers of [{ Origin: 'https://other.example' }, { 'Sec-Fetch-Site': 'cross-site' }]) {
+    assert.equal((await instance.call(path, {}, cookie, 'POST', headers)).status, 403);
+  }
+  for (const body of [{ fid: 'untrusted-folder' }, null, [], '']) {
+    assert.equal((await instance.call(path, body, cookie)).status, 400);
+  }
+  assert.equal(repairs, 0); assert.equal(invalidations, 0);
+  const response = await instance.call(path, {}, cookie, 'POST', { Origin: instance.base });
+  assert.equal(response.status, 200); assert.deepEqual(await response.json(), { ...settings, searchPool: poolStatus });
+  assert.equal(repairs, 1); assert.equal(invalidations, 1);
+  assert.equal((await instance.call('/api/auth/logout', {}, cookie)).status, 200);
+  assert.throws(() => retainedValid(), error => error.status === 401, '后台恢复操作必须持续核验家庭会话');
+});
+
 test('compatibility playback status, trusted selection, assets and stop use the authenticated service contract', async t => {
   const calls=[];
   const initialConfig={...configured,sources:[{id:'demo',name:'可信源',api:'https://api.example/vod',enabled:true}]};
