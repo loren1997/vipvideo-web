@@ -12,6 +12,8 @@
 
 ## 可选搜索助手
 
+使用 [docker-compose.nas.yml 一体化部署](README-WEB.md#intel-核显-nas-单文件部署) 时，PanSou 搜索助手及其资源限制已经包含在同一文件中。只使用该文件启动和更新，然后在播放器设置页填写夸克 Cookie。
+
 在现有 `docker-compose.yml` 所在目录下载附加文件：
 
 ```sh

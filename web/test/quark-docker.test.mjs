@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as wait } from 'node:timers/promises';
 
@@ -62,6 +65,20 @@ test('optional Quark search companion preserves Compose settings and becomes hea
   assert.equal(combined.services.web.pids_limit, 128);
   assert.equal(combined.services.web.blkio_config.weight, 100);
   assert.deepEqual(combined.services.web.tmpfs, ['/tmp:size=128m,mode=1777']);
+  const nasYaml = readFileSync(join(root, 'docker-compose.nas.yml'), 'utf8');
+  assert.doesNotMatch(nasYaml, /\$\{/);
+  assert.equal(nasYaml.match(/填写_RENDER_GID/g)?.length, 1);
+  const nasFile = join(tmpdir(), `${name}-nas.yml`);
+  writeFileSync(nasFile, nasYaml.replace('填写_RENDER_GID', '109'), { flag: 'wx' });
+  try {
+    const nas = JSON.parse(execFileSync('docker', ['compose', '--project-directory', root, '-f', nasFile, 'config', '--format', 'json'], {
+      cwd: root, windowsHide: true, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
+    }));
+    assert.equal(nas.name, 'vipvideo-web');
+    assert.deepEqual(nas, combined, 'Single-file NAS settings must preserve the complete four-file configuration');
+  } finally {
+    unlinkSync(nasFile);
+  }
   try {
     compose(['up', '-d', 'pansou']);
     let healthy = false;

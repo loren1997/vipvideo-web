@@ -39,6 +39,23 @@ docker compose -f docker-compose.yml logs --tail=100 web
 
 浏览器访问 `http://NAS的局域网IP:3000`，输入密码后即可浏览内置源的电影、电视剧和动漫，也可在设置页管理或导入其他影视源。需要 Docker Engine 和 Docker Compose v2；建议至少 1 GB 内存。镜像包含 FFmpeg，兼容播放和媒体转发会使用部署主机的带宽，软件转码还会使用 CPU。容器健康检查由镜像提供，使用非 root 用户运行，数据保存在命名卷中。
 
+### Intel 核显 NAS 单文件部署
+
+PVE → Ubuntu Docker、i3-8100T 等 Intel 核显主机推荐使用 [docker-compose.nas.yml](docker-compose.nas.yml)。这个文件已经合并播放器、Intel VAAPI、PanSou 夸克搜索和 Plex 资源保护；启动、升级都只使用这一个 YAML 文件，不需要 `.env`。
+
+1. 在原 Compose 项目目录下载文件，填入原部署的 `APP_PASSWORD`，至少 16 位。
+2. 在 Ubuntu 执行 `stat -c '%g' /dev/dri/renderD128`，把 `group_add` 中的 `填写_RENDER_GID` 替换为输出数字，保留引号。已有正确核显组号可直接填入。
+3. 将原有自定义端口、`COOKIE_SECURE` 和数据挂载填入新文件。默认项目名和 `vipvideo_data` 卷名与原部署一致；原来使用 `-p` 指定项目名时，继续使用同一参数，避免创建另一个数据卷。
+
+```sh
+curl -fL -o docker-compose.nas.yml https://raw.githubusercontent.com/loren1997/vipvideo-web/main/docker-compose.nas.yml
+# 填写上述密码、核显组号及原有自定义配置后运行：
+docker compose -f docker-compose.nas.yml up -d --pull always
+docker compose -f docker-compose.nas.yml ps
+```
+
+以后更新只需再次执行同一条 `up -d --pull always` 命令。停机备份和恢复也使用 `-f docker-compose.nas.yml`；沿用原项目名及数据挂载，夸克 Cookie、配置、收藏和进度继续使用原数据卷。此配置需要 Ubuntu 已有可访问的 `/dev/dri/renderD128`；硬件不可用时兼容转码会提示失败，保护配置禁止回退到 CPU 软件编码。
+
 ## 从源码本地构建
 
 已有源码时使用单独的 [compose.yaml](compose.yaml)，明确指定 `-f compose.yaml`，与 NAS 镜像部署文件区分：
@@ -119,6 +136,8 @@ docker compose -f docker-compose.yml -f compose.gpu.yaml exec -T web \
 跳转或修改倍速会重新建立兼容流。FFmpeg 的 `readrate` 只控制输入读取节奏，输出时间戳保持原速度，由浏览器完成倍速播放；直播兼容播放固定为 1 倍且不提供跳转。临时 HLS 只保留约一分钟的滑动窗口，长时间暂停后恢复或跳到窗口外需重新建立任务。第三方解析网页、DRM 内容和无法读取的源不支持兼容转码。
 
 ### 与 Plex 共用 NAS 时
+
+Intel 核显 NAS 推荐直接使用上面的 [单文件部署](#intel-核显-nas-单文件部署)，其中已包含本节的核显、夸克搜索和资源保护配置。
 
 启用 [compose.plex-safe.yaml](compose.plex-safe.yaml)：本应用限制为 1 核 CPU、768 MiB 内存、128 个进程，禁用 swap，降低 CPU / 磁盘竞争权重；转码分片放在 128 MiB 内存临时目录。软件编码与 CPU 回退关闭，硬件不可用时提示失败；直连和普通媒体转发仍可使用。可选 PanSou 配置降低至 0.25 核、单后台 worker、384 MiB 内存。
 
