@@ -141,7 +141,7 @@ try {
   const errors = [];
   const network = [];
   const media = silentMedia();
-  async function context(viewport, nativeMedia = true, realServices = false) {
+  async function context(viewport, nativeMedia = true, realServices = false, initialHash = '') {
     const value = await browser.newContext({ viewport });
     const contextId = ++nextContextId;
     await value.route('**/*', async route => {
@@ -251,7 +251,7 @@ try {
         liveRequests.push(url);
         if (liveProgress) liveProgress.reads++;
         const available = (app.store.config().liveSources || []).some(item => item.enabled !== false) ? channels : [];
-        return route.fulfill({ json: { channels: parsed.searchParams.get('verified') === '1' ? available.filter(channel => channel.streams.some(stream => stream.status === 'ok')) : available, failedSources: liveFailures, probing: liveProgress?.probing || false, checkedStreams: liveProgress ? liveProgress.probing ? 2 : 5 : 5, totalStreams: 6, lastProbe: Date.now() } });
+        return route.fulfill({ json: { channels: parsed.searchParams.get('verified') === '1' ? available.filter(channel => channel.streams.some(stream => stream.status === 'ok')) : available, failedSources: liveFailures, probing: liveProgress?.probing || false, checkedStreams: liveProgress?.checkedStreams ?? (liveProgress?.probing ? 2 : 5), totalStreams: liveProgress?.totalStreams ?? 6, lastProbe: Date.now() } });
       }
       if (parsed.origin === base && parsed.pathname === '/api/live/playback') {
         liveRequests.push(url);
@@ -272,7 +272,7 @@ try {
     const page = await value.newPage();
     page.setDefaultTimeout(10000);
     page.on('pageerror', error => errors.push(error.message));
-    await page.goto(base);
+    await page.goto(base + initialHash);
     // WAV只验证原生媒体事件，不冒充可被Hls.js解码的MPEG-TS。
     if (nativeMedia) await page.evaluate(() => { window.Hls = { isSupported: () => false, Events: { ERROR: 'hlsError', MANIFEST_PARSED: 'hlsManifestParsed' } }; });
     await page.locator('#password').fill('browser-test-password');
@@ -1032,9 +1032,13 @@ try {
   await liveCard.locator('.channel-fallback').getByText('测试电视一', { exact: true }).waitFor();
   assert.equal(await page.getByRole('button', { name: '播放频道 未验证电视样例', exact: true }).count(), 0);
   await page.locator('.resource-progress').filter({ hasText: '后台正在探测' }).waitFor();
+  await page.getByLabel('频道分组', { exact: true }).selectOption('测试频道');
+  await page.getByLabel('频道分组', { exact: true }).evaluate(element => { window.__liveGroupOptions = [...element.options]; });
   await liveCard.evaluate(element => { window.__liveCard = element; });
   await page.clock.fastForward(1000); await until(() => liveProgress.reads >= 2, '直播后台探测进度刷新');
   assert.equal(await liveCard.evaluate(element => element === window.__liveCard), true, '进度更新保留卡片DOM和图片');
+  assert.equal(await page.getByLabel('频道分组', { exact: true }).evaluate(element => [...element.options].every((option, index) => option === window.__liveGroupOptions[index])), true, '轮询保留正在使用的分组选项节点');
+  assert.equal(await page.getByLabel('频道分组', { exact: true }).inputValue(), '测试频道');
   assert.equal(apiReads.filter(item => item.contextId === 1 && item.path === '/api/live/probe').length, liveProbeBeforeCards, '进入直播无需等待整批探测');
   await liveCard.locator('.channel-cover').click(); await until(() => page.locator('video').evaluate(video => video.readyState >= 2 && video.currentSrc.includes('live-second')).catch(() => false), '海报点击直接自动播放');
   assert.equal(new URL(liveRequests.filter(url => url.includes('/api/live/playback')).at(-1)).searchParams.get('line'), '1');
@@ -1045,10 +1049,50 @@ try {
   await liveCard.locator('.channel-cover').click(); await until(() => page.locator('.player-note').textContent().then(text => text.includes('浏览器需要你点击')), '直播自动播放被拦截时给播放键提示');
   assert.equal(liveRequests.filter(url => url.includes('/api/live/playback')).length, policyLiveStart + 1, '浏览器政策不误换直播源');
   await page.evaluate(() => { HTMLMediaElement.prototype.play = window.__originalLivePlay; });
-  liveProgress.probing = false; await page.clock.fastForward(1000); await until(() => page.locator('.resource-progress').count().then(count => count === 0), '直播渐进探测完成');
+  liveProgress.probing = false; liveProgress.checkedStreams = 6; liveProgress.totalStreams = 6;
+  channels[0].streams[3].status = 'error'; channels[2].streams[0].status = 'error';
+  await page.clock.fastForward(1000); await until(() => page.locator('.resource-progress').count().then(count => count === 0), '直播渐进探测完成');
   const stoppedLiveReads = liveProgress.reads; await page.locator('nav a[href="#home"]').click(); await page.clock.fastForward(3000); assert.equal(liveProgress.reads, stoppedLiveReads, '离开直播停止进度轮询');
+  const directLive = await context({ width: 1440, height: 1000 }, true, false, '#live');
+  await directLive.page.getByRole('button', { name: '播放频道 测试电视一', exact: true }).waitFor();
+  await until(() => directLive.page.locator('#login-form button').isEnabled(), '直播深链接启动巡检不挂住登录boot');
+  await directLive.value.close();
+  const lateChannel = { id: 'test-tv-late', name: '晚到电视样例', group: '测试频道', streams: [{ name: '晚到已验证线路', type: 'mp4', status: 'unknown', url: 'https://fixtures.example/live-late.mp4?token=fixture' }] };
+  channels.push(lateChannel); liveProgress = { reads: 0, probing: false, checkedStreams: 6, totalStreams: 7 };
+  await page.getByRole('button', { name: '电视直播', exact: true }).click();
+  await page.locator('.resource-progress').filter({ hasText: '已检查 6/7' }).waitFor();
+  assert.equal(await page.getByRole('button', { name: '播放频道 晚到电视样例', exact: true }).count(), 0, '批次间隙仍不显示未知频道');
+  await liveCard.evaluate(element => { window.__gapCard = element; });
+  await page.getByLabel('频道分组', { exact: true }).selectOption('测试频道'); await page.getByLabel('频道分组', { exact: true }).evaluate(element => { window.__gapGroupOptions = [...element.options]; });
+  await liveCard.locator('.channel-cover').click(); await until(() => page.locator('video').evaluate(video => video.readyState >= 2 && video.currentSrc.includes('live-second')).catch(() => false), '批次间隙已验证频道仍可播放');
+  await page.locator('video').evaluate(video => video.pause());
+  lateChannel.streams[0].status = 'ok'; await page.clock.fastForward(1000);
+  await page.getByRole('button', { name: '播放频道 晚到电视样例', exact: true }).waitFor();
+  assert.equal(await liveCard.evaluate(element => element === window.__gapCard), true, '晚来频道追加时保留既有卡片和台标DOM');
+  assert.equal(await page.getByLabel('频道分组', { exact: true }).evaluate(element => [...element.options].every((option, index) => option === window.__gapGroupOptions[index])), true, '同组晚来频道不重建分类菜单选项');
+  assert.equal(await page.getByLabel('频道分组', { exact: true }).inputValue(), '测试频道');
+  const ongoingSource = await page.locator('video').evaluate(video => video.currentSrc);
+  channels[0].streams[1].status = 'error'; await page.clock.fastForward(1000);
+  await until(() => page.locator('#live-lines button[data-line="1"]').count().then(count => count === 0), '后台失败移除原URL对应线路选项');
+  assert.equal(await page.locator('video').evaluate(video => video.currentSrc), ongoingSource, '后台探测不停止正在播放的原流');
+  assert.equal(await page.locator('#live-lines button[data-line="2"]').count(), 1, '其余同URL可用线路保留原数组编号');
+  const reportsBeforeUrlChange = liveReports.length;
+  channels[0].streams[1].url = 'https://fixtures.example/live-replaced.mp4?token=fixture'; channels[0].streams[1].status = 'ok';
+  await page.clock.fastForward(1000); await until(() => liveProgress.reads >= 4, '后台URL变更列表同步');
+  assert.equal(await page.locator('video').evaluate(video => video.currentSrc), ongoingSource, '新数组URL不能接管正在播放的原流');
+  assert.equal(await page.locator('#live-lines button[data-line="1"]').count(), 0, '同编号不同URL不恢复旧线路按钮');
+  await page.locator('video').evaluate(video => { Object.defineProperty(video, 'error', { value: { code: 4, message: '固定解码故障' }, configurable: true }); video.dispatchEvent(new Event('error')); delete video.error; });
+  await until(() => page.locator('video').evaluate(video => video.readyState >= 2 && video.currentSrc.includes('live-third')).catch(() => false), '实际媒体失败仍使用原编号的可用备用');
+  assert.equal(liveReports.slice(reportsBeforeUrlChange).some(report => report.id === 'test-tv-one' && report.line === 1 && report.status === 'error'), false, '原流错误不能报告新数组中另一个URL');
+  await page.locator('video').evaluate(video => video.pause());
+  liveProgress.checkedStreams = 7; await page.clock.fastForward(3000); await until(() => page.locator('.resource-progress').count().then(count => count === 0), '全部检查完成进入低频同步');
+  const idleLiveReads = liveProgress.reads; await page.clock.fastForward(20000); assert.equal(liveProgress.reads, idleLiveReads, '完成状态不持续高频请求');
+  await page.clock.fastForward(10000); await until(() => liveProgress.reads > idleLiveReads, '完成后30秒仍同步源新增或状态变化');
+  const beforeIdleLeave = liveProgress.reads; await page.locator('nav a[href="#home"]').click(); await page.clock.fastForward(30000); assert.equal(liveProgress.reads, beforeIdleLeave, '离开直播取消30秒巡检');
+  channels[0].streams[1].url = 'https://fixtures.example/live-second.mp4?token=fixture'; channels[0].streams[1].status = 'ok';
+  channels.splice(channels.indexOf(lateChannel), 1);
   liveProgress = null;
-  console.log('PASS 直播海报卡片分组与logo姓名回退、仅ok频道、缓存GET即时展示/后台进度、保留卡片DOM、点击播放/政策提示、手机布局和离页取消');
+  console.log('PASS 直播海报/批间gap晚来频道、仅ok选项、保持既有卡片与原流URL/编号、后台失败同步、1秒/3秒/30秒巡检、播放政策与离页取消');
 
   await page.locator('nav a[href="#settings"]').click();
   const parsers = page.locator('.settings-section').filter({ has: page.getByRole('heading', { name: '解析线路', exact: true }) });

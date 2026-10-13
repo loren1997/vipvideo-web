@@ -383,6 +383,16 @@ test('a pending old probe cannot replace a newer real playback failure report', 
   } finally { release?.(); await live.stop(); }
 });
 
+test('an entirely fresh probe batch makes no upstream requests or database writes and retains lastProbe', async () => {
+  const config = { liveSources: [source] }, state = cacheStore(config); let time = 1000, lists = 0, checked = 0;
+  const live = createLive({ store: state.store, now: () => time, request: async () => { lists++; return response(playlist(2)); }, playability: { async check() { checked++; return { playable: true, checkedAt: time }; } } });
+  try {
+    await live.probe(config); const writes = state.writes.length, lastProbe = JSON.parse(state.metadata.get('live-health')).lastProbe;
+    time += 1000; await live.probe(config);
+    assert.equal(lists, 1); assert.equal(checked, 2); assert.equal(state.writes.length, writes); assert.equal(JSON.parse(state.metadata.get('live-health')).lastProbe, lastProbe);
+  } finally { await live.stop(); }
+});
+
 test('playlist refresh and stream probes share the same two live work slots', async () => {
   const second = { ...source, id: 'two', url: 'https://tv.example/two/list.m3u' }, config = { liveSources: [source, second] }, state = cacheStore(config);
   let time = 1000, delayed = false, active = 0, maximum = 0, checked = 0; const releases = [];

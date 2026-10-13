@@ -147,6 +147,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, env = process.env, 
         if (Buffer.byteLength(body) > 128 * 1024 || !body.startsWith('#EXTM3U') || segments.some(file => !/^segment\d{6,12}\.ts$/.test(file))) throw failure('兼容播放输出清单无效');
         if (segments.length && (await stat(join(task.dir, segments[0]))).size > 0) { task.produced = true; return; }
       } catch (error) { if (!['ENOENT'].includes(error.code)) throw error; }
+      assertValid(task);
       if (task.attempt.done) throw failure('FFmpeg 未能启动兼容编码，请检查输入格式或硬件权限');
       await wait(Math.min(pollInterval, Math.max(1, deadline - now())));
     }

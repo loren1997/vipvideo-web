@@ -283,6 +283,7 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
           const url = urls[(health.cursor + walked++) % urls.length], record = health.streams[url];
           if (!record || record.checkedAt > now() || now() - record.checkedAt >= (record.status === 'ok' ? 30 * 60_000 : 10 * 60_000)) sample.push(url);
         }
+        if (!sample.length) return service.status(config);
         let next = 0;
         await Promise.all(Array.from({ length: Math.min(2, sample.length) }, async () => {
           while (unchanged() && next < sample.length) {

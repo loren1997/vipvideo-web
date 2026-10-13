@@ -922,10 +922,14 @@ async function renderLive(params, stamp) {
     renderedCards = signature;
     const focused = document.activeElement?.closest('.channel-card')?.dataset.channel;
     const scrollTop = list.scrollTop;
-    list.replaceChildren();
+    const existing = new Map([...list.querySelectorAll('.channel-card')].map(item => [item.dataset.channel, item]));
+    const ordered = [];
     for (const channel of visible) {
       const selectedChannel = player?.live && player.channel.id === channel.id;
-      const item = button('', () => { const latest = channels.find(value => value.id === channel.id); if (latest) void startLiveChannel(latest, preferredLiveLine(latest), stamp); }, `channel-card channel-button${selectedChannel ? ' selected' : ''}`); item.dataset.channel = channel.id;
+      const appearance = JSON.stringify([channel.name, channel.group, channel.logo]);
+      let item = existing.get(channel.id);
+      if (!item || item.dataset.appearance !== appearance) {
+      item = button('', () => { const latest = channels.find(value => value.id === channel.id); if (latest) void startLiveChannel(latest, preferredLiveLine(latest), stamp); }, 'channel-card channel-button'); item.dataset.channel = channel.id; item.dataset.appearance = appearance;
       const cover = node('span', undefined, 'channel-cover');
       const fallback = node('span', undefined, 'channel-fallback'); fallback.append(node('small', 'TV'), node('span', channel.name)); cover.append(fallback);
       const logo = httpUrl(channel.logo);
@@ -935,8 +939,12 @@ async function renderLive(params, stamp) {
       }
       cover.append(node('span', '可播放', 'channel-badge'));
       const caption = node('span', undefined, 'channel-caption'); caption.append(node('strong', channel.name), node('small', channel.group || '电视直播')); item.append(cover, caption);
-      item.setAttribute('aria-label', `播放频道 ${channel.name}`); item.setAttribute('aria-pressed', String(player?.live && player.channel.id === channel.id)); list.append(item);
+      item.setAttribute('aria-label', `播放频道 ${channel.name}`);
+      }
+      item.classList.toggle('selected', Boolean(selectedChannel)); item.setAttribute('aria-pressed', String(Boolean(selectedChannel))); ordered.push(item);
     }
+    ordered.forEach((item, index) => { if (list.children[index] !== item) list.insertBefore(item, list.children[index] || null); });
+    const retained = new Set(ordered); for (const item of [...list.children]) if (!retained.has(item)) item.remove();
     if (!list.childElementCount) list.append(node('p', '没有可用频道。', 'muted'));
     list.scrollTop = scrollTop;
     if (focused) [...list.querySelectorAll('.channel-card')].find(item => item.dataset.channel === focused)?.focus({ preventScroll: true });
@@ -947,13 +955,28 @@ async function renderLive(params, stamp) {
     try {
       const draw = result => {
       channels = (result.channels || []).filter(channel => channel.streams?.some(stream => stream.status === 'ok')); feedback.replaceChildren();
+      const active = player?.live ? player : null, updated = active && channels.find(channel => channel.id === active.channel.id);
+      if (updated) {
+        active.staleLiveLines ||= new Set();
+        active.channel.streams.forEach((stream, index) => {
+          const same = updated.streams[index]?.url === stream.url;
+          if (same) { stream.status = updated.streams[index].status; active.staleLiveLines.delete(index); }
+          else active.staleLiveLines.add(index);
+          if (!same || stream.status !== 'ok') $(`#live-lines button[data-line="${index}"]`)?.remove();
+        });
+      }
       const failures = failuresList(result.failedSources, '直播源');
       if (failures) { failures.open = result.failedSources.some(source => source.stale); feedback.append(failures); }
-      if (result.probing) feedback.append(node('p', `${channels.length ? `已显示 ${channels.length} 个可播放频道 · ` : ''}后台正在探测${Number.isFinite(result.totalStreams) ? ` · 已检查 ${result.checkedStreams || 0}/${result.totalStreams} 条线路` : ''}…`, 'resource-progress muted'));
-      if (!channels.length && !result.probing) feedback.append(empty('暂无已验证可播放频道', '可继续刷新，探测下一批线路；也可以在资源设置中添加 M3U 直播源。', button('添加直播源', () => goto('settings'), 'button primary')));
-      const selected = group.value; group.replaceChildren(); const all = node('option', '全部频道'); all.value = ''; group.append(all);
-      for (const name of [...new Set(channels.map(channel => channel.group).filter(Boolean))]) { const option = node('option', name); option.value = name; group.append(option); }
-      group.value = [...group.options].some(option => option.value === selected) ? selected : ''; drawChannels();
+      const pending = Number.isFinite(result.checkedStreams) && Number.isFinite(result.totalStreams) && result.checkedStreams < result.totalStreams;
+      if (result.probing || pending) feedback.append(node('p', `${channels.length ? `已显示 ${channels.length} 个可播放频道 · ` : ''}${result.probing ? '后台正在探测' : '等待下一批探测'}${Number.isFinite(result.totalStreams) ? ` · 已检查 ${result.checkedStreams || 0}/${result.totalStreams} 条线路` : ''}…`, 'resource-progress muted'));
+      if (!channels.length && !result.probing && !pending) feedback.append(empty('暂无已验证可播放频道', '可继续刷新，探测下一批线路；也可以在资源设置中添加 M3U 直播源。', button('添加直播源', () => goto('settings'), 'button primary')));
+      const names = new Set(channels.map(channel => channel.group).filter(Boolean));
+      if (group.options.length !== names.size + 1 || [...group.options].slice(1).some(option => !names.has(option.value))) {
+        const selected = group.value; group.replaceChildren(); const all = node('option', '全部频道'); all.value = ''; group.append(all);
+        for (const name of names) { const option = node('option', name); option.value = name; group.append(option); }
+        group.value = [...group.options].some(option => option.value === selected) ? selected : '';
+      }
+      drawChannels();
       if (!restoredChannel && !force && params.get('id')) {
         const channel = channels.find(item => item.id === params.get('id'));
         if (channel) { const savedLine = Number(params.get('line')); restoredChannel = true; void startLiveChannel(channel, params.has('line') && channel.streams[savedLine]?.status === 'ok' ? savedLine : preferredLiveLine(channel), stamp); }
@@ -965,15 +988,18 @@ async function renderLive(params, stamp) {
       let updates = 0;
       while (valid(request)) {
         liveSnapshot = { sources: sourcesAtEntry, at: Date.now(), data: result }; draw(result); refresh.disabled = false;
-        if (!result.probing) break;
-        await new Promise(resolve => setTimeout(resolve, ++updates <= 3 ? 1000 : 3000));
+        const pending = Number.isFinite(result.checkedStreams) && Number.isFinite(result.totalStreams) && result.checkedStreams < result.totalStreams;
+        let delay = 30000;
+        if (result.probing || pending) delay = ++updates <= 3 ? 1000 : 3000;
+        else updates = 0;
+        await new Promise(resolve => setTimeout(resolve, delay));
         if (!valid(request)) return;
         result = await api('/api/live?verified=1');
       }
     } catch (error) { if (stamp === routeVersion && request === loadingVersion) feedback.replaceChildren(empty('频道暂时不可用', error.message, button('重试', () => void loadChannels()))); }
     finally { if (stamp === routeVersion && request === loadingVersion) refresh.disabled = false; }
   }
-  await loadChannels();
+  void loadChannels();
 }
 
 function preferredLiveLine(channel, tried = new Set()) {
@@ -981,7 +1007,7 @@ function preferredLiveLine(channel, tried = new Set()) {
 }
 
 function reportLive(current, status) {
-  if (player !== current || current.transcoded || current.liveReported === status) return;
+  if (player !== current || current.transcoded || current.staleLiveLines?.has(current.line) || current.liveReported === status) return;
   current.liveReported = status;
   current.channel.streams[current.line].status = status;
   if (status === 'error') {
@@ -1030,7 +1056,7 @@ async function recoverLive(current) {
     loadMedia(current, '直连失败，正在尝试兼容转发…'); return;
   }
   reportLive(current, 'error');
-  const next = preferredLiveLine(current.channel, current.flow.tried);
+  const next = preferredLiveLine(current.channel, new Set([...current.flow.tried, ...(current.staleLiveLines || [])]));
   if (current.flow.tried.size < 3 && next >= 0) { await startLiveChannel(current.channel, next, current.stamp, current.flow); return; }
   if (!current.flow.transcodeTried && ['hls', 'mp4'].includes(current.type)) { current.recovering = false; await startCompatibility(current, 0, true); return; }
   current.failed = true; current.recovering = false;
