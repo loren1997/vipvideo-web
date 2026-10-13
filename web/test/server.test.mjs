@@ -103,6 +103,25 @@ test('Quark account authentication errors remain distinct from a revoked househo
   assert.equal((await loggedOut.json()).quarkAuth, undefined);
 });
 
+test('logout during a share directory read prevents further reads and candidate caching', async t => {
+  let release, entered, continued = 0;
+  const pending = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { entered = resolve; });
+  const source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
+  const { call, login } = await running(t, { initialConfig: { ...empty, sources: [source] },
+    quark: { files: async (_, options) => {
+      entered(); await pending;
+      if (options.valid) options.valid();
+      continued++; return { files: [] };
+    } } });
+  t.after(release);
+  const cookie = await login(), response = call('/api/quark/files?source=demo&id=1&shareId=share', undefined, cookie);
+  await started;
+  try { assert.equal((await call('/api/auth/logout', {}, cookie)).status, 200); } finally { release(); }
+  const revoked = await response;
+  assert.equal(revoked.status, 401); assert.equal((await revoked.json()).quarkAuth, undefined);
+  assert.equal(continued, 0);
+});
+
 test('logout during delayed film lookup prevents a subsequent cloud transfer', async t => {
   let release, entered, transfers = 0;
   const pending = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { entered = resolve; });
