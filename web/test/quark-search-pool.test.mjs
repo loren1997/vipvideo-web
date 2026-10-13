@@ -380,8 +380,9 @@ test('stop during pending RSS rejects a late result without cache or persistence
 
 test('explicit web lookup skips APIs, shares two network slots and merges Google with RSS by date and share ID', async () => {
   let active = 0, peak = 0, googleCalls = 0;
+  const at = Date.now();
   const latest = Date.parse('2026-10-13T00:00:00Z'), older = Date.parse('2026-09-01T00:00:00Z');
-  const f = fixture({ saved: savedBackup(Date.now()), request: async (url, options) => {
+  const f = fixture({ now: () => at, saved: savedBackup(at), request: async (url, options) => {
     assert.equal(/cookie|authorization|user-cookie|user-token/i.test(JSON.stringify(options)), false);
     peak = Math.max(peak, ++active); await new Promise(done => setImmediate(done)); active--;
     return response(url.includes('bing.com') ? `<rss><channel><item><title>电影 2026</title><pubDate>Tue, 01 Sep 2026 00:00:00 GMT</pubDate><link>${quarkUrl}?pwd=1234</link></item><item><title>电影 4K</title><link>https://pan.quark.cn/s/unknown12345</link></item></channel></rss>` : '<html>public index</html>');
