@@ -1,7 +1,9 @@
 import http from 'node:http';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import { createReadStream, readFileSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { stat, readFile } from 'node:fs/promises';
+import { gzip as gzipCallback } from 'node:zlib';
+import { promisify } from 'node:util';
 import { dirname, resolve, sep, extname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createStore } from './lib/store.mjs';
@@ -20,6 +22,7 @@ import { createTranscoder } from './lib/transcode.mjs';
 const root = dirname(fileURLToPath(import.meta.url));
 const defaults = JSON.parse(readFileSync(resolve(root, 'defaults.json'), 'utf8'));
 const WEEK = 7 * 24 * 3600;
+const gzip = promisify(gzipCallback);
 const hashToken = (token) => createHash('sha256').update(token).digest('hex');
 
 function json(res, status, body) {
@@ -74,6 +77,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   store.setMeta('password-hash', passwordHash.toString('hex'));
   const attempts = new Map();
   const publicDir = resolve(root, 'public');
+  const staticFiles = new Map();
   const cookie = (value, age) => `vipvideo_session=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${age}${cookieSecure ? '; Secure' : ''}`;
   const visibleEntries = (kind) => {
     const rows = store.list(kind);
@@ -204,7 +208,11 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           await liveService.list(store.config(), { refresh: true });
           return json(res, 200, { ...result, liveSources: liveService.status?.(store.config()) ?? [], discovery: discoveryService.status() });
         }
-        if (path === '/api/live' && method === 'GET') return json(res, 200, await liveService.list(store.config(), { refresh: url.searchParams.get('refresh') === '1' }));
+        if (path === '/api/live' && method === 'GET') {
+          const result = await liveService.list(store.config(), { refresh: url.searchParams.get('refresh') === '1' });
+          return json(res, 200, url.searchParams.get('verified') === '1'
+            ? { ...result, channels: result.channels.filter(channel => channel.streams.some(stream => stream.status === 'ok')) } : result);
+        }
         if (path === '/api/live/probe' && method === 'POST') {
           await readBody(req);
           await liveService.probe?.(store.config());
@@ -252,18 +260,23 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         if (path === '/api/danmaku/binding' && method === 'PUT') return json(res, 200, await danmakuService.bind(await readBody(req)));
         if (path === '/api/browse' && method === 'GET') {
           const category = url.searchParams.get('category') ?? 'movie';
-          const result = await catalog.browse(store.config(), {
+          const snapshot = store.config();
+          const result = await catalog.browse(snapshot, {
             category,
             page: url.searchParams.get('page') ?? '1',
             source: url.searchParams.get('source') ?? undefined,
+            ...(url.searchParams.get('progressive') === '1' ? { progressive: true } : {}),
           });
           ensureVisible(category);
+          if (JSON.stringify(snapshot.sources) !== JSON.stringify(store.config().sources)) throw Object.assign(new Error('影视源已修改，请刷新列表'), { status: 409 });
           return json(res, 200, result);
         }
         if (path === '/api/search' && method === 'GET') {
           const q = url.searchParams.get('q')?.trim();
           if (!q || q.length > 100) throw badRequest('请输入 1–100 字的搜索内容');
-          const result = await catalog.search(store.config(), q);
+          const snapshot = store.config();
+          const result = await catalog.search(snapshot, q, url.searchParams.get('progressive') === '1' ? { progressive: true } : {});
+          if (JSON.stringify(snapshot.sources) !== JSON.stringify(store.config().sources)) throw Object.assign(new Error('影视源已修改，请重新搜索'), { status: 409 });
           if (store.config().showAdult !== true) {
             result.groups = result.groups.flatMap(group => {
               const items = group.items.filter(item => item.category !== 'adult');
@@ -333,6 +346,35 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
       }
       if (!info.isFile()) return json(res, 404, { error: '文件不存在' });
       const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+      if (Object.hasOwn(types, extname(file)) && info.size <= 2 * 1024 * 1024) {
+        const stamp = `${info.mtimeMs}:${info.ctimeMs}:${info.size}`;
+        let entry = staticFiles.get(file);
+        if (entry?.stamp !== stamp) {
+          entry = { stamp, promise: readFile(file).then(async body => ({ body, compressed: await gzip(body),
+            hash: createHash('sha256').update(body).digest('base64url') })).catch(error => {
+            if (staticFiles.get(file) === entry) staticFiles.delete(file); throw error;
+          }) };
+          if (staticFiles.size >= 32) staticFiles.delete(staticFiles.keys().next().value);
+          staticFiles.set(file, entry);
+        }
+        const asset = await entry.promise;
+        const encoding = String(req.headers['accept-encoding'] || '').split(',').find(value => /^\s*gzip(?:\s*;|\s*$)/i.test(value));
+        const quality = encoding?.match(/;\s*q\s*=\s*([0-9.]+)/i)?.[1];
+        const compressed = !!encoding && (quality === undefined || Number(quality) > 0 && Number(quality) <= 1);
+        const body = compressed ? asset.compressed : asset.body;
+        const etag = `"${asset.hash}${compressed ? '-gzip' : ''}"`;
+        res.setHeader('Content-Type', types[extname(file)]); res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Vary', 'Accept-Encoding'); res.setHeader('ETag', etag);
+        res.setHeader('Last-Modified', info.mtime.toUTCString());
+        if (compressed) res.setHeader('Content-Encoding', 'gzip');
+        const tags = req.headers['if-none-match']?.split(',').map(tag => tag.trim().replace(/^W\//, ''));
+        const modifiedSince = Date.parse(req.headers['if-modified-since']);
+        if (tags ? tags.includes('*') || tags.includes(etag) : Number.isFinite(modifiedSince) && Math.floor(info.mtimeMs / 1000) <= Math.floor(modifiedSince / 1000)) {
+          res.writeHead(304); return res.end();
+        }
+        res.setHeader('Content-Length', body.length); res.writeHead(200);
+        return res.end(method === 'HEAD' ? undefined : body);
+      }
       res.writeHead(200, { 'Content-Type': types[extname(file)] ?? 'application/octet-stream', 'Content-Length': info.size, 'Cache-Control': 'no-cache' });
       if (method === 'HEAD') res.end();
       else createReadStream(file).on('error', (error) => { logger.error(error); res.destroy(); }).pipe(res);

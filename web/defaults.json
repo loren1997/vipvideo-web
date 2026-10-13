@@ -426,6 +426,18 @@
       "name": "IPTV-org 中国频道",
       "url": "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/cn.m3u",
       "enabled": true
+    },
+    {
+      "id": "vbskycn-ipv4",
+      "name": "vbskycn IPv4 中文直播",
+      "url": "https://raw.githubusercontent.com/vbskycn/iptv/master/tv/iptv4.m3u",
+      "enabled": true
+    },
+    {
+      "id": "tvbox-live",
+      "name": "TVBox 公开直播汇总",
+      "url": "https://raw.githubusercontent.com/JianghaoPi/my-tvbox-sources/main/output/live.m3u",
+      "enabled": true
     }
   ]
 }

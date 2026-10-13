@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { createLive, parsePlaylist } from '../lib/live.mjs';
 import { createStore } from '../lib/store.mjs';
+import { DatabaseSync } from 'node:sqlite';
 
 const source = { id: 'one', name: '公开电视源', url: 'https://tv.example/channels/list.m3u', enabled: true };
 const response = (body, statusCode = 200) => Object.assign(Readable.from([body]), { statusCode, headers: {}, finalUrl: source.url });
@@ -51,7 +52,7 @@ test('live lists combine alternate lines, isolate source failures, share request
   assert.equal((await live.list(config)).channels.length, 1);
   assert.equal(calls, 3);
   now += 10 * 60_000 + 1;
-  await live.list(config); assert.equal(calls, 6);
+  await live.list(config); await live.list(config, { refresh: true }); assert.equal(calls, 6);
   await live.list({ liveSources: [{ ...source, enabled: false }] }); assert.equal(calls, 6);
   await live.list(config, { refresh: true }); assert.equal(calls, 9);
 });
@@ -70,11 +71,11 @@ test('live probing rotates a bounded sample, persists status and reports recent 
   await Promise.all([live.probe(config), live.probe(config)]);
   assert.equal(checked.length, 20);
   let list = await live.list(config);
-  assert.equal(list.channels[0].streams[0].status, 'error');
-  assert.equal(list.channels[1].streams[0].status, 'ok');
-  assert.equal(list.channels[24].streams[0].status, 'unknown');
+  assert.equal(list.channels.find(channel => channel.name === '频道0').streams[0].status, 'error');
+  assert.equal(list.channels.find(channel => channel.name === '频道1').streams[0].status, 'ok');
+  assert.equal(list.channels.find(channel => channel.name === '频道24').streams[0].status, 'unknown');
   await live.probe(config);
-  assert.equal(checked.length, 40); assert.equal(checked[20], 'https://tv.example/20.m3u8');
+  assert.equal(checked.length, 25); assert.equal(checked[20], 'https://tv.example/20.m3u8');
   live.report('https://tv.example/0.m3u8', 'ok');
   list = await live.list(config);
   assert.equal(list.channels[0].streams[0].status, 'ok');
@@ -101,6 +102,7 @@ test('stopping live refresh waits for active requests and leaves queued sources 
   const waiting = new Promise(resolve => { release = resolve; });
   const live = createLive({ request: async () => { calls++; await waiting; return response('#EXTM3U\n#EXTINF:-1,测试\nhttps://tv.example/live.m3u8'); } });
   const pending = live.list({ liveSources: Array.from({ length: 5 }, (_, i) => ({ ...source, id: String(i), url: `https://tv.example/${i}.m3u` })) });
+  while (calls < 2) await new Promise(done => setImmediate(done));
   const stopping = live.stop().then(() => { stopped = true; });
   await Promise.resolve(); assert.equal(stopped, false);
   release(); await stopping; await pending;
@@ -218,7 +220,7 @@ test('a last successful list survives reopening the actual SQLite database while
     const good = await live.list(config); await live.stop(); store.close();
     store = createStore(directory, config);
     live = createLive({ store, now: () => 2000, request: async () => response('offline', 503) });
-    const cached = await live.list(config);
+    const cached = await live.list(config, { refresh: true });
     assert.equal(cached.channels[0].id, good.channels[0].id);
     assert.equal(cached.channels[0].streams[0].url, good.channels[0].streams[0].url);
     assert.equal(cached.failedSources[0].stale, true);
@@ -272,46 +274,178 @@ test('live probing delegates HLS and MP4 checks without removing or reordering f
   await live.stop();
 });
 
-test('successful lists keep at most two thousand stored channel rows and prefer the newest source data', async () => {
+test('successful lists keep at most five thousand stored channel rows and prefer the newest source data', async () => {
   const second = { ...source, id: 'two', name: '第二电视源', url: 'https://tv.example/two/list.m3u' };
+  const third = { ...source, id: 'three', name: '第三电视源', url: 'https://tv.example/three/list.m3u' };
   const initial = { liveSources: [source] }, state = cacheStore(initial);
-  let timestamp = 1000, originalOnline = true, secondOnline = true;
+  let timestamp = 1000, online = true;
   const live = createLive({ store: state.store, now: () => timestamp, request: async url => {
-    const online = url === source.url ? originalOnline : secondOnline;
-    return response(online ? playlist(1500, url === source.url ? '第一频道' : '第二频道') : 'offline', online ? 200 : 503);
+    timestamp++;
+    return response(online ? playlist(2000, url === source.url ? '第一频道' : url === second.url ? '第二频道' : '第三频道') : 'offline', online ? 200 : 503);
   } });
   await live.list(initial);
-  timestamp = 2000; originalOnline = false;
+  timestamp = 2000;
   const combined = { liveSources: [source, second] }; state.setConfig(combined);
-  await live.list(combined);
+  await live.list(combined, { refresh: true });
+  timestamp = 3000; const all = { liveSources: [source, second, third] }; state.setConfig(all);
+  await live.list(all, { refresh: true });
   const saved = JSON.parse(state.metadata.get('live-playlists-v1'));
-  assert.equal(saved.one.channels.length, 500);
-  assert.equal(saved.two.channels.length, 1500);
-  assert.equal(Object.values(saved).reduce((sum, record) => sum + record.channels.length, 0), 2000);
-  secondOnline = false; timestamp = 3000;
-  const fallback = await live.list(combined, { refresh: true });
-  assert.equal(fallback.channels.length, 2000);
-  assert.equal(fallback.failedSources.length, 2);
+  assert.equal(saved.three.channels.length, 2000);
+  assert.equal(Object.values(saved).reduce((sum, record) => sum + record.channels.length, 0), 5000);
+  online = false; timestamp = 4000;
+  const fallback = await live.list(all, { refresh: true });
+  assert.equal(fallback.channels.length, 5000);
+  assert.equal(fallback.failedSources.length, 3);
   assert.ok(fallback.failedSources.every(item => item.stale));
   await live.stop();
 });
 
 test('oversized stored lists are trimmed by recency on load and invalid future cache timestamps are rejected', async () => {
   const second = { ...source, id: 'two', name: '第二源', url: 'https://tv.example/two/list.m3u' };
+  const third = { ...source, id: 'three', name: '第三源', url: 'https://tv.example/three/list.m3u' };
   const future = { ...source, id: 'future', url: 'https://tv.example/future/list.m3u' };
-  const config = { liveSources: [source, second, future] }, state = cacheStore(config);
+  const config = { liveSources: [source, second, third, future] }, state = cacheStore(config);
   state.metadata.set('live-playlists-v1', JSON.stringify({
-    one: { url: source.url, checkedAt: 1000, channels: parsePlaylist(playlist(1500, '较早频道'), source) },
-    two: { url: second.url, checkedAt: 2000, channels: parsePlaylist(playlist(1500, '较新频道'), second) },
+    one: { url: source.url, checkedAt: 1000, channels: parsePlaylist(playlist(2000, '较早频道'), source) },
+    two: { url: second.url, checkedAt: 2000, channels: parsePlaylist(playlist(2000, '较新频道'), second) },
+    three: { url: third.url, checkedAt: 2500, channels: parsePlaylist(playlist(2000, '最新频道'), third) },
     future: { url: future.url, checkedAt: 4000, channels: parsePlaylist(playlist(1, '未来频道'), future) },
   }));
   const live = createLive({ store: state.store, now: () => 3000, request: async () => response('offline', 503) });
-  const result = await live.list(config);
-  assert.equal(result.channels.length, 2000);
+  const result = await live.list(config, { refresh: true });
+  assert.equal(result.channels.length, 5000);
   assert.equal(result.failedSources.find(item => item.source === 'future').stale, undefined);
   const saved = JSON.parse(state.metadata.get('live-playlists-v1'));
-  assert.equal(saved.one.channels.length, 500);
-  assert.equal(saved.two.channels.length, 1500);
+  assert.equal(saved.one.channels.length, 1000);
+  assert.equal(saved.two.channels.length, 2000);
   assert.equal(saved.future, undefined);
   await live.stop();
+});
+
+test('cached lists return immediately during an expired refresh and after restart without trusting unknown streams', async () => {
+  let time = 1000, release, online = true, calls = 0;
+  const config = { liveSources: [source] }, state = cacheStore(config);
+  const request = async () => { calls++; return online ? response(playlist()) : new Promise(done => { release = () => done(response('offline', 503)); }); };
+  let live = createLive({ store: state.store, now: () => time, request });
+  try {
+    await live.list(config); live.report('https://tv.example/%E7%BC%93%E5%AD%98%E9%A2%91%E9%81%93/0.m3u8?token=keep%24value', 'ok');
+    time += 10 * 60_000 + 1; online = false;
+    const fast = await Promise.race([live.list(config), new Promise(done => setImmediate(() => done(null)))]);
+    assert.ok(fast); assert.equal(fast.probing, true); assert.equal(fast.totalStreams, 1); assert.equal(fast.checkedStreams, 1); assert.equal(fast.channels[0].streams[0].status, 'ok');
+    await live.list(config); assert.equal(calls, 2); release(); await live.list(config, { refresh: true }); await live.stop();
+    live = createLive({ store: state.store, now: () => time, request });
+    const reopened = await Promise.race([live.list(config), new Promise(done => setImmediate(() => done(null)))]);
+    assert.ok(reopened); assert.equal(reopened.channels.length, 1); assert.equal(reopened.probing, true); release(); await live.stop();
+  } finally { release?.(); await live.stop(); }
+});
+
+test('background batches cover more than five hundred streams without downloading every batch and keep refreshing results', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const config = { liveSources: [source] }, state = cacheStore(config); let lists = 0, checked = 0, healthy = true;
+  const live = createLive({ store: state.store, request: async () => { lists++; return response(playlist(650)); }, playability: { async check() { checked++; return { playable: healthy, checkedAt: Date.now(), error: '本次线路失败' }; } } });
+  const flush = () => new Promise(done => setImmediate(done));
+  try {
+    live.start(); t.mock.timers.tick(0); await flush(); assert.equal(checked, 20);
+    for (let batch = 1; batch < 33; batch++) { t.mock.timers.tick(5000); await flush(); }
+    const complete = await live.list(config);
+    assert.equal(checked, 650); assert.equal(lists, 1); assert.equal(complete.checkedStreams, 650); assert.equal(complete.totalStreams, 650); assert.equal(complete.channels.filter(channel => channel.streams[0].status === 'ok').length, 650);
+    assert.equal(Object.keys(JSON.parse(state.metadata.get('live-health')).streams).length, 650);
+    healthy = false; t.mock.timers.tick(30 * 60_000); await flush();
+    const updated = await live.list(config); assert.ok(updated.channels.some(channel => channel.streams[0].status === 'error')); assert.ok(updated.channels.some(channel => channel.streams[0].status === 'ok')); assert.ok(lists >= 2);
+    await live.stop(); const count = checked; t.mock.timers.tick(day); await flush(); assert.equal(checked, count);
+  } finally { await live.stop(); }
+});
+
+test('progressive probing prioritizes each channel before backup lines and rejects results after source disable', async () => {
+  const second = { ...source, id: 'two', url: 'https://tv.example/two/list.m3u' }, config = { liveSources: [source, second] }, state = cacheStore(config);
+  const checked = [], releases = [];
+  const request = async target => response('#EXTM3U\n' + Array.from({ length: 25 }, (_, index) => `#EXTINF:-1 tvg-id="Channel${index}.cn",频道${index}\nhttps://tv.example/${target === source.url ? 'one' : 'two'}/${index}.m3u8`).join('\n'));
+  let delayed = false;
+  const live = createLive({ store: state.store, request, playability: { async check({ url }) { checked.push(url); if (delayed) await new Promise(done => releases.push(done)); return { playable: true, checkedAt: Date.now() }; } } });
+  try {
+    await live.probe(config); assert.equal(checked.length, 20); assert.ok(checked.every(url => url.includes('/one/')));
+    delayed = true; const pending = live.probe(config); while (releases.length < 2) await new Promise(done => setImmediate(done));
+    state.setConfig({ liveSources: [source, { ...second, enabled: false }] }); releases.forEach(done => done()); await pending;
+    assert.equal(checked.length, 22); assert.equal(Object.keys(JSON.parse(state.metadata.get('live-health')).streams).length, 20);
+    assert.ok((await live.list(state.store.config())).channels.every(channel => channel.streams.length === 1));
+  } finally { releases.forEach(done => done()); await live.stop(); }
+});
+
+test('a pending old probe cannot replace a newer real playback failure report', async () => {
+  const config = { liveSources: [source] }, state = cacheStore(config); let release;
+  const url = 'https://tv.example/live.m3u8';
+  const live = createLive({ store: state.store, request: async () => response(`#EXTM3U\n#EXTINF:-1,普通直播\n${url}`), playability: { check: async () => new Promise(done => { release = () => done({ playable: true, checkedAt: Date.now() }); }), report() {} } });
+  try {
+    const pending = live.probe(config); while (!release) await new Promise(done => setImmediate(done));
+    live.report(url, 'error'); release(); await pending;
+    assert.equal((await live.list(config)).channels[0].streams[0].status, 'error');
+    assert.equal(JSON.parse(state.metadata.get('live-health')).streams[url].status, 'error');
+  } finally { release?.(); await live.stop(); }
+});
+
+test('playlist refresh and stream probes share the same two live work slots', async () => {
+  const second = { ...source, id: 'two', url: 'https://tv.example/two/list.m3u' }, config = { liveSources: [source, second] }, state = cacheStore(config);
+  let time = 1000, delayed = false, active = 0, maximum = 0, checked = 0; const releases = [];
+  const live = createLive({ store: state.store, now: () => time, request: async target => {
+    active++; maximum = Math.max(maximum, active);
+    if (delayed) await new Promise(done => releases.push(done)); active--;
+    return response(`#EXTM3U\n#EXTINF:-1,${target}\n${target.replace('list.m3u', 'live.m3u8')}`);
+  }, playability: { async check() { checked++; active++; maximum = Math.max(maximum, active); await new Promise(done => setImmediate(done)); active--; return { playable: true, checkedAt: time }; } } });
+  try {
+    await live.list(config); delayed = true; time += 10 * 60_000 + 1; await live.list(config);
+    while (releases.length < 2) await new Promise(done => setImmediate(done));
+    const refresh = live.list(config, { refresh: true }), pending = live.probe(config); await new Promise(done => setImmediate(done)); assert.equal(checked, 0);
+    releases.forEach(done => done()); await Promise.all([pending, refresh]); assert.equal(checked, 2); assert.ok(maximum <= 2);
+  } finally { releases.forEach(done => done()); await live.stop(); }
+});
+
+test('only the unchanged built-in source uses its packaged seed and every seed line remains unverified', async () => {
+  const builtin = { id: 'live-presets', name: '内置', url: 'https://raw.githubusercontent.com/loren1997/vipvideo-web/main/web/live-presets.m3u', enabled: true };
+  const config = { liveSources: [builtin] }, state = cacheStore(config); let release;
+  const live = createLive({ store: state.store, request: async () => new Promise(done => { release = () => done(response('offline', 503)); }) });
+  try {
+    const first = await Promise.race([live.list(config), new Promise(done => setTimeout(() => done(null), 100))]);
+    assert.ok(first?.channels.length); assert.ok(first.channels.every(channel => channel.streams.every(stream => stream.status === 'unknown'))); release();
+    const offline = await live.list(config, { refresh: true }); assert.match(offline.failedSources[0].error, /内置频道列表/);
+    state.setConfig({ liveSources: [{ ...builtin, enabled: false }] }); assert.equal((await live.list(state.store.config())).channels.length, 0);
+    assert.equal(state.metadata.get('live-playlists-v1'), undefined);
+  } finally { release?.(); await live.stop(); }
+});
+
+test('reliable CCTV names share existing canonical IDs across subscriptions while unrelated numeric TVG IDs stay distinct', async () => {
+  const left = parsePlaylist('#EXTM3U\n#EXTINF:-1 tvg-id="CCTV1.cn" group-title="央视",CCTV-1 综合\nhttps://tv.example/one.m3u8\n', source);
+  const right = parsePlaylist('#EXTM3U\n#EXTINF:-1 tvg-id="1" group-title="央视频道",CCTV1\nhttps://tv.example/two.m3u8\n#EXTINF:-1 tvg-id="1" group-title="地方",其他地方台\nhttps://tv.example/local.m3u8\n', { ...source, id: 'two' });
+  assert.equal(left[0].id, right[0].id); assert.notEqual(right[0].id, right[1].id);
+});
+
+test('new live defaults migrate once without restoring removed, disabled or tombstoned user sources', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'vipvideo-live-migration-'));
+  const additions = [{ ...source, id: 'vbskycn-ipv4', url: 'https://tv.example/new-one.m3u' }, { ...source, id: 'tvbox-live', url: 'https://tv.example/new-two.m3u' }];
+  const original = { showAdult: false, sources: [{ id: 'user-source' }], liveSources: [{ ...additions[0], enabled: false }] };
+  let store;
+  const clearMigrationMarker = () => { const db = new DatabaseSync(join(directory, 'app.sqlite')); db.prepare('DELETE FROM meta WHERE key=?').run('builtin-live-sources-v2'); db.close(); };
+  try {
+    store = createStore(directory, original); store.close(); clearMigrationMarker();
+    store = createStore(directory, { ...original, liveSources: additions });
+    assert.equal(store.config().liveSources.length, 2); assert.equal(store.config().liveSources[0].enabled, false); assert.deepEqual(store.config().sources, original.sources);
+    store.setConfig({ ...store.config(), liveSources: [store.config().liveSources[0]] }); store.close();
+    store = createStore(directory, { ...original, liveSources: additions }); assert.equal(store.config().liveSources.length, 1);
+    store.setMeta('source-discovery-v1', JSON.stringify({ managed: { [additions[1].url]: { blocked: true } } })); store.close(); clearMigrationMarker();
+    store = createStore(directory, { ...original, liveSources: additions }); assert.equal(store.config().liveSources.length, 1);
+  } finally { store?.close(); const target = resolve(directory), root = resolve(tmpdir()); assert.ok(target.startsWith(root + sep) && target.split(sep).at(-1).startsWith('vipvideo-live-migration-')); await rm(target, { recursive: true, force: true }); }
+});
+
+test('long public stream URLs cannot exceed the persistent playlist byte budget', async () => {
+  const sources = Array.from({ length: 16 }, (_, index) => ({ ...source, id: 'bounded-' + index, url: `https://tv.example/list-${index}.m3u` }));
+  const config = { liveSources: sources }, state = cacheStore(config); let time = 1000;
+  const live = createLive({ store: state.store, now: () => time, request: async target => {
+    time++;
+    const body = '#EXTM3U\n' + Array.from({ length: 300 }, (_, index) => `#EXTINF:-1,${target}-${index}\nhttps://tv.example/${index}.m3u8?source=${encodeURIComponent(target)}&token=${'a'.repeat(6000)}`).join('\n');
+    assert.ok(Buffer.byteLength(body) < 2 * 1024 * 1024); return response(body);
+  } });
+  try {
+    await live.list(config, { refresh: true });
+    const saved = state.metadata.get('live-playlists-v1'), rows = Object.values(JSON.parse(saved)).reduce((count, record) => count + record.channels.length, 0);
+    assert.ok(Buffer.byteLength(saved) <= 24 * 1024 * 1024); assert.ok(rows > 3000 && rows < 4800);
+  } finally { await live.stop(); }
 });

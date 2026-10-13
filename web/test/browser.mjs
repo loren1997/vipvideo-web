@@ -28,6 +28,7 @@ function fixture(title, type, id, typeName, remarks = '正片', sources = ['firs
 }
 const movie = fixture('海风来信', 'movie', 'movie', '剧情片');
 movie.douban = { id: 'fixture-subject', score: 7.7, votes: 123 }; movie.items.forEach(item => { item.douban = movie.douban; });
+movie.poster = 'https://fixtures.example/movie-poster.svg'; movie.items.forEach(item => { item.poster = movie.poster; });
 const moviePage2 = fixture('晴天笔记', 'movie', 'movie-page2', '喜剧片');
 const anime = fixture('动画旅人', 'series', 'anime', '国产动漫', '全2集');
 const variety = fixture('周末栏目样例', 'series', 'variety', '综艺', '更新至2期');
@@ -39,13 +40,16 @@ const slow = fixture('慢响应', 'series', 'slow', '国产剧', '全2集');
 const hlsPriority = fixture('HLS选择样例', 'series', 'hls-priority', '国产剧', '全2集');
 const controlsFilm = fixture('播放器样例', 'series', 'controls', '国产剧', '全2集');
 const compatibilityFilm = fixture('兼容播放样例', 'series', 'compatibility', '国产剧', '全2集', ['first']);
+const progressiveFast = fixture('渐进先到样例', 'movie', 'progressive-fast', '剧情片', '正片', ['first']);
+const progressiveSlow = fixture('渐进后到样例', 'movie', 'progressive-slow', '剧情片', '正片', ['second']);
+const progressiveAnime = fixture('动画后到样例', 'series', 'progressive-anime', '国产动漫', '全2集', ['second']);
 const verifiedFilm = fixture('可播放验证样例', 'series', 'verified', '国产剧', '全2集', ['first', 'second', 'third']);
 const adult = fixture('限制级样例', 'movie', 'adult', '限制级', '样例');
 adult.category = 'adult'; adult.items.forEach(item => { item.category = 'adult'; });
 const categoryBoundary = fixture('分类边界样例', 'movie', 'category-normal', '剧情片', '样例');
 const categoryAdult = { ...categoryBoundary.items[0], source: 'third', id: 'category-adult', category: 'adult', typeName: '限制级' };
 const mixedCategory = { ...categoryBoundary, category: 'adult', typeName: '限制级', items: [...categoryBoundary.items, categoryAdult] };
-const groups = [{ ...summary, items }, movie, moviePage2, anime, variety, broken, badDetail, doomed, slow, hlsPriority, controlsFilm, compatibilityFilm, verifiedFilm, adult, mixedCategory];
+const groups = [{ ...summary, items }, movie, moviePage2, anime, variety, broken, badDetail, doomed, slow, hlsPriority, controlsFilm, compatibilityFilm, progressiveFast, progressiveSlow, progressiveAnime, verifiedFilm, adult, mixedCategory];
 let delayAdultDetail = false;
 const catalogRequests = [];
 const maintenance = { probeCount: 0, updateCount: 0, discoverCount: 0, statusReads: 0, checkedAt: 0, updatedAt: 0 };
@@ -56,6 +60,10 @@ const playabilityRequests = [], playabilityReports = [], playableResults = new M
 const transcodeStarts = [], transcodeStops = [];
 let transcodeMode = 'disabled', transcodeDuration = 1200, transcodeAcceleration = 'software', holdTranscode = false, releaseTranscode;
 let holdCandidateSearch = false, releaseCandidateSearch;
+let holdState = false, releaseStates = [], progressiveBrowse = null, progressiveSearch = null, liveProgress = null;
+const apiReads = [], vendorReads = [];
+let nextContextId = 0;
+let holdVendor = false, releaseVendor;
 let probeActive = 0, probeMax = 0, holdVerifiedProbe = false, releaseVerifiedProbes = [];
 const preferences = new Map(), bindings = new Map(), comments = new Map();
 const episodeKey = (film, episode) => JSON.stringify([film, episode]);
@@ -72,7 +80,7 @@ let holdMovieRatings = false, releaseMovieRatings;
 let fixtureImportWarnings = false;
 const savedConfigBodies = [];
 const channels = [
-  { id: 'test-tv-one', name: '测试电视一', group: '测试频道', streams: [
+  { id: 'test-tv-one', name: '测试电视一', group: '测试频道', logo: 'https://fixtures.example/channel-logo.svg', streams: [
     { name: '故障线路', type: 'hls', status: 'error', url: 'https://fixtures.example/fail-live.m3u8?token=fixture' },
     { name: '测试直连', type: 'mp4', status: 'ok', url: 'https://fixtures.example/live-second.mp4?token=fixture' },
     { name: '备用测试线路', type: 'mp4', status: 'ok', url: 'https://fixtures.example/live-third.mp4?token=fixture' },
@@ -135,9 +143,21 @@ try {
   const media = silentMedia();
   async function context(viewport, nativeMedia = true, realServices = false) {
     const value = await browser.newContext({ viewport });
+    const contextId = ++nextContextId;
     await value.route('**/*', async route => {
       const url = route.request().url();
       const parsed = new URL(url);
+      if (parsed.origin === base && ['/api/config', '/api/state', '/api/browse', '/api/search', '/api/live', '/api/live/probe'].includes(parsed.pathname)) apiReads.push({ contextId, path: parsed.pathname, url, method: route.request().method() });
+      if (parsed.origin === base && parsed.pathname === '/vendor/hls.min.js') { vendorReads.push({ contextId, url }); if (holdVendor) await new Promise(ok => { releaseVendor = ok; }); }
+      if (parsed.origin === base && parsed.pathname === '/api/state' && holdState) await new Promise(ok => releaseStates.push(ok));
+      if (parsed.origin === base && parsed.pathname === '/api/browse' && progressiveBrowse && parsed.searchParams.get('category') === 'anime' && !parsed.searchParams.has('source')) {
+        progressiveBrowse.reads++;
+        return route.fulfill({ json: { category: 'anime', page: 1, groups: [{ ...anime, items: anime.items.filter(item => progressiveBrowse.complete || item.source === 'first') }, ...(progressiveBrowse.complete ? [progressiveAnime] : [])], failedSources: [], hasMore: false, complete: progressiveBrowse.complete, pendingSources: progressiveBrowse.complete ? [] : [{ source: 'second', name: '第二源' }] } });
+      }
+      if (parsed.origin === base && parsed.pathname === '/api/search' && progressiveSearch && parsed.searchParams.get('q') === '渐进') {
+        progressiveSearch.reads++;
+        return route.fulfill({ json: { groups: [progressiveFast, ...(progressiveSearch.complete ? [progressiveSlow] : [])], failedSources: [], complete: progressiveSearch.complete, pendingSources: progressiveSearch.complete ? [] : [{ source: 'second', name: '第二源' }] } });
+      }
       if (parsed.origin === base && parsed.pathname === '/api/search' && holdCandidateSearch && parsed.searchParams.get('q') === broken.title) await new Promise(ok => { releaseCandidateSearch = ok; });
       if (realServices && parsed.origin === base && ['/api/player/preferences', '/api/danmaku', '/api/danmaku/binding'].includes(parsed.pathname)) return route.continue();
       if (parsed.origin === base && parsed.pathname === '/api/config' && route.request().method() === 'PUT') savedConfigBodies.push(route.request().postDataJSON());
@@ -228,7 +248,10 @@ try {
         return route.fulfill({ json: { douban, errors: [] } });
       }
       if (parsed.origin === base && ['/api/live', '/api/live/probe'].includes(parsed.pathname)) {
-        liveRequests.push(url); return route.fulfill({ json: { channels: (app.store.config().liveSources || []).some(item => item.enabled !== false) ? channels : [], failedSources: liveFailures } });
+        liveRequests.push(url);
+        if (liveProgress) liveProgress.reads++;
+        const available = (app.store.config().liveSources || []).some(item => item.enabled !== false) ? channels : [];
+        return route.fulfill({ json: { channels: parsed.searchParams.get('verified') === '1' ? available.filter(channel => channel.streams.some(stream => stream.status === 'ok')) : available, failedSources: liveFailures, probing: liveProgress?.probing || false, checkedStreams: liveProgress ? liveProgress.probing ? 2 : 5 : 5, totalStreams: 6, lastProbe: Date.now() } });
       }
       if (parsed.origin === base && parsed.pathname === '/api/live/playback') {
         liveRequests.push(url);
@@ -239,6 +262,8 @@ try {
       if (parsed.origin === base && parsed.pathname === '/api/live/report') { liveReports.push(route.request().postDataJSON()); return route.fulfill({ json: { ok: true } }); }
       if (url.startsWith(base + '/api/media?')) return route.fulfill({ status: 404, body: 'fixture failed proxy' });
       if (url.startsWith(base + '/')) return route.continue();
+      if (url === 'https://fixtures.example/channel-logo.svg') return route.fulfill({ status: 404, body: 'fixed unavailable logo' });
+      if (url === 'https://fixtures.example/movie-poster.svg') return route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="180" height="270"><rect width="180" height="270" fill="#27454a"/><circle cx="90" cy="110" r="40" fill="#62dcc8"/></svg>' });
       if (url.startsWith('https://fixtures.example/fail-')) return route.fulfill({ status: 404, body: 'fixture failed media', headers: { 'Access-Control-Allow-Origin': '*' } });
       if (url.startsWith('https://fixtures.example/')) return route.fulfill({ status: 200, contentType: 'audio/wav', body: media,
         headers: { 'Access-Control-Allow-Origin': '*', 'Accept-Ranges': 'bytes' } });
@@ -249,14 +274,17 @@ try {
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(base);
     // WAV只验证原生媒体事件，不冒充可被Hls.js解码的MPEG-TS。
-    if (nativeMedia) await page.evaluate(() => { window.Hls.isSupported = () => false; });
+    if (nativeMedia) await page.evaluate(() => { window.Hls = { isSupported: () => false, Events: { ERROR: 'hlsError', MANIFEST_PARSED: 'hlsManifestParsed' } }; });
     await page.locator('#password').fill('browser-test-password');
     await page.locator('#login-form button').click();
     await page.locator('#app-view').waitFor({ state: 'visible' });
-    return { value, page };
+    return { value, page, contextId };
   }
   const { page } = await context({ width: 1440, height: 1000 });
   await page.locator('.notice').filter({ hasText: '还没有影视源' }).waitFor();
+  assert.equal(vendorReads.length, 0, '首页不预加载HLS组件');
+  assert.equal(apiReads.filter(item => item.contextId === 1 && item.path === '/api/config').length, 1, '登录启动不重复读取配置');
+  assert.equal(apiReads.filter(item => item.contextId === 1 && item.path === '/api/state').length, 1, '登录启动不重复读取共享记录');
   assert.equal(await page.getByRole('button', { name: '三级', exact: true }).count(), 0, '默认隐藏三级分类');
   await page.screenshot({ path: join(output, 'desktop-home.png'), fullPage: true });
   console.log('PASS 桌面登录与初始空配置');
@@ -462,18 +490,27 @@ try {
 
   const priority = await context({ width: 1440, height: 1000 }, false);
   await priority.page.evaluate(() => {
-    const RealHls = window.Hls;
-    window.__actualHlsSupported = RealHls.isSupported();
     window.__hlsLoads = [];
-    window.Hls = class extends RealHls {
-      loadSource(url) { window.__hlsLoads.push(url); super.loadSource(url); }
-    };
+    let constructor;
+    Object.defineProperty(window, 'Hls', { configurable: true, get: () => constructor, set: RealHls => {
+      window.__actualHlsSupported = RealHls.isSupported();
+      constructor = class extends RealHls { loadSource(url) { window.__hlsLoads.push(url); super.loadSource(url); } };
+    } });
     const nativeCanPlayType = HTMLMediaElement.prototype.canPlayType;
     HTMLMediaElement.prototype.canPlayType = function (type) { return type === 'application/vnd.apple.mpegurl' ? 'maybe' : nativeCanPlayType.call(this, type); };
   });
-  assert.equal(await priority.page.evaluate(() => window.__actualHlsSupported), true, '此回归需要真实MSE支持');
+  assert.equal(vendorReads.filter(item => item.contextId === priority.contextId).length, 0, '普通页面不下载HLS组件');
+  holdVendor = true;
   await priority.page.evaluate(() => { location.hash = '#detail?source=first&id=hls-priority'; });
-  await until(() => priority.page.evaluate(() => window.__hlsLoads.some(url => url.includes('hls-priority-first-1.m3u8'))), 'MSE可用时优先Hls.js');
+  await until(() => releaseVendor, '首次HLS按需加载组件');
+  await priority.page.locator('#episodes .episode-grid').getByRole('button', { name: '第2集', exact: true }).click();
+  await until(() => playerRequests.some(url => new URL(url).searchParams.get('id') === 'hls-priority' && new URL(url).searchParams.get('episode') === '1'), '组件加载时第二个播放请求');
+  holdVendor = false; releaseVendor(); releaseVendor = null;
+  try { await until(() => priority.page.evaluate(() => window.__hlsLoads.some(url => url.includes('hls-priority-first-2.m3u8'))), 'MSE可用时优先Hls.js'); }
+  catch (error) { console.error('LAZY_HLS_DEBUG', JSON.stringify({ page: await priority.page.evaluate(() => ({ hls: typeof window.Hls, loads: window.__hlsLoads, supported: window.__actualHlsSupported, note: document.querySelector('.player-note')?.textContent, scripts: [...document.scripts].map(script => script.src), src: document.querySelector('video')?.currentSrc })), requests: playerRequests.filter(url => new URL(url).searchParams.get('id') === 'hls-priority'), vendor: vendorReads, errors })); throw error; }
+  assert.equal(await priority.page.evaluate(() => window.__hlsLoads.some(url => url.includes('hls-priority-first-1.m3u8'))), false, '旧播放请求不能在组件加载后接管');
+  assert.equal(await priority.page.evaluate(() => window.__actualHlsSupported), true, '此回归需要真实MSE支持');
+  assert.equal(vendorReads.filter(item => item.contextId === priority.contextId).length, 1, '首次HLS播放只下载一次组件');
   assert.equal(await priority.page.locator('video').evaluate(video => video.canPlayType('application/vnd.apple.mpegurl')), 'maybe');
   assert.ok(!(await priority.page.locator('video').getAttribute('src') || '').includes('.m3u8'), '不能把native maybe当作优先直连HLS的依据');
   await priority.value.close();
@@ -641,7 +678,8 @@ try {
   await page.locator('video').evaluate(video => video.pause());
   liveFailures = [{ source: 'test-live', name: '测试直播', error: '临时不可用，使用最近可用列表', stale: true, cachedAt: Date.now() }];
   await page.getByRole('button', { name: '刷新频道', exact: true }).click();
-  assert.ok(liveRequests.filter(url => url.endsWith('/api/live/probe')).length >= 3, '进入直播和手动刷新都先探测');
+  assert.ok(liveRequests.filter(url => url.endsWith('/api/live/probe')).length >= 2, '手动刷新探测下一批线路');
+  assert.ok(liveRequests.some(url => new URL(url).pathname === '/api/live' && new URL(url).searchParams.get('verified') === '1'), '进入直播先快速读取已验证频道');
   await page.getByText('临时不可用，使用最近可用列表', { exact: false }).waitFor();
   assert.equal(await page.getByRole('button', { name: '播放频道 测试电视一', exact: true }).count(), 1, '最近可用频道与刷新故障提示同时显示');
   liveFailures = [];
@@ -940,6 +978,78 @@ try {
   await compat.value.close(); transcodeDuration = 1200; transcodeAcceleration = 'software'; transcodeMode = 'disabled';
   console.log('PASS 直播手动/最后兼容回退、稳定线路编号与0起点1倍速、原流状态隔离、无影视进度/弹幕、退出停止');
 
+  holdState = true;
+  await page.evaluate(() => { location.hash = '#home?category=movie&source=first'; });
+  await page.locator('#browse-results').getByRole('button', { name: '播放 海风来信', exact: true }).waitFor();
+  await until(() => releaseStates.length > 0, '共享记录请求等待中');
+  const movieReads = () => apiReads.filter(item => item.contextId === 1 && item.path === '/api/browse' && new URL(item.url).searchParams.get('category') === 'movie' && new URL(item.url).searchParams.get('source') === 'first').length;
+  const browseBeforeReturn = movieReads();
+  const firstPoster = page.locator('#browse-results img').first();
+  assert.equal(await firstPoster.getAttribute('loading'), 'eager'); assert.equal(await firstPoster.getAttribute('decoding'), 'async');
+  await page.locator('nav a[href="#favorites"]').click();
+  await page.locator('nav a[href="#home"]').click();
+  await page.evaluate(() => { location.hash = '#home?category=movie&source=first'; });
+  await page.locator('#browse-results').getByRole('button', { name: '播放 海风来信', exact: true }).waitFor();
+  assert.equal(movieReads(), browseBeforeReturn, '短时返回同一分类复用结果，不重复请求');
+  holdState = false; for (const release of releaseStates.splice(0)) release();
+  await page.locator('.home-collections').getByRole('button', { name: '播放 星海旅途', exact: true }).waitFor();
+  assert.equal(vendorReads.filter(item => item.contextId === 1).length, 0, '原生MP4与普通页面无需HLS组件');
+  console.log('PASS 首页分类不等待共享记录、登录无重复配置/记录请求、短时分类缓存与首屏异步海报优先、MP4零HLS下载');
+
+  await page.clock.fastForward(31000); progressiveBrowse = { reads: 0, complete: false };
+  await page.evaluate(() => { location.hash = '#home?category=anime'; });
+  await page.locator('#browse-results').getByRole('button', { name: '播放 动画旅人', exact: true }).waitFor();
+  await page.locator('.resource-progress').waitFor();
+  await page.clock.fastForward(1000); await until(() => progressiveBrowse.reads >= 2, '分类共用任务继续渐进返回');
+  const pendingBrowseReads = progressiveBrowse.reads;
+  await page.locator('nav a[href="#home"]').click(); await page.locator('#browse-results').getByRole('button', { name: '播放 海风来信', exact: true }).waitFor(); await page.clock.fastForward(3000);
+  assert.equal(progressiveBrowse.reads, pendingBrowseReads, '离开分类不继续轮询');
+  progressiveBrowse.complete = true;
+  await page.evaluate(() => { location.hash = '#home?category=anime'; });
+  await page.getByRole('button', { name: '播放 动画后到样例', exact: true }).waitFor();
+  assert.equal(await page.getByRole('button', { name: '播放 动画旅人', exact: true }).count(), 1, '渐进分组合并不重复');
+  assert.equal(await page.locator('.resource-progress').count(), 0);
+  progressiveSearch = { reads: 0, complete: false };
+  await page.locator('nav a[href="#search"]').click(); await page.getByLabel('影片名称', { exact: true }).fill('渐进'); await page.getByRole('button', { name: '搜索', exact: true }).click();
+  await page.getByRole('button', { name: '播放 渐进先到样例', exact: true }).waitFor(); await page.locator('.resource-progress').waitFor();
+  await page.getByRole('button', { name: '播放 渐进先到样例', exact: true }).click();
+  await until(() => page.locator('video').evaluate(video => video.readyState >= 2 && video.currentSrc.includes('progressive-fast')).catch(() => false), '慢源完成前先到影片即可播放');
+  const pendingSearchReads = progressiveSearch.reads; await page.locator('nav a[href="#home"]').click(); await page.clock.fastForward(3000);
+  assert.equal(progressiveSearch.reads, pendingSearchReads, '进入播放器或离开搜索取消渐进轮询');
+  progressiveSearch.complete = true;
+  await page.evaluate(() => { location.hash = '#search?q=%E6%B8%90%E8%BF%9B'; });
+  await page.getByRole('button', { name: '播放 渐进后到样例', exact: true }).waitFor();
+  assert.equal(await page.getByRole('button', { name: '播放 渐进先到样例', exact: true }).count(), 1);
+  progressiveBrowse = null; progressiveSearch = null;
+  console.log('PASS 分类/搜索先显示快源、pending提示、后续结果去重合并、慢源完成前可播放、离页停止渐进请求');
+
+  liveProgress = { reads: 0, probing: true };
+  await page.locator('nav a[href="#home"]').click(); const liveProbeBeforeCards = apiReads.filter(item => item.contextId === 1 && item.path === '/api/live/probe').length;
+  await page.getByRole('button', { name: '电视直播', exact: true }).click();
+  const liveCard = page.getByRole('button', { name: '播放频道 测试电视一', exact: true }); await liveCard.waitFor();
+  assert.equal(await liveCard.locator('.channel-cover').count(), 1, '频道封面可点击');
+  await until(() => liveCard.locator('img').count().then(count => count === 0), '频道logo错误回退');
+  await liveCard.locator('.channel-fallback').getByText('测试电视一', { exact: true }).waitFor();
+  assert.equal(await page.getByRole('button', { name: '播放频道 未验证电视样例', exact: true }).count(), 0);
+  await page.locator('.resource-progress').filter({ hasText: '后台正在探测' }).waitFor();
+  await liveCard.evaluate(element => { window.__liveCard = element; });
+  await page.clock.fastForward(1000); await until(() => liveProgress.reads >= 2, '直播后台探测进度刷新');
+  assert.equal(await liveCard.evaluate(element => element === window.__liveCard), true, '进度更新保留卡片DOM和图片');
+  assert.equal(apiReads.filter(item => item.contextId === 1 && item.path === '/api/live/probe').length, liveProbeBeforeCards, '进入直播无需等待整批探测');
+  await liveCard.locator('.channel-cover').click(); await until(() => page.locator('video').evaluate(video => video.readyState >= 2 && video.currentSrc.includes('live-second')).catch(() => false), '海报点击直接自动播放');
+  assert.equal(new URL(liveRequests.filter(url => url.includes('/api/live/playback')).at(-1)).searchParams.get('line'), '1');
+  await page.locator('video').evaluate(video => video.pause()); await page.screenshot({ path: join(output, 'desktop-live-cards.png'), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 }); assert.ok(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1); await page.screenshot({ path: join(output, 'mobile-live-cards.png'), fullPage: true }); await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.evaluate(() => { window.__originalLivePlay = HTMLMediaElement.prototype.play; HTMLMediaElement.prototype.play = function() { return Promise.reject(new DOMException('fixed policy', 'NotAllowedError')); }; });
+  const policyLiveStart = liveRequests.filter(url => url.includes('/api/live/playback')).length;
+  await liveCard.locator('.channel-cover').click(); await until(() => page.locator('.player-note').textContent().then(text => text.includes('浏览器需要你点击')), '直播自动播放被拦截时给播放键提示');
+  assert.equal(liveRequests.filter(url => url.includes('/api/live/playback')).length, policyLiveStart + 1, '浏览器政策不误换直播源');
+  await page.evaluate(() => { HTMLMediaElement.prototype.play = window.__originalLivePlay; });
+  liveProgress.probing = false; await page.clock.fastForward(1000); await until(() => page.locator('.resource-progress').count().then(count => count === 0), '直播渐进探测完成');
+  const stoppedLiveReads = liveProgress.reads; await page.locator('nav a[href="#home"]').click(); await page.clock.fastForward(3000); assert.equal(liveProgress.reads, stoppedLiveReads, '离开直播停止进度轮询');
+  liveProgress = null;
+  console.log('PASS 直播海报卡片分组与logo姓名回退、仅ok频道、缓存GET即时展示/后台进度、保留卡片DOM、点击播放/政策提示、手机布局和离页取消');
+
   await page.locator('nav a[href="#settings"]').click();
   const parsers = page.locator('.settings-section').filter({ has: page.getByRole('heading', { name: '解析线路', exact: true }) });
   await parsers.getByRole('button', { name: '＋ 添加', exact: true }).click();
@@ -1020,6 +1130,7 @@ try {
 } finally {
   releaseMovieRatings?.();
   releaseTranscode?.(); releaseCandidateSearch?.();
+  releaseVendor?.(); for (const release of releaseStates.splice(0)) release();
   for (const release of releaseVerifiedProbes.splice(0)) release();
   await browser?.close(); await app.close(); await rm(directory, { recursive: true, force: true });
 }

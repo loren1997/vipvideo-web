@@ -157,8 +157,19 @@ a.rating-score:hover { background:#2a4939; }
 .rating-attribution { display:block; color:var(--muted); font-size:10px; margin-top:6px; }
 .film-ratings > .muted { display:block; margin-top:5px; font-size:11px; }
 .channel-panel select { width:100%; padding:8px 10px; margin-bottom:12px; }
-.channel-list { display:flex; flex-direction:column; gap:7px; max-height:480px; overflow:auto; }
-.channel-button { width:100%; text-align:left; overflow-wrap:anywhere; }
+.channel-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 10px; max-height:580px; overflow:auto; padding:4px; }
+.channel-card { padding:0; border:1px solid var(--line); border-radius:9px; background:var(--surface); color:var(--text); text-align:left; overflow:hidden; cursor:pointer; min-width:0; width:100%; }
+.channel-card:hover,.channel-card.selected { border-color:var(--accent); background:var(--accent-dim); }
+.channel-cover { display:block; aspect-ratio:16/11; position:relative; background:linear-gradient(135deg,#25424b,#1b2435); overflow:hidden; }
+.channel-cover img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; padding:14px; }
+.channel-fallback { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; padding:12px; text-align:center; font-size:13px; font-weight:600; }
+.channel-fallback small { font-size:9px; letter-spacing:3px; color:var(--accent); }
+.channel-badge { position:absolute; right:5px; bottom:5px; padding:1px 4px; border-radius:4px; background:#10252bdd; color:var(--accent); font-size:9px; }
+.channel-caption { display:flex; flex-direction:column; padding:8px; gap:2px; }
+.channel-caption strong { font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.channel-caption small { color:var(--muted); font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+@media(max-width:900px) { .channel-list { grid-template-columns:repeat(4,minmax(0,1fr)); } }
+@media(max-width:640px) { .channel-list { grid-template-columns:repeat(3,minmax(0,1fr)); } }
 .maintenance-status { margin-top:18px; }
 .maintenance-summary { font-size:12px; color:var(--muted); margin-bottom:15px; overflow-wrap:anywhere; }
 .maintenance-status h3 { margin:15px 0 9px; }

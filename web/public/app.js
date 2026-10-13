@@ -9,6 +9,7 @@ let detail = null;
 let detailTarget = null;
 let player = null;
 let hls = null;
+let hlsScriptPromise;
 let routeVersion = 0;
 let playVersion = 0;
 let toastTimer;
@@ -19,6 +20,68 @@ const sourceSuccess = new Map();
 const playabilityCache = new Map();
 let verificationActive = 0;
 const verificationQueue = [];
+const resourceSnapshots = new Map();
+const resourceRequests = new Map();
+let liveSnapshot;
+let resourceVersion = 0;
+
+function resourceKey(path) { return `${resourceVersion}:${path}`; }
+
+function resourceSnapshot(path) {
+  const saved = resourceSnapshots.get(resourceKey(path));
+  return saved && Date.now() - saved.at < 30000 ? saved.data : null;
+}
+
+function resourceRequest(path, force = false) {
+  const key = resourceKey(path), saved = resourceSnapshot(path);
+  if (!force && saved && saved.complete !== false) return Promise.resolve(saved);
+  if (resourceRequests.has(key)) return resourceRequests.get(key);
+  const request = api(path).then(data => {
+    resourceSnapshots.set(key, { at: Date.now(), data });
+    if (resourceSnapshots.size > 24) resourceSnapshots.delete(resourceSnapshots.keys().next().value);
+    return data;
+  }).finally(() => resourceRequests.delete(key));
+  resourceRequests.set(key, request); return request;
+}
+
+async function progressiveResults(path, valid, draw, force = false) {
+  let data;
+  do {
+    try { data = await resourceRequest(path, force); }
+    catch (error) {
+      if (error.status === 409 && valid()) {
+        const latest = await api('/api/config');
+        if (valid() && !applyConfig(latest)) void renderRoute();
+        return null;
+      }
+      throw error;
+    }
+    if (!valid()) return null;
+    draw(data); content.setAttribute('aria-busy', 'false');
+    if (data.complete !== false) break;
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    force = true;
+  } while (valid());
+  return data;
+}
+
+function pendingSources(data) {
+  const pending = data.pendingSources || [];
+  return data.complete === false ? `已显示先返回的影片，${pending.length ? `${pending.length} 个影视源` : '其他影视源'}仍在加载…` : '';
+}
+
+function ensureHls() {
+  if (window.Hls) return Promise.resolve(window.Hls);
+  if (hlsScriptPromise) return hlsScriptPromise;
+  hlsScriptPromise = new Promise((resolve, reject) => {
+    const script = node('script'); script.src = '/vendor/hls.min.js'; script.async = true;
+    const timer = setTimeout(() => { script.remove(); hlsScriptPromise = null; reject(new Error('播放器组件加载超时，请刷新后重试。')); }, 15000);
+    script.onload = () => { clearTimeout(timer); if (window.Hls) resolve(window.Hls); else { script.remove(); hlsScriptPromise = null; reject(new Error('播放器组件未能初始化，请刷新后重试。')); } };
+    script.onerror = () => { clearTimeout(timer); script.remove(); hlsScriptPromise = null; reject(new Error('播放器组件加载失败，请刷新后重试。')); };
+    document.head.append(script);
+  });
+  return hlsScriptPromise;
+}
 
 function node(tag, text, className) {
   const element = document.createElement(tag);
@@ -139,7 +202,8 @@ function leaveAdultScreen() {
 function applyConfig(next) {
   const changed = Boolean(config.showAdult) !== Boolean(next.showAdult);
   const sourcesChanged = JSON.stringify(config.sources) !== JSON.stringify(next.sources);
-  if (sourcesChanged || changed) { sourceSuccess.clear(); playabilityCache.clear(); }
+  if (sourcesChanged || changed) { resourceVersion++; sourceSuccess.clear(); playabilityCache.clear(); resourceSnapshots.clear(); }
+  if (JSON.stringify(config.liveSources) !== JSON.stringify(next.liveSources)) liveSnapshot = null;
   const adultScreen = detail?.category === 'adult' || detailTarget?.category === 'adult' || openingItem?.category === 'adult' || location.hash.startsWith('#home?') && new URLSearchParams(location.hash.split('?')[1]).get('category') === 'adult';
   config = next;
   if (changed) {
@@ -176,7 +240,7 @@ function card(item, options = {}) {
   const poster = httpUrl(item.poster);
   if (poster) {
     const image = node('img');
-    image.src = poster; image.alt = ''; image.loading = 'lazy'; image.referrerPolicy = 'no-referrer';
+    image.src = poster; image.alt = ''; image.loading = options.priority ? 'eager' : 'lazy'; image.decoding = 'async'; image.fetchPriority = options.priority ? 'high' : 'low'; image.referrerPolicy = 'no-referrer';
     image.addEventListener('error', () => image.remove(), { once: true });
     cover.append(image);
   }
@@ -198,7 +262,7 @@ function card(item, options = {}) {
 
 function grid(items, options = {}) {
   const element = node('div', undefined, 'poster-grid');
-  for (const item of items.filter(visibleItem)) element.append(card(item, typeof options === 'function' ? options(item) : options));
+  items.filter(visibleItem).forEach((item, index) => element.append(card(item, typeof options === 'function' ? options(item) : { ...options, priority: index < (options.priorityCount || 0) })));
   return element;
 }
 
@@ -268,7 +332,7 @@ function categoryTabs(category, selectedSource = '') {
   return tabs;
 }
 
-async function renderHome(category = 'movie', selectedSource = '', stamp = routeVersion) {
+async function renderHome(category = 'movie', selectedSource = '', stamp = routeVersion, statePromise = null) {
   const page = document.createDocumentFragment();
   const catalog = section('发现好故事', '选一部，直接开始看');
   const controls = node('div', undefined, 'browse-controls');
@@ -294,14 +358,18 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
     const guide = node('div', '还没有影视源。添加内置源，或导入兼容 MoonTV / KatelyaTV 的配置后即可浏览影片。', 'notice');
     guide.append(presetButton(), button('导入自定义源', () => goto('settings'), 'button small')); listing.append(guide);
   }
+  const collections = node('div', undefined, 'home-collections');
+  const drawCollections = () => {
   const recent = library.history.filter(item => !item.key.startsWith('link:') && visibleItem(item)).slice(0, 6);
   const watching = section('继续观看', recent.length ? `${recent.length} 部影片` : '', externalLink('全部记录 →', `${location.origin}/#history`, 'text-link'));
   const historyLink = $('.text-link', watching); if (historyLink) { historyLink.target = '_self'; historyLink.removeAttribute('rel'); }
   watching.append(recent.length ? grid(recent, { resume: true }) : empty('从一部影片开始', '搜索并播放后，观看进度会保存在这里。', button('搜索影片', () => goto('search'), 'button primary')));
-  page.append(watching);
   const savedFavorites = library.favorites.filter(visibleItem);
   const favorites = section('我的收藏', savedFavorites.length ? `${savedFavorites.length} 部` : '', button('查看全部 →', () => goto('favorites'), 'button subtle small'));
-  favorites.append(savedFavorites.length ? grid(savedFavorites.slice(0, 6)) : node('p', '遇到喜欢的影片，点亮收藏按钮，留给下次观看。', 'muted')); page.append(favorites);
+  favorites.append(savedFavorites.length ? grid(savedFavorites.slice(0, 6)) : node('p', '遇到喜欢的影片，点亮收藏按钮，留给下次观看。', 'muted'));
+  collections.replaceChildren(watching, favorites);
+  };
+  drawCollections(); page.append(collections);
   const platforms = section('平台入口', '在平台找到视频页后，粘贴链接解析');
   const platformGrid = node('div', undefined, 'platform-grid');
   for (const platform of config.platforms.filter(item => item.enabled !== false && httpUrl(item.url))) {
@@ -311,26 +379,37 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
   }
   platforms.append(platformGrid.childElementCount ? platformGrid : empty('暂无平台入口', '可在资源设置中添加平台链接。')); page.append(urlForm(), platforms);
   content.replaceChildren(page);
+  if (statePromise) void statePromise.then(state => {
+    if (state && stamp === routeVersion && content.contains(collections)) { library = state; drawCollections(); }
+  });
   let groups = [];
   let nextPage = 1;
-  async function loadPage() {
+  const sourcesAtEntry = resourceVersion, hashAtEntry = location.hash;
+  const valid = () => stamp === routeVersion && hashAtEntry === location.hash && sourcesAtEntry === resourceVersion;
+  async function loadPage(force = false) {
     more.disabled = true;
-    if (nextPage === 1) listing.replaceChildren(node('div', `正在加载${categories[category]}…`, 'loading'));
+    if (nextPage === 1 && !groups.length) listing.replaceChildren(node('div', `正在加载${categories[category]}…`, 'loading'));
     else more.textContent = '正在加载…';
     try {
-      const result = await api(`/api/browse?${new URLSearchParams({ category, page: nextPage, ...(selectedSource ? { source: selectedSource } : {}) })}`);
-      if (stamp !== routeVersion) return;
+      const path = `/api/browse?${new URLSearchParams({ category, page: nextPage, progressive: '1', ...(selectedSource ? { source: selectedSource } : {}) })}`;
+      const draw = result => {
       updateSourceChoices();
       const incoming = (result.groups || []).filter(group => category === 'adult' ? group.category === 'adult' : group.category !== 'adult').map(group => ({ ...group, items: group.items.filter(item => category === 'adult' ? item.category === 'adult' : item.category !== 'adult') }));
       groups = mergeGroups(groups, incoming.filter(group => group.items.length)); browseGroups = mergeGroups(browseGroups, groups);
       listing.replaceChildren(); const failures = failuresList(result.failedSources); if (failures) listing.append(failures);
-      listing.append(groups.length ? grid(groupCards(groups)) : empty('这个分类暂时没有影片', '试试切换影视源或稍后重新加载。', button('重新加载', () => void loadPage())));
-      more.hidden = !result.hasMore; nextPage++; more.textContent = '加载更多';
+      if (result.complete === false) listing.append(node('p', pendingSources(result), 'resource-progress muted'));
+      listing.append(groups.length ? grid(groupCards(groups), { priorityCount: 6 }) : result.complete === false ? node('p', '正在等待影视源返回影片…', 'muted') : empty('这个分类暂时没有影片', '试试切换影视源或稍后重新加载。', button('重新加载', () => void loadPage(true))));
+      more.hidden = !result.hasMore; more.textContent = '加载更多';
+      };
+      const cached = resourceSnapshot(path); if (cached && !force) draw(cached);
+      const result = await progressiveResults(path, valid, draw, force);
+      if (!valid() || !result) return;
+      nextPage++;
     } catch (error) {
       if (stamp !== routeVersion) return;
       if (error.adultHidden) { leaveAdultScreen(); return; }
       if (selectedSource) { sourceSuccess.delete(selectedSource); updateSourceChoices(); }
-      if (nextPage === 1) listing.replaceChildren(empty('分类内容暂时不可用', error.message, button('重新加载', () => void loadPage())));
+      if (nextPage === 1 && !groups.length) listing.replaceChildren(empty('分类内容暂时不可用', error.message, button('重新加载', () => void loadPage(true))));
       else { more.textContent = '重试加载更多'; notify(error.message, true); }
     } finally { more.disabled = false; }
   }
@@ -388,16 +467,23 @@ async function renderSearch(query, stamp) {
   if (!query) { results.append(empty('你想看什么？', '输入片名，在已启用的影视源中同时搜索。')); input.focus({ preventScroll: true }); return; }
   results.append(node('div', '正在各个影视源中查找…', 'loading'));
   try {
-    const data = await api(`/api/search?${new URLSearchParams({ q: query })}`);
-    if (stamp !== routeVersion) return;
-    lastSearch = { q: query, groups: (data.groups || []).filter(visibleItem) };
+    const sourcesAtEntry = resourceVersion, hashAtEntry = location.hash;
+    const valid = () => stamp === routeVersion && hashAtEntry === location.hash && sourcesAtEntry === resourceVersion;
+    const path = `/api/search?${new URLSearchParams({ q: query, progressive: '1' })}`;
+    let groups = [];
+    const draw = data => {
+    groups = mergeGroups(groups, (data.groups || []).filter(visibleItem)); lastSearch = { q: query, groups };
     results.replaceChildren();
     if (data.failedSources?.length) {
       results.append(failuresList(data.failedSources));
     }
     const heading = section('搜索结果', `${lastSearch.groups.length} 部影片`);
     const items = groupCards(lastSearch.groups);
-    heading.append(items.length ? grid(items) : empty('没有找到相关影片', '试试更短的片名，或在设置中检查影视源。')); results.append(heading);
+    if (data.complete === false) heading.append(node('p', pendingSources(data), 'resource-progress muted'));
+    heading.append(items.length ? grid(items, { priorityCount: 6 }) : data.complete === false ? node('p', '正在等待影视源返回影片…', 'muted') : empty('没有找到相关影片', '试试更短的片名，或在设置中检查影视源。')); results.append(heading);
+    };
+    const cached = resourceSnapshot(path); if (cached) draw(cached);
+    await progressiveResults(path, valid, draw);
   } catch (error) { if (stamp === routeVersion) results.replaceChildren(empty('搜索暂时不可用', error.message, button('重试', () => goto('search', { q: query }), 'button'))); }
 }
 
@@ -673,7 +759,7 @@ async function openDetail(source, id, stamp) {
 function renderDetail(data, candidates) {
   const summary = node('section', undefined, 'detail-summary');
   const posterUrl = httpUrl(data.poster);
-  if (posterUrl) { const image = node('img', undefined, 'detail-poster'); image.src = posterUrl; image.alt = ''; image.referrerPolicy = 'no-referrer'; image.addEventListener('error', () => image.remove(), { once: true }); summary.append(image); }
+  if (posterUrl) { const image = node('img', undefined, 'detail-poster'); image.src = posterUrl; image.alt = ''; image.decoding = 'async'; image.fetchPriority = 'high'; image.referrerPolicy = 'no-referrer'; image.addEventListener('error', () => image.remove(), { once: true }); summary.append(image); }
   const info = node('div', undefined, 'detail-info');
   info.append(node('h2', data.title), node('p', `${data.year || '年份未知'} · ${data.typeName || typeLabel(data.type)} · ${sourceName(data.source)}`, 'meta'));
   const ratings = node('div', '正在读取评分…', 'film-ratings'); ratings.setAttribute('aria-live', 'polite'); info.append(ratings);
@@ -824,33 +910,65 @@ async function renderLive(params, stamp) {
   const lines = node('div', undefined, 'source-row'); lines.id = 'live-lines'; watch.append(host, lines);
   const panel = node('aside', undefined, 'episode-panel channel-panel'); panel.append(node('h3', '频道'));
   const group = node('select'); group.setAttribute('aria-label', '频道分组');
-  const list = node('div', undefined, 'channel-list'); panel.append(group, list); layout.append(watch, panel); page.append(layout); content.replaceChildren(page);
+  const list = node('div', undefined, 'channel-list'); list.setAttribute('aria-label', '可播放直播频道'); panel.append(group, list); layout.append(watch, panel); page.append(layout); content.replaceChildren(page);
   let channels = [], loadingVersion = 0;
+  let renderedCards = '', restoredChannel = false;
+  const sourcesAtEntry = JSON.stringify(config.liveSources);
+  const valid = request => stamp === routeVersion && location.hash.startsWith('#live') && request === loadingVersion && sourcesAtEntry === JSON.stringify(config.liveSources);
   function drawChannels() {
+    const visible = channels.filter(item => item.streams.some(stream => stream.status === 'ok') && (!group.value || item.group === group.value));
+    const signature = JSON.stringify(visible.map(item => [item.id, item.name, item.group, item.logo]));
+    if (signature === renderedCards && list.childElementCount) return;
+    renderedCards = signature;
+    const focused = document.activeElement?.closest('.channel-card')?.dataset.channel;
+    const scrollTop = list.scrollTop;
     list.replaceChildren();
-    for (const channel of channels.filter(item => item.streams.some(stream => stream.status === 'ok') && (!group.value || item.group === group.value))) {
+    for (const channel of visible) {
       const selectedChannel = player?.live && player.channel.id === channel.id;
-      const item = button(channel.name, () => void startLiveChannel(channel, preferredLiveLine(channel), stamp), `button channel-button${selectedChannel ? ' selected' : ''}`); item.dataset.channel = channel.id;
+      const item = button('', () => { const latest = channels.find(value => value.id === channel.id); if (latest) void startLiveChannel(latest, preferredLiveLine(latest), stamp); }, `channel-card channel-button${selectedChannel ? ' selected' : ''}`); item.dataset.channel = channel.id;
+      const cover = node('span', undefined, 'channel-cover');
+      const fallback = node('span', undefined, 'channel-fallback'); fallback.append(node('small', 'TV'), node('span', channel.name)); cover.append(fallback);
+      const logo = httpUrl(channel.logo);
+      if (logo) {
+        const image = node('img'); image.src = logo; image.alt = ''; image.loading = 'lazy'; image.decoding = 'async'; image.referrerPolicy = 'no-referrer';
+        image.addEventListener('load', () => { fallback.hidden = true; }); image.addEventListener('error', () => { image.remove(); fallback.hidden = false; }); cover.append(image);
+      }
+      cover.append(node('span', '可播放', 'channel-badge'));
+      const caption = node('span', undefined, 'channel-caption'); caption.append(node('strong', channel.name), node('small', channel.group || '电视直播')); item.append(cover, caption);
       item.setAttribute('aria-label', `播放频道 ${channel.name}`); item.setAttribute('aria-pressed', String(player?.live && player.channel.id === channel.id)); list.append(item);
     }
     if (!list.childElementCount) list.append(node('p', '没有可用频道。', 'muted'));
+    list.scrollTop = scrollTop;
+    if (focused) [...list.querySelectorAll('.channel-card')].find(item => item.dataset.channel === focused)?.focus({ preventScroll: true });
   }
   group.addEventListener('change', drawChannels);
   async function loadChannels(force = false) {
-    const request = ++loadingVersion; refresh.disabled = true; feedback.replaceChildren(node('p', '正在探测可播放频道…', 'muted'));
+    const request = ++loadingVersion; refresh.disabled = force; feedback.replaceChildren(node('p', force ? '正在探测下一批可播放频道…' : '正在读取已验证频道…', 'muted'));
     try {
-      const result = await api('/api/live/probe', { method: 'POST', body: {}, timeoutMs: 150000 });
-      if (stamp !== routeVersion || request !== loadingVersion) return;
+      const draw = result => {
       channels = (result.channels || []).filter(channel => channel.streams?.some(stream => stream.status === 'ok')); feedback.replaceChildren();
       const failures = failuresList(result.failedSources, '直播源');
       if (failures) { failures.open = result.failedSources.some(source => source.stale); feedback.append(failures); }
-      if (!channels.length) feedback.append(empty('暂无已验证可播放频道', '可继续刷新，探测下一批线路；也可以在资源设置中添加 M3U 直播源。', button('添加直播源', () => goto('settings'), 'button primary')));
+      if (result.probing) feedback.append(node('p', `${channels.length ? `已显示 ${channels.length} 个可播放频道 · ` : ''}后台正在探测${Number.isFinite(result.totalStreams) ? ` · 已检查 ${result.checkedStreams || 0}/${result.totalStreams} 条线路` : ''}…`, 'resource-progress muted'));
+      if (!channels.length && !result.probing) feedback.append(empty('暂无已验证可播放频道', '可继续刷新，探测下一批线路；也可以在资源设置中添加 M3U 直播源。', button('添加直播源', () => goto('settings'), 'button primary')));
       const selected = group.value; group.replaceChildren(); const all = node('option', '全部频道'); all.value = ''; group.append(all);
       for (const name of [...new Set(channels.map(channel => channel.group).filter(Boolean))]) { const option = node('option', name); option.value = name; group.append(option); }
       group.value = [...group.options].some(option => option.value === selected) ? selected : ''; drawChannels();
-      if (!force && params.get('id')) {
+      if (!restoredChannel && !force && params.get('id')) {
         const channel = channels.find(item => item.id === params.get('id'));
-        if (channel) void startLiveChannel(channel, params.has('line') ? Number(params.get('line')) || 0 : preferredLiveLine(channel), stamp);
+        if (channel) { const savedLine = Number(params.get('line')); restoredChannel = true; void startLiveChannel(channel, params.has('line') && channel.streams[savedLine]?.status === 'ok' ? savedLine : preferredLiveLine(channel), stamp); }
+      }
+      content.setAttribute('aria-busy', 'false');
+      };
+      if (!force && liveSnapshot?.sources === sourcesAtEntry && Date.now() - liveSnapshot.at < 30000) draw(liveSnapshot.data);
+      let result = await api(force ? '/api/live/probe' : '/api/live?verified=1', force ? { method: 'POST', body: {}, timeoutMs: 150000 } : {});
+      let updates = 0;
+      while (valid(request)) {
+        liveSnapshot = { sources: sourcesAtEntry, at: Date.now(), data: result }; draw(result); refresh.disabled = false;
+        if (!result.probing) break;
+        await new Promise(resolve => setTimeout(resolve, ++updates <= 3 ? 1000 : 3000));
+        if (!valid(request)) return;
+        result = await api('/api/live?verified=1');
       }
     } catch (error) { if (stamp === routeVersion && request === loadingVersion) feedback.replaceChildren(empty('频道暂时不可用', error.message, button('重试', () => void loadChannels()))); }
     finally { if (stamp === routeVersion && request === loadingVersion) refresh.disabled = false; }
@@ -1286,7 +1404,7 @@ function attemptPlay(current, generation) {
   });
 }
 
-function loadMedia(current, message = '正在连接播放地址…') {
+async function loadMedia(current, message = '正在连接播放地址…') {
   if (hls) { hls.destroy(); hls = null; }
   clearTimeout(current.loadTimer);
   const generation = (current.mediaVersion || 0) + 1; current.mediaVersion = generation;
@@ -1294,6 +1412,14 @@ function loadMedia(current, message = '正在连接播放地址…') {
   if (!url) return playbackError(current);
   current.note.className = 'player-note'; current.note.textContent = message;
   const video = current.video;
+  if (current.type === 'hls') {
+    try { await ensureHls(); }
+    catch (error) {
+      if (player === current && generation === current.mediaVersion) { current.failed = true; current.note.textContent = error.message; current.note.className = 'player-note error-message'; }
+      return;
+    }
+    if (player !== current || generation !== current.mediaVersion) return;
+  }
   current.loadTimer = setTimeout(() => { if (player === current && generation === current.mediaVersion && video.readyState < 2) playbackError(current); }, 15000);
   if (current.type === 'hls' && window.Hls?.isSupported()) {
     hls = new window.Hls(current.transcoded ? { startPosition: 0 } : {}); hls.loadSource(url); hls.attachMedia(video);
@@ -1491,16 +1617,14 @@ async function renderRoute() {
   content.replaceChildren(node('div', '正在加载…', 'loading'));
   try {
     const needsState = ['home', 'favorites', 'history', 'detail'].includes(selectedView);
-    if (needsState) {
-      await historyQueue.catch(error => console.warn('等待记录保存时失败', error));
-    }
-    const [latestConfig, latestState] = await Promise.all([api('/api/config'), needsState ? api('/api/state') : Promise.resolve(null)]);
+    const statePromise = needsState ? historyQueue.catch(error => console.warn('等待记录保存时失败', error)).then(() => api('/api/state')).catch(error => { if (stamp === routeVersion) notify(`共享记录暂时未同步：${error.message}`, true); return null; }) : Promise.resolve(null);
+    const latestConfig = await api('/api/config');
     if (stamp !== routeVersion) return;
     applyConfig(latestConfig); updateSourceStatus();
     if (stamp !== routeVersion) return;
-    if (latestState) library = latestState;
+    if (selectedView !== 'home') { const latestState = await statePromise; if (stamp !== routeVersion) return; if (latestState) library = latestState; }
     if (selectedView === 'home' && params.get('category') === 'adult' && !config.showAdult) { leaveAdultScreen(); return; }
-    if (selectedView === 'home') await renderHome(params.get('category') || 'movie', params.get('source') || '', stamp);
+    if (selectedView === 'home') await renderHome(params.get('category') || 'movie', params.get('source') || '', stamp, statePromise);
     else if (selectedView === 'favorites' || selectedView === 'history') renderLibrary(selectedView);
     else if (selectedView === 'settings') renderSettings();
     else if (selectedView === 'search') await renderSearch(params.get('q') || '', stamp);
@@ -1516,13 +1640,13 @@ async function renderRoute() {
 }
 
 function showLogin() {
+  resourceSnapshots.clear();
   routeVersion++; void stopPlayer(); $('#app-view').hidden = true; $('#login-view').hidden = false; $('#password').focus({ preventScroll: true });
 }
 
 async function boot() {
   const auth = await api('/api/auth');
   if (!auth.authenticated) { showLogin(); return; }
-  [config, library] = await Promise.all([api('/api/config'), api('/api/state')]);
   $('#login-view').hidden = true; $('#app-view').hidden = false; updateSourceStatus(); await renderRoute();
 }
 

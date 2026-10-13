@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { get } from 'node:http';
+import { gunzipSync } from 'node:zlib';
+import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../server.mjs';
@@ -11,6 +15,77 @@ const detail = { key: 'film', source: 'demo', id: '1', title: '测试影片', ye
   lines: [{ name: '线路', episodes: [{ name: '正片', url: 'https://media.example/video.m3u8?token=abc', type: 'hls' }] }] };
 const catalog = { async search() { return { groups: [{ ...detail, items: [{ source: 'demo', id: '1' }] }], failedSources: [] }; },
   async detail() { return detail; } };
+
+test('static gzip and conditional cache preserve bytes, HEAD, representation tags and file updates', async t => {
+  const { base, call } = await running(t);
+  const raw = (path, headers = {}) => new Promise((resolve, reject) => {
+    get(base + path, { headers }, res => {
+      const chunks = []; res.on('data', chunk => chunks.push(chunk)); res.on('error', reject);
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    }).on('error', reject);
+  });
+  const plain = await raw('/app.js', { 'Accept-Encoding': 'identity' });
+  const compressed = await raw('/app.js', { 'Accept-Encoding': 'gzip' });
+  assert.equal(compressed.status, 200); assert.equal(compressed.headers['content-encoding'], 'gzip');
+  assert.deepEqual(gunzipSync(compressed.body), plain.body);
+  assert(compressed.body.length < plain.body.length / 2); assert.equal(compressed.headers.vary, 'Accept-Encoding');
+  assert.notEqual(plain.headers.etag, compressed.headers.etag);
+  const revalidated = await raw('/app.js', { 'Accept-Encoding': 'gzip', 'If-None-Match': `W/${compressed.headers.etag}` });
+  assert.equal(revalidated.status, 304); assert.equal(revalidated.body.length, 0);
+  assert.equal((await raw('/app.js', { 'If-Modified-Since': plain.headers['last-modified'], 'Accept-Encoding': 'identity' })).status, 304);
+  assert.equal((await raw('/app.js', { 'If-None-Match': '"different"', 'If-Modified-Since': 'Tue, 01 Jan 2099 00:00:00 GMT' })).status, 200);
+  assert.equal((await raw('/app.js', { 'Accept-Encoding': 'gzip;q=0, identity' })).headers['content-encoding'], undefined);
+  const head = await call('/app.js', undefined, undefined, 'HEAD', { 'Accept-Encoding': 'gzip' });
+  assert.equal(head.status, 200); assert.equal(await head.text(), ''); assert.equal(Number(head.headers.get('content-length')), compressed.body.length);
+  const name = `cache-test-${randomBytes(6).toString('hex')}.svg`;
+  const file = fileURLToPath(new URL(`../public/${name}`, import.meta.url));
+  t.after(() => rm(file, { force: true }));
+  await writeFile(file, '<svg>first</svg>'); const before = await raw('/' + name);
+  await writeFile(file, '<svg>second changed</svg>'); const after = await raw('/' + name, { 'If-None-Match': before.headers.etag });
+  assert.equal(after.status, 200); assert.notEqual(after.headers.etag, before.headers.etag); assert.equal(after.body.toString(), '<svg>second changed</svg>');
+});
+
+test('progressive browsing/search forward their flag and private API responses stay uncached', async t => {
+  const received = [];
+  const mock = { ...catalog,
+    async browse(_config, options) { received.push(options); return { groups: [], failedSources: [], complete: false, pendingSources: [] }; },
+    async search(_config, q, options) { received.push({ q, ...options }); return { groups: [], failedSources: [], complete: true, pendingSources: [] }; } };
+  const { call, login } = await running(t, { catalog: mock });
+  assert.equal((await call('/api/browse?progressive=1')).status, 401);
+  const cookie = await login();
+  const browse = await call('/api/browse?category=movie&progressive=1', undefined, cookie);
+  assert.equal(browse.headers.get('cache-control'), 'no-store'); assert.equal(browse.headers.get('etag'), null);
+  assert.equal((await browse.json()).complete, false);
+  await call('/api/search?q=sample&progressive=1', undefined, cookie);
+  assert.equal(received[0].progressive, true); assert.deepEqual(received[1], { q: 'sample', progressive: true });
+});
+
+test('pending browse/search responses are rejected when their configured sources change', async t => {
+  for (const route of ['/api/browse?progressive=1', '/api/search?q=sample&progressive=1']) {
+    let release, entered;
+    const blocked = new Promise(resolve => { release = resolve; });
+    const began = new Promise(resolve => { entered = resolve; });
+    const load = async () => { entered(); await blocked; return { groups: [], failedSources: [] }; };
+    const { app, call, login } = await running(t, { catalog: { ...catalog, browse: load, search: load } });
+    const cookie = await login(); const pending = call(route, undefined, cookie); await began;
+    app.store.setConfig({ ...empty, sources: [{ id: 'new', name: '新增', api: 'https://example.org/api' }] });
+    release(); assert.equal((await pending).status, 409);
+  }
+});
+
+test('verified live listing omits unverified channels while preserving original playback line indices', async t => {
+  const streams = [{ url: 'https://media.example/a.m3u8', status: 'error' }, { url: 'https://media.example/b.m3u8', status: 'ok' }];
+  const result = { channels: [{ id: 'ready', streams }, { id: 'unknown', streams: [{ status: 'unknown' }] },
+    { id: 'failed', streams: [{ status: 'error' }] }], probing: true, checkedStreams: 3, totalStreams: 4 };
+  const live = { async list() { return structuredClone(result); }, start() {}, async stop() {} };
+  const { call, login } = await running(t, { live });
+  const cookie = await login();
+  const response = await (await call('/api/live?verified=1', undefined, cookie)).json();
+  assert.deepEqual(response.channels.map(channel => channel.id), ['ready']);
+  assert.deepEqual(response.channels[0].streams, streams); assert.equal(response.channels[0].streams[1].status, 'ok');
+  assert.equal(response.totalStreams, 4); assert.equal(response.checkedStreams, 3);
+  assert.equal((await (await call('/api/live', undefined, cookie)).json()).channels.length, 3);
+});
 
 test('browse passes category, page and selected source to the configured catalog', async (t) => {
   let received;

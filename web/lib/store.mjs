@@ -18,6 +18,20 @@ export function createStore(directory, defaults) {
   const getMeta = db.prepare('SELECT value FROM meta WHERE key=?');
   const setMeta = db.prepare('INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
   if (!getMeta.get('config')) setMeta.run('config', JSON.stringify(defaults));
+  if (!getMeta.get('builtin-live-sources-v2')) {
+    const current = JSON.parse(getMeta.get('config').value);
+    if (Array.isArray(current.liveSources)) {
+      let managed = {};
+      try { managed = JSON.parse(getMeta.get('source-discovery-v1')?.value || '{}').managed || {}; } catch { /* 损坏的发现记录不参与升级；现有配置仍保留。 */ }
+      const rows = [...current.liveSources];
+      for (const source of defaults.liveSources || []) {
+        if (!['vbskycn-ipv4', 'tvbox-live'].includes(source.id) || rows.length >= 20 || managed[source.url]?.blocked || rows.some(row => row.id === source.id || row.url === source.url)) continue;
+        rows.push(source);
+      }
+      if (rows.length !== current.liveSources.length) setMeta.run('config', JSON.stringify({ ...current, liveSources: rows }));
+    }
+    setMeta.run('builtin-live-sources-v2', '1');
+  }
   return {
     meta(key) { return getMeta.get(key)?.value; },
     setMeta(key, value) { setMeta.run(key, value); },

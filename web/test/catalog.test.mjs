@@ -7,6 +7,87 @@ const config = { sources: [{ id: 'a', name: '甲源', api: 'https://a.example/ap
 function response(list, extra = {}) { return Object.assign(Readable.from([Buffer.from(JSON.stringify({ list, ...extra }))]), { statusCode: 200, headers: {} }); }
 function video(id, title = '影片', year = '2026', extra = {}) { return { vod_id: id, vod_name: title, vod_year: year, vod_play_from: '直链', vod_play_url: '正片$https://cdn.example/v.mp4?token=a%2Fb&dollar=$keep', ...extra }; }
 
+test('progressive browse displays a ready source while a slow source continues, sharing the same work', async () => {
+  let release, calls = 0;
+  const slow = new Promise(resolve => { release = resolve; });
+  const catalog = createCatalog({ request: async url => {
+    calls++;
+    if (url.searchParams.get('ac') === 'list') return response([], { class: [{ type_id: 1, type_name: '电影' }] });
+    if (url.hostname === 'b.example') await slow;
+    return response([video(1, url.hostname, '2026', { type_id: 1, type_name: '电影' })], { pagecount: 1 });
+  } });
+  const first = await catalog.browse(config, { progressive: true });
+  assert.equal(first.complete, false);
+  assert.deepEqual(first.groups.map(group => group.title), ['a.example']);
+  assert.deepEqual(first.pendingSources, [{ source: 'b', name: '乙源' }]);
+  first.groups[0].title = 'mutated';
+  assert.equal((await catalog.browse(config, { progressive: true })).groups[0].title, 'a.example');
+  assert.equal(calls, 4);
+  release();
+  await catalog.browse(config);
+  const complete = await catalog.browse(config, { progressive: true });
+  assert.equal(complete.complete, true); assert.deepEqual(complete.pendingSources, []);
+  assert.equal(complete.groups.length, 2); assert.equal(calls, 4);
+});
+
+test('progressive request returns its loading state after 150ms even when all sources are stalled', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let release;
+  const stalled = new Promise(resolve => { release = resolve; });
+  const catalog = createCatalog({ request: async () => { await stalled; return response([]); } });
+  const pending = catalog.search(config, '搜索', { progressive: true });
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(150);
+  const first = await pending;
+  assert.equal(first.complete, false); assert.equal(first.pendingSources.length, 2); assert.deepEqual(first.groups, []);
+  release(); await catalog.search(config, '搜索');
+});
+
+test('search deduplicates in-flight requests and short cache, then invalidates expiry and configuration', async t => {
+  let now = 1000, calls = 0;
+  t.mock.method(Date, 'now', () => now);
+  const catalog = createCatalog({ request: async url => { calls++; return response([video(1, url.hostname)]); } });
+  const state = structuredClone(config);
+  const [first, second] = await Promise.all([catalog.search(state, '影片'), catalog.search(state, '影片')]);
+  assert.equal(calls, 2);
+  first.groups[0].title = 'mutated'; assert.notEqual(second.groups[0].title, 'mutated');
+  assert.notEqual((await catalog.search(state, '影片')).groups[0].title, 'mutated'); assert.equal(calls, 2);
+  now += 30001; await catalog.search(state, '影片'); assert.equal(calls, 4);
+  state.sources[1].enabled = false;
+  assert.equal((await catalog.search(state, '影片')).groups.length, 1); assert.equal(calls, 5);
+});
+
+test('progressive failures are briefly cached so polling does not restart a failed batch', async t => {
+  let now = 1000, calls = 0;
+  t.mock.method(Date, 'now', () => now);
+  const catalog = createCatalog({ request: async () => { calls++; throw new Error('固定故障'); } });
+  let result;
+  do { result = await catalog.search(config, '影片', { progressive: true }); } while (!result.complete);
+  assert.equal(result.failedSources.length, 2); assert.equal(calls, 2);
+  await catalog.search(config, '影片', { progressive: true }); assert.equal(calls, 2);
+  now += 15001;
+  do { result = await catalog.search(config, '影片', { progressive: true }); } while (!result.complete);
+  assert.equal(calls, 4);
+});
+
+test('playback detail gets the next available upstream slot ahead of queued browse work', async () => {
+  const calls = [], blocked = [];
+  let gate = true;
+  const catalog = createCatalog({ request: async url => {
+    calls.push(new URL(url));
+    if (gate) await new Promise(resolve => blocked.push(resolve));
+    return url.searchParams.get('ac') === 'list' ? response([]) : response([video(1)]);
+  } });
+  const browsing = catalog.search({ sources: Array.from({ length: 6 }, (_, index) => ({ id: String(index), name: String(index), api: `https://s${index}.example/api` })) }, '排队');
+  await new Promise(resolve => setImmediate(resolve));
+  const background = catalog.browse(config);
+  await new Promise(resolve => setImmediate(resolve));
+  const detail = catalog.detail(config, 'a', '1');
+  gate = false; blocked.splice(0).forEach(resolve => resolve());
+  await Promise.all([browsing, background, detail]);
+  assert.equal(calls[3].searchParams.get('ids'), '1');
+});
+
 test('aggregates matching title/year/type with all sources while preserving query tokens', async () => {
   const calls = [];
   const catalog = createCatalog({ request: async (url, options) => {

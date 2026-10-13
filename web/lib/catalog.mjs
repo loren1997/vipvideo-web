@@ -132,7 +132,7 @@ function aggregate(results, category) {
   return { groups: [...groups.values()], failedSources };
 }
 
-async function fromSources(sources, load) {
+async function fromSources(sources, load, completed) {
   const results = new Array(sources.length);
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(3, sources.length) }, async () => {
@@ -141,6 +141,7 @@ async function fromSources(sources, load) {
       const source = sources[index];
       try { results[index] = { source, ...await load(source) }; }
       catch (error) { results[index] = { source, error }; }
+      completed?.(results[index], index);
     }
   }));
   return results;
@@ -149,17 +150,19 @@ async function fromSources(sources, load) {
 export function createCatalog({ request = networkRequest } = {}) {
   const typeCache = new Map();
   const browseCache = new Map();
+  const searchCache = new Map();
   const detailCache = new Map();
-  let configSignature;
+  let configSignature, typeSignature;
   let active = 0;
   const waiting = [];
-  function limited(operation) {
+  const urgent = [];
+  function limited(operation, priority = false) {
     return new Promise((resolve, reject) => {
       const run = () => {
         active++;
-        operation().then(resolve, reject).finally(() => { active--; waiting.shift()?.(); });
+        operation().then(resolve, reject).finally(() => { active--; (urgent.shift() || waiting.shift())?.(); });
       };
-      if (active < 3) run(); else waiting.push(run);
+      if (active < 3) run(); else (priority ? urgent : waiting).push(run);
     });
   }
   async function cached(cache, key, ttl, load) {
@@ -172,7 +175,42 @@ export function createCatalog({ request = networkRequest } = {}) {
     try { return await entry.promise; }
     catch (error) { if (cache.get(key) === entry) cache.delete(key); throw error; }
   }
-  async function query(source, parameters) {
+  function signature(config) {
+    const sources = JSON.stringify(config.sources.map(source => [source.id, source.api, source.name, source.enabled]));
+    const value = JSON.stringify([config.showAdult === true, sources]);
+    if (sources !== typeSignature) { typeCache.clear(); typeSignature = sources; }
+    if (value !== configSignature) { browseCache.clear(); searchCache.clear(); configSignature = value; }
+    return value;
+  }
+  async function batch(cache, key, ttl, sources, load, format, progressive) {
+    let entry = cache.get(key);
+    if (!entry || (entry.done && entry.expires <= Date.now())) {
+      if (cache.size >= 128) {
+        const oldest = [...cache].find(([, item]) => item.done);
+        if (!oldest) throw failure('正在加载的请求过多，请稍后重试', 503);
+        cache.delete(oldest[0]);
+      }
+      let first;
+      entry = { results: new Array(sources.length), done: false, firstReady: new Promise(resolve => { first = resolve; }) };
+      cache.set(key, entry);
+      entry.promise = fromSources(sources, load, (result, index) => { entry.results[index] = result; first(); }).then(results => {
+        entry.results = results; entry.done = true;
+        entry.expires = Date.now() + (results.some(result => result.error) ? 15000 : ttl);
+      });
+    }
+    if (progressive && !entry.done) {
+      let timer;
+      try { await Promise.race([entry.promise, entry.firstReady, new Promise(resolve => { timer = setTimeout(resolve, 150); })]); }
+      finally { clearTimeout(timer); }
+    } else await entry.promise;
+    const result = format(entry.results.filter(Boolean));
+    if (progressive) {
+      result.complete = entry.done;
+      result.pendingSources = sources.filter((_, index) => !entry.results[index]).map(source => ({ source: source.id, name: source.name }));
+    } else if (result.failedSources.length && cache.get(key) === entry) cache.delete(key);
+    return structuredClone(result);
+  }
+  async function query(source, parameters, priority = false) {
     const url = validateUrl(source.api);
     for (const key of ['wd', 'ids', 't', 'pg', 'ac']) url.searchParams.delete(key);
     url.searchParams.set('ac', 'videolist');
@@ -201,7 +239,7 @@ export function createCatalog({ request = networkRequest } = {}) {
       } catch (cause) {
         throw cause.status ? cause : failure('影视源请求失败', 502, cause);
       } finally { clearTimeout(timer); }
-    });
+    }, priority);
   }
   function videos(body) {
     if (!Array.isArray(body.list)) throw failure('影视源返回的数据格式不兼容');
@@ -216,15 +254,15 @@ export function createCatalog({ request = networkRequest } = {}) {
     if (body.total != null && body.limit != null && Number.isInteger(total) && total >= 0 && Number.isInteger(limit) && limit > 0) return page * limit < total;
     return body.list.length > 0;
   }
-  async function sourceTypes(source) {
+  async function sourceTypes(source, priority = false) {
     return cached(typeCache, JSON.stringify([source.id, source.api]), 180000, async () => {
-      const body = await query(source, { ac: 'list' });
+      const body = await query(source, { ac: 'list' }, priority);
       return classifyTypes(Array.isArray(body.class) ? body.class : []);
     });
   }
-  async function classifiedVideos(source, body) {
+  async function classifiedVideos(source, body, priority = false) {
     const list = videos(body);
-    const types = Array.isArray(body.class) ? classifyTypes(body.class) : list.some(video => video?.type_id != null) ? await sourceTypes(source) : undefined;
+    const types = Array.isArray(body.class) ? classifyTypes(body.class) : list.some(video => video?.type_id != null) ? await sourceTypes(source, priority) : undefined;
     return types ? list.map(video => types.categories.get(String(video?.type_id)) === 'adult' ? { ...video, _catalogAdult: true } : video) : list;
   }
   async function sourceBrowse(source, category, page) {
@@ -264,29 +302,26 @@ export function createCatalog({ request = networkRequest } = {}) {
   }
 
   return {
-    async search(config, value) {
+    async search(config, value, { progressive = false } = {}) {
       const q = String(value ?? '').trim();
       if (!q || q.length > 100) throw failure('请输入 1 到 100 个字符的关键词', 400);
       const sources = config.sources.filter(source => source.enabled !== false);
-      return aggregate(await fromSources(sources, async source => ({ videos: (await classifiedVideos(source, await query(source, { wd: q }))).filter(video => config.showAdult === true || !adultVideo(video)) })));
+      const key = JSON.stringify([signature(config), q]);
+      return batch(searchCache, key, 30000, sources,
+        async source => ({ videos: (await classifiedVideos(source, await query(source, { wd: q }))).filter(video => config.showAdult === true || !adultVideo(video)) }),
+        results => aggregate(results), progressive);
     },
 
-    async browse(config, { category = 'movie', page = 1, source: sourceId } = {}) {
+    async browse(config, { category = 'movie', page = 1, source: sourceId, progressive = false } = {}) {
       if (typeof category !== 'string' || !Object.hasOwn(ROOT_NAMES, category)) throw failure('分类必须为 movie、tv、anime、variety 或 adult', 400);
       if (category === 'adult' && config.showAdult !== true) throw failure('三级内容已隐藏，请先在设置中开启显示', 403);
       if (!((typeof page === 'number' && Number.isInteger(page)) || (typeof page === 'string' && /^[1-9]\d{0,2}$/.test(page))) || Number(page) < 1 || Number(page) > 100) throw failure('页码必须为 1 到 100 的整数', 400);
       page = Number(page);
       const sources = config.sources.filter(source => source.enabled !== false && (sourceId === undefined || source.id === sourceId));
       if (sourceId !== undefined && !sources.length) throw failure('影视源不存在或已停用', 400);
-      const signature = JSON.stringify([config.showAdult === true, config.sources.map(source => [source.id, source.api, source.name, source.enabled])]);
-      if (signature !== configSignature) { typeCache.clear(); browseCache.clear(); configSignature = signature; }
-      const key = JSON.stringify([signature, category, page, sourceId]);
-      const result = await cached(browseCache, key, 180000, async () => {
-        const results = await fromSources(sources, source => sourceBrowse(source, category, page));
-        return { category, page, ...aggregate(results, category), hasMore: results.some(result => result.hasMore === true) };
-      });
-      if (result.failedSources.length) browseCache.delete(key);
-      return structuredClone(result);
+      const key = JSON.stringify([signature(config), category, page, sourceId]);
+      return batch(browseCache, key, 180000, sources, source => sourceBrowse(source, category, page),
+        results => ({ category, page, ...aggregate(results, category), hasMore: results.some(result => result.hasMore === true) }), progressive);
     },
 
     async detail(config, sourceId, id) {
@@ -296,7 +331,7 @@ export function createCatalog({ request = networkRequest } = {}) {
       if (!videoId || videoId.length > 128 || /[\u0000-\u001f\u007f]/.test(videoId)) throw failure('影片标识无效', 400);
       const key = JSON.stringify([source.id, source.api, source.name, videoId]);
       const item = await cached(detailCache, key, 30000, async () => {
-        const video = (await classifiedVideos(source, await query(source, { ids: videoId }))).find(item => String(item.vod_id) === videoId);
+        const video = (await classifiedVideos(source, await query(source, { ids: videoId }, true), true)).find(item => String(item.vod_id) === videoId);
         const item = metadata(video, source);
         if (!item) throw failure('影片不存在或源未返回详情');
         const description = String(video.vod_content || video.vod_blurb || '').replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '').replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').trim();
