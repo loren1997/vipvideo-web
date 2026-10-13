@@ -15,6 +15,17 @@ test('detail extracts bounded public Quark shares without treating arbitrary URL
   assert.deepEqual((await catalog.detail(config, 'a', '1')).quarkShares, ['https://pan.quark.cn/s/ABC123456?pwd=test']);
 });
 
+test('detail preserves only bounded explicit aliases for public resource searches', async () => {
+  const catalog = createCatalog({ request: async () => response([
+    video(1, '影片', '2026', { vod_sub: '影片 / <b>正式别名</b> / 正式别名 | Film Alias；其它别名', vod_en: 'film-url-slug' }),
+    video(2, '无别名', '2026', { vod_en: 'not-a-real-alias' }),
+    video(3, '无效别名', '2026', { vod_sub: 'https://example.com/link / ' + '长'.repeat(301) }),
+  ]) });
+  assert.deepEqual((await catalog.detail(config, 'a', '1')).aliases, ['正式别名', 'Film Alias']);
+  assert.equal((await catalog.detail(config, 'a', '2')).aliases, undefined);
+  assert.equal((await catalog.detail(config, 'a', '3')).aliases, undefined);
+});
+
 test('genre uses each source category ID and enforces year even when the source ignores its filter', async () => {
   const calls = [];
   const single = { sources: [{ ...config.sources[0], api: 'https://a.example/api?token=keep&year=1990&class=stale&sort_direction=asc' }] };

@@ -13,7 +13,7 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
     async playback(assetId, { valid: authorized = () => true, owner } = {}) {
       if (!authorized()) throw failure('登录会话已结束，请重新登录', 401);
       const before = generation;
-      const descriptor = await quark.playback(assetId);
+      const descriptor = await quark.playback(assetId, { valid: authorized });
       if (!authorized()) throw failure('登录会话已结束，请重新登录', 401);
       if (before !== generation) throw failure('夸克账号已变更，请重新播放', 409);
       const episode = descriptor.episode;

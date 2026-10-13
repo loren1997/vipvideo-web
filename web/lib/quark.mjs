@@ -5,6 +5,7 @@ import { request as networkRequest, readText, validateUrl } from './network.mjs'
 
 const API = 'https://drive.quark.cn/1/clouddrive', REFERER = 'https://pan.quark.cn/';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const PLAYBACK_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch';
 const DAY = 86400000, GIB = 1024 ** 3, SIDECAR = 'http://pansou:8888/api/search';
 const defaults = { enabled: false, autoSave: false, cleanupEnabled: false, retentionDays: 7, maxDailyTransfers: 100, maxDailyBytes: 20 * GIB, searchApi: '' };
 const id = () => randomBytes(16).toString('hex');
@@ -54,29 +55,35 @@ function detailInfo(detail, options = {}) {
 }
 
 function number(value) {
-  if (/^\d+$/.test(value || '')) return Number(value);
-  const digits = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (/^\d{1,3}$/.test(value || '')) return Number(value);
+  const digits = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  const hundreds = /^([一二两三四五六七八九])百([零〇一二两三四五六七八九十]*)$/.exec(value || '');
+  if (hundreds) { const tail = hundreds[2], rest = !tail ? 0 : /^[零〇][一二三四五六七八九]$/.test(tail) ? digits[tail[1]] : tail.includes('十') ? number(tail) : undefined; return rest === undefined ? undefined : digits[hundreds[1]] * 100 + rest; }
   if (value === '十') return 10;
   if (/^[一二三四五六七八九]?十[一二三四五六七八九]?$/.test(value || '')) { const [left, right] = value.split('十'); return (digits[left] || 1) * 10 + (digits[right] || 0); }
   return Object.hasOwn(digits, value) ? digits[value] : undefined;
 }
-const seasonNumber = value => { const match = /(?:\bS(\d{1,2})(?:E\d+)?|第([零一二两三四五六七八九十\d]+)季)/i.exec(value || ''); return match ? number(match[1] || match[2]) : undefined; };
+const seasonNumber = value => { const matches = [...String(value || '').normalize('NFKC').matchAll(/(?:^|[^a-z0-9])s(\d{1,2})(?=e\d|[^a-z0-9]|$)|(?:^|[^a-z0-9])(\d{1,2})x\d{1,3}(?!\d)|第([零〇一二两三四五六七八九十百\d]+)季/gi)].map(match => number(match[1] || match[2] || match[3])); return matches.some(value => value === undefined || value !== matches[0]) ? null : matches[0]; };
 const episodeNumber = value => {
-  const match = /(?:^|[^a-z])(?:s\d{1,2}[ ._-]*)?e(?:p)?[ ._-]*(\d{1,3})|第([零一二两三四五六七八九十\d]+)集/i.exec(value || '');
-  return match ? number(match[1] || match[2]) : /^(?:0*\d{1,3})(?:\.[a-z0-9]+)?$/i.test(value || '') ? Number(String(value).split('.')[0]) : undefined;
+  const text = String(value || '').normalize('NFKC');
+  if (/第[零〇一二两三四五六七八九十百\d]+\s*[-~～至到—–]\s*第?[零〇一二两三四五六七八九十百\d]+[集话]|(?:^|[^a-z0-9])(?:s\d{1,2}[ ._-]*)?(?:episode|ep|e)?[ ._-]*\d{1,3}[ ._]*[-~～至到—–][ ._]*(?:s\d{1,2}[ ._-]*)?(?:episode|ep|e)?[ ._-]*\d{1,3}(?![a-z0-9])/i.test(text)) return null;
+  const matches = [...text.matchAll(/(?:^|[^a-z0-9])(?:s\d{1,2}[ ._-]*)?(?:episode|ep|e)[ ._-]*(\d{1,3})(?![a-z0-9])|(?:^|[^a-z0-9])\d{1,2}x(\d{1,3})(?![a-z0-9])|第([零〇一二两三四五六七八九十百\d]+)[集话]/gi)];
+  if (matches.length) return matches.length === 1 ? number(matches[0][1] || matches[0][2] || matches[0][3]) ?? null : null;
+  return /^(?:\d{1,3})(?:\.[a-z0-9]+)?$/i.test(text) ? Number(text.split('.')[0]) : undefined;
 };
 const normalized = value => String(value).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 function matches(info, file) {
   if (!info.selected || info.title.length < 2) return false;
   const parts = [...file.path, file.name], title = normalized(info.title);
-  const suffix = /^(?:(?:19|20)\d{2}|s\d{1,2}(?:e\d{1,3})?|e(?:p)?\d{1,3}|第[零一二两三四五六七八九十\d]+[季集]|(?:480|720|1080|2160)p|[48]k|hdr|dv|dolby|webdl|webrip|bluray|bdrip|[hx]26[45]|aac|ac3|国语|中字|中英字幕|正片|高清|超清|完整版|全集|完结|全\d+集)*$/i;
+  const suffix = /^(?:(?:19|20)\d{2}|s\d{1,2}(?:e\d{1,3})?|(?:episode|ep|e)\d{1,3}|\d{1,2}x\d{1,3}|第[零〇一二两三四五六七八九十百\d]+[季集话]|(?:480|720|1080|2160)p|[48]k|hdr|dv|dolby|webdl|webrip|bluray|bdrip|[hx]26[45]|aac|ac3|国语|中字|中英字幕|正片|高清|超清|完整版|全集|完结|全\d+集)*$/i;
   if (!parts.some(part => { const stem = normalized(part.replace(/\.[a-z0-9]{2,5}$/i, '')); return stem.startsWith(title) && suffix.test(stem.slice(title.length)); })) return false;
   const years = parts.flatMap(part => [...part.matchAll(/(?:19|20)\d{2}/g)].map(match => match[0]));
   if (info.year && (!years.includes(info.year) || years.some(year => year !== info.year))) return false;
   const wantedEpisode = episodeNumber(info.selected.name);
-  const season = Number.isInteger(info.season) ? info.season : seasonNumber(info.title) ?? seasonNumber(info.selected.name);
+  if (wantedEpisode === null) return false;
+  const wantedSeasons = [Number.isInteger(info.season) ? info.season : undefined, seasonNumber(info.title), seasonNumber(info.selected.name)].filter(value => value !== undefined), season = wantedSeasons[0];
   const seasons = parts.map(seasonNumber).filter(value => value !== undefined);
-  if (seasons.some(value => season === undefined || value !== season)) return false;
+  if (wantedSeasons.some(value => value === null || value !== season) || seasons.some(value => value === null || season === undefined || value !== season) || season > 1 && !seasons.length) return false;
   if (wantedEpisode !== undefined) return episodeNumber(file.name.replace(/\.[^.]+$/, '')) === wantedEpisode;
   return info.index === 0 && /^(?:正片|电影|完整版|全集)$/i.test(info.selected.name || '') && episodeNumber(file.name.replace(/\.[^.]+$/, '')) === undefined;
 }
@@ -140,7 +147,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (active >= 2) { if (waiters.length >= 64) throw failure('夸克请求繁忙，请稍后重试', 429); await new Promise(resolve => waiters.push(resolve)); } else active++;
     try { return await operation(); } finally { const next = waiters.shift(); if (next) next(); else active--; }
   }
-  async function api(path, { method = 'GET', body, query = {}, credentials = '', guard, beforeSend } = {}) {
+  async function api(path, { method = 'GET', body, query = {}, credentials = '', guard, beforeSend, userAgent = UA } = {}) {
     return limited(async () => {
       if (stopped) throw failure('夸克服务正在关闭', 503);
       guard?.();
@@ -149,24 +156,27 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       let response, timeout, expired = false;
       try {
         const task = (async () => {
-          response = await request(target.href, { method, body: body === undefined ? undefined : JSON.stringify(body), followRedirects: false, timeout: 8000, headers: { accept: 'application/json', 'content-type': 'application/json', referer: REFERER, 'user-agent': UA, ...(credentials ? { cookie: credentials } : {}) } });
+          response = await request(target.href, { method, body: body === undefined ? undefined : JSON.stringify(body), followRedirects: false, timeout: 8000, headers: { accept: 'application/json', 'content-type': 'application/json', referer: REFERER, 'user-agent': userAgent, ...(credentials ? { cookie: credentials } : {}) } });
           response.on('error', () => {});
           if (expired) { response.destroy(); throw failure('夸克接口请求超过8秒', 504); }
           if (response.finalUrl && new URL(response.finalUrl).origin !== new URL(API).origin) throw failure('夸克接口返回了非官方目标，已停止请求');
           if (response.statusCode !== 200) throw responseFailure(response.statusCode);
           const json = JSON.parse(await readText(response, 1024 * 1024));
-          if (json.code !== 0 || Number(json.status || 200) >= 400) throw responseFailure(Number(json.status || 200));
+          if (json.code !== 0 || Number(json.status || 200) >= 400) throw responseFailure(Number(json.status || 200), json.code, response.statusCode);
           return json;
         })();
         return await Promise.race([task, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('夸克接口请求超过8秒', 504)); }, 8000); })]);
       } catch (cause) { if (cause.quarkSafe) throw cause; throw failure('夸克接口连接失败，请稍后重试'); }
       finally { expired = true; clearTimeout(timeout); response?.destroy(); }
     });
-    function responseFailure(status) {
-      if (status === 401) return accountFailure(credentials ? '夸克登录验证未通过，请在设置中更新网页登录 Cookie' : '此夸克分享需要登录，请在设置中连接并启用夸克账号');
-      if (status === 403) return failure('夸克接口拒绝访问（403），可能存在分享权限或访问限制，请到夸克官方页面确认', 403);
-      if (status === 429) return failure('夸克请求过于频繁（429），请稍后重试', 429);
-      return failure(path.startsWith('/share/sharepage/') ? '夸克分享暂时不可读取，可能已失效、需要提取码或受访问限制，请打开公开分享确认' : '夸克接口暂时不可用，请稍后重试');
+    function responseFailure(status, code, httpStatus = status) {
+      const cause = status === 401 ? accountFailure(credentials ? '夸克登录验证未通过，请在设置中更新网页登录 Cookie' : '此夸克分享需要登录，请在设置中连接并启用夸克账号')
+        : status === 403 ? failure('夸克接口拒绝访问（403），可能存在分享权限或访问限制，请到夸克官方页面确认', 403)
+          : status === 429 ? failure('夸克请求过于频繁（429），请稍后重试', 429)
+            : failure(path.startsWith('/share/sharepage/') ? '夸克分享暂时不可读取，可能已失效、需要提取码或受访问限制，请打开公开分享确认' : '夸克接口暂时不可用，请稍后重试');
+      if (Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599) cause.quarkUpstreamStatus = httpStatus;
+      if (Number.isSafeInteger(code)) cause.quarkUpstreamCode = code;
+      return cause;
     }
   }
   async function verify(value) {
@@ -228,11 +238,15 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   }
   function addShare(info, link, label) {
     const parsed = share(link?.url || link, link?.password || link?.pwd || ''); if (!parsed) return null;
-    const duplicate = [...shares.values()].find(value => value.detail === info.key && value.url === parsed.url);
+    const publishedAt = Number.isSafeInteger(link?.publishedAt) && link.publishedAt >= 0 && link.publishedAt <= now() + DAY ? link.publishedAt : undefined;
+    const duplicate = [...shares.values()].find(value => value.detail === info.key && value.pwdId === parsed.pwdId);
     const row = duplicate || { id: id(), detail: info.key, ...parsed };
-    row.name = name(label || link?.name || link?.title) || info.title; row.expires = now() + 10 * 60000; shares.set(row.id, row);
+    if (!duplicate || !row.name || publishedAt !== undefined && publishedAt > (row.publishedAt ?? -1)) row.name = name(label || link?.name || link?.title) || info.title;
+    if (parsed.password && (!row.password || publishedAt !== undefined && publishedAt > (row.passwordAt ?? -1))) { row.password = parsed.password; row.url = parsed.url; row.passwordAt = publishedAt ?? -1; }
+    if (publishedAt !== undefined && publishedAt > (row.publishedAt ?? -1)) row.publishedAt = publishedAt;
+    row.expires = now() + 10 * 60000; shares.set(row.id, row);
     while (shares.size > 128) shares.delete(shares.keys().next().value);
-    return { id: row.id, name: row.name, url: row.url };
+    return { id: row.id, name: row.name, url: row.url, ...(row.publishedAt === undefined ? {} : { publishedAt: row.publishedAt }) };
   }
   async function lookupResources(detail, options = {}) {
     const info = detailInfo(detail, options), rows = new Map();
@@ -240,15 +254,15 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     for (const link of (Array.isArray(provided) ? provided : [provided]).slice(0, 20)) { const row = addShare(info, link); if (row) rows.set(row.id, row); }
     let reason;
     const cached = searches.get(info.key);
-    if (cached && cached.expires > now()) for (const row of cached.rows) { const existing = shares.get(row.id); if (existing) { existing.expires = now() + 10 * 60000; rows.set(row.id, row); } }
-    else {
+    if (cached && cached.expires > now()) for (const row of cached.rows) { const existing = shares.get(row.id); if (existing) { const fresh = addShare(info, existing, existing.name); rows.set(fresh.id, fresh); } }
+    if (!cached || cached.expires <= now() || options.webSearch === true) {
       let response, timeout, expired = false;
       try {
         const configured = config.searchApi || defaultSearchApi;
         const target = configured ? new URL(searchUrl(configured)) : new URL('https://www.bing.com/search');
         if (configured) { target.searchParams.set('kw', info.title + (info.year ? ' ' + info.year : '')); target.searchParams.set('cloud_types', 'quark'); target.searchParams.set('res', 'results'); target.searchParams.set('conc', '2'); }
         else { target.searchParams.set('q', info.title + (info.year ? ' ' + info.year : '') + ' site:pan.quark.cn/s'); target.searchParams.set('format', 'rss'); }
-        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
+        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, aliases: detail.aliases, webSearch: options.webSearch === true, headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
         const body = await Promise.race([fetch, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('公开夸克搜索超时', 504)); }, 8000); })]);
         let visited = 0;
         const found = [], visit = (value, label = '', depth = 0) => {
@@ -257,7 +271,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
           else if (Array.isArray(value)) value.slice(0, 100).forEach(item => visit(item, label, depth + 1));
           else if (value && typeof value === 'object') {
             const title = name(value.work_title || value.title || value.name || value.file_name || value.note) || label;
-            if ((!value.type || value.type === 'quark') && share(value.url || value.link, value.password || '')) found.push({ url: value.url || value.link, password: value.password || '', name: title });
+            if ((!value.type || value.type === 'quark') && share(value.url || value.link, value.password || '')) found.push({ url: value.url || value.link, password: value.password || '', name: title, publishedAt: value.publishedAt });
             for (const [field, item] of Object.entries(value).slice(0, 30)) if (['links', 'results', 'data', 'merged_by_type', 'quark', 'list'].includes(field)) visit(item, title, depth + 1);
           }
         };
@@ -267,10 +281,10 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       } catch (cause) { reason = publicReason(cause); }
       finally { expired = true; clearTimeout(timeout); response?.destroy(); }
     }
-    return { resources: [...rows.values()], ...(reason ? { reason } : {}) };
+    return { resources: [...rows.values()].sort((a, b) => (b.publishedAt ?? -1) - (a.publishedAt ?? -1)), ...(reason ? { reason } : {}) };
   }
   async function resources(detail, options = {}) {
-    const key = detailInfo(detail, options).key + ':' + (config.searchApi || defaultSearchApi);
+    const key = detailInfo(detail, options).key + ':' + (config.searchApi || defaultSearchApi) + ':' + (options.webSearch === true ? 'web' : 'normal');
     if (searchFlights.has(key)) return structuredClone(await searchFlights.get(key));
     if (searchFlights.size >= 64) return { resources: [], reason: '公开夸克搜索繁忙，请稍后重试' };
     const job = lookupResources(detail, options).finally(() => searchFlights.delete(key)); searchFlights.set(key, job);
@@ -398,26 +412,35 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     }).finally(() => prepareFlights.delete(key));
     prepareFlights.set(key, job); return job;
   }
-  async function playback(assetId) {
-    const context = await snapshot(), asset = findAsset(assetId, context);
+  async function playback(assetId, options = {}) {
+    const context = await snapshot(); context.valid = typeof options.valid === 'function' ? options.valid : undefined; current(context);
+    const asset = findAsset(assetId, context);
     if (asset.status !== 'ready') throw failure('夸克视频尚未就绪或正在清理', 409);
     asset.leaseUntil = now() + 120000; asset.lastActivity = now(); persist();
     await ownedFile(context, asset); current(context);
-    let target, type, mode = 'official', quality;
+    let target, type, mode = 'official', quality, officialError;
+    const diagnostic = cause => [Number.isInteger(cause?.quarkUpstreamStatus) ? 'HTTP ' + cause.quarkUpstreamStatus : '', Number.isSafeInteger(cause?.quarkUpstreamCode) ? 'API ' + cause.quarkUpstreamCode : ''].filter(Boolean).join('，');
     try {
-      const result = await auth(context, '/file/v2/play/project', { method: 'POST', body: { fid: asset.fid, resolutions: 'low,normal,high,super,2k,4k', supports: 'fmp4_av,m3u8,dolby_vision' } }); current(context);
-      const list = (Array.isArray(result.data?.video_list) ? result.data.video_list : []).map(row => row.video_info).filter(info => typeof info?.url === 'string' && info.success !== false && info.finish !== false).sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
+      const result = await auth(context, '/file/v2/play/project', { method: 'POST', userAgent: PLAYBACK_UA, body: { fid: asset.fid, resolutions: 'low,normal,high,super,2k,4k', supports: 'fmp4_av,m3u8,dolby_vision' } }); current(context);
+      const list = (Array.isArray(result.data?.video_list) ? result.data.video_list : []).filter(row => row?.accessable !== false).map(row => row?.video_info).filter(info => typeof info?.url === 'string' && info.success !== false && info.finish !== false).sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
       for (const info of list) { try { target = validateUrl(info.url).href; type = /\.m3u8$/i.test(new URL(target).pathname) || /hls|m3u8/i.test(String(info.format || info.hls_type || '')) ? 'hls' : 'mp4'; if (Number.isSafeInteger(info.width) && Number.isSafeInteger(info.height) && info.width > 0 && info.width <= 8192 && info.height > 0 && info.height <= 4320) quality = { width: info.width, height: info.height }; break; } catch {} }
-    } catch { current(context); }
+    } catch (cause) { current(context); if ([401, 429].includes(cause.status)) throw cause; officialError = cause; }
     if (!target) {
-      mode = 'download'; const result = await auth(context, '/file/download', { method: 'POST', body: { fids: [asset.fid] } }); current(context);
+      mode = 'download'; let result;
+      try { result = await auth(context, '/file/download', { method: 'POST', userAgent: PLAYBACK_UA, query: { uc_param_str: '' }, body: { fids: [asset.fid] } }); current(context); }
+      catch (cause) {
+        current(context); if ([401, 429].includes(cause.status)) throw cause;
+        const project = diagnostic(officialError), download = diagnostic(cause);
+        throw failure(`夸克官方在线播放未提供可用链接${project ? '（' + project + '）' : ''}；原文件链接获取也失败${download ? '（' + download + '）' : ''}。请在夸克官方客户端确认该文件可下载后重试`, [403, 504].includes(cause.status) ? cause.status : 502);
+      }
       const row = Array.isArray(result.data) && result.data.length === 1 && result.data.find(row => (!row.fid || row.fid === asset.fid) && typeof row.download_url === 'string');
       if (!row) throw failure('夸克未返回可播放的原文件链接');
       try { target = validateUrl(row.download_url).href; } catch { throw failure('夸克返回的播放地址不符合安全限制'); }
       type = /\.mkv$/i.test(asset.name) ? 'mkv' : /\.webm$/i.test(asset.name) ? 'webm' : /\.avi$/i.test(asset.name) ? 'avi' : /\.(?:ts|m2ts)$/i.test(asset.name) ? 'mpegts' : 'mp4';
     }
     const parsed = new URL(target), firstParty = parsed.protocol === 'https:' && (parsed.hostname === 'quark.cn' || parsed.hostname.endsWith('.quark.cn') || parsed.hostname === 'uc.cn' || parsed.hostname.endsWith('.uc.cn'));
-    return { episode: { url: target, type }, headers: { referer: REFERER, 'user-agent': UA, ...(firstParty ? { cookie: context.cookie } : {}) }, allowCookieOrigins: firstParty ? [parsed.origin] : [], metadata: { assetId: asset.id, name: asset.name, size: asset.size, category: asset.category || '', mode, version: hash(JSON.stringify([asset.fid, mode, quality || null])).slice(0, 24), ...(quality ? { quality } : {}), requiresCompatibility: !['hls', 'mp4', 'webm'].includes(type) } };
+    current(context);
+    return { episode: { url: target, type }, headers: { referer: REFERER, 'user-agent': PLAYBACK_UA, ...(firstParty ? { cookie: context.cookie } : {}) }, allowCookieOrigins: firstParty ? [parsed.origin] : [], metadata: { assetId: asset.id, name: asset.name, size: asset.size, category: asset.category || '', mode, version: hash(JSON.stringify([asset.fid, mode, quality || null])).slice(0, 24), ...(quality ? { quality } : {}), requiresCompatibility: !['hls', 'mp4', 'webm'].includes(type) } };
   }
   async function progress(assetId, input) {
     const context = await snapshot(), asset = findAsset(assetId, context);

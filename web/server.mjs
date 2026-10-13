@@ -193,9 +193,10 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         }
         if (['/api/quark/resources', '/api/quark/files'].includes(path) && method === 'GET') {
           const input = Object.fromEntries(url.searchParams), selected = await cloudSelection(input, hashToken(token));
+          if (input.web !== undefined && input.web !== '1') throw badRequest('公开网页搜索选项无效');
           const result = path.endsWith('/files')
             ? await quarkService.files(selected.detail, { ...selected.options, valid: selected.valid, shareId: text(input.shareId, '夸克分享标识', 200) })
-            : await quarkService.resources(selected.detail, selected.options);
+            : await quarkService.resources(selected.detail, { ...selected.options, ...(input.web === '1' ? { webSearch: true } : {}) });
           selected.valid(); return json(res, 200, result);
         }
         if (path === '/api/quark/prepare' && method === 'POST') {

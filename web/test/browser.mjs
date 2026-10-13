@@ -244,6 +244,11 @@ try {
         if (parsed.pathname === '/api/quark/cleanup') { assert.deepEqual(body, {}); quarkSettings.lastCleanup = Date.now(); return route.fulfill({ json: { removed: 0, failed: 0 } }); }
         if (parsed.pathname === '/api/quark/resources') {
           if (holdQuarkResources) await new Promise(ok => { releaseQuarkResources = ok; });
+          if (parsed.searchParams.get('web') === '1') return route.fulfill({ json: { resources: [
+            { id: 'share-new', name: '当前片新增公开资源', url: 'https://pan.quark.cn/s/new123456', publishedAt: Date.UTC(2026, 8, 20) },
+            { id: 'share-old', name: '当前片已有公开资源', url: 'https://pan.quark.cn/s/old123456', publishedAt: Date.UTC(2025, 8, 20) },
+            { id: 'share-undated', name: '当前片无日期资源', url: 'https://pan.quark.cn/s/nodate123' },
+          ] } });
           if (quarkChoicesFixture) return route.fulfill({ json: { resources: ['first', 'second'].map(id => ({ id: `share-${id}`, name: `${id === 'first' ? '第一' : '第二'}份分享 · 4K HQ 60FPS 高码率 DTS 环绕声 内嵌简英字幕 ${'完整长标题'.repeat(12)}`, url: `https://pan.quark.cn/s/${id}` })), reason: '' } });
           return route.fulfill({ json: { resources: [{ id: 'share-fixture', name: '当前片分享样例', url: 'https://pan.quark.cn/s/fixture' }], reason: '' } });
         }
@@ -542,6 +547,29 @@ try {
     } finally { maintenanceHealth = false; await isolated?.value.close(); }
   }
 
+  async function verifyQuarkPublicSearch() {
+    const before = structuredClone(quarkSettings); let isolated;
+    try {
+      Object.assign(quarkSettings, { configured: true, enabled: true, autoSave: false, account: { connected: true, label: '测试账号' } });
+      isolated = await context({ width: 1440, height: 1000 }, true, false, '#detail?source=first&id=quark'); const p = isolated.page;
+      const more = p.getByRole('button', { name: '查找更多公开资源', exact: true });
+      await until(() => more.isEnabled(), '主动公开资源搜索可用');
+      await until(() => p.getByLabel('夸克视频文件', { exact: true }).isEnabled(), '普通资源列表就绪');
+      const prepares = quarkRequests.filter(request => request.path === '/api/quark/prepare').length;
+      quarkSettings.autoSave = true; await more.click();
+      await until(() => p.getByLabel('夸克分享资源', { exact: true }).locator('option').count().then(count => count === 3), '更多公开资源显示');
+      const options = await p.getByLabel('夸克分享资源', { exact: true }).locator('option').allTextContents();
+      assert.match(options[0], /新增公开资源.*2026/); assert.match(options[1], /已有公开资源.*2025/); assert.equal(options[2], '当前片无日期资源');
+      assert.equal(quarkRequests.filter(request => request.path === '/api/quark/resources').at(-1).query.web, '1');
+      await until(() => more.isEnabled(), '更多搜索结束后按钮恢复');
+      await p.waitForTimeout(100); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').length, prepares, '主动拓展搜索不会自动转存未知的新分享');
+      holdQuarkResources = true; await more.click(); await until(() => Boolean(releaseQuarkResources), '更多资源等待中');
+      await p.locator('nav a[href="#home"]').click(); releaseQuarkResources(); releaseQuarkResources = null; holdQuarkResources = false;
+      await p.waitForTimeout(100); assert.equal(await p.locator('#quark-resources').count(), 0, '离开页面后迟到搜索不接管页面');
+      console.log('PASS 主动Google和网页资源查询、页面日期显示、无日期末尾、不自动转存新发现、离页迟到结果取消');
+    } finally { holdQuarkResources = false; releaseQuarkResources?.(); releaseQuarkResources = null; Object.assign(quarkSettings, before); await isolated?.value.close(); }
+  }
+
   async function verifyQuarkChoices() {
     const settingsBefore = structuredClone(quarkSettings); let isolated;
     try {
@@ -682,9 +710,10 @@ try {
         window.Hls = class CloudFixtureHls {
           static isSupported() { return true; }
           static Events = { ERROR: 'hlsError', MANIFEST_PARSED: 'hlsManifestParsed' };
+          constructor() { (window.cloudHlsInstances ||= []).push(this); }
           loadSource(url) { this.url = url; }
           attachMedia(video) { video.src = this.url.replace('.m3u8', '.mp4'); }
-          on(event, callback) { if (event === 'hlsManifestParsed') queueMicrotask(() => callback(event)); }
+          on(event, callback) { if (event === 'hlsManifestParsed') queueMicrotask(() => callback(event)); else if (event === 'hlsError') this.emitError = data => callback(event, data); }
           destroy() {}
         };
       });
@@ -707,12 +736,27 @@ try {
       const nearEnd = quarkProgress.length; await p.locator('video').evaluate(video => { video.currentTime = 28.5; video.dispatchEvent(new Event('pause')); }); await until(() => quarkProgress.slice(nearEnd).some(body => body.position === 28.5), '95%位置保存'); assert.equal(quarkProgress.slice(nearEnd).some(body => body.ended), false, 'seek/95%暂停保存不推断完成'); await p.locator('video').evaluate(video => { video.currentTime = 5; });
       await p.screenshot({ path: join(output, 'desktop-quark-player.png'), fullPage: true }); await p.setViewportSize({ width: 390, height: 844 }); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1); await p.screenshot({ path: join(output, 'mobile-quark-player.png'), fullPage: true });
       const beforeFailure = playabilityReports.length, networkJobs = transcodeStarts.length;
+      for (const code of [401, 403, 502]) {
+        await p.evaluate(code => { window.staleCloudHls = window.cloudHlsInstances.at(-1); window.staleCloudHls.emitError({ fatal: true, type: 'networkError', details: 'fragLoadError', response: { code } }); }, code);
+        await p.locator('.player-note').getByText(/夸克播放中断/).waitFor(); assert.equal(transcodeStarts.length, networkJobs, `HLS HTTP ${code} 不误当解码错误`);
+        await retryQuark(); await decoded('/api/quark/media/share-fixture-file-1');
+        await p.evaluate(() => window.staleCloudHls.emitError({ fatal: true, type: 'mediaError', details: 'bufferAddCodecError' })); await p.waitForTimeout(50);
+        assert.equal(transcodeStarts.length, networkJobs, '旧HLS播放器迟到媒体错误不启动转码');
+      }
+      await p.evaluate(() => window.cloudHlsInstances.at(-1).emitError({ fatal: true, type: 'mediaError', details: 'bufferAddCodecError', response: { code: 403 } }));
+      await p.locator('.player-note').getByText(/夸克播放中断/).waitFor(); assert.equal(transcodeStarts.length, networkJobs, '携带拒绝访问响应的HLS错误不启动解码');
+      await retryQuark(); await decoded('/api/quark/media/share-fixture-file-1');
       await p.locator('video').evaluate(video => { Object.defineProperty(video, 'error', { value: { code: 2 }, configurable: true }); video.dispatchEvent(new Event('error')); delete video.error; }); await p.locator('.player-note').getByText(/夸克播放中断/).waitFor(); assert.equal(playabilityReports.length, beforeFailure, '云网络故障不停用原来源'); assert.equal(transcodeStarts.length, networkJobs, '云网络错误不启动兼容');
       await retryQuark(); await decoded('/api/quark/media/share-fixture-file-1'); await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 5; });
       transcodeMode = 'enabled'; transcodeDuration = 30; const decodeJobs = transcodeStarts.length;
       await p.locator('video').evaluate(video => { Object.defineProperty(video, 'error', { value: { code: 4 }, configurable: true }); video.dispatchEvent(new Event('error')); video.dispatchEvent(new Event('error')); delete video.error; }); await decoded('/api/transcode/');
       assert.equal(transcodeStarts.length, decodeJobs + 1, '明确解码错误只自动兼容一次'); assert.equal(transcodeStarts.at(-1).quarkAsset, 'share-fixture-file-1'); assert.equal(transcodeStarts.at(-1).source, undefined); assert.ok(transcodeStarts.at(-1).position >= 5, '云解码回退沿用原片绝对进度'); assert.equal(playabilityReports.length, beforeFailure);
       await p.locator('video').evaluate(video => { Object.defineProperty(video, 'error', { value: { code: 4 }, configurable: true }); video.dispatchEvent(new Event('error')); delete video.error; }); await p.locator('.player-note').getByText(/兼容播放中断/).waitFor(); assert.equal(transcodeStarts.length, decodeJobs + 1, '云兼容流失败不自动重复转码'); assert.equal(playabilityReports.length, beforeFailure, '兼容失败仍不报告原影视源');
+      await retryQuark(); await decoded('/api/quark/media/share-fixture-file-1'); await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 6; }); const hlsDecodeJobs = transcodeStarts.length;
+      assert.equal(await p.locator('video').evaluate(video => video.error), null, 'HLS codec失败无需原生video.error');
+      await p.evaluate(() => { const instance = window.cloudHlsInstances.at(-1); instance.emitError({ fatal: true, type: 'mediaError', details: 'bufferAddCodecError' }); instance.emitError({ fatal: true, type: 'mediaError', details: 'bufferAddCodecError' }); }); await decoded('/api/transcode/');
+      assert.equal(transcodeStarts.length, hlsDecodeJobs + 1, 'HLS codec fatal仅自动启动一次现有兼容任务'); assert.equal(transcodeStarts.at(-1).quarkAsset, 'share-fixture-file-1'); assert.ok(transcodeStarts.at(-1).position >= 6); assert.equal(playabilityReports.length, beforeFailure);
+      await p.evaluate(() => window.cloudHlsInstances.at(-1).emitError({ fatal: true, type: 'mediaError', details: 'bufferAddCodecError' })); await p.locator('.player-note').getByText(/兼容播放中断/).waitFor(); assert.equal(transcodeStarts.length, hlsDecodeJobs + 1, '转码输出再发生HLS错误不循环重建任务');
       transcodeMode = 'disabled'; transcodeDuration = previousDuration;
       await p.getByRole('button', { name: '返回原线路', exact: true }).click(); await decoded('quark-first-1'); await p.locator('video').evaluate(video => video.pause());
       quarkMode = 'webm'; const webmJobs = transcodeStarts.length; await p.getByRole('button', { name: '夸克播放', exact: true }).click(); await decoded('/api/quark/media/share-fixture-file-1'); assert.equal(transcodeStarts.length, webmJobs, '可信WebM先走浏览器原生，不主动转码'); quarkMode = 'matched';
@@ -1716,6 +1760,7 @@ try {
   await verifyQuarantineStatus();
   await verifyQuarkAutoplay();
   await verifyQuarkFlow();
+  await verifyQuarkPublicSearch();
   await verifyQuarkChoices();
   await verifyCompactSettings();
   await verifyLowLoadLive();

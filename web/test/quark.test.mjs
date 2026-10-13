@@ -368,6 +368,95 @@ test('file candidates expose opaque IDs only and complete exact movie evidence p
   const save = state.calls.find(call => call.path === '/share/sharepage/save'); assert.deepEqual(save.body.fid_list, ['share-video']); assert.notEqual(save.body.to_pdir_fid, '0');
 });
 
+test('automatic single-episode transfers recognize bounded episode notation and Chinese hundreds through the share listing', async t => {
+  for (const [selected, fileName, season, folder] of [
+    ['第12集', '剧集.2026.S01E012.1080p.H265.mkv', 1],
+    ['EP12', '剧集.2026.EP12.mkv'],
+    ['Episode 12', '剧集.2026.Episode12.mkv'],
+    ['第十二集', '剧集.2026.1x12.mkv', 1],
+    ['第十二话', '剧集.2026.第十二话.mkv'],
+    ['第101话', '剧集.2026.第一百零一话.mkv'],
+    ['第一百二十集', '剧集.2026.EP120.mkv'],
+    ['第999集', '剧集.2026.第九百九十九集.mkv'],
+    ['第201集', '剧集.2026.第两百零一集.mkv'],
+    ['ＥＰ１２', '剧集.2026.EP12.mkv'],
+    ['S01E012', '012.mkv', 1, '剧集.2026'],
+  ]) await t.test(selected + ' / ' + fileName, async t => {
+    const { service, state, connect } = await fixture(t); await connect({ autoSave: true });
+    const series = { ...detail, id: 'episodes', title: '剧集', category: 'tv', season, lines: [{ episodes: [{ name: selected }] }] };
+    state.source = [sourceVideo('target', fileName), sourceVideo('other', '剧集.2026.EP121.mkv')];
+    if (folder) state.beforeRequest = call => call.path === '/share/sharepage/detail' ? reply({ list: new URL(call.value).searchParams.get('pdir_fid') === '0' ? [{ fid: 'series-folder', file_name: folder, file: false }] : state.source }) : undefined;
+    const resources = await service.resources(series), listing = await service.files(series, { shareId: resources.resources[0].id });
+    assert.deepEqual(listing.files.filter(file => file.match).map(file => file.name), [fileName]); assert.equal(listing.ambiguous, false);
+    const result = await service.prepare(series, { auto: true }); assert.equal(result.status, 'ready'); assert.equal(result.name, fileName);
+    const transfer = state.calls.find(call => call.path === '/share/sharepage/save'); assert.deepEqual(transfer.body.fid_list, ['target']); assert.equal(state.saved, 1);
+  });
+});
+
+test('episode ranges, metadata numbers and conflicting or ambiguous seasons never choose an automatic transfer', async t => {
+  for (const [selected, names, season, folder] of [
+    ['第12集', ['剧集.2026.EP120.mkv']],
+    ['第12集', ['剧集.2026.EP1200.mkv']],
+    ['第1集', ['2026.2160p60fps.H265.DTS5.1.mkv'], undefined, '剧集.2026'],
+    ['第12集', ['剧集.2025.EP12.mkv']],
+    ['第1集', ['剧集.2026.E01-E02.mkv']],
+    ['第1集', ['01-02.mkv'], undefined, '剧集.2026'],
+    ['第1集', ['剧集.2026.第1-2集.mkv']],
+    ['第十二集', ['剧集.2026.第十二至十三集.mkv']],
+    ['第1集', ['剧集.2026.E01+E02.mkv']],
+    ['第1集', ['剧集.2026.S02E01.mkv'], 1],
+    ['第1集', ['剧集.2026.S02E01.mkv']],
+    ['第1集', ['剧集.2026.EP01.mkv'], 2],
+    ['第1集', ['剧集.2026.S01E01.S02E01.mkv'], 1],
+    ['S02E01', ['剧集.2026.S01E01.mkv'], 1],
+    ['第12集', ['剧集.2026.EP12.720p.mkv', '剧集.2026.EP12.1080p.mkv']],
+    ['第1-2集', ['剧集.2026.EP01.mkv']],
+  ]) await t.test(selected + ' / ' + names.join(',') + ' / ' + season, async t => {
+    const { service, state, connect } = await fixture(t); await connect({ autoSave: true });
+    const series = { ...detail, id: 'ambiguous-episodes', title: '剧集', category: 'anime', season, lines: [{ episodes: [{ name: selected }] }] };
+    state.source = names.map((value, index) => sourceVideo('candidate-' + index, value));
+    if (folder) state.beforeRequest = call => call.path === '/share/sharepage/detail' ? reply({ list: new URL(call.value).searchParams.get('pdir_fid') === '0' ? [{ fid: 'series-folder', file_name: folder, file: false }] : state.source }) : undefined;
+    const result = await service.prepare(series, { auto: true }); assert.equal(result.status, 'needsSelection'); assert.equal(state.saved, 0);
+    assert.equal(state.calls.some(call => call.path === '/share/sharepage/save' || call.path === '/file' && call.options.method === 'POST'), false);
+  });
+});
+
+test('explicit catalog aliases reach the search pool as local options without entering the public URL or headers', async t => {
+  const { service, state } = await fixture(t); const aliases = ['公开别名', 'Known Alternate Title'];
+  await service.resources({ ...detail, aliases }); assert.equal(state.searchCalls.length, 1);
+  assert.deepEqual(state.searchCalls[0].options.aliases, aliases);
+  assert.equal(aliases.some(alias => decodeURIComponent(state.searchCalls[0].value).includes(alias)), false);
+  assert.equal(JSON.stringify(state.searchCalls[0].options.headers).includes('Known Alternate Title'), false);
+});
+
+test('public share dates are bounded, sorted newest first and merged without losing extraction passwords', async t => {
+  const { service, state } = await fixture(t); const at = state.clock;
+  const row = (id, label, publishedAt, password) => ({ url: 'https://pan.quark.cn/s/' + id, name: label, publishedAt, password });
+  state.searchBody = JSON.stringify({ results: [
+    row('aaaaaa', '较旧有提取码', at - 20, 'A1'), row('aaaaaa', '较新无提取码', at - 10), row('aaaaaa', '最新无提取码', at - 2), row('aaaaaa', '最新提取码', at - 5, 'B2'), row('aaaaaa', '过时提取码', at - 30, 'C3'),
+    row('bbbbbb', '最新资源', at), row('cccccc', '无日期资源', undefined),
+    row('dddddd', '错误未来日期', at + DAY + 1), row('eeeeee', '错误负日期', -1), row('ffffff', '错误字符串日期', String(at)),
+  ] });
+  const film = { ...detail, quarkShares: [] }, result = await service.resources(film);
+  assert.deepEqual(result.resources.map(row => new URL(row.url).pathname), ['/s/bbbbbb', '/s/aaaaaa', '/s/cccccc', '/s/dddddd', '/s/eeeeee', '/s/ffffff']);
+  assert.equal(result.resources[1].name, '最新无提取码'); assert.equal(result.resources[1].publishedAt, at - 2); assert.equal(new URL(result.resources[1].url).searchParams.get('pwd'), 'B2');
+  assert.equal(Object.hasOwn(result.resources[1], 'passwordAt'), false);
+  assert.equal(result.resources.slice(2).every(row => !Object.hasOwn(row, 'publishedAt')), true);
+  assert.deepEqual(await service.resources(film), result); assert.equal(state.searchCalls.length, 1);
+});
+
+test('an explicit web search bypasses the ordinary resource cache and preserves already found API shares', async t => {
+  const { service, state } = await fixture(t); const film = { ...detail, quarkShares: [] };
+  state.searchBody = JSON.stringify({ results: [{ url: 'https://pan.quark.cn/s/aaaaaa', name: 'API 资源', publishedAt: state.clock - 10 }] });
+  const ordinary = await service.resources(film); assert.equal(ordinary.resources.length, 1);
+  assert.deepEqual(await service.resources(film), ordinary); assert.equal(state.searchCalls.length, 1);
+  state.searchBody = JSON.stringify({ results: [{ url: 'https://pan.quark.cn/s/bbbbbb', name: '公开网页资源', publishedAt: state.clock }] });
+  const result = await service.resources(film, { webSearch: true });
+  assert.equal(state.searchCalls.length, 2); assert.equal(state.searchCalls[1].options.webSearch, true);
+  assert.deepEqual(result.resources.map(row => row.name), ['公开网页资源', 'API 资源']);
+  assert.deepEqual(await service.resources(film), result); assert.equal(state.searchCalls.length, 2);
+});
+
 test('ambiguity, unknown years, mismatched seasons or episodes and incomplete selection prevent automatic saves', async t => {
   const { service, state, connect } = await fixture(t); await connect({ autoSave: true });
   for (const source of [[sourceVideo('x', '影片.mp4')], [sourceVideo('x', '影片.2025.mp4')], [sourceVideo('x', '影片2.2026.mp4')], [sourceVideo('x'), sourceVideo('y', '影片.2026.1080p.mp4')]]) { state.source = source; assert.equal((await service.prepare(detail, { auto: true })).status, 'needsSelection'); }
@@ -414,6 +503,92 @@ test('quota counts total daily bytes, never charges reuse and rejects unknown or
   state.source = [sourceVideo('second')]; const second = await select(); assert.match((await service.prepare(detail, second)).reason, /上限/); assert.equal(state.saved, 1);
   for (const size of [0, NaN, 21 * GIB]) { state.source = [sourceVideo('unknown', '影片.2026.mp4', size)]; const selected = await select(); assert.equal((await service.prepare(detail, selected)).status, 'error'); }
   await service.configure({ maxDailyTransfers: 10, maxDailyBytes: 5 * 1024 * 1024 }); state.source = [sourceVideo('bytes-limit')]; const selected = await select(); assert.match((await service.prepare(detail, selected)).reason, /上限/);
+});
+
+test('official desktop playback protocol accepts completed accessible video_info and keeps the matching media User-Agent', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
+  const signed = 'https://video-cloud.quark.cn/stream.m3u8?auth_key=A%2BB%2FC&x=1';
+  state.beforeRequest = call => {
+    if (call.path !== '/file/v2/play/project') return;
+    assert.match(call.options.headers['user-agent'], /quark-cloud-drive\/2\.5\.20/);
+    assert.equal(call.options.headers.cookie, COOKIE); assert.equal(call.options.headers.referer, 'https://pan.quark.cn/');
+    assert.deepEqual(call.body, { fid: 'saved-1', resolutions: 'low,normal,high,super,2k,4k', supports: 'fmp4_av,m3u8,dolby_vision' });
+    return reply({ default_resolution: 'high', origin_default_resolution: '4k', file_name: '影片.2026.mkv', video_list: [
+      null,
+      { resolution: '4k', accessable: false, video_info: { url: 'https://video-cloud.quark.cn/denied.m3u8', width: 3840, height: 2160, success: true, finish: true } },
+      { resolution: '4k', accessable: true, video_info: { url: 'https://video-cloud.quark.cn/unfinished.m3u8', width: 3840, height: 2160, success: true, finish: false } },
+      { resolution: 'super', accessable: true, supports_format: 'fmp4_av,m3u8', video_info: { url: signed, width: 1920, height: 1080, format: 'm3u8', codec: 'h264', fps: 25, audio: { codec: 'aac', channels: 2 }, success: true, finish: true } },
+      { resolution: 'high', video_info: { url: 'https://video-cloud.quark.cn/lower.m3u8', width: 1280, height: 720, success: true, finish: true } },
+    ] });
+  };
+  const result = await service.playback(saved.assetId, { valid: () => true });
+  assert.equal(result.episode.url, signed); assert.equal(result.episode.type, 'hls'); assert.equal(result.metadata.mode, 'official');
+  assert.deepEqual(result.metadata.quality, { width: 1920, height: 1080 });
+  const project = state.calls.find(call => call.path === '/file/v2/play/project');
+  assert.equal(result.headers['user-agent'], project.options.headers['user-agent']); assert.equal(result.headers.cookie, COOKIE);
+  assert.equal(state.calls.filter(call => call.path === '/file/download').length, 0);
+});
+
+test('a normal official download fallback uses desktop credentials and returns the signed MKV for NAS compatibility', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); state.source = [sourceVideo('mkv-original', '影片.2026.HEVC10bit.DTS.mkv', 16 * GIB)]; const saved = await save();
+  const signed = 'https://download.quark.cn/original?auth_key=A%2BB&filename=movie.mkv';
+  state.beforeRequest = call => {
+    if (call.path === '/file/v2/play/project') return reply(null, { status: 403, code: 32003 });
+    if (call.path === '/file/download') {
+      assert.match(call.options.headers['user-agent'], /quark-cloud-drive\//); assert.equal(call.options.headers.cookie, COOKIE);
+      assert.deepEqual(call.body, { fids: ['saved-1'] }); assert.equal(new URL(call.value).searchParams.get('uc_param_str'), '');
+      return reply([{ fid: 'saved-1', file_name: '影片.2026.HEVC10bit.DTS.mkv', pdir_fid: 'app-folder-A', size: 16 * GIB, format_type: 'video/x-matroska', download_url: signed }]);
+    }
+  };
+  const result = await service.playback(saved.assetId);
+  assert.equal(result.episode.url, signed); assert.equal(result.episode.type, 'mkv'); assert.equal(result.metadata.mode, 'download'); assert.equal(result.metadata.requiresCompatibility, true);
+  assert.equal(result.headers['user-agent'], state.calls.find(call => call.path === '/file/download').options.headers['user-agent']);
+  assert.equal(result.headers.cookie, COOKIE); assert.deepEqual(result.allowCookieOrigins, ['https://download.quark.cn']);
+  assert.equal(state.calls.filter(call => call.path === '/file/download').length, 1);
+});
+
+test('official playback login rejection and rate limits never continue to the download endpoint', async t => {
+  for (const status of [401, 429]) for (const http of [200, status]) await t.test(`${status} / HTTP ${http}`, async t => {
+    const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
+    state.beforeRequest = call => call.path === '/file/v2/play/project' ? reply(null, { code: status, status, http }) : undefined;
+    await assert.rejects(service.playback(saved.assetId), error => error.status === status && (status !== 401 || error.quarkAuth === true));
+    assert.equal(state.calls.filter(call => call.path === '/file/download').length, 0); assert.equal((await service.settings()).configured, true);
+  });
+});
+
+test('Quark playback cancellation across official and download awaits never returns a URL or continues a revoked request', async t => {
+  for (const phase of ['project', 'download']) for (const mutation of ['view', 'session', 'account', 'disable']) await t.test(`${phase} / ${mutation}`, async t => {
+    const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
+    let valid = true, revoked, release; const entered = new Promise(resolve => { revoked = resolve; });
+    state.beforeRequest = async call => {
+      if (call.path === '/file/v2/play/project' && phase === 'download') return reply({ video_list: [] });
+      if (call.path === (phase === 'project' ? '/file/v2/play/project' : '/file/download')) { revoked(); await new Promise(resolve => { release = resolve; }); }
+    };
+    const validHook = () => { if (!valid && mutation === 'session') throw Object.assign(new Error('family login ended'), { status: 401 }); return valid; };
+    const pending = service.playback(saved.assetId, { valid: validHook }); await entered;
+    if (mutation === 'account') await service.clearAccount();
+    else if (mutation === 'disable') await service.configure({ enabled: false });
+    else valid = false;
+    release(); await assert.rejects(pending, error => error.status === (mutation === 'session' ? 401 : 409));
+    assert.equal(state.calls.filter(call => call.path === '/file/download').length, phase === 'download' ? 1 : 0);
+    assert.equal(state.deletes.length, 0);
+  });
+});
+
+test('a revoked playback authorization is checked before file validation or leasing the asset', async t => {
+  const { service, state, connect, save, metadata } = await fixture(t); await connect(); const saved = await save();
+  const before = metadata.get('quark-registry-v1'), calls = state.calls.length;
+  await assert.rejects(service.playback(saved.assetId, { valid: () => false }), error => error.status === 409);
+  assert.equal(state.calls.length, calls); assert.equal(metadata.get('quark-registry-v1'), before);
+});
+
+test('failure of both normal playback routes reports safe phases and numeric codes without exposing upstream secrets', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
+  state.beforeRequest = call => {
+    if (call.path === '/file/v2/play/project' || call.path === '/file/download') return textReply(JSON.stringify({ status: 500, code: call.path === '/file/download' ? 31105 : 32003, message: COOKIE + ' https://private.example/video?secret=sensitive-upstream' }));
+  };
+  await assert.rejects(service.playback(saved.assetId), error => error.status === 502 && /官方在线播放.*HTTP 200，API 32003.*原文件链接获取也失败.*HTTP 200，API 31105/.test(error.message) && !error.message.includes(COOKIE) && !error.message.includes('private.example') && !error.message.includes('sensitive-upstream'));
+  assert.equal(state.calls.filter(call => call.path === '/file/download').length, 1);
 });
 
 test('playback uses the best officially returned quality and keeps stable category/version metadata', async t => {

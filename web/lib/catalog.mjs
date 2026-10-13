@@ -410,7 +410,9 @@ export function createCatalog({ request = networkRequest } = {}) {
           if (!sharesByPath.has(url.pathname) || url.search) sharesByPath.set(url.pathname, url.href);
         }
         const quarkShares = [...sharesByPath.values()].slice(0, 10);
-        return { ...item, description, ...(quarkShares.length ? { quarkShares } : {}) };
+        const aliases = [...new Set(String(video.vod_sub || '').slice(0, 2048).normalize('NFKC').replace(/https?:\/\/[^\s|、;；]+/gi, '').replace(/<[^>]*>|[\u0000-\u001f\u007f]/g, ' ')
+          .split(/[/|、;；]/).map(value => value.trim()).filter(value => value.length >= 2 && value.length <= 300 && value !== item.title && !/https?:\/\//i.test(value)))].slice(0, 2);
+        return { ...item, description, ...(aliases.length ? { aliases } : {}), ...(quarkShares.length ? { quarkShares } : {}) };
       });
       if (item.category === 'adult' && config.showAdult !== true) throw failure('三级内容已隐藏，请先在设置中开启显示', 403);
       if (!item.lines.length) { detailCache.delete(key); throw failure('该影片没有可用的 HTTP / HTTPS 播放线路'); }

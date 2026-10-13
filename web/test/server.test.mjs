@@ -107,6 +107,21 @@ test('Quark resource searches use the maintained pool and expose its status only
   assert.equal(searches, 1);
 });
 
+test('explicit public webpage discovery is a validated option on the authenticated resource route', async t => {
+  const options = [], source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
+  const { call, login } = await running(t, { initialConfig: { ...empty, sources: [source] },
+    quark: { resources: async (_, input) => { options.push(input); return { resources: [] }; } } });
+  const path = '/api/quark/resources?source=demo&id=1';
+  assert.equal((await call(path + '&web=1')).status, 401);
+  const cookie = await login();
+  assert.equal((await call(path + '&web=https://example.com', undefined, cookie)).status, 400);
+  assert.equal(options.length, 0);
+  assert.equal((await call(path + '&web=1', undefined, cookie)).status, 200);
+  assert.deepEqual(options[0], { line: 0, episode: 0, webSearch: true });
+  assert.equal((await call(path, undefined, cookie)).status, 200);
+  assert.deepEqual(options[1], { line: 0, episode: 0 });
+});
+
 test('Quark account authentication errors remain distinct from a revoked household session', async t => {
   const source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
   let upstreamStatus = 401;

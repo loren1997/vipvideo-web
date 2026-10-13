@@ -1213,6 +1213,8 @@ function mountQuark(current) {
   const choices = node('div', undefined, 'quark-choices'), result = node('div', undefined, 'quark-ready'); panel.append(feedback, choices, result); host.replaceChildren(panel);
   const state = current.quarkState ||= { resources: [], files: [], version: 0 };
   const valid = () => player === current && current.stamp === routeVersion && host.contains(panel);
+  let searchVersion = 0;
+  const more = button('查找更多公开资源', () => void load(true), 'button small'); more.disabled = true; panel.append(more);
   function ready(data) {
     state.ready = data; result.replaceChildren(node('p', `${data.name || '当前集'}：${data.status === 'ready' ? '已准备好' : data.status === 'pending' ? '正在准备' : '准备未完成'}${data.saved ? ' · 已转存' : ''}`, 'muted'));
     if (data.status === 'ready' && data.assetId) { const play = button(current.quarkAsset === data.assetId ? '正在夸克播放' : '夸克播放', () => void playQuark(current, data.assetId), 'button primary small'); play.disabled = current.quarkAsset === data.assetId; result.append(play); }
@@ -1270,18 +1272,24 @@ function mountQuark(current) {
     } catch (error) { if (valid() && version === state.version) { filePlaceholder('文件读取失败，请重试或切换分享'); feedback.textContent = `网盘文件暂时不可用：${error.message}`; result.replaceChildren(button('重试读取文件', () => void loadFiles(), 'button small')); } }
   }
   shareSelect.addEventListener('change', () => void loadFiles()); fileSelect.addEventListener('change', () => { clearTimeout(current.quarkTimer); state.version++; delete state.ready; delete state.selection; result.replaceChildren(); const file = state.files.find(value => value.id === fileSelect.value); transfer.disabled = !file; fileSelect.title = file?.name || '请选择当前集视频'; });
-  async function load() {
+  async function load(webSearch = false) {
+    const search = ++searchVersion; let configured = false; more.disabled = true;
+    const currentSearch = () => valid() && search === searchVersion;
     try {
-      const settings = await api('/api/quark/settings'); if (!valid()) return;
+      const settings = await api('/api/quark/settings'); if (!currentSearch()) return;
       if (!settings.configured || !settings.enabled) { feedback.textContent = '连接并启用夸克后，可为当前单集准备网盘版本。'; choices.replaceChildren(button('设置夸克账号', () => goto('settings'), 'button small')); return; }
-      if (state.ready) { ready(state.ready); feedback.textContent = current.quarkAsset === state.ready.assetId ? '正在夸克播放。转存保留源文件画质。' : '当前集已准备，可点击夸克播放。'; return; }
-      const data = await api(`/api/quark/resources?${new URLSearchParams(playbackSelection(current.detail, current.line, current.episode))}`, { timeoutMs: 35000 }); if (!valid()) return;
-      state.resources = Array.isArray(data.resources) ? data.resources : []; shareSelect.replaceChildren();
-      if (!state.resources.length) { feedback.textContent = data.reason || '当前集暂未找到可用夸克分享，普通播放不受影响。'; return; }
-      for (const resource of state.resources) { const option = node('option', resource.name || resource.id); option.value = resource.id; shareSelect.append(option); }
+      configured = true;
+      if (state.ready && !webSearch) { ready(state.ready); feedback.textContent = current.quarkAsset === state.ready.assetId ? '正在夸克播放。转存保留源文件画质。' : '当前集已准备，可点击夸克播放。'; return; }
+      if (webSearch) { clearTimeout(current.quarkTimer); state.version++; delete state.selection; shareSelect.disabled = true; filePlaceholder('正在查找更多分享…'); feedback.textContent = '正在查询 Google 和公开网页，按可确认的页面发布时间排序…'; }
+      const query = new URLSearchParams(playbackSelection(current.detail, current.line, current.episode)); if (webSearch) query.set('web', '1');
+      const data = await api(`/api/quark/resources?${query}`, { timeoutMs: 35000 }); if (!currentSearch()) return;
+      state.resources = Array.isArray(data.resources) ? data.resources : []; shareSelect.disabled = false; shareSelect.replaceChildren();
+      if (!state.resources.length) { feedback.textContent = data.reason || '当前集暂未找到可用夸克分享，普通播放不受影响。'; choices.replaceChildren(); return; }
+      for (const resource of state.resources) { const dated = Number.isSafeInteger(resource.publishedAt) && resource.publishedAt > 0 ? ` · 页面日期 ${new Date(resource.publishedAt).toLocaleDateString('zh-CN')}` : ''; const option = node('option', (resource.name || resource.id) + dated); option.value = resource.id; shareSelect.append(option); }
       choices.replaceChildren(shareField, fileField, actions);
-      void loadFiles(settings.autoSave === true && current.flow.quarkAutomatic !== false);
-    } catch (error) { if (valid()) { feedback.textContent = `夸克资源暂时不可用：${error.message}`; choices.replaceChildren(button('重试夸克资源', () => void load(), 'button small')); } }
+      void loadFiles(!webSearch && settings.autoSave === true && current.flow.quarkAutomatic !== false);
+    } catch (error) { if (currentSearch()) { feedback.textContent = `夸克资源暂时不可用：${error.message}`; choices.replaceChildren(button('重试夸克资源', () => void load(webSearch), 'button small')); } }
+    finally { if (currentSearch()) more.disabled = !configured; }
   }
   void load();
 }
@@ -1690,7 +1698,7 @@ function mountPlayer(current) {
   updateClock(); void saveHistory(current); if (current.catalog) mountQuark(current);
 }
 
-function playbackError(current) {
+function playbackError(current, hlsError) {
   if (player !== current || current.failed) return;
   clearTimeout(current.loadTimer);
   if (current.transcodeLoading) return;
@@ -1700,7 +1708,10 @@ function playbackError(current) {
     void stopTranscode(current.transcodeId); current.transcodeId = null; return;
   }
   if (current.quarkAsset) {
-    if ([3, 4].includes(current.video?.error?.code) && !current.requiresCompatibility && !current.flow.transcodeTried) { void startCompatibility(current, playPosition(current), true); return; }
+    const decodeError = hlsError
+      ? hlsError.type === 'mediaError' && ['manifestIncompatibleCodecsError', 'bufferAddCodecError', 'bufferIncompatibleCodecsError', 'bufferAppendError', 'bufferAppendingError'].includes(hlsError.details) && !(hlsError.response?.code >= 400)
+      : [3, 4].includes(current.video?.error?.code);
+    if (decodeError && !current.requiresCompatibility && !current.flow.transcodeTried) { void startCompatibility(current, playPosition(current), true); return; }
     current.failed = true; current.note.textContent = '夸克播放中断。可重试夸克播放，或返回原线路；原影视源不会因此停用。'; current.note.className = 'player-note error-message'; return;
   }
   if (current.catalog) void recoverPlayback(current);
@@ -1758,7 +1769,7 @@ async function loadMedia(current, message = '正在连接播放地址…') {
     const quality = current.live && !current.transcoded ? liveQuality(current.channel.streams[current.line]) : null;
     const selectLevel = Boolean(quality);
     hls = new window.Hls(current.transcoded ? { startPosition: 0 } : selectLevel ? { autoStartLoad: false } : {}); const instance = hls; hls.loadSource(url); hls.attachMedia(video);
-    hls.on(window.Hls.Events.ERROR, (_event, data) => { if (player === current && generation === current.mediaVersion && data.fatal) playbackError(current); });
+    hls.on(window.Hls.Events.ERROR, (_event, data) => { if (player === current && generation === current.mediaVersion && data.fatal) playbackError(current, data); });
     hls.on(window.Hls.Events.MANIFEST_PARSED, (_event, data) => {
       if (player !== current || generation !== current.mediaVersion) return;
       if (selectLevel) {

@@ -54,6 +54,20 @@ test('original download forwards Range while account changes invalidate media an
   await assert.rejects(result, { status: 409 });
 });
 
+test('passes the household authorization guard into delayed upstream playback lookup', async () => {
+  let allowed = true, release, entered, continued = 0, guard;
+  const pending = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { entered = resolve; });
+  const cloud = createQuarkMedia({ quark: { playback: async (_, options) => {
+    guard = options?.valid; entered(); await pending;
+    if (guard && !guard()) throw Object.assign(new Error('会话已结束'), { status: 401 });
+    continued++; return descriptor();
+  } } });
+  const playback = cloud.playback('asset', { valid: () => allowed });
+  await started; allowed = false; release();
+  await assert.rejects(playback, { status: 401 });
+  assert.equal(typeof guard, 'function'); assert.equal(continued, 0);
+});
+
 test('rejects credential origin lookalikes, private media and hidden content before producing a URL', async () => {
   for (const extra of [{ allowCookieOrigins: ['https://video.quark.cn.evil'] },
     { allowCookieOrigins: ['http://video.quark.cn'] }, { episode: { type: 'mp4', url: 'http://127.0.0.1/private' } }]) {

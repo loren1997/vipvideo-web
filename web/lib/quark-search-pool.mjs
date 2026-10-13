@@ -1,13 +1,14 @@
 import { Readable } from 'node:stream';
 import { request as networkRequest, readText, validateUrl } from './network.mjs';
 import { createQuarkSearchRequest } from './quark-search.mjs';
+import { searchGoogleQuark } from './quark-google-search.mjs';
 
 const KEY = 'quark-search-pool-v1', DAY = 86_400_000, HEALTH_INTERVAL = 6 * 60 * 60_000;
 const OFFICIAL = 'https://so.252035.xyz/api/search';
 const sources = [
   'https://api.github.com/repos/fish2018/pansou-web',
   'https://raw.githubusercontent.com/fish2018/pansou-web/main/README.md',
-  'https://www.bing.com/search?format=rss&q=PanSou%20%22api%2Fsearch%22',
+  ...['PanSou "api/search"', '夸克 搜索 "api/search" PanSou', '网盘搜索 公共 API PanSou "api/search"'].map(query => 'https://www.bing.com/search?' + new URLSearchParams({ format: 'rss', q: query })),
 ];
 const searchFields = ['kw', 'cloud_types', 'res', 'src', 'conc', 'channels', 'plugins', 'refresh'];
 const sensitive = key => /cookie|authorization|password|secret|api.?key|(?:^|_)token(?:$|_)/i.test(key);
@@ -37,51 +38,91 @@ function share(value, password = '') {
     return { url: url.origin + url.pathname.replace(/\/$/, '') + (pwd ? '?pwd=' + encodeURIComponent(pwd) : ''), ...(pwd ? { password: pwd } : {}) };
   } catch { return; }
 }
-function shares(data) {
+function timestamp(value, at = Date.now()) {
+  const parsed = typeof value === 'number' && value > 9999 ? value < 1e12 ? value * 1000 : value : typeof value === 'string' && value.length <= 100 && /^(?:\d{4}-\d{2}-\d{2}(?:[T\s]|$)|(?:[A-Za-z]{3},?\s+)?\d{1,2}\s+[A-Za-z]{3}\s+\d{4}(?:\s|$))/.test(value) ? Date.parse(value) : NaN;
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= at + DAY ? parsed : undefined;
+}
+// A newer post without a code must not make an older code appear newer.
+const passwordDate = Symbol('passwordDate');
+function mergeShare(rows, row) {
+  const link = share(row.url, row.password || ''); if (!link) return;
+  row = { ...row, ...link };
+  const key = new URL(row.url).pathname, previous = rows.get(key);
+  if (!previous && rows.size >= 30) return;
+  const codeDate = row[passwordDate] ?? row.publishedAt ?? 0, previousCodeDate = previous?.[passwordDate] ?? previous?.publishedAt ?? 0;
+  const replace = !previous || row.password && (!previous.password || codeDate > previousCodeDate);
+  const selected = replace ? { ...row } : previous, date = Math.max(row.publishedAt || 0, previous?.publishedAt || 0);
+  if (selected.password) selected[passwordDate] = replace ? codeDate : previousCodeDate;
+  if (date) selected.publishedAt = date;
+  rows.set(key, selected);
+}
+function shares(data, at) {
   const found = new Map(); let visited = 0;
-  function visit(value, title = '', depth = 0) {
+  function visit(value, title = '', depth = 0, publishedAt) {
     if (++visited > 10_000 || depth > 6 || found.size >= 30) return;
-    if (Array.isArray(value)) { for (const item of value.slice(0, 100)) visit(item, title, depth + 1); return; }
+    if (Array.isArray(value)) { for (const item of value.slice(0, 100)) visit(item, title, depth + 1, publishedAt); return; }
     if (!value || typeof value !== 'object') return;
     title = String(value.work_title || value.title || value.name || value.file_name || value.note || title).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 300);
+    publishedAt = timestamp(value.publishedAt ?? value.published_at ?? value.datetime ?? value.date, at) ?? publishedAt;
     const link = (!value.type || value.type === 'quark') && share(value.url || value.link, value.password || '');
-    if (link) found.set(link.url, { ...link, name: title });
-    for (const key of ['results', 'links', 'data', 'merged_by_type', 'quark', 'list']) if (value[key] !== undefined) visit(value[key], title, depth + 1);
+    if (link) mergeShare(found, { ...link, name: title, ...(publishedAt ? { publishedAt } : {}) });
+    for (const key of ['results', 'links', 'data', 'merged_by_type', 'quark', 'list']) if (value[key] !== undefined) visit(value[key], title, depth + 1, publishedAt);
   }
   visit(data);
   return [...found.values()];
 }
-function compatible(body) {
+function compatible(body, at) {
   let data; try { data = JSON.parse(body); } catch { return; }
   if (!data || typeof data !== 'object' || Array.isArray(data)) return;
   const payload = data.data && typeof data.data === 'object' ? data.data : data;
   if (data.error || data.success === false || data.code !== undefined && ![0, 200, '0', '200'].includes(data.code)) return;
   if (!Array.isArray(payload.results) && !(payload.merged_by_type && typeof payload.merged_by_type === 'object' && !Array.isArray(payload.merged_by_type))) return;
-  return shares(data);
+  return shares(data, at);
 }
-function rssShares(body) {
+function rssShares(body, at) {
   if (!/<rss\b/i.test(body) || /<!DOCTYPE\b|<!ENTITY\b|captcha|安全验证/i.test(body)) throw failure('公开网页搜索暂不可用');
   const rows = new Map();
-  for (const match of body.replace(/&amp;/g, '&').matchAll(/https:\/\/pan\.quark\.cn\/s\/[a-z0-9]{6,32}(?:\?pwd=[a-z0-9]{1,16})?/gi)) {
-    const link = share(match[0]); if (link) rows.set(link.url, link); if (rows.size >= 30) break;
+  for (const item of body.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)) {
+    const title = (/<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(item[1])?.[1] || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/<[^>]*>/g, '').replace(/&(?:amp|quot|apos|lt|gt);/g, value => ({ '&amp;': '&', '&quot;': '"', '&apos;': "'", '&lt;': '<', '&gt;': '>' })[value]).slice(0, 300);
+    const publishedAt = timestamp(/<pubDate\b[^>]*>([\s\S]*?)<\/pubDate>/i.exec(item[1])?.[1]?.trim(), at);
+    for (const match of item[1].replace(/&amp;/g, '&').matchAll(/https:\/\/pan\.quark\.cn\/s\/[a-z0-9]{6,32}(?:\?pwd=[a-z0-9]{1,16})?/gi)) {
+      const link = share(match[0]);
+      if (link) mergeShare(rows, { ...link, name: title, ...(publishedAt ? { publishedAt } : {}) });
+      if (rows.size >= 30) break;
+    }
+    if (rows.size >= 30) break;
   }
   return [...rows.values()];
 }
+const normalized = value => value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+function queryTerms(keyword, values) {
+  const dated = /^(.*?)\s+((?:19|20)\d{2})$/.exec(keyword), title = dated?.[1] || keyword;
+  const aliases = (Array.isArray(values) ? values.slice(0, 10) : []).filter(value => typeof value === 'string' && value.trim() && value.length <= 300 && !/[\u0000-\u001f\u007f]/.test(value)).slice(0, 2).map(value => value.trim());
+  return { words: [...new Set([keyword, title, ...aliases])], titles: [...new Set([title, ...aliases].map(normalized).filter(Boolean))].map(word => ({ word, pattern: /^[a-z0-9]+$/.test(word) ? new RegExp('(?:^|[^a-z0-9])' + word.split('').join('[^a-z0-9]*') + '(?:$|[^a-z0-9])', 'i') : undefined })), year: dated?.[2] };
+}
+function matching(rows, query) {
+  return rows.filter(row => {
+    const title = normalized(row.name || '');
+    if (!query.titles.some(({ word, pattern }) => title.includes(word) && (!pattern || pattern.test((row.name || '').normalize('NFKC'))))) return false;
+    const years = [...(row.name || '').matchAll(/(?:^|[^\d])((?:19|20)\d{2})(?!\d)/g)].map(match => match[1]);
+    return !query.year || !years.length || years.includes(query.year);
+  });
+}
 const result = rows => {
-  const body = JSON.stringify({ results: rows });
+  const body = JSON.stringify({ results: [...rows].sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0)) });
   return Object.assign(Readable.from([body]), { statusCode: 200, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } });
 };
 
-export function createQuarkSearchPool({ store, request = createQuarkSearchRequest(), discoveryRequest = networkRequest, now = Date.now } = {}) {
+export function createQuarkSearchPool({ store, request = createQuarkSearchRequest(), discoveryRequest = networkRequest, googleSearch = searchGoogleQuark, now = Date.now } = {}) {
   if (!store?.meta || !store?.setMeta) throw new TypeError('Search pool requires store metadata');
-  let state = { candidates: [], lastDiscovery: 0, lastHealth: 0, healthCursor: 0, discoveryError: '' };
+  let state = { candidates: [], lastDiscovery: 0, lastHealth: 0, healthCursor: 0, discoveryCursor: 0, discoveryError: '' };
   let active = 0, timer, started = false, stopping = false, discoveryJob, currentPrimary;
-  const waiting = [], jobs = new Set();
+  const waiting = [], jobs = new Set(), recent = new Map();
   try {
     const text = store.meta(KEY);
     if (typeof text === 'string' && text.length <= 64 * 1024) {
       const saved = JSON.parse(text);
-      for (const key of ['lastDiscovery', 'lastHealth', 'healthCursor']) if (Number.isSafeInteger(saved[key]) && saved[key] >= 0 && saved[key] <= now()) state[key] = saved[key];
+      for (const key of ['lastDiscovery', 'lastHealth', 'healthCursor', 'discoveryCursor']) if (Number.isSafeInteger(saved[key]) && saved[key] >= 0 && saved[key] <= now()) state[key] = saved[key];
       for (const row of Array.isArray(saved.candidates) ? saved.candidates.slice(0, 8) : []) {
         try {
           const url = row.automatic === false ? endpoint(row.url, true) : candidate(row.url);
@@ -158,7 +199,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
     const rows = state.candidates.filter(row => row.automatic && row.retryAt <= now() && (row.status !== 'healthy' || now() - row.checkedAt >= HEALTH_INTERVAL));
     for (let count = 0; count < Math.min(2, rows.length) && !stopping; count++) {
       const row = rows[(state.healthCursor + count) % rows.length];
-      try { const links = compatible(await text(apiUrl(row.url, '星际穿越'), 4000)); if (stopping) break; if (links === undefined) throw failure('搜索接口格式不兼容'); checked(row, links); }
+      try { const links = compatible(await text(apiUrl(row.url, '星际穿越'), 4000), now()); if (stopping) break; if (links === undefined) throw failure('搜索接口格式不兼容'); checked(row, links); }
       catch (cause) { if (stopping) break; failed(row, cause); }
     }
     if (!stopping) { state.healthCursor += Math.min(2, rows.length); state.lastHealth = now(); persist(); }
@@ -177,7 +218,8 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
     if (stopping || state.lastDiscovery && now() - state.lastDiscovery < DAY) return Promise.resolve(status());
     discoveryJob = track(async () => {
       state.lastDiscovery = now(); state.discoveryError = '';
-      for (const url of sources) {
+      const directories = [...sources.slice(0, 2), sources[2 + state.discoveryCursor++ % (sources.length - 2)]];
+      for (const url of directories) {
         if (stopping) break;
         try {
           const body = await text(url, 2500, discoveryRequest, 512 * 1024);
@@ -188,7 +230,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
             if (typeof homepage === 'string' && homepage) { const published = new URL(endpoint(homepage)); published.pathname = '/api/search'; published.search = ''; found.push(published.href); }
           }
           for (const match of body.replace(/&amp;/g, '&').matchAll(/https?:\/\/[^\s<>"'()\\]+/gi)) found.push(match[0].replace(/[.,;\]}]+$/, ''));
-          for (const value of found.slice(0, 40)) { try { add(candidate(value), url === sources[2] ? '公开目录' : '官方项目'); } catch { /* Only explicitly published public API endpoints become candidates. */ } }
+          for (const value of found.slice(0, 40)) { try { add(candidate(value), sources.slice(0, 2).includes(url) ? '官方项目' : '公开目录'); } catch { /* Only explicitly published public API endpoints become candidates. */ } }
         } catch { if (stopping) break; state.discoveryError = '部分公开接口目录暂不可访问，保留现有接口'; }
       }
       await verifyCandidates(); persist(); return status();
@@ -210,20 +252,36 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
       return track(async () => {
         if (stopping) throw failure('公开搜索已停止', 503, true);
         const input = value instanceof URL ? value.href : value, base = endpoint(input, true), parsed = new URL(input);
-        const web = parsed.hostname === 'www.bing.com' && parsed.pathname === '/search';
-        const keyword = (parsed.searchParams.get(web ? 'q' : 'kw') || '').replace(/\s+site:pan\.quark\.cn\/s\b/gi, '').trim().slice(0, 1000);
+        const webUrl = parsed.hostname === 'www.bing.com' && parsed.pathname === '/search', web = webUrl || _options.webSearch === true;
+        const keyword = (parsed.searchParams.get(webUrl ? 'q' : 'kw') || '').replace(/\s+site:pan\.quark\.cn\/s\b/gi, '').trim().slice(0, 1000);
         if (!keyword) throw failure('搜索关键词不能为空', 400);
         currentPrimary = web ? undefined : base;
         const primary = web ? undefined : add(base, '手动配置', false), deadline = now() + 7500;
+        const query = queryTerms(keyword, _options.aliases), cacheKey = JSON.stringify([base, keyword, query.words, web]);
+        for (const [key, entry] of recent) if (entry.expires <= now()) recent.delete(key);
+        const cached = recent.get(cacheKey);
+        if (cached?.rows.size) return result([...cached.rows.values()]);
+        const entry = { rows: new Map(), expires: now() + 2 * 60_000 };
+        recent.set(cacheKey, entry); while (recent.size > 32) recent.delete(recent.keys().next().value);
+        const merge = rows => {
+          if (stopping || entry.expires <= now()) return;
+          for (const row of rows) {
+            const { publishedAt: rawDate, ...item } = row, publishedAt = timestamp(rawDate, now());
+            mergeShare(entry.rows, { ...item, ...(publishedAt ? { publishedAt } : {}) });
+          }
+        };
         const backups = state.candidates.filter(row => row.automatic && row.url !== base && row.status === 'healthy' && row.retryAt <= now()).sort((a, b) => b.checkedAt - a.checkedAt);
-        const selected = [...(primary && primary.retryAt <= now() ? [primary] : []), ...backups].slice(0, 2);
+        const selected = web ? [] : [...(primary && primary.retryAt <= now() ? [primary] : []), ...backups].slice(0, 2);
         let valid = false;
         const attempts = selected.map(row => track(async () => {
-          try {
-            const links = compatible(await text(apiUrl(row.url, keyword), 5500, request, 2 * 1024 * 1024, deadline - 1800));
-            if (links === undefined) throw failure('搜索接口格式不兼容'); valid = true; checked(row, links);
-            return links;
-          } catch (cause) { failed(row, cause); }
+          for (const [index, word] of query.words.entries()) {
+            if (stopping || index && deadline - 1800 - now() < 250) break;
+            try {
+              const links = compatible(await text(apiUrl(row.url, word), 5500, request, 2 * 1024 * 1024, deadline - 1800), now());
+              if (links === undefined) throw failure('搜索接口格式不兼容'); valid = true; checked(row, links);
+              const matched = matching(links, query); merge(matched); if (matched.length) return matched;
+            } catch (cause) { failed(row, cause); break; }
+          }
           return [];
         }));
         const first = await new Promise(resolve => {
@@ -232,14 +290,26 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           for (const attempt of attempts) attempt.then(links => { if (links.length) resolve(links); else if (!--remaining) resolve([]); }, () => { if (!--remaining) resolve([]); });
         });
         if (stopping) throw failure('公开搜索已停止', 503, true);
-        if (first.length) return result(first);
-        const fallback = new URL('https://www.bing.com/search'); fallback.search = new URLSearchParams({ q: keyword + ' site:pan.quark.cn/s', format: 'rss' }).toString();
-        try { return result(rssShares(await text(fallback.href, Math.max(1, deadline - now()), request, 2 * 1024 * 1024, deadline))); }
-        catch { if (valid) return result([]); throw failure('公开搜索接口和网页搜索暂不可用，请稍后重试'); }
+        if (first.length) {
+          let timer;
+          try { await Promise.race([Promise.allSettled(attempts), new Promise(done => { timer = setTimeout(done, Math.max(1, Math.min(150, deadline - now()))); })]); }
+          finally { clearTimeout(timer); }
+          if (stopping) throw failure('公开搜索已停止', 503, true);
+          return result([...entry.rows.values()]);
+        }
+        const fallback = new URL('https://www.bing.com/search'); fallback.search = new URLSearchParams({ q: (query.year ? query.words[1] : keyword) + ' site:pan.quark.cn/s', format: 'rss' }).toString();
+        const pages = await Promise.allSettled([
+          googleSearch(keyword, { read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline)), deadline, now }),
+          text(fallback.href, Math.max(1, deadline - now()), request, 2 * 1024 * 1024, deadline).then(body => rssShares(body, now())),
+        ]);
+        if (stopping) throw failure('公开搜索已停止', 503, true);
+        for (const page of pages) if (page.status === 'fulfilled') { valid = true; merge(matching(page.value, query)); }
+        if (valid) return result([...entry.rows.values()]);
+        throw failure('公开搜索接口和网页搜索暂不可用，请稍后重试');
       });
     },
     status, discover,
     start() { if (!started) { started = true; stopping = false; schedule(0); } },
-    async stop() { stopping = true; started = false; clearTimeout(timer); for (const entry of waiting.splice(0)) entry.reject(failure('公开搜索已停止', 503, true)); while (jobs.size) await Promise.allSettled([...jobs]); },
+    async stop() { stopping = true; started = false; clearTimeout(timer); recent.clear(); for (const entry of waiting.splice(0)) entry.reject(failure('公开搜索已停止', 503, true)); while (jobs.size) await Promise.allSettled([...jobs]); },
   };
 }
