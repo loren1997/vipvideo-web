@@ -89,8 +89,9 @@ let adMetadataMode = 'none', holdAdMetadata = false, releaseAdMetadata, maintena
 const quarkRequests = [], quarkProgress = [], quarkAssets = new Map();
 let quarkCookie = '', quarkMode = 'matched', holdQuarkResources = false, releaseQuarkResources;
 let quarkChoicesFixture = false, quarkFilesFixture = 'matched';
+let holdQuarkPrepare = false, releaseQuarkPrepare, holdQuarkPlayback = false, releaseQuarkPlayback, quarkPendingChecks = 0;
 const heldQuarkFileReads = new Map();
-const quarkSettings = { configured: false, enabled: false, autoSave: true, cleanupEnabled: true, retentionDays: 7, maxDailyTransfers: 10, maxDailyBytes: 21474836480, searchApi: '', account: { connected: false, label: '' }, managedFiles: 0, lastCleanup: 0, lastError: '' };
+const quarkSettings = { configured: false, enabled: false, autoSave: true, cleanupEnabled: true, retentionDays: 7, maxDailyTransfers: 10, maxDailyBytes: 21474836480, searchApi: '', account: { connected: false, label: '' }, managedFiles: 0, lastCleanup: 0, lastError: '', searchPool: { enabled: true, discovering: false, lastDiscovery: 0, lastHealth: 0, healthy: 2, pending: 1, suspended: 1, candidates: [] } };
 const episodeKey = (film, episode) => JSON.stringify([film, episode]);
 function fixtureEpisode(value) {
   if (typeof value === 'string' && /^-?\d+(?:\.\d+)?$/.test(value.trim())) value = Number(value.trim());
@@ -262,12 +263,14 @@ try {
         if (parsed.pathname === '/api/quark/prepare') {
           assert.ok(body.source && body.id && Number.isInteger(body.line) && Number.isInteger(body.episode)); assert.equal(typeof body.auto, 'boolean'); assert.ok(body.fileId && body.shareId);
           if (body.auto) assert.equal(body.fileId, `file-${body.episode + 1}`, '自动仅转当前选中的单集');
+          if (holdQuarkPrepare) await new Promise(ok => { releaseQuarkPrepare = ok; });
+          if (quarkMode === 'prepare-error') return route.fulfill({ json: { status: 'error', reason: '固定专用目录错误，未转存' } });
           const assetId = `${body.shareId}-${body.fileId}`;
           const seen = quarkAssets.has(assetId); quarkAssets.set(assetId, { body, name: `网盘样例第${body.episode + 1}集.mp4` }); quarkSettings.managedFiles = quarkAssets.size;
-          return route.fulfill({ json: { assetId, name: quarkAssets.get(assetId).name, status: quarkMode === 'pending' && !seen ? 'pending' : 'ready', saved: !seen } });
+          return route.fulfill({ json: { assetId, name: quarkAssets.get(assetId).name, status: quarkMode === 'pending-forever' || quarkMode === 'pending' && ++quarkPendingChecks === 1 ? 'pending' : 'ready', saved: !seen } });
         }
-        if (parsed.pathname === '/api/quark/playback') { assert.ok(quarkAssets.has(body.assetId)); const type = quarkMode === 'requires' ? 'mkv' : ['webm', 'avi', 'mpegts'].includes(quarkMode) ? quarkMode : 'hls'; return route.fulfill({ json: { assetId: body.assetId, name: quarkAssets.get(body.assetId).name, url: `/api/quark/media/${body.assetId}/index.${type === 'hls' ? 'm3u8' : type}`, type, size: 10485760, version: 'official-fixture-h264-v1', requiresCompatibility: ['requires', 'avi', 'mpegts'].includes(quarkMode), duration: 30 } }); }
-        if (parsed.pathname === '/api/quark/progress') { assert.ok(quarkAssets.has(body.assetId)); assert.ok(Number.isFinite(body.position) && Number.isFinite(body.duration) && typeof body.ended === 'boolean'); quarkProgress.push(body); return route.fulfill({ json: { ok: true } }); }
+        if (parsed.pathname === '/api/quark/playback') { if (holdQuarkPlayback) await new Promise(ok => { releaseQuarkPlayback = ok; }); if (quarkMode === 'playback-error') return route.fulfill({ status: 502, json: { error: '固定夸克播放链接错误' } }); assert.ok(quarkAssets.has(body.assetId)); const type = quarkMode === 'requires' ? 'mkv' : ['webm', 'avi', 'mpegts'].includes(quarkMode) ? quarkMode : 'hls'; return route.fulfill({ json: { assetId: body.assetId, name: quarkAssets.get(body.assetId).name, url: `/api/quark/media/${body.assetId}/index.${type === 'hls' ? 'm3u8' : type}`, type, size: 10485760, version: 'official-fixture-h264-v1', requiresCompatibility: ['requires', 'avi', 'mpegts'].includes(quarkMode), duration: 30 } }); }
+        if (parsed.pathname === '/api/quark/progress') { assert.ok(quarkAssets.has(body.assetId), `未知测试资产 ${body.assetId} / ${[...quarkAssets.keys()].join(',')}`); assert.ok(Number.isFinite(body.position) && Number.isFinite(body.duration) && typeof body.ended === 'boolean'); quarkProgress.push(body); return route.fulfill({ json: { ok: true } }); }
         if (parsed.pathname.startsWith('/api/quark/media/')) return route.fulfill({ contentType: 'audio/wav', body: media, headers: { 'Accept-Ranges': 'bytes' } });
       }
       if (parsed.origin === base && parsed.pathname === '/api/playability/report') {
@@ -565,9 +568,10 @@ try {
         assert.equal(bounds.overflow, false, '长资源/文件标题不撑出页面'); for (const control of bounds.controls) { assert.ok(control.width > 0); assert.ok(control.left >= bounds.left - 1 && control.right <= bounds.right + 1, '下拉框和按钮保持在面板内'); }
         if (viewport.width < 640) assert.ok(bounds.controls[1].top >= bounds.controls[0].bottom, '手机下拉框按行排布');
         await p.screenshot({ path: join(output, `${viewport.width < 640 ? 'mobile' : 'desktop'}-quark-choices.png`), fullPage: true });
-        await transfer.click(); await p.getByRole('button', { name: '夸克播放', exact: true }).waitFor();
+        await transfer.click(); await p.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
         const selected = quarkRequests.filter(request => request.path === '/api/quark/prepare').at(-1).body;
         assert.deepEqual({ source: selected.source, id: selected.id, line: selected.line, episode: selected.episode, shareId: selected.shareId, fileId: selected.fileId, auto: selected.auto }, { source: 'first', id: 'quark', line: Number(currentSelection.line), episode: Number(currentSelection.episode), shareId: 'share-second', fileId: 'share-second-video', auto: false }, '转存仅提交当前播放剧集、分享与有效不透明文件标识');
+        await p.locator('nav a[href="#home"]').click(); await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await until(() => files.isEnabled(), '重新打开当前集恢复分享选择');
         quarkFilesFixture = 'account'; await share.selectOption('share-first'); await p.locator('#quark-resources').getByText(/夸克账号登录已失效/).waitFor();
         assert.equal(await files.isDisabled(), true); assert.equal(await p.locator('#app-view').isVisible(), true, '夸克账号401不退出家庭登录'); assert.equal(await p.locator('#login-view').isVisible(), false);
         quarkFilesFixture = 'matched'; await p.getByRole('button', { name: '重试读取文件', exact: true }).click(); await until(() => files.isEnabled(), '账号错误重试后恢复文件');
@@ -580,12 +584,86 @@ try {
     }
   }
 
+  async function verifyQuarkAutoplay() {
+    const settingsBefore = structuredClone(quarkSettings); let isolated;
+    const count = path => quarkRequests.filter(request => request.path === path).length;
+    async function open(mode, hold = '') {
+      await isolated?.value.close(); quarkPendingChecks = 0; quarkMode = mode;
+      holdQuarkPrepare = hold === 'prepare'; holdQuarkPlayback = hold === 'playback';
+      Object.assign(quarkSettings, { configured: true, enabled: true, autoSave: true, account: { connected: true, label: '测试账号' } });
+      isolated = await context({ width: 1440, height: 1000 }, true, false, '#home'); const p = isolated.page; await p.clock.install(); await p.clock.pauseAt(new Date());
+      await p.evaluate(() => {
+        window.Hls = class {
+          static isSupported() { return true; }
+          static Events = { ERROR: 'hlsError', MANIFEST_PARSED: 'hlsManifestParsed' };
+          loadSource(url) { this.url = url; }
+          attachMedia(video) { video.src = this.url.replace('.m3u8', '.mp4'); }
+          on(event, callback) { if (event === 'hlsManifestParsed') queueMicrotask(() => callback(event)); }
+          destroy() {}
+        };
+      });
+      await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; });
+      return p;
+    }
+    const decoded = (p, fragment) => until(() => p.locator('video').evaluate((video, fragment) => video.readyState >= 2 && video.currentSrc.includes(fragment), fragment).catch(() => false), `自动切换媒体 ${fragment}`);
+    try {
+      let p = await open('pending'); await decoded(p, 'quark-first-1'); await p.getByRole('button', { name: '刷新准备状态', exact: true }).waitFor();
+      await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 7; }); const initial = count('/api/quark/prepare');
+      await p.evaluate(() => { const original = HTMLMediaElement.prototype.play; window.restoreCloudPlay = () => { HTMLMediaElement.prototype.play = original; }; HTMLMediaElement.prototype.play = function () { return this.src.includes('/api/quark/') ? Promise.reject(new DOMException('fixture', 'NotAllowedError')) : original.call(this); }; });
+      await p.clock.fastForward(4999); assert.equal(count('/api/quark/prepare'), initial, '等待5秒再检查，不密集轮询');
+      await p.clock.fastForward(1); await decoded(p, '/api/quark/media/share-fixture-file-1'); await p.locator('.player-note').getByText(/浏览器需要你点击/).waitFor();
+      assert.equal(count('/api/quark/prepare'), initial + 1); assert.ok(await p.locator('video').evaluate(video => Math.abs(video.currentTime - 7) < 0.5), '自动切换保留普通线路进度');
+      assert.equal(await p.locator('video').evaluate(video => video.paused), true, '自动播放被拒绝仍保留可点击播放器');
+      await p.evaluate(() => window.restoreCloudPlay()); await p.locator('video').evaluate(video => video.play()); await p.locator('video').evaluate(video => video.pause());
+      await p.screenshot({ path: join(output, 'desktop-quark-auto-play.png'), fullPage: true });
+      await p.getByRole('button', { name: '返回原线路', exact: true }).click(); await decoded(p, 'quark-first-1'); await p.clock.fastForward(10000);
+      assert.equal(count('/api/quark/prepare'), initial + 1, '主动返回原线路不再次准备或自动反切'); await decoded(p, 'quark-first-1');
+
+      p = await open('pending-forever'); await decoded(p, 'quark-first-1'); await p.getByRole('button', { name: '刷新准备状态', exact: true }).waitFor(); const pending = count('/api/quark/prepare');
+      for (let index = 1; index <= 11; index++) { await p.clock.fastForward(5000); await until(() => count('/api/quark/prepare') === pending + index, '有界准备检查'); await p.waitForTimeout(50); }
+      await p.locator('#quark-resources').getByText(/已暂停自动检查/).waitFor(); await p.clock.fastForward(60000); assert.equal(count('/api/quark/prepare'), pending + 11, '每轮最多12次，持续pending不无限检查');
+      await p.getByRole('button', { name: '刷新准备状态', exact: true }).click(); await until(() => count('/api/quark/prepare') === pending + 12, '超时后可手动继续');
+      await p.locator('nav a[href="#home"]').click(); const stopped = count('/api/quark/prepare'); await p.clock.fastForward(10000); assert.equal(count('/api/quark/prepare'), stopped, '离页清理准备检查定时器');
+
+      p = await open('matched', 'prepare'); await until(() => Boolean(releaseQuarkPrepare), '转存响应等待中'); await decoded(p, 'quark-first-1');
+      const plays = count('/api/quark/playback'); await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-2'); holdQuarkPrepare = false; releaseQuarkPrepare(); releaseQuarkPrepare = null; await p.waitForTimeout(150);
+      assert.equal(count('/api/quark/playback'), plays, '更换所选文件取消旧转存自动播放'); await decoded(p, 'quark-first-1');
+
+      p = await open('matched', 'playback'); await until(() => Boolean(releaseQuarkPlayback), '延迟播放链接响应等待中'); await decoded(p, 'quark-first-1');
+      await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 11; });
+      holdQuarkPlayback = false; releaseQuarkPlayback(); releaseQuarkPlayback = null; await decoded(p, '/api/quark/media/share-fixture-file-1');
+      assert.ok(await p.locator('video').evaluate(video => Math.abs(video.currentTime - 11) < 0.5), '播放链接等待期间普通线路推进，切换使用完成响应时的最新进度');
+
+      p = await open('matched', 'playback'); await until(() => Boolean(releaseQuarkPlayback), '播放链接响应等待中'); await decoded(p, 'quark-first-1');
+      await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-2'); holdQuarkPlayback = false; releaseQuarkPlayback(); releaseQuarkPlayback = null; await p.waitForTimeout(150); await decoded(p, 'quark-first-1');
+      assert.equal(await p.getByRole('button', { name: '正在夸克播放', exact: true }).count(), 0, '旧播放链接响应不接管新选择');
+
+      p = await open('matched', 'prepare'); await until(() => Boolean(releaseQuarkPrepare), '换源前转存等待中');
+      await p.getByRole('button', { name: '第二源', exact: true }).click(); await decoded(p, 'quark-second-1'); const switched = count('/api/quark/playback');
+      holdQuarkPrepare = false; releaseQuarkPrepare(); releaseQuarkPrepare = null; await p.waitForTimeout(150); assert.equal(count('/api/quark/playback'), switched, '自动准备开启时，手动换普通源后旧转存不反切'); await decoded(p, 'quark-second-1'); await p.clock.fastForward(10000); assert.equal(count('/api/quark/playback'), switched, '手动新来源不重复自动转存已准备影片');
+
+      p = await open('matched', 'prepare'); await until(() => Boolean(releaseQuarkPrepare), '离页前转存等待中'); const navigation = count('/api/quark/playback'); await p.locator('nav a[href="#favorites"]').click();
+      holdQuarkPrepare = false; releaseQuarkPrepare(); releaseQuarkPrepare = null; await p.waitForTimeout(150); assert.equal(count('/api/quark/playback'), navigation, '离页后转存完成不触发播放'); assert.equal(await p.locator('video').count(), 0);
+
+      for (const mode of ['prepare-error', 'playback-error']) {
+        p = await open(mode); await decoded(p, 'quark-first-1');
+        await p.locator('#quark-resources').getByText(mode === 'prepare-error' ? /固定专用目录错误/ : /自动切换未完成/).first().waitFor(); const beforeError = count('/api/quark/prepare'); await p.clock.fastForward(10000);
+        assert.equal(count('/api/quark/prepare'), beforeError, '明确失败不轮询或重新转存'); await decoded(p, 'quark-first-1');
+      }
+      console.log('PASS 夸克pending每5秒最多12次/超时手动继续、自动切换保留进度/禁止自动播放可点击、返回原线不反切、换文件/换源/导航/迟到URL取消、明确失败保留普通播放');
+    } finally {
+      holdQuarkPrepare = false; holdQuarkPlayback = false; releaseQuarkPrepare?.(); releaseQuarkPlayback?.(); releaseQuarkPrepare = null; releaseQuarkPlayback = null;
+      quarkMode = 'matched'; Object.assign(quarkSettings, settingsBefore); await isolated?.value.close();
+    }
+  }
+
   async function verifyQuarkFlow() {
     let isolated; const previousMode = transcodeMode, previousDuration = transcodeDuration;
     try {
       isolated = await context({ width: 1440, height: 1000 }, true, false, '#settings'); const p = isolated.page; await openSettingsSection(p, '夸克网盘');
       await p.getByLabel('夸克账号 Cookie', { exact: true }).waitFor(); await until(() => p.getByLabel('夸克账号 Cookie', { exact: true }).isEnabled(), '账号设置加载完成');
       assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).inputValue(), ''); assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).getAttribute('type'), 'password'); assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).getAttribute('autocomplete'), 'off');
+      await p.getByText('自动备用搜索接口：可用 2 个 / 待验证 1 个 / 暂不可用 1 个', { exact: true }).waitFor();
       const dailyTransfers = p.getByLabel('每日最多转存次数', { exact: true }); assert.equal(await dailyTransfers.inputValue(), String(quarkSettings.maxDailyTransfers)); assert.equal(await dailyTransfers.getAttribute('min'), '1'); assert.equal(await dailyTransfers.getAttribute('max'), '100');
       await p.getByLabel('启用夸克', { exact: true }).check(); await p.getByLabel('自动准备当前单集', { exact: true }).check(); await p.getByLabel('定期清理已看完文件', { exact: true }).check(); await p.getByLabel('夸克看完后保留天数', { exact: true }).fill('3'); await p.getByLabel('夸克账号 Cookie', { exact: true }).fill('quark-fixture-secret-cookie');
       const settingsWrites = () => quarkRequests.filter(request => request.path === '/api/quark/settings' && request.method === 'PUT').length;
@@ -616,11 +694,11 @@ try {
         await until(() => p.locator('video').evaluate((video, old) => video !== old, previous).catch(() => false), '重试后挂载新网盘播放器'); await previous.dispose();
       }
       const beforePrepare = quarkRequests.filter(request => request.path === '/api/quark/prepare').length;
-      await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await decoded('quark-first-1'); await p.getByRole('button', { name: '夸克播放', exact: true }).waitFor();
-      assert.equal(await p.locator('video').evaluate(video => video.currentSrc.includes('/api/quark/')), false, '准备完成不打断普通播放');
+      await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await decoded('/api/quark/media/share-fixture-file-1'); await p.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
+      assert.equal(await p.locator('video').evaluate(video => video.currentSrc.includes('/api/quark/')), true, '当前集准备完成自动切换夸克播放');
       const firstPrepare = quarkRequests.filter(request => request.path === '/api/quark/prepare').slice(beforePrepare); assert.equal(firstPrepare.length, 1); assert.equal(firstPrepare[0].body.episode, 0); assert.equal(firstPrepare[0].body.fileId, 'file-1'); assert.equal(firstPrepare[0].body.auto, true);
       await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 1; }); const sourceReports = playabilityReports.length, markers = adRequests.length;
-      await p.getByRole('button', { name: '夸克播放', exact: true }).click(); await decoded('/api/quark/media/share-fixture-file-1'); await p.locator('video').evaluate(video => video.pause());
+      await p.locator('video').evaluate(video => video.pause());
       assert.equal(new URL(await p.getByRole('link', { name: '原链接 ↗', exact: true }).getAttribute('href')).origin, base, '云原链仅本应用代理URL');
       assert.equal(playabilityReports.length, sourceReports, '夸克loadeddata不报告原影视源'); assert.equal(adRequests.length, markers, '夸克不套用原源HLS广告标记');
       await p.locator('video').evaluate(async video => { video.currentTime = 5; await video.play(); video.dispatchEvent(new Event('timeupdate')); }); await p.waitForTimeout(150); assert.ok(await p.locator('video').evaluate(video => video.currentTime < 6), '夸克版本不误用普通源广告范围'); await p.locator('video').evaluate(video => video.pause());
@@ -638,14 +716,14 @@ try {
       transcodeMode = 'disabled'; transcodeDuration = previousDuration;
       await p.getByRole('button', { name: '返回原线路', exact: true }).click(); await decoded('quark-first-1'); await p.locator('video').evaluate(video => video.pause());
       quarkMode = 'webm'; const webmJobs = transcodeStarts.length; await p.getByRole('button', { name: '夸克播放', exact: true }).click(); await decoded('/api/quark/media/share-fixture-file-1'); assert.equal(transcodeStarts.length, webmJobs, '可信WebM先走浏览器原生，不主动转码'); quarkMode = 'matched';
-      await p.locator('video').evaluate(video => { video.pause(); video.currentTime = video.duration - 0.1; video.dispatchEvent(new Event('ended')); }); await decoded('quark-first-2');
+      await p.locator('video').evaluate(video => { video.pause(); video.currentTime = video.duration - 0.1; video.dispatchEvent(new Event('ended')); }); await decoded('/api/quark/media/share-fixture-file-2');
       await until(() => quarkProgress.some(body => body.assetId === 'share-fixture-file-1' && body.ended && body.position >= 29), 'ended先捕获旧asset快照再下一集');
-      await p.getByRole('button', { name: '夸克播放', exact: true }).waitFor(); const latestPrepare = quarkRequests.filter(request => request.path === '/api/quark/prepare').at(-1).body; assert.equal(latestPrepare.episode, 1); assert.equal(latestPrepare.fileId, 'file-2', '只准备当前新选集，不预转未看集');
-      await p.locator('.episode-grid').getByRole('button', { name: '第1集', exact: true }).click(); await decoded('quark-first-1'); await p.locator('video').evaluate(video => video.pause());
-      await p.getByLabel('跳过片尾（秒）', { exact: true }).fill('5'); await p.getByRole('button', { name: '保存播放偏好', exact: true }).click(); await until(() => preferences.get(quarkFilm.key)?.outroSeconds === 5, '云片尾偏好保存'); await p.getByRole('button', { name: '夸克播放', exact: true }).click(); await decoded('/api/quark/media/share-fixture-file-1');
-      const beforeOutro = quarkProgress.length; await p.locator('video').evaluate(async video => { video.pause(); video.currentTime = 26; try { await video.play(); } catch (error) { if (error.name !== 'AbortError') throw error; } video.dispatchEvent(new Event('timeupdate')); video.dispatchEvent(new Event('timeupdate')); }); await decoded('quark-first-2');
+      await p.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor(); const latestPrepare = quarkRequests.filter(request => request.path === '/api/quark/prepare').at(-1).body; assert.equal(latestPrepare.episode, 1); assert.equal(latestPrepare.fileId, 'file-2', '只准备当前新选集，不预转未看集');
+      await p.locator('.episode-grid').getByRole('button', { name: '第1集', exact: true }).click(); await decoded('/api/quark/media/share-fixture-file-1'); await p.locator('video').evaluate(video => video.pause());
+      await p.getByLabel('跳过片尾（秒）', { exact: true }).fill('5'); await p.getByRole('button', { name: '保存播放偏好', exact: true }).click(); await until(() => preferences.get(quarkFilm.key)?.outroSeconds === 5, '云片尾偏好保存');
+      const beforeOutro = quarkProgress.length; await p.locator('video').evaluate(async video => { video.pause(); video.currentTime = 26; try { await video.play(); } catch (error) { if (error.name !== 'AbortError') throw error; } video.dispatchEvent(new Event('timeupdate')); video.dispatchEvent(new Event('timeupdate')); }); await decoded('/api/quark/media/share-fixture-file-2');
       await until(() => quarkProgress.slice(beforeOutro).some(body => body.assetId === 'share-fixture-file-1' && body.ended && body.position === 30 && body.duration === 30), '跳片尾逻辑完成完整原时长快照保留旧asset'); assert.equal(quarkProgress.slice(beforeOutro).filter(body => body.assetId === 'share-fixture-file-1' && body.ended && body.position === 30).length, 1, '重复timeupdate不重复标完成');
-      await p.getByRole('button', { name: '夸克播放', exact: true }).click(); await decoded('/api/quark/media/share-fixture-file-2'); await p.locator('video').evaluate(video => video.pause());
+      await p.locator('video').evaluate(video => video.pause());
       quarkMode = 'requires'; transcodeMode = 'enabled'; transcodeDuration = 1200; const jobs = transcodeStarts.length; await retryQuark(); await decoded('/api/transcode/');
       assert.equal(transcodeStarts.slice(jobs)[0].quarkAsset, 'share-fixture-file-2'); assert.equal(transcodeStarts.slice(jobs)[0].source, undefined, '兼容任务使用cloud asset而非原源URL');
       await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 2; }); await until(() => quarkProgress.some(body => body.assetId === 'share-fixture-file-2' && body.position >= 2 && body.duration === 1200), '云兼容进度仍是原片绝对时间');
@@ -655,11 +733,11 @@ try {
       }
       quarkMode = 'ambiguous'; await p.locator('nav a[href="#home"]').click(); const ambiguousStarts = quarkRequests.filter(request => request.path === '/api/quark/prepare').length; await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await decoded('quark-first-2'); await p.getByLabel('夸克视频文件', { exact: true }).waitFor();
       await p.waitForTimeout(150); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').length, ambiguousStarts, '文件歧义不自动转存');
-      await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-2'); await p.getByRole('button', { name: '转存所选单集', exact: true }).click(); await p.getByRole('button', { name: '夸克播放', exact: true }).waitFor(); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').at(-1).body.auto, false);
-      await p.locator('nav a[href="#home"]').click(); quarkMode = 'pending'; quarkAssets.delete('share-fixture-file-2'); await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await p.getByRole('button', { name: '刷新准备状态', exact: true }).waitFor(); const pendingRequests = quarkRequests.filter(request => request.path === '/api/quark/prepare').length; await p.waitForTimeout(150); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').length, pendingRequests, 'pending不无穷轮询/重复转存'); await p.getByRole('button', { name: '刷新准备状态', exact: true }).click(); await p.getByRole('button', { name: '夸克播放', exact: true }).waitFor();
+      await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-2'); await p.getByRole('button', { name: '转存所选单集', exact: true }).click(); await p.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor(); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').at(-1).body.auto, false);
+      await p.locator('nav a[href="#home"]').click(); quarkMode = 'pending'; quarkPendingChecks = 0; await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await p.getByRole('button', { name: '刷新准备状态', exact: true }).waitFor(); const pendingRequests = quarkRequests.filter(request => request.path === '/api/quark/prepare').length; await p.waitForTimeout(150); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').length, pendingRequests, 'pending不无穷轮询/重复转存'); await p.clock.fastForward(5000); await p.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor(); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').length, pendingRequests + 1, 'pending按5秒复查，幂等完成后自动播放');
       await p.locator('nav a[href="#home"]').click(); holdQuarkResources = true; await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await until(() => Boolean(releaseQuarkResources), '资源查询等待中'); await p.locator('nav a[href="#favorites"]').click(); holdQuarkResources = false; releaseQuarkResources(); releaseQuarkResources = null; await p.getByRole('heading', { name: '我的收藏', exact: true }).waitFor(); assert.equal(await p.locator('#quark-resources').count(), 0, '旧网盘异步响应不能接管新路由');
       await p.locator('nav a[href="#settings"]').click(); await openSettingsSection(p, '夸克网盘'); await until(() => p.getByRole('button', { name: '断开夸克账号', exact: true }).isEnabled(), '账号状态同步'); const fileCount = quarkSettings.managedFiles, deletes = quarkRequests.filter(request => request.path === '/api/quark/cleanup').length; await p.getByRole('button', { name: '断开夸克账号', exact: true }).click(); await until(() => quarkSettings.configured === false, '账号断连'); assert.equal(quarkSettings.managedFiles, fileCount); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/cleanup').length, deletes, '断连不删除云文件');
-      console.log('PASS 夸克异步只准备当前集/歧义手选/幂等pending刷新、不打断普通流、共享收藏进度和ended旧asset快照、严格广告/原源报告隔离、云兼容、手机桌面与请求取消（固定契约）');
+      console.log('PASS 夸克异步只准备当前集/歧义手选/幂等pending检查、准备完成自动播放、共享收藏进度和ended旧asset快照、严格广告/原源报告隔离、云兼容、手机桌面与请求取消（固定契约）');
     } finally { holdQuarkResources = false; releaseQuarkResources?.(); releaseQuarkResources = null; transcodeMode = previousMode; transcodeDuration = previousDuration; quarkMode = 'matched'; quarkSettings.configured = false; quarkSettings.account = { connected: false, label: '' }; await isolated?.value.close(); }
   }
 
@@ -1636,6 +1714,7 @@ try {
   await verifyProgressiveMetadata();
   await verifyAdSkipping();
   await verifyQuarantineStatus();
+  await verifyQuarkAutoplay();
   await verifyQuarkFlow();
   await verifyQuarkChoices();
   await verifyCompactSettings();

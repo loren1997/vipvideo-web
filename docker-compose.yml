@@ -3,6 +3,7 @@ name: vipvideo-web
 services:
   web:
     image: ghcr.io/loren1997/vipvideo-web:latest
+    pull_policy: always
     restart: unless-stopped
     ports:
       - "3000:3000"

@@ -62,6 +62,81 @@ async function fixture(t, extra = {}) {
   return { service, options, state, metadata, store, dataDir, request, connect, select, save, userFolder, userFile };
 }
 
+test('managed mkdir waits for indexed visibility without repeating creation or transferring early', async t => {
+  const { service, state, connect, select, metadata } = await fixture(t); await connect();
+  const selected = await select(); let confirmations = 0;
+  state.beforeRequest = call => {
+    if (call.path !== '/file/sort') return;
+    const query = new URL(call.value).searchParams;
+    assert.equal(query.get('fetch_all_file'), '1'); assert.equal(query.get('_sort'), 'file_type:asc,updated_at:desc');
+    if (query.get('pdir_fid') === '0' && state.folders.has('A') && ++confirmations < 3) {
+      assert.equal(state.saved, 0); return reply({ list: [] });
+    }
+  };
+  const result = await service.prepare(detail, { ...selected, line: 0, episode: 0 });
+  assert.equal(result.status, 'ready'); assert.equal(state.saved, 1);
+  assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+  const folder = Object.values(JSON.parse(metadata.get('quark-registry-v1')).folders)[0];
+  assert.equal(folder.fid, 'app-folder-A'); assert.equal(folder.mkdirStarted, undefined);
+});
+
+test('invisible managed mkdir stops at three confirmation reads and recovers later without creating another folder', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect();
+  const selected = await select(); let confirmations = 0, invisible = true;
+  state.beforeRequest = call => {
+    if (call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') === '0' && state.folders.has('A') && invisible) {
+      confirmations++; return reply({ list: [] });
+    }
+  };
+  const first = await service.prepare(detail, { ...selected, line: 0, episode: 0 });
+  assert.equal(first.status, 'error'); assert.match(first.reason, /专用目录暂未可见/); assert.equal(confirmations, 3); assert.equal(state.saved, 0);
+  const second = await service.prepare(detail, { ...selected, line: 0, episode: 0 });
+  assert.equal(second.status, 'error'); assert.equal(confirmations, 7); assert.equal(state.saved, 0);
+  invisible = false;
+  assert.equal((await service.prepare(detail, { ...selected, line: 0, episode: 0 })).status, 'ready');
+  assert.equal(state.saved, 1); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+  assert.deepEqual(state.deletes, []);
+});
+
+test('managed mkdir pins the returned fid and refuses to adopt a different same-name folder', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect(); const selected = await select();
+  state.beforeRequest = call => {
+    if (call.path === '/file' && call.options.method === 'POST') {
+      state.folders.set('A', { fid: 'different-folder', file_name: call.body.file_name, file: false, pdir_fid: '0' });
+      return reply({ fid: 'created-folder' });
+    }
+  };
+  const result = await service.prepare(detail, { ...selected, line: 0, episode: 0 });
+  assert.equal(result.status, 'error'); assert.equal(state.saved, 0); assert.deepEqual(state.deletes, []);
+  assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+});
+
+test('a pre-existing same-name root directory is not adopted before this application has created it', async t => {
+  const { service, state, connect, select, metadata } = await fixture(t); await connect(); const selected = await select();
+  const installId = JSON.parse(metadata.get('quark-settings-v1')).installId;
+  state.beforeRequest = call => {
+    if (call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') === '0') {
+      return reply({ list: [{ fid: 'user-owned-same-name', file_name: 'VipVideo-' + installId, file: false, pdir_fid: '0' }] });
+    }
+  };
+  const result = await service.prepare(detail, { ...selected, line: 0, episode: 0 });
+  assert.equal(result.status, 'error'); assert.match(result.reason, /无法确认/); assert.equal(state.saved, 0);
+  assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 0); assert.deepEqual(state.deletes, []);
+});
+
+test('revoking the viewing authorization during directory indexing cancels all later reads and transfers', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect(); const selected = await select();
+  let valid = true, confirmations = 0;
+  state.beforeRequest = call => {
+    if (call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') === '0' && state.folders.has('A')) {
+      confirmations++; setImmediate(() => { valid = false; }); return reply({ list: [] });
+    }
+  };
+  const result = await service.prepare(detail, { ...selected, line: 0, episode: 0, valid: () => valid });
+  assert.equal(result.status, 'error'); assert.match(result.reason, /授权已失效/); assert.equal(confirmations, 1); assert.equal(state.saved, 0);
+  assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1); assert.deepEqual(state.deletes, []);
+});
+
 test('connected share requests use the stored Cookie only at the fixed official API; anonymous and disabled accounts do not', async t => {
   const { service, state, connect, select } = await fixture(t);
   await select();

@@ -1,0 +1,245 @@
+import { Readable } from 'node:stream';
+import { request as networkRequest, readText, validateUrl } from './network.mjs';
+import { createQuarkSearchRequest } from './quark-search.mjs';
+
+const KEY = 'quark-search-pool-v1', DAY = 86_400_000, HEALTH_INTERVAL = 6 * 60 * 60_000;
+const OFFICIAL = 'https://so.252035.xyz/api/search';
+const sources = [
+  'https://api.github.com/repos/fish2018/pansou-web',
+  'https://raw.githubusercontent.com/fish2018/pansou-web/main/README.md',
+  'https://www.bing.com/search?format=rss&q=PanSou%20%22api%2Fsearch%22',
+];
+const searchFields = ['kw', 'cloud_types', 'res', 'src', 'conc', 'channels', 'plugins', 'refresh'];
+const sensitive = key => /cookie|authorization|password|secret|api.?key|(?:^|_)token(?:$|_)/i.test(key);
+const failure = (message, status = 502, local = false) => Object.assign(new Error(message), { status, quarkSafe: true, ...(local ? { quarkPoolLocal: true } : {}) });
+
+function endpoint(value, internal = false) {
+  if (typeof value !== 'string' || value.length > 8192 || value.includes('#')) throw failure('搜索地址无效', 400);
+  const exactSidecar = /^http:\/\/pansou:8888\/api\/search(?:\?[^#]*)?$/.test(value);
+  const url = validateUrl(value);
+  if ([...url.searchParams.keys()].some(sensitive)) throw failure('搜索地址不能包含账号凭证', 400);
+  if ((!internal || !exactSidecar) && !url.hostname.includes('.') && !url.hostname.includes(':')) throw failure('自动搜索仅接受公网地址', 403);
+  for (const field of searchFields) url.searchParams.delete(field);
+  return url.href;
+}
+function candidate(value) {
+  const url = new URL(endpoint(value));
+  if (!/^\/api\/search\/?$/.test(url.pathname) || url.search) throw failure('公开候选不是 PanSou 搜索接口', 400);
+  url.pathname = '/api/search';
+  return url.href;
+}
+function share(value, password = '') {
+  try {
+    const url = validateUrl(value);
+    if (url.protocol !== 'https:' || url.hostname !== 'pan.quark.cn' || url.port || !/^\/s\/[a-z0-9]{6,32}\/?$/i.test(url.pathname)) return;
+    const pwd = password || url.searchParams.get('pwd') || '';
+    if (typeof pwd !== 'string' || !/^[A-Za-z0-9]{0,16}$/.test(pwd)) return;
+    return { url: url.origin + url.pathname.replace(/\/$/, '') + (pwd ? '?pwd=' + encodeURIComponent(pwd) : ''), ...(pwd ? { password: pwd } : {}) };
+  } catch { return; }
+}
+function shares(data) {
+  const found = new Map(); let visited = 0;
+  function visit(value, title = '', depth = 0) {
+    if (++visited > 10_000 || depth > 6 || found.size >= 30) return;
+    if (Array.isArray(value)) { for (const item of value.slice(0, 100)) visit(item, title, depth + 1); return; }
+    if (!value || typeof value !== 'object') return;
+    title = String(value.work_title || value.title || value.name || value.file_name || value.note || title).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 300);
+    const link = (!value.type || value.type === 'quark') && share(value.url || value.link, value.password || '');
+    if (link) found.set(link.url, { ...link, name: title });
+    for (const key of ['results', 'links', 'data', 'merged_by_type', 'quark', 'list']) if (value[key] !== undefined) visit(value[key], title, depth + 1);
+  }
+  visit(data);
+  return [...found.values()];
+}
+function compatible(body) {
+  let data; try { data = JSON.parse(body); } catch { return; }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+  const payload = data.data && typeof data.data === 'object' ? data.data : data;
+  if (data.error || data.success === false || data.code !== undefined && ![0, 200, '0', '200'].includes(data.code)) return;
+  if (!Array.isArray(payload.results) && !(payload.merged_by_type && typeof payload.merged_by_type === 'object' && !Array.isArray(payload.merged_by_type))) return;
+  return shares(data);
+}
+function rssShares(body) {
+  if (!/<rss\b/i.test(body) || /<!DOCTYPE\b|<!ENTITY\b|captcha|安全验证/i.test(body)) throw failure('公开网页搜索暂不可用');
+  const rows = new Map();
+  for (const match of body.replace(/&amp;/g, '&').matchAll(/https:\/\/pan\.quark\.cn\/s\/[a-z0-9]{6,32}(?:\?pwd=[a-z0-9]{1,16})?/gi)) {
+    const link = share(match[0]); if (link) rows.set(link.url, link); if (rows.size >= 30) break;
+  }
+  return [...rows.values()];
+}
+const result = rows => {
+  const body = JSON.stringify({ results: rows });
+  return Object.assign(Readable.from([body]), { statusCode: 200, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } });
+};
+
+export function createQuarkSearchPool({ store, request = createQuarkSearchRequest(), discoveryRequest = networkRequest, now = Date.now } = {}) {
+  if (!store?.meta || !store?.setMeta) throw new TypeError('Search pool requires store metadata');
+  let state = { candidates: [], lastDiscovery: 0, lastHealth: 0, healthCursor: 0, discoveryError: '' };
+  let active = 0, timer, started = false, stopping = false, discoveryJob, currentPrimary;
+  const waiting = [], jobs = new Set();
+  try {
+    const text = store.meta(KEY);
+    if (typeof text === 'string' && text.length <= 64 * 1024) {
+      const saved = JSON.parse(text);
+      for (const key of ['lastDiscovery', 'lastHealth', 'healthCursor']) if (Number.isSafeInteger(saved[key]) && saved[key] >= 0 && saved[key] <= now()) state[key] = saved[key];
+      for (const row of Array.isArray(saved.candidates) ? saved.candidates.slice(0, 8) : []) {
+        try {
+          const url = row.automatic === false ? endpoint(row.url, true) : candidate(row.url);
+          state.candidates.push({ url, automatic: row.automatic !== false, source: row.automatic === false ? '手动配置' : row.source === '官方项目' ? '官方项目' : '公开目录',
+            status: ['healthy', 'pending', 'paused'].includes(row.status) ? row.status : 'pending', failures: Math.min(8, Math.max(0, Number(row.failures) || 0)),
+            addedAt: Math.max(0, Math.min(now(), Number(row.addedAt) || 0)), checkedAt: Math.max(0, Math.min(now(), Number(row.checkedAt) || 0)), retryAt: Math.max(0, Math.min(now() + HEALTH_INTERVAL, Number(row.retryAt) || 0)) });
+        } catch { /* Saved endpoints are revalidated before reuse. */ }
+      }
+    }
+  } catch { state.discoveryError = '已保存的搜索接口记录无法读取'; }
+  const persist = () => { if (!stopping) store.setMeta(KEY, JSON.stringify(state)); };
+  function add(url, source, automatic = true) {
+    const existing = state.candidates.find(row => row.url === url);
+    if (existing) { if (automatic) { existing.automatic = true; existing.source = source; } return existing; }
+    state.candidates = state.candidates.filter(row => row.url === currentPrimary || !row.automatic || row.status === 'healthy' || row.failures < 3 && now() - row.addedAt < 7 * DAY);
+    if (state.candidates.length >= 8) {
+      const removable = state.candidates.filter(row => row.url !== currentPrimary && (row.automatic && row.status !== 'healthy' || !row.automatic)).sort((a, b) => a.addedAt - b.addedAt);
+      if (!removable.length) return;
+      state.candidates.splice(state.candidates.indexOf(removable[0]), 1);
+    }
+    const row = { url, source, automatic, status: 'pending', failures: 0, addedAt: now(), checkedAt: 0, retryAt: 0 };
+    state.candidates.push(row); return row;
+  }
+  add(OFFICIAL, '官方项目');
+  function track(work) {
+    const job = Promise.resolve().then(work); jobs.add(job);
+    job.then(() => jobs.delete(job), () => jobs.delete(job)); return job;
+  }
+  async function slot(deadline) {
+    if (stopping || deadline <= now()) throw failure('公开搜索已停止或超时', 503, true);
+    if (active < 2) { active++; return; }
+    if (waiting.length >= 16) throw failure('公开搜索繁忙，请稍后重试', 503, true);
+    await new Promise((resolve, reject) => {
+      const entry = { resolve: () => { clearTimeout(entry.timer); resolve(); }, reject: error => { clearTimeout(entry.timer); reject(error); } };
+      entry.timer = setTimeout(() => { const index = waiting.indexOf(entry); if (index >= 0) waiting.splice(index, 1); entry.reject(failure('公开搜索排队超时', 504, true)); }, Math.max(1, deadline - now()));
+      waiting.push(entry);
+    });
+  }
+  function release() { const next = waiting.shift(); if (next) next.resolve(); else active--; }
+  function text(url, duration, transport = request, maxBytes = 2 * 1024 * 1024, deadline = now() + duration) {
+    return track(async () => {
+      await slot(deadline);
+      let response, timeout, expired = false;
+      try {
+        if (stopping || deadline <= now()) throw failure('公开搜索已停止或超时', 503, true);
+        const remaining = Math.max(1, Math.min(duration, deadline - now()));
+        const work = (async () => {
+          response = await transport(url, { method: 'GET', timeout: remaining, followRedirects: false, headers: { accept: 'application/json, application/rss+xml, text/plain', 'user-agent': 'VipVideo-Web-quark-search' } });
+          if (expired) { response.destroy(); throw failure('公开搜索超时', 504); }
+          if (response.statusCode !== 200) throw failure(response.statusCode === 401 || response.statusCode === 403 ? '公开接口需要认证或拒绝访问' : '公开搜索接口暂不可用');
+          return await readText(response, maxBytes);
+        })();
+        return await Promise.race([work, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('公开搜索超时', 504)); }, remaining); })]);
+      } finally { expired = true; clearTimeout(timeout); response?.destroy(); release(); }
+    });
+  }
+  function checked(row, links) {
+    if (stopping) return;
+    row.checkedAt = now(); row.failures = 0; row.retryAt = 0; delete row.error;
+    if (links.length) row.status = 'healthy'; else if (row.status !== 'healthy') row.status = 'pending';
+    persist();
+  }
+  function failed(row, cause) {
+    if (stopping || cause?.quarkPoolLocal) return;
+    row.checkedAt = now(); row.failures = Math.min(8, row.failures + 1); row.status = 'paused';
+    row.retryAt = now() + Math.min(HEALTH_INTERVAL, 15 * 60_000 * 2 ** (row.failures - 1)); row.error = '接口未通过搜索验证，已暂时避开'; persist();
+  }
+  function apiUrl(base, keyword) {
+    const url = new URL(base);
+    for (const [key, value] of Object.entries({ kw: keyword, cloud_types: 'quark', res: 'results', conc: '1' })) url.searchParams.set(key, value);
+    return url.href;
+  }
+  async function verifyCandidates() {
+    const rows = state.candidates.filter(row => row.automatic && row.retryAt <= now() && (row.status !== 'healthy' || now() - row.checkedAt >= HEALTH_INTERVAL));
+    for (let count = 0; count < Math.min(2, rows.length) && !stopping; count++) {
+      const row = rows[(state.healthCursor + count) % rows.length];
+      try { const links = compatible(await text(apiUrl(row.url, '星际穿越'), 4000)); if (stopping) break; if (links === undefined) throw failure('搜索接口格式不兼容'); checked(row, links); }
+      catch (cause) { if (stopping) break; failed(row, cause); }
+    }
+    if (!stopping) { state.healthCursor += Math.min(2, rows.length); state.lastHealth = now(); persist(); }
+  }
+  function status() {
+    const automatic = state.candidates.filter(row => row.automatic && row.url !== currentPrimary);
+    return { enabled: !stopping, discovering: !!discoveryJob, lastDiscovery: state.lastDiscovery, lastHealth: state.lastHealth,
+      healthy: automatic.filter(row => row.status === 'healthy' && row.retryAt <= now()).length,
+      pending: automatic.filter(row => row.status === 'pending').length,
+      suspended: automatic.filter(row => row.status === 'paused').length,
+      candidates: state.candidates.map(row => { const url = new URL(row.url); return { apiUrl: url.origin + url.pathname, source: row.source, status: row.status, checkedAt: row.checkedAt, retryAt: row.retryAt, ...(row.error ? { reason: '接口未通过搜索验证，已暂时避开' } : {}) }; }),
+      ...(state.discoveryError ? { reason: state.discoveryError } : {}) };
+  }
+  function discover() {
+    if (discoveryJob) return discoveryJob;
+    if (stopping || state.lastDiscovery && now() - state.lastDiscovery < DAY) return Promise.resolve(status());
+    discoveryJob = track(async () => {
+      state.lastDiscovery = now(); state.discoveryError = '';
+      for (const url of sources) {
+        if (stopping) break;
+        try {
+          const body = await text(url, 2500, discoveryRequest, 512 * 1024);
+          if (stopping) break;
+          const found = [];
+          if (url === sources[0]) {
+            const homepage = JSON.parse(body).homepage;
+            if (typeof homepage === 'string' && homepage) { const published = new URL(endpoint(homepage)); published.pathname = '/api/search'; published.search = ''; found.push(published.href); }
+          }
+          for (const match of body.replace(/&amp;/g, '&').matchAll(/https?:\/\/[^\s<>"'()\\]+/gi)) found.push(match[0].replace(/[.,;\]}]+$/, ''));
+          for (const value of found.slice(0, 40)) { try { add(candidate(value), url === sources[2] ? '公开目录' : '官方项目'); } catch { /* Only explicitly published public API endpoints become candidates. */ } }
+        } catch { if (stopping) break; state.discoveryError = '部分公开接口目录暂不可访问，保留现有接口'; }
+      }
+      await verifyCandidates(); persist(); return status();
+    });
+    discoveryJob.then(() => { discoveryJob = undefined; }, () => { discoveryJob = undefined; });
+    return discoveryJob;
+  }
+  function schedule(delay = HEALTH_INTERVAL) {
+    clearTimeout(timer);
+    if (!started || stopping) return;
+    timer = setTimeout(() => {
+      const job = !state.lastDiscovery || now() - state.lastDiscovery >= DAY ? discover() : track(verifyCandidates);
+      job.catch(() => { if (!stopping) { state.discoveryError = '搜索接口后台验证暂未完成'; persist(); } }).finally(() => schedule());
+    }, delay);
+    timer.unref?.();
+  }
+  return {
+    request(value, _options = {}) {
+      return track(async () => {
+        if (stopping) throw failure('公开搜索已停止', 503, true);
+        const input = value instanceof URL ? value.href : value, base = endpoint(input, true), parsed = new URL(input);
+        const web = parsed.hostname === 'www.bing.com' && parsed.pathname === '/search';
+        const keyword = (parsed.searchParams.get(web ? 'q' : 'kw') || '').replace(/\s+site:pan\.quark\.cn\/s\b/gi, '').trim().slice(0, 1000);
+        if (!keyword) throw failure('搜索关键词不能为空', 400);
+        currentPrimary = web ? undefined : base;
+        const primary = web ? undefined : add(base, '手动配置', false), deadline = now() + 7500;
+        const backups = state.candidates.filter(row => row.automatic && row.url !== base && row.status === 'healthy' && row.retryAt <= now()).sort((a, b) => b.checkedAt - a.checkedAt);
+        const selected = [...(primary && primary.retryAt <= now() ? [primary] : []), ...backups].slice(0, 2);
+        let valid = false;
+        const attempts = selected.map(row => track(async () => {
+          try {
+            const links = compatible(await text(apiUrl(row.url, keyword), 5500, request, 2 * 1024 * 1024, deadline - 1800));
+            if (links === undefined) throw failure('搜索接口格式不兼容'); valid = true; checked(row, links);
+            return links;
+          } catch (cause) { failed(row, cause); }
+          return [];
+        }));
+        const first = await new Promise(resolve => {
+          let remaining = attempts.length;
+          if (!remaining) resolve([]);
+          for (const attempt of attempts) attempt.then(links => { if (links.length) resolve(links); else if (!--remaining) resolve([]); }, () => { if (!--remaining) resolve([]); });
+        });
+        if (stopping) throw failure('公开搜索已停止', 503, true);
+        if (first.length) return result(first);
+        const fallback = new URL('https://www.bing.com/search'); fallback.search = new URLSearchParams({ q: keyword + ' site:pan.quark.cn/s', format: 'rss' }).toString();
+        try { return result(rssShares(await text(fallback.href, Math.max(1, deadline - now()), request, 2 * 1024 * 1024, deadline))); }
+        catch { if (valid) return result([]); throw failure('公开搜索接口和网页搜索暂不可用，请稍后重试'); }
+      });
+    },
+    status, discover,
+    start() { if (!started) { started = true; stopping = false; schedule(0); } },
+    async stop() { stopping = true; started = false; clearTimeout(timer); for (const entry of waiting.splice(0)) entry.reject(failure('公开搜索已停止', 503, true)); while (jobs.size) await Promise.allSettled([...jobs]); },
+  };
+}

@@ -85,6 +85,28 @@ test('cloud routes protect account data, resolve trusted selections and proxy on
   assert.equal((await call(playback.url, undefined, cookie)).status, 403);
 });
 
+test('Quark resource searches use the maintained pool and expose its status only after login', async t => {
+  let searches = 0;
+  const poolStatus = { healthy: 1, pending: 1, lastDiscovery: 123 };
+  const quarkSearchPool = {
+    status: () => poolStatus,
+    request: async value => {
+      searches++; assert.match(String(value), /测试影片|%E6%B5%8B%E8%AF%95/);
+      return Object.assign(Readable.from([JSON.stringify({ results: [{ title: '测试影片 2025', url: 'https://pan.quark.cn/s/abcdef123456' }] })]), { statusCode: 200 });
+    },
+    stop: async () => {},
+  };
+  const source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
+  const { app, call, login } = await running(t, { initialConfig: { ...empty, sources: [source] }, quarkSearchPool });
+  assert.equal(app.quarkSearch, quarkSearchPool);
+  assert.equal((await call('/api/quark/settings')).status, 401);
+  const cookie = await login();
+  assert.deepEqual((await (await call('/api/quark/settings', undefined, cookie)).json()).searchPool, poolStatus);
+  const resources = await call('/api/quark/resources?source=demo&id=1', undefined, cookie);
+  assert.equal(resources.status, 200); assert.equal((await resources.json()).resources.length, 1);
+  assert.equal(searches, 1);
+});
+
 test('Quark account authentication errors remain distinct from a revoked household session', async t => {
   const source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
   let upstreamStatus = 401;

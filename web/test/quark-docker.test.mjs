@@ -63,6 +63,7 @@ test('optional Quark search companion preserves Compose settings and becomes hea
   assert.equal(Number(combined.services.web.mem_limit), 768 * 1024 * 1024);
   assert.equal(Number(combined.services.web.memswap_limit), Number(combined.services.web.mem_limit));
   assert.equal(combined.services.web.pids_limit, 128);
+  assert.equal(combined.services.web.pull_policy, 'always');
   assert.equal(combined.services.web.blkio_config.weight, 100);
   assert.deepEqual(combined.services.web.tmpfs, ['/tmp:size=128m,mode=1777']);
   const nasYaml = readFileSync(join(root, 'docker-compose.nas.yml'), 'utf8');

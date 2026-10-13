@@ -20,7 +20,7 @@ import { repairImport } from './lib/import-repair.mjs';
 import { createTranscoder } from './lib/transcode.mjs';
 import { createAdMarkers } from './lib/ad-markers.mjs';
 import { createQuark } from './lib/quark.mjs';
-import { createQuarkSearchRequest } from './lib/quark-search.mjs';
+import { createQuarkSearchPool } from './lib/quark-search-pool.mjs';
 import { createQuarkMedia } from './lib/quark-media.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -53,7 +53,7 @@ function tokenFrom(req) {
 
 export function createApp({ password = process.env.APP_PASSWORD, dataDir = process.env.DATA_DIR ?? resolve(root, 'data'),
   catalog = createCatalog(), media = createMedia(), initialConfig = defaults, cookieSecure = process.env.COOKIE_SECURE === 'true',
-  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder, adMarkers, quark, quarkMedia } = {}) {
+  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder, adMarkers, quark, quarkMedia, quarkSearchPool } = {}) {
   if (typeof password !== 'string' || password.length < 8 || password.length > 1024) throw new Error('APP_PASSWORD 必须设置，且长度为 8–1024 个字符');
   const initial = validateConfig(initialConfig);
   const store = createStore(dataDir, initial);
@@ -76,7 +76,8 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const ratingService = ratings ?? createRatings({ store });
   const danmakuService = danmaku ?? createDanmaku({ store });
   const transcodeService = transcoder ?? createTranscoder({ media, logger });
-  const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: createQuarkSearchRequest(), defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
+  const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store });
+  const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: searchPool.request, defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
   const cloudMedia = quarkMedia ?? createQuarkMedia({ quark: quarkService, visible: category => ensureVisible(category) });
   const salt = store.meta('password-salt') ?? randomBytes(16).toString('hex');
   const passwordHash = scryptSync(password, salt, 32);
@@ -178,14 +179,14 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         if (path === '/api/config/presets' && method === 'GET') {
           return json(res, 200, { api_site: Object.fromEntries(initial.sources.map(({ id, name, api }) => [id, { name, api }])) });
         }
-        if (path === '/api/quark/settings' && method === 'GET') return json(res, 200, await quarkService.settings());
+        if (path === '/api/quark/settings' && method === 'GET') return json(res, 200, { ...await quarkService.settings(), searchPool: searchPool.status() });
         if (path === '/api/quark/settings' && method === 'PUT') {
           const result = await quarkService.configure(await readBody(req)); cloudMedia.invalidate();
-          return json(res, 200, result);
+          return json(res, 200, { ...result, searchPool: searchPool.status() });
         }
         if (path === '/api/quark/account' && method === 'DELETE') {
           await readBody(req); const result = await quarkService.clearAccount(); cloudMedia.invalidate();
-          return json(res, 200, result);
+          return json(res, 200, { ...result, searchPool: searchPool.status() });
         }
         if (path === '/api/quark/cleanup' && method === 'POST') {
           await readBody(req); return json(res, 200, await quarkService.cleanup());
@@ -486,8 +487,8 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
   return {
-    server, store, maintenance: sourceService, live: liveService, discovery: discoveryService, quark: quarkService,
-    async close() { cloudMedia.invalidate(); await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.(), transcodeService.close?.(), quarkService.stop?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
+    server, store, maintenance: sourceService, live: liveService, discovery: discoveryService, quark: quarkService, quarkSearch: searchPool,
+    async close() { cloudMedia.invalidate(); await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.(), transcodeService.close?.(), quarkService.stop?.(), searchPool.stop?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
   };
 }
 
@@ -496,7 +497,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     const port = Number(process.env.PORT ?? 3000);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT 必须是 1–65535 的整数');
     const app = createApp();
-    app.server.listen(port, '0.0.0.0', () => { app.maintenance.start(); app.live.start?.(); app.discovery.start(); app.quark.start?.(); console.log(`VipVideo Web 正在监听端口 ${port}`); });
+    app.server.listen(port, '0.0.0.0', () => { app.maintenance.start(); app.live.start?.(); app.discovery.start(); app.quark.start?.(); app.quarkSearch.start?.(); console.log(`VipVideo Web 正在监听端口 ${port}`); });
     app.server.on('error', (error) => { console.error(error); process.exitCode = 1; app.store.close(); });
     let stopping = false;
     for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {

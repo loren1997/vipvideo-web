@@ -317,7 +317,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   async function ownList(context, parent) {
     const output = []; let complete = false;
     for (let page = 1; page <= 6; page++) {
-      const result = await auth(context, '/file/sort', { query: { pdir_fid: parent, _page: String(page), _size: '100', _fetch_total: '1' } }); current(context);
+      const result = await auth(context, '/file/sort', { query: { pdir_fid: parent, _page: String(page), _size: '100', _fetch_total: '1', fetch_all_file: '1', _sort: 'file_type:asc,updated_at:desc' } }); current(context);
       if (!Array.isArray(result.data?.list) || result.data.list.length > 100) throw failure('无法可靠核验夸克文件目录');
       output.push(...result.data.list);
       if (result.data.list.length < 100 || Number(result.metadata?._total) <= page * 100) { complete = true; break; }
@@ -330,13 +330,20 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (!folder) { if (!create) throw failure('未找到本应用登记的夸克目录', 409); folder = { name: 'VipVideo-' + config.installId, createdAt: now() }; registry.folders[context.account] = folder; persist(); }
     const root = await ownList(context, '0');
     const matches = root.list.filter(row => directory(row) && row.file_name === folder.name && (!folder.fid || row.fid === folder.fid) && (!row.pdir_fid || row.pdir_fid === '0'));
-    if (matches.length === 1 && validFid(matches[0].fid)) { folder.fid = matches[0].fid; persist(); return folder; }
-    if (!create || folder.fid || !root.complete || matches.length) throw failure('无法确认本应用专用夸克目录，已停止操作', 409);
-    if (folder.mkdirStarted) throw failure('目录创建响应不确定，请稍后重试核验', 409);
-    await auth(context, '/file', { method: 'POST', body: { pdir_fid: '0', file_name: folder.name, dir_path: '', dir_init_lock: false }, beforeSend: () => { current(context); folder.mkdirStarted = true; persist(); } }); current(context);
-    const confirmed = await ownList(context, '0'), rows = confirmed.list.filter(row => directory(row) && row.file_name === folder.name && (!row.pdir_fid || row.pdir_fid === '0'));
-    if (rows.length !== 1 || !validFid(rows[0].fid)) throw failure('夸克专用目录暂未可见，请稍后重试', 409);
-    folder.fid = rows[0].fid; persist(); return folder;
+    if (matches.length === 1 && validFid(matches[0].fid) && (folder.fid || folder.mkdirStarted)) { folder.fid = matches[0].fid; delete folder.mkdirStarted; persist(); return folder; }
+    if (!create || folder.fid && !folder.mkdirStarted || !root.complete || matches.length) throw failure('无法确认本应用专用夸克目录，已停止操作', 409);
+    if (!folder.mkdirStarted) {
+      const created = await auth(context, '/file', { method: 'POST', body: { pdir_fid: '0', file_name: folder.name, dir_path: '', dir_init_lock: false }, beforeSend: () => { current(context); folder.mkdirStarted = true; persist(); } }); current(context);
+      if (created.data?.fid !== undefined) { if (!validFid(created.data.fid)) throw failure('无法核验夸克创建目录的响应', 409); folder.fid = created.data.fid; persist(); }
+    }
+    // Quark can acknowledge mkdir before its directory listing is updated; retry reads, never creation.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await new Promise(resolve => setTimeout(resolve, attempt * 500)); current(context);
+      const confirmed = await ownList(context, '0'), rows = confirmed.list.filter(row => directory(row) && row.file_name === folder.name && (!folder.fid || row.fid === folder.fid) && (!row.pdir_fid || row.pdir_fid === '0'));
+      if (rows.length === 1 && validFid(rows[0].fid)) { folder.fid = rows[0].fid; delete folder.mkdirStarted; persist(); return folder; }
+      if (rows.length) throw failure('无法确认本应用专用夸克目录，已停止操作', 409);
+    }
+    throw failure('夸克专用目录暂未可见，请稍后重试', 409);
   }
   async function ownedFile(context, asset) {
     const folder = await ownedFolder(context); if (folder.fid !== asset.parent) throw failure('视频不在本应用专用目录，已停止操作', 409);
