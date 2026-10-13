@@ -96,9 +96,15 @@ test('optional Quark search companion preserves Compose settings and accepts rea
     assert.ok(healthy, 'Optional PanSou companion must become healthy');
     const health = JSON.parse(compose(['exec', '-T', 'pansou', 'wget', '-qO-', 'http://127.0.0.1:8888/api/health']));
     assert.ok(health.status || health.success || health.code !== undefined);
-    // A nonexistent plugin checks the real search contract without contacting upstream resources.
-    const body = compose(['exec', '-T', 'pansou', 'wget', '-qO-',
-      'http://127.0.0.1:8888/api/search?kw=vipvideo-protocol-selfcheck&src=plugin&plugins=vipvideo_no_such_plugin_90d5&res=results&cloud_types=quark&conc=1']);
+    // Use the web service's network and current transport; a nonexistent plugin avoids upstream requests.
+    const body = compose(['run', '--rm', '-T', '--no-deps', '--volume', `${join(root, 'web/lib')}:/app/lib:ro`,
+      'web', 'node', '--input-type=module', '-e', `
+        import { createQuarkSearchRequest } from './lib/quark-search.mjs';
+        import { readText } from './lib/network.mjs';
+        const response = await createQuarkSearchRequest()('http://pansou:8888/api/search?kw=vipvideo-protocol-selfcheck&src=plugin&plugins=vipvideo_no_such_plugin_90d5&res=results&cloud_types=quark&conc=1');
+        if (response.statusCode !== 200) throw new Error('PanSou search HTTP ' + response.statusCode);
+        process.stdout.write(await readText(response));
+      `]);
     const wire = JSON.parse(body);
     assert.equal(wire.code, 0);
     assert.equal(wire.data.total, 0);

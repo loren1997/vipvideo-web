@@ -1213,8 +1213,10 @@ function mountQuark(current) {
   const choices = node('div', undefined, 'quark-choices'), result = node('div', undefined, 'quark-ready'); panel.append(feedback, choices, result); host.replaceChildren(panel);
   const state = current.quarkState ||= { resources: [], files: [], version: 0 };
   const valid = () => player === current && current.stamp === routeVersion && host.contains(panel);
-  let searchVersion = 0;
-  const more = button('查找更多公开资源', () => void load(true), 'button small'); more.disabled = true; panel.append(more);
+  let searchVersion = 0, loading = false;
+  const retry = button('重试搜索', () => void load(false, false), 'button small'); retry.hidden = true;
+  const more = button('查找更多公开资源', () => void load(true), 'button small'); more.disabled = true;
+  const searchActions = node('div', undefined, 'settings-actions'); searchActions.append(retry, more); panel.append(searchActions);
   function ready(data) {
     state.ready = data; result.replaceChildren(node('p', `${data.name || '当前集'}：${data.status === 'ready' ? '已准备好' : data.status === 'pending' ? '正在准备' : '准备未完成'}${data.saved ? ' · 已转存' : ''}`, 'muted'));
     if (data.status === 'ready' && data.assetId) { const play = button(current.quarkAsset === data.assetId ? '正在夸克播放' : '夸克播放', () => void playQuark(current, data.assetId), 'button primary small'); play.disabled = current.quarkAsset === data.assetId; result.append(play); }
@@ -1272,8 +1274,10 @@ function mountQuark(current) {
     } catch (error) { if (valid() && version === state.version) { filePlaceholder('文件读取失败，请重试或切换分享'); feedback.textContent = `网盘文件暂时不可用：${error.message}`; result.replaceChildren(button('重试读取文件', () => void loadFiles(), 'button small')); } }
   }
   shareSelect.addEventListener('change', () => void loadFiles()); fileSelect.addEventListener('change', () => { clearTimeout(current.quarkTimer); state.version++; delete state.ready; delete state.selection; result.replaceChildren(); const file = state.files.find(value => value.id === fileSelect.value); transfer.disabled = !file; fileSelect.title = file?.name || '请选择当前集视频'; });
-  async function load(webSearch = false) {
-    const search = ++searchVersion; let configured = false; more.disabled = true;
+  async function load(webSearch = false, automatic = true) {
+    if (loading) return; loading = true;
+    const search = ++searchVersion; let configured = false; more.disabled = retry.disabled = true;
+    if (!webSearch) feedback.textContent = '正在按作品名称查找夸克分享…';
     const currentSearch = () => valid() && search === searchVersion;
     try {
       const settings = await api('/api/quark/settings'); if (!currentSearch()) return;
@@ -1284,12 +1288,13 @@ function mountQuark(current) {
       const query = new URLSearchParams(playbackSelection(current.detail, current.line, current.episode)); if (webSearch) query.set('web', '1');
       const data = await api(`/api/quark/resources?${query}`, { timeoutMs: 35000 }); if (!currentSearch()) return;
       state.resources = Array.isArray(data.resources) ? data.resources : []; shareSelect.disabled = false; shareSelect.replaceChildren();
+      retry.hidden = !!state.resources.length || !data.reason;
       if (!state.resources.length) { feedback.textContent = data.reason || `暂未找到“${current.detail.title}”的夸克分享，普通播放不受影响。`; choices.replaceChildren(); return; }
       for (const resource of state.resources) { const dated = Number.isSafeInteger(resource.publishedAt) && resource.publishedAt > 0 ? ` · 页面日期 ${new Date(resource.publishedAt).toLocaleDateString('zh-CN')}` : ''; const option = node('option', (resource.name || resource.id) + dated); option.value = resource.id; shareSelect.append(option); }
       choices.replaceChildren(shareField, fileField, actions);
-      void loadFiles(!webSearch && settings.autoSave === true && current.flow.quarkAutomatic !== false);
-    } catch (error) { if (currentSearch()) { feedback.textContent = `夸克资源暂时不可用：${error.message}`; choices.replaceChildren(button('重试夸克资源', () => void load(webSearch), 'button small')); } }
-    finally { if (currentSearch()) more.disabled = !configured; }
+      void loadFiles(automatic && !webSearch && settings.autoSave === true && current.flow.quarkAutomatic !== false);
+    } catch (error) { if (currentSearch()) { feedback.textContent = `夸克资源暂时不可用：${error.message}`; choices.replaceChildren(); retry.hidden = false; } }
+    finally { loading = false; if (currentSearch()) more.disabled = retry.disabled = !configured; }
   }
   void load();
 }

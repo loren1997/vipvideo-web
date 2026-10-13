@@ -434,12 +434,17 @@ test('movie query language suffixes become search aliases while exact file-title
   await service.resources({ ...detail, id: 'numeric-title', title: '希望2026', type: 'movie' }); assert.equal(new URL(state.searchCalls.at(-1).value).searchParams.get('kw'), '希望2026');
 });
 
-test('safe pool reasons survive empty result caching without exposing arbitrary remote error fields', async t => {
+test('safe empty pool failures are not cached and the same work can recover immediately', async t => {
   const { service, state } = await fixture(t); const film = { ...detail, quarkShares: [] };
   state.searchBody = JSON.stringify({ results: [], reason: '\u0000Google 公开搜索暂不可用；' + '网络失败'.repeat(100), error: 'remote raw error must stay hidden', message: 'remote secret message' });
   const first = await service.resources(film); assert.equal(first.resources.length, 0); assert.ok(first.reason.startsWith('Google')); assert.ok(first.reason.length <= 300); assert.equal(first.reason.includes('remote'), false);
-  assert.deepEqual(await service.resources(film), first); assert.equal(state.searchCalls.length, 1);
+  state.searchBody = JSON.stringify({ results: [{ name: '影片', url: 'https://pan.quark.cn/s/recovered123' }] });
+  const recovered = await service.resources(film); assert.equal(recovered.resources.length, 1); assert.equal(recovered.reason, undefined); assert.equal(state.searchCalls.length, 2);
+  assert.deepEqual(await service.resources(film), recovered); assert.equal(state.searchCalls.length, 2);
   state.searchBody = JSON.stringify({ results: [] }); const refreshed = await service.resources(film, { webSearch: true }); assert.equal(refreshed.reason, undefined);
+  assert.deepEqual(await service.resources(film), refreshed); assert.equal(state.searchCalls.length, 3);
+  const emptyFilm = { ...film, id: 'empty', title: '正常空结果' }, empty = await service.resources(emptyFilm); assert.equal(empty.resources.length, 0); assert.equal(empty.reason, undefined);
+  assert.deepEqual(await service.resources(emptyFilm), empty); assert.equal(state.searchCalls.length, 4);
 });
 
 test('automatic single-episode transfers recognize bounded episode notation and Chinese hundreds through the share listing', async t => {

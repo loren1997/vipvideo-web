@@ -288,7 +288,9 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         };
         try { const result = JSON.parse(body); visit(result); if (typeof result?.reason === 'string') reason = name(result.reason); } catch { visit(body); }
         for (const link of found) { const row = addShare(info, link, link.name); if (row) rows.set(row.id, row); }
-        searches.set(info.key, { rows: [...rows.values()], ...(reason ? { reason } : {}), expires: now() + 60000 }); while (searches.size > 64) searches.delete(searches.keys().next().value);
+        if (rows.size || !reason) searches.set(info.key, { rows: [...rows.values()], ...(reason ? { reason } : {}), expires: now() + 60000 });
+        else searches.delete(info.key);
+        while (searches.size > 64) searches.delete(searches.keys().next().value);
       } catch (cause) { reason = publicReason(cause); }
       finally { expired = true; clearTimeout(timeout); response?.destroy(); }
     }

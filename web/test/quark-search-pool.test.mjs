@@ -718,7 +718,7 @@ test('a genuine full-budget connection failure still backs off and the next film
   } });
   try {
     const first = await lookup(f.pool);
-    assert.deepEqual(first.results, []); assert.match(first.reason, /已配置搜索接口：搜索服务连接失败/);
+    assert.deepEqual(first.results, []); assert.match(first.reason, /已配置搜索接口：搜索服务拒绝连接/);
     assert.match(first.reason, /HTTP 503/);
     const primary = f.pool.status().candidates.find(row => row.apiUrl.includes('manual.example'));
     assert.equal(primary.status, 'paused'); assert.ok(primary.retryAt > Date.now());
@@ -757,6 +757,96 @@ test('HTML search failures expose a fixed non-JSON diagnostic without echoing up
     assert.deepEqual(result.results, []); assert.match(result.reason, /搜索接口未返回 JSON/);
     assert.equal(/user-cookie|user-token|Authorization|<html>/.test(result.reason), false);
   } finally { await f.pool.stop(); }
+});
+
+test('the fixed built-in helper backs off for 10, 20, 40 and at most 60 seconds after DNS startup failures', async () => {
+  let clock = 1000;
+  const f = fixture({ now: () => clock, request: url => {
+    if (!url.startsWith('http://pansou:8888/')) return response('<rss><channel></channel></rss>');
+    throw Object.assign(new Error('private http://pansou:8888/ Cookie user-cookie'), { status: 502, cause: Object.assign(new Error('private DNS detail'), { code: 'ENOTFOUND' }) });
+  } });
+  try {
+    for (const delay of [10_000, 20_000, 40_000, 60_000, 60_000]) {
+      const result = await lookup(f.pool, 'http://pansou:8888/api/search?kw=电影');
+      assert.match(result.reason, /找不到搜索助手，请确认 pansou 服务已启动/);
+      const current = f.pool.status().candidates.find(row => row.apiUrl === 'http://pansou:8888/api/search');
+      assert.equal(current.retryAt - clock, delay);
+      const before = f.calls.filter(call => call.url.startsWith('http://pansou:8888/')).length;
+      const paused = await lookup(f.pool, 'http://pansou:8888/api/search?kw=遮天');
+      assert.match(paused.reason, new RegExp((delay / 1000) + ' 秒后重试'));
+      assert.equal(f.calls.filter(call => call.url.startsWith('http://pansou:8888/')).length, before);
+      assert.equal(/private|user-cookie|http:\/\//.test(result.reason), false);
+      clock = current.retryAt;
+    }
+  } finally { await f.pool.stop(); }
+});
+
+test('an old long pause on the fixed helper is lifted without another migration marker', async () => {
+  const clock = Date.now(), sidecar = 'http://pansou:8888/api/search';
+  const f = fixture({ now: () => clock, saved: { candidates: [{ url: sidecar, automatic: false, status: 'paused', failures: 5, addedAt: clock - 1000, checkedAt: clock - 100, retryAt: clock + 30 * 60_000 }] } });
+  f.metadata.set('quark-search-availability-v3', '1');
+  const beforeKeys = [...f.metadata.keys()].sort();
+  try {
+    const result = await lookup(f.pool, sidecar + '?kw=遮天');
+    assert.equal(result.results.length, 1);
+    assert.equal(f.calls.filter(call => call.url.startsWith(sidecar)).length, 1);
+    const current = f.pool.status().candidates.find(row => row.apiUrl === sidecar);
+    assert.equal(current.status, 'healthy'); assert.equal(current.retryAt, 0);
+    assert.deepEqual([...f.metadata.keys()].sort(), beforeKeys);
+  } finally { await f.pool.stop(); }
+});
+
+test('public network diagnostics use fixed categories without confusing a public DNS failure with the built-in helper', async () => {
+  const cases = [
+    ['ENOTFOUND', /域名解析失败/], ['EAI_AGAIN', /域名暂时无法解析/],
+    ['ECONNREFUSED', /拒绝连接/], ['ENETUNREACH', /网络不可达/], ['EHOSTUNREACH', /网络不可达/],
+    ['ECONNRESET', /连接中断/], ['EPIPE', /连接中断/], ['ETIMEDOUT', /请求超时/],
+    ['CERT_HAS_EXPIRED', /TLS 验证或握手失败/], ['ERR_TLS_CERT_ALTNAME_INVALID', /TLS 验证或握手失败/],
+    ['UNRECOGNIZED_PRIVATE_CODE', /连接失败/],
+  ];
+  for (const [code, expected] of cases) {
+    const clock = Date.now();
+    const f = fixture({ now: () => clock, request: url => {
+      if (url.includes('bing.com')) return response('<rss><channel></channel></rss>');
+      throw Object.assign(new Error('private http://private.example Cookie user-cookie'), { status: 502, cause: Object.assign(new Error('private DNS Authorization user-token'), { code }) });
+    } });
+    try {
+      const result = await lookup(f.pool, 'https://pansou.example/api/search?kw=电影');
+      assert.match(result.reason, expected);
+      assert.equal(/private|user-cookie|user-token|Authorization|https?:|pansou/.test(result.reason), false);
+      const current = f.pool.status().candidates.find(row => row.apiUrl === 'https://pansou.example/api/search');
+      assert.equal(current.retryAt - clock, 15 * 60_000);
+    } finally { await f.pool.stop(); }
+  }
+});
+
+test('Google DNS diagnostics stay generic and unsupported content encoding has a fixed response error', async () => {
+  const f = fixture({ request: url => {
+    if (url.includes('bing.com')) return response('<rss><channel></channel></rss>');
+    const upstream = response('private body user-cookie'); upstream.headers['content-encoding'] = 'unsupported'; return upstream;
+  }, googleSearch: async () => { throw Object.assign(new Error('private Google DNS user-token'), { code: 'ENOTFOUND' }); } });
+  try {
+    const result = await lookup(f.pool);
+    assert.match(result.reason, /搜索响应内容异常/); assert.match(result.reason, /Google 公开搜索：搜索服务域名解析失败/);
+    assert.equal(/private|user-cookie|user-token|pansou|http/.test(result.reason), false);
+  } finally { await f.pool.stop(); }
+});
+
+test('a short persisted helper pause survives restart while old public pauses remain unchanged', async () => {
+  let clock = Date.now();
+  const sidecar = 'http://pansou:8888/api/search', publicApi = 'https://manual.example/api/search';
+  for (const [url, delay] of [[sidecar, 60_000], [publicApi, 30 * 60_000]]) {
+    const f = fixture({ now: () => clock, saved: { candidates: [{ url, automatic: false, status: 'paused', failures: 6, addedAt: clock - 1000, checkedAt: clock - 100, retryAt: clock + delay }] } });
+    f.metadata.set('quark-search-availability-v3', '1');
+    try {
+      const result = await lookup(f.pool, url + '?kw=电影');
+      assert.match(result.reason, url === sidecar ? /60 秒后重试/ : /30 分钟后重试/);
+      assert.ok(f.calls.every(call => !call.url.startsWith(url)));
+      const current = f.pool.status().candidates.find(row => row.apiUrl === url);
+      assert.equal(current.retryAt, clock + delay);
+      assert.equal(JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === url).failures, 6);
+    } finally { await f.pool.stop(); }
+  }
 });
 
 const DAY = 86_400_000;

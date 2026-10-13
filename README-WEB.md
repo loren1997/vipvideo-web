@@ -56,10 +56,10 @@ docker compose -f docker-compose.nas.yml ps
 
 以后更新只需再次执行同一条 `up -d --pull always` 命令。停机备份和恢复也使用 `-f docker-compose.nas.yml`；沿用原项目名及数据挂载，夸克 Cookie、配置、收藏和进度继续使用原数据卷。此配置需要 Ubuntu 已有可访问的 `/dev/dri/renderD128`；硬件不可用时兼容转码会提示失败，保护配置禁止回退到 CPU 软件编码。
 
-更新后仍显示旧界面时，在原部署目录明确拉取并重建播放器：
+更新后仍显示旧界面时，在原部署目录明确拉取并重建播放器和搜索助手：
 
 ```sh
-docker compose -f docker-compose.nas.yml up -d --pull always --force-recreate web
+docker compose -f docker-compose.nas.yml up -d --pull always --force-recreate web pansou
 ```
 
 沿用你原来实际使用的文件名及项目名称；若一体化文件保存为 `docker-compose.yml`，使用 `-f docker-compose.yml`。`docker compose config --images` 查看配置指定的镜像名称，与本地是否已下载镜像无关。目录里同时有 `compose.yaml` 和 `docker-compose.yml` 时，不带 `-f` 会优先读取用于源码构建的 `compose.yaml`，所以仓库内启动发布镜像需明确指定部署文件。新的公开部署文件已设置 `pull_policy: always`；旧文件不必替换，在更新命令中保留 `--pull always` 即可。

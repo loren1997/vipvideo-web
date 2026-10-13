@@ -548,6 +548,29 @@ try {
     } finally { maintenanceHealth = false; await isolated?.value.close(); }
   }
 
+  async function verifyQuarkSearchRetry() {
+    const before = structuredClone(quarkSettings), previousMode = quarkMode; let isolated;
+    try {
+      Object.assign(quarkSettings, { configured: true, enabled: true, autoSave: true, account: { connected: true, label: '测试账号' } });
+      quarkMode = 'search-empty';
+      isolated = await context({ width: 1440, height: 1000 }, true, false, '#detail?source=first&id=quark'); const p = isolated.page;
+      const retry = p.getByRole('button', { name: '重试搜索', exact: true }), more = p.getByRole('button', { name: '查找更多公开资源', exact: true });
+      await until(() => retry.isEnabled(), '搜索失败后可重试原接口');
+      const prepares = quarkRequests.filter(request => request.path === '/api/quark/prepare').length, searches = quarkRequests.filter(request => request.path === '/api/quark/resources').length;
+      quarkMode = 'matched'; holdQuarkResources = true; await retry.click();
+      await until(() => Boolean(releaseQuarkResources), '重试原接口等待中');
+      assert.equal(await retry.isDisabled(), true); assert.equal(await more.isDisabled(), true);
+      await retry.evaluate(element => { element.click(); element.click(); });
+      assert.equal(quarkRequests.filter(request => request.path === '/api/quark/resources').length, searches + 1, '重试中不会重复发起搜索');
+      releaseQuarkResources(); releaseQuarkResources = null; holdQuarkResources = false;
+      await p.getByLabel('夸克分享资源', { exact: true }).waitFor(); await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
+      const request = quarkRequests.filter(request => request.path === '/api/quark/resources').at(-1); assert.equal(request.query.web, undefined, '恢复时重试配置接口');
+      assert.equal(await retry.isVisible(), false); await p.waitForTimeout(100);
+      assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').length, prepares, '重试找到单个匹配资源也不会自动转存');
+      console.log('PASS 夸克接口恢复后同页重试、禁止重复搜索、保留普通搜索、不自动转存恢复结果');
+    } finally { holdQuarkResources = false; releaseQuarkResources?.(); releaseQuarkResources = null; quarkMode = previousMode; Object.assign(quarkSettings, before); await isolated?.value.close(); }
+  }
+
   async function verifyQuarkPublicSearch() {
     const before = structuredClone(quarkSettings), previousMode = quarkMode; let isolated;
     try {
@@ -1764,6 +1787,7 @@ try {
   await verifyQuarkAutoplay();
   await verifyQuarkFlow();
   await verifyQuarkPublicSearch();
+  await verifyQuarkSearchRetry();
   await verifyQuarkChoices();
   await verifyCompactSettings();
   await verifyLowLoadLive();

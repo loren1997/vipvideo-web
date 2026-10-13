@@ -5,6 +5,7 @@ import { searchGoogleQuark } from './quark-google-search.mjs';
 
 const KEY = 'quark-search-pool-v1', DAY = 86_400_000, HEALTH_INTERVAL = 6 * 60 * 60_000;
 const RECALL_KEY = 'quark-search-availability-v3';
+const SIDECAR = 'http://pansou:8888/api/search';
 const OFFICIAL = 'https://so.252035.xyz/api/search';
 const sources = [
   'https://api.github.com/repos/fish2018/pansou-web',
@@ -16,8 +17,16 @@ const sensitive = key => /cookie|authorization|password|secret|api.?key|(?:^|_)t
 const failure = (message, status = 502, local = false) => Object.assign(new Error(message), { status, quarkSafe: true, quarkPoolReason: message, ...(local ? { quarkPoolLocal: true } : {}) });
 function safeFailure(cause, reading = false) {
   if (cause?.quarkPoolReason) return cause;
-  const code = cause?.code || cause?.cause?.code;
+  const code = cause?.code || cause?.cause?.code || cause?.cause?.cause?.code;
   if (code === 'ETIMEDOUT' || cause?.name === 'TimeoutError' || ['网盘搜索超时（8 秒）', '影视源请求超时', '影视源读取超时'].includes(cause?.message)) return failure('搜索请求超时', 504);
+  if (code === 'ENOTFOUND') return failure('搜索服务域名解析失败');
+  if (code === 'EAI_AGAIN') return failure('搜索服务域名暂时无法解析');
+  if (code === 'ECONNREFUSED') return failure('搜索服务拒绝连接，请确认服务已启动');
+  if (['ENETUNREACH', 'EHOSTUNREACH'].includes(code)) return failure('搜索服务网络不可达');
+  if (['ECONNRESET', 'ECONNABORTED', 'EPIPE', 'ENETRESET'].includes(code)) return failure(reading ? '搜索响应读取中断' : '搜索服务连接中断');
+  if (['CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_TLS_HANDSHAKE_TIMEOUT', 'ERR_SSL_WRONG_VERSION_NUMBER', 'ERR_SSL_PROTOCOL_ERROR'].includes(code)) return failure('搜索服务 TLS 验证或握手失败');
+  if (['影视源响应过大', '搜索结果超过 2 MiB'].includes(cause?.message)) return failure('搜索响应内容异常（超过大小限制）');
+  if (['Z_DATA_ERROR', 'Z_BUF_ERROR'].includes(code) || cause?.message === '影视源使用了不支持的内容编码') return failure('搜索响应内容异常（编码不支持或数据损坏）');
   if (cause?.status === 403) return failure('搜索地址被安全检查拒绝', 403);
   return failure(reading ? '搜索响应正文读取失败' : '搜索服务连接失败');
 }
@@ -200,7 +209,8 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
   function failed(row, cause) {
     if (stopping || cause?.quarkPoolLocal) return;
     row.checkedAt = now(); row.failures = Math.min(8, row.failures + 1); row.status = 'paused';
-    row.retryAt = now() + Math.min(HEALTH_INTERVAL, 15 * 60_000 * 2 ** (row.failures - 1)); row.error = '接口未通过搜索验证，已暂时避开'; persist();
+    const delay = row.url === SIDECAR ? Math.min(60_000, 10_000 * 2 ** (row.failures - 1)) : Math.min(HEALTH_INTERVAL, 15 * 60_000 * 2 ** (row.failures - 1));
+    row.retryAt = now() + delay; row.error = '接口未通过搜索验证，已暂时避开'; persist();
   }
   function apiUrl(base, keyword) {
     const url = new URL(base);
@@ -273,13 +283,14 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           store.setMeta(RECALL_KEY, '1');
           if (!primary.automatic && primary.status === 'paused') { primary.status = 'pending'; primary.retryAt = 0; persist(); }
         }
+        if (primary?.url === SIDECAR && primary.status === 'paused' && primary.retryAt > now() + 60_000) { primary.status = 'pending'; primary.retryAt = 0; persist(); }
         const query = queryTerms(keyword, _options.aliases, _options.year), cacheKey = JSON.stringify([base, keyword, query.words, query.year, web]);
         for (const [key, entry] of recent) if (entry.expires <= now()) recent.delete(key);
         const cached = recent.get(cacheKey);
         if (cached?.rows.size) return result([...cached.rows.values()], query, cached.reason);
         const entry = { rows: new Map(), expires: now() + 2 * 60_000 };
         const notes = new Set(), report = message => { notes.add(message); entry.reason = [...notes].join('；'); };
-        if (primary && primary.retryAt > now()) report('已配置搜索接口正在暂缓重试，约 ' + Math.ceil((primary.retryAt - now()) / 60_000) + ' 分钟后重试');
+        if (primary && primary.retryAt > now()) report('已配置搜索接口正在暂缓重试，约 ' + (primary.url === SIDECAR ? Math.ceil((primary.retryAt - now()) / 1000) + ' 秒' : Math.ceil((primary.retryAt - now()) / 60_000) + ' 分钟') + '后重试');
         recent.set(cacheKey, entry); while (recent.size > 32) recent.delete(recent.keys().next().value);
         const merge = rows => {
           if (stopping || entry.expires <= now()) return;
@@ -303,7 +314,8 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
             } catch (cause) {
               // A short optional query does not establish a site-wide failure.
               if (!answered && (cause?.searchBudgetMs ?? budget) >= 5000) failed(row, cause);
-              report((row === primary ? '已配置搜索接口：' : '备用搜索接口：') + safeFailure(cause).quarkPoolReason); break;
+              const reason = safeFailure(cause).quarkPoolReason;
+              report((row === primary ? '已配置搜索接口：' : '备用搜索接口：') + (row.url === SIDECAR && reason === '搜索服务域名解析失败' ? '找不到搜索助手，请确认 pansou 服务已启动' : reason)); break;
             }
           }
           return [];
