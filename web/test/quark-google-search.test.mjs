@@ -29,7 +29,8 @@ test('Google requests the title plus Quark and best-effort date order, following
   assert.equal(query.origin, 'https://www.google.com'); assert.equal(query.pathname, '/search');
   assert.equal(query.searchParams.get('q'), title + ' 夸克'); assert.equal(query.searchParams.get('tbs'), 'sbd:1');
   assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/1', 'https://posts.example/2', 'https://posts.example/3']);
-  for (const call of input.calls) { assert.equal(call.maxBytes, 512 * 1024); assert.equal(call.deadline, time + 3000); assert.ok(call.duration <= 1800); }
+  for (const call of input.calls) { assert.equal(call.maxBytes, 512 * 1024); assert.equal(call.deadline, time + 3000); assert.ok(call.duration <= 2000); }
+  assert.equal(input.calls[0].duration, 2000);
 });
 
 test('a release-year hint never removes matching Google resources which omit that year', async () => {
@@ -133,6 +134,48 @@ test('Google CAPTCHA and transport errors fail safely without retries or exposin
   });
   const empty = fixture('<html><title>Google</title><p>No matching documents</p></html>');
   assert.deepEqual(await searchGoogleQuark(title, empty), []);
+});
+
+test('Google preserves classified reader failures and error codes while keeping unknown messages private', async t => {
+  for (const upstream of [
+    Object.assign(new Error('private Cookie=secret'), { quarkPoolReason: '搜索请求超时' }),
+    Object.assign(new Error('private Cookie=secret'), { code: 'ENOTFOUND' }),
+    new Error('private Cookie=secret', { cause: Object.assign(new Error('private URL'), { code: 'ENETUNREACH' }) }),
+    new Error('private Cookie=secret'),
+  ]) await t.test(upstream.quarkPoolReason || upstream.code || upstream.cause?.code || 'unknown', async () => {
+    const input = fixture(upstream);
+    await assert.rejects(searchGoogleQuark(title, input), error => {
+      assert.equal(error.message, 'Google 公开搜索暂不可用，请稍后重试');
+      assert.equal(error.cause, upstream);
+      assert.equal(error.quarkPoolReason, upstream.quarkPoolReason);
+      assert.equal(/private|Cookie|secret/.test(JSON.stringify(error)), false);
+      return true;
+    });
+    assert.equal(input.calls.length, 1);
+  });
+});
+
+test('Google validation pages report a fixed reason without parsing hidden resources', async () => {
+  const input = fixture('<title>安全验证</title>private Cookie=secret ' + link('https://pan.quark.cn/s/hidden1'));
+  await assert.rejects(searchGoogleQuark(title, input), error => {
+    assert.equal(error.quarkPoolReason, '搜索页面要求登录或人机验证，已停止自动读取');
+    assert.equal(/private|Cookie|secret|hidden1/.test(JSON.stringify(error)), false);
+    return true;
+  });
+  assert.equal(input.calls.length, 1);
+});
+
+test('a slower search page shares the original three-second budget with follow-up pages', async () => {
+  let current = time;
+  const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': article(link('https://pan.quark.cn/s/abcdef1')) });
+  const rows = await searchGoogleQuark(title, { now: () => current, read: async (...args) => {
+    const html = await input.read(...args);
+    if (input.calls.length === 1) { assert.equal(args[1], 2000); current += 1600; }
+    return html;
+  } });
+  assert.equal(rows.length, 1);
+  assert.equal(input.calls[1].duration, 1400);
+  assert.ok(input.calls.every(call => call.deadline === time + 3000));
 });
 
 test('individual public-page failures and login challenges preserve other results without recursive crawling', async () => {

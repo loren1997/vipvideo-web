@@ -73,14 +73,16 @@ export async function searchGoogleQuark(keyword, { read, deadline, now = Date.no
     if (end <= now()) return '';
     try {
       const html = await read(url, Math.min(duration, end - now()), MAX_BODY, end);
-      if (now() > end || typeof html !== 'string' || Buffer.byteLength(html) > MAX_BODY || blocked(html)) throw new Error();
+      if (now() > end) throw Object.assign(new Error(), { quarkPoolReason: '搜索请求超时' });
+      if (typeof html !== 'string' || Buffer.byteLength(html) > MAX_BODY) throw Object.assign(new Error(), { quarkPoolReason: '搜索响应内容异常（超过大小限制或非网页响应）' });
+      if (blocked(html)) throw Object.assign(new Error(), { quarkPoolReason: '搜索页面要求登录或人机验证，已停止自动读取' });
       return html;
-    } catch { if (required) throw new Error('Google 公开搜索暂不可用，请稍后重试'); return ''; }
+    } catch (cause) { if (required) throw Object.assign(new Error('Google 公开搜索暂不可用，请稍后重试', { cause }), cause?.quarkPoolReason ? { quarkPoolReason: cause.quarkPoolReason } : {}); return ''; }
   };
   const search = new URL('https://www.google.com/search');
   search.search = new URLSearchParams({ q: `${title} 夸克`, hl: 'zh-CN', num: '10', tbs: 'sbd:1' }).toString();
   // Google can ignore date sorting or require CAPTCHA; never bypass either restriction.
-  const html = visible(await load(search.href, 1200, true)), pages = new Map();
+  const html = visible(await load(search.href, 2000, true)), pages = new Map();
   for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)) {
     const name = text(match[2]), url = target(attribute(match[1], 'href'), search.href);
     if (!url || !relevant(name)) continue;

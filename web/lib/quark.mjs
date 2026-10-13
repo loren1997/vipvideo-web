@@ -6,8 +6,8 @@ import { request as networkRequest, readText, validateUrl } from './network.mjs'
 const API = 'https://drive.quark.cn/1/clouddrive', REFERER = 'https://pan.quark.cn/';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const PLAYBACK_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch';
-const DAY = 86400000, GIB = 1024 ** 3, SIDECAR = 'http://pansou:8888/api/search';
-const defaults = { enabled: false, autoSave: false, cleanupEnabled: false, retentionDays: 7, maxDailyTransfers: 100, maxDailyBytes: 20 * GIB, searchApi: '' };
+const DAY = 86400000, GIB = 1024 ** 3, DAILY_BYTES = 3_000_000_000_000, SIDECAR = 'http://pansou:8888/api/search';
+const defaults = { enabled: false, autoSave: false, cleanupEnabled: false, retentionDays: 7, maxDailyTransfers: 100, maxDailyBytes: DAILY_BYTES, searchApi: '' };
 const id = () => randomBytes(16).toString('hex');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const validFid = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
@@ -102,12 +102,16 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   const parse = (key, fallback) => { try { const text = store.meta(key); return text && text.length <= 2 * 1024 * 1024 ? JSON.parse(text) : fallback; } catch { return fallback; } };
   const initial = parse('quark-settings-v1', {}), config = { ...defaults, installId: /^[a-f0-9]{32}$/.test(initial.installId || '') ? initial.installId : id() };
   for (const field of ['enabled', 'autoSave', 'cleanupEnabled']) if (typeof initial[field] === 'boolean') config[field] = initial[field];
-  for (const [field, minimum, maximum] of [['retentionDays', 1, 365], ['maxDailyTransfers', 1, 100], ['maxDailyBytes', 1024 * 1024, 100 * GIB]]) if (Number.isSafeInteger(initial[field]) && initial[field] >= minimum && initial[field] <= maximum) config[field] = initial[field];
+  for (const [field, minimum, maximum] of [['retentionDays', 1, 365], ['maxDailyTransfers', 1, 100], ['maxDailyBytes', 1024 * 1024, DAILY_BYTES]]) if (Number.isSafeInteger(initial[field]) && initial[field] >= minimum && initial[field] <= maximum) config[field] = initial[field];
   if (typeof initial.searchApi === 'string' && initial.searchApi.length <= 2048) config.searchApi = initial.searchApi;
   if (/^[a-f0-9]{64}$/.test(initial.account?.id || '') && ['iv', 'tag', 'ciphertext'].every(field => typeof initial.account[field] === 'string' && initial.account[field].length <= 16384)) config.account = { id: initial.account.id, iv: initial.account.iv, tag: initial.account.tag, ciphertext: initial.account.ciphertext };
   if (store.meta('quark-transfer-default-100-v1') !== '1') {
-    if (initial.maxDailyTransfers === 10) { config.maxDailyTransfers = 100; store.setMeta('quark-settings-v1', JSON.stringify({ ...initial, maxDailyTransfers: 100 })); }
+    if (initial.maxDailyTransfers === 10) { config.maxDailyTransfers = initial.maxDailyTransfers = 100; store.setMeta('quark-settings-v1', JSON.stringify(initial)); }
     store.setMeta('quark-transfer-default-100-v1', '1');
+  }
+  if (store.meta('quark-transfer-bytes-3tb-v1') !== '1') {
+    if (initial.maxDailyBytes === 20 * GIB) { config.maxDailyBytes = initial.maxDailyBytes = DAILY_BYTES; store.setMeta('quark-settings-v1', JSON.stringify(initial)); }
+    store.setMeta('quark-transfer-bytes-3tb-v1', '1');
   }
   const savedRegistry = parse('quark-registry-v1', {});
   const folders = Object.fromEntries(Object.entries(savedRegistry.folders || {}).filter(([account, folder]) => /^[a-f0-9]{64}$/.test(account) && folder?.name === 'VipVideo-' + config.installId && (!folder.fid || validFid(folder.fid))));
@@ -227,7 +231,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw failure('夸克设置格式无效', 400);
     const next = { ...config };
     for (const field of ['enabled', 'autoSave', 'cleanupEnabled']) if (Object.hasOwn(input, field)) { if (typeof input[field] !== 'boolean') throw failure('夸克开关设置无效', 400); next[field] = input[field]; }
-    for (const [field, minimum, maximum] of [['retentionDays', 1, 365], ['maxDailyTransfers', 1, 100], ['maxDailyBytes', 1024 * 1024, 100 * GIB]]) if (Object.hasOwn(input, field)) { if (!Number.isSafeInteger(input[field]) || input[field] < minimum || input[field] > maximum) throw failure('夸克容量或保留期设置无效', 400); next[field] = input[field]; }
+    for (const [field, minimum, maximum] of [['retentionDays', 1, 365], ['maxDailyTransfers', 1, 100], ['maxDailyBytes', 1024 * 1024, DAILY_BYTES]]) if (Object.hasOwn(input, field)) { if (!Number.isSafeInteger(input[field]) || input[field] < minimum || input[field] > maximum) throw failure('夸克容量或保留期设置无效', 400); next[field] = input[field]; }
     if (Object.hasOwn(input, 'searchApi')) { if (typeof input.searchApi !== 'string' || input.searchApi.length > 2048) throw failure('公开搜索地址无效', 400); next.searchApi = input.searchApi ? searchUrl(input.searchApi) : ''; }
     if (Object.hasOwn(input, 'cookie')) {
       const value = cookieInput(input.cookie), generation = ++epoch;
@@ -358,7 +362,13 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     const root = await ownList(context, '0');
     const matches = root.list.filter(row => directory(row) && row.file_name === folder.name && (!folder.fid || row.fid === folder.fid) && (!row.pdir_fid || row.pdir_fid === '0'));
     if (matches.length === 1 && validFid(matches[0].fid) && (folder.fid || folder.mkdirStarted)) { folder.fid = matches[0].fid; delete folder.mkdirStarted; persist(); return folder; }
-    if (!create || folder.fid && !folder.mkdirStarted || !root.complete || matches.length) throw failure('无法确认本应用专用夸克目录，已停止操作', 409);
+    if (!create || folder.fid && !folder.mkdirStarted || !root.complete || matches.length) {
+      const reason = !root.complete ? '根目录列表超过核验范围，已停止操作'
+        : matches.length > 1 ? '目录记录冲突，已停止操作'
+          : folder.fid ? '已登记目录未找到或已改名、移动，请在夸克恢复原目录后重试'
+            : matches.length ? '存在同名但未登记的目录，已停止操作' : '目录登记不完整，已停止操作';
+      throw failure('无法确认本应用专用夸克目录：' + reason, 409);
+    }
     if (!folder.mkdirStarted) {
       const created = await auth(context, '/file', { method: 'POST', body: { pdir_fid: '0', file_name: folder.name, dir_path: '', dir_init_lock: false }, beforeSend: () => { current(context); folder.mkdirStarted = true; persist(); } }); current(context);
       if (created.data?.fid !== undefined) { if (!validFid(created.data.fid)) throw failure('无法核验夸克创建目录的响应', 409); folder.fid = created.data.fid; persist(); }
@@ -368,7 +378,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       if (attempt) await new Promise(resolve => setTimeout(resolve, attempt * 500)); current(context);
       const confirmed = await ownList(context, '0'), rows = confirmed.list.filter(row => directory(row) && row.file_name === folder.name && (!folder.fid || row.fid === folder.fid) && (!row.pdir_fid || row.pdir_fid === '0'));
       if (rows.length === 1 && validFid(rows[0].fid)) { folder.fid = rows[0].fid; delete folder.mkdirStarted; persist(); return folder; }
-      if (rows.length) throw failure('无法确认本应用专用夸克目录，已停止操作', 409);
+      if (rows.length) throw failure('无法确认本应用专用夸克目录：创建后的目录记录冲突，已停止操作', 409);
     }
     throw failure('夸克专用目录暂未可见，请稍后重试', 409);
   }

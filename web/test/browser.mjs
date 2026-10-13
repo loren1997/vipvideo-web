@@ -91,7 +91,7 @@ let quarkCookie = '', quarkMode = 'matched', holdQuarkResources = false, release
 let quarkChoicesFixture = false, quarkFilesFixture = 'matched';
 let holdQuarkPrepare = false, releaseQuarkPrepare, holdQuarkPlayback = false, releaseQuarkPlayback, quarkPendingChecks = 0;
 const heldQuarkFileReads = new Map();
-const quarkSettings = { configured: false, enabled: false, autoSave: true, cleanupEnabled: true, retentionDays: 7, maxDailyTransfers: 10, maxDailyBytes: 21474836480, searchApi: '', account: { connected: false, label: '' }, managedFiles: 0, lastCleanup: 0, lastError: '', searchPool: { enabled: true, discovering: false, lastDiscovery: 0, lastHealth: 0, healthy: 2, pending: 1, suspended: 1, candidates: [] } };
+const quarkSettings = { configured: false, enabled: false, autoSave: true, cleanupEnabled: true, retentionDays: 7, maxDailyTransfers: 10, maxDailyBytes: 3_000_000_000_000, searchApi: '', account: { connected: false, label: '' }, managedFiles: 0, lastCleanup: 0, lastError: '', searchPool: { enabled: true, discovering: false, lastDiscovery: 0, lastHealth: 0, healthy: 2, pending: 1, suspended: 1, candidates: [] } };
 const episodeKey = (film, episode) => JSON.stringify([film, episode]);
 function fixtureEpisode(value) {
   if (typeof value === 'string' && /^-?\d+(?:\.\d+)?$/.test(value.trim())) value = Number(value.trim());
@@ -725,7 +725,7 @@ try {
       for (const invalid of ['0', '101', '1.5', '']) { await dailyTransfers.fill(invalid); await p.getByRole('button', { name: '保存夸克设置', exact: true }).click(); await p.waitForTimeout(150); assert.equal(settingsWrites(), beforeInvalid, '次数须为1至100的整数，空值或越界在界面阻止提交'); }
       assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).inputValue(), 'quark-fixture-secret-cookie'); assert.equal(await p.getByLabel('夸克看完后保留天数', { exact: true }).inputValue(), '3'); await dailyTransfers.fill('100');
       await p.getByRole('button', { name: '保存夸克设置', exact: true }).click(); await until(async () => quarkSettings.configured && await p.getByLabel('夸克账号 Cookie', { exact: true }).inputValue() === '', '保存账号后凭证清空');
-      assert.equal(quarkSettings.maxDailyTransfers, 100); assert.equal(await dailyTransfers.inputValue(), '100'); await p.getByText(/每日转存上限：100 次/).waitFor();
+      assert.equal(quarkSettings.maxDailyTransfers, 100); assert.equal(await dailyTransfers.inputValue(), '100'); await p.getByText(/每日转存上限：100 次 \/ 3\.0 TB/).waitFor(); assert.equal(await p.getByText(/每日转存上限：.*20\.0 GiB/).count(), 0);
       const exposed = await (await p.request.get(base + '/api/quark/settings')).text(); assert.equal(exposed.includes('quark-fixture-secret-cookie'), false); assert.equal((await (await p.request.get(base + '/api/config')).text()).includes('quark-fixture-secret-cookie'), false, '配置导出数据不包含独立账号凭证');
       assert.equal(quarkSettings.retentionDays, 3); const cleanupBefore = quarkRequests.filter(request => request.path === '/api/quark/cleanup').length;
       await p.getByRole('button', { name: '清理到期已看完文件', exact: true }).click(); await until(() => quarkSettings.lastCleanup > 0, '仅调用受限到期清理接口'); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/cleanup').length, cleanupBefore + 1);

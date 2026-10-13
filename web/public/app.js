@@ -1928,7 +1928,8 @@ function quarkSettingsPanel(stamp) {
     const count = Number.isFinite(next.managedFiles) ? next.managedFiles : Array.isArray(next.managedFiles) ? next.managedFiles.length : Number.isFinite(next.managedFiles?.total) ? next.managedFiles.total : null;
     status.textContent = `${next.account?.connected ? `已连接 · ${next.account.label || '夸克账号'}` : '尚未连接夸克账号'}${count !== null ? ` · 管理 ${count} 个文件` : ''} · 最近清理：${formatDate(next.lastCleanup)}${next.lastError ? ` · ${next.lastError}` : ''}`;
     searchStatus.hidden = !next.searchPool; searchStatus.textContent = next.searchPool ? `自动备用搜索接口：可用 ${next.searchPool.healthy} 个 / 待验证 ${next.searchPool.pending} 个 / 暂不可用 ${next.searchPool.suspended} 个` : '';
-    limit.textContent = `每日转存上限：${next.maxDailyTransfers ?? 100} 次 / ${fileSize(next.maxDailyBytes ?? 21474836480)}。转存保留源文件画质，不会自动提升分辨率。`;
+    const dailyBytes = next.maxDailyBytes ?? 3_000_000_000_000;
+    limit.textContent = `每日转存上限：${next.maxDailyTransfers ?? 100} 次 / ${dailyBytes >= 1e12 ? `${(dailyBytes / 1e12).toFixed(1)} TB` : fileSize(dailyBytes)}。转存保留源文件画质，不会自动提升分辨率。`;
     disconnect.disabled = !next.account?.connected; cleanup.disabled = !next.account?.connected;
   }
   async function load() {

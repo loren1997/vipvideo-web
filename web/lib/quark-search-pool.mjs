@@ -7,11 +7,16 @@ const KEY = 'quark-search-pool-v1', DAY = 86_400_000, HEALTH_INTERVAL = 6 * 60 *
 const RECALL_KEY = 'quark-search-availability-v3';
 const SIDECAR = 'http://pansou:8888/api/search';
 const OFFICIAL = 'https://so.252035.xyz/api/search';
+const publishedApis = ['https://pansou.252035.xyz/api/search', 'https://www.pansousuo.com/api/search'];
 const sources = [
   'https://api.github.com/repos/fish2018/pansou-web',
   'https://raw.githubusercontent.com/fish2018/pansou-web/main/README.md',
-  ...['PanSou "api/search"', '夸克 搜索 "api/search" PanSou', '网盘搜索 公共 API PanSou "api/search"'].map(query => 'https://www.bing.com/search?' + new URLSearchParams({ format: 'rss', q: query })),
 ];
+const deployments = [
+  ...['pansou in:name fork:false', 'pansou in:name fork:only'].map(q => 'https://api.github.com/search/repositories?' + new URLSearchParams({ q, sort: 'updated', per_page: '5' })),
+  'https://raw.githubusercontent.com/fish2018/pansou/main/plugin/quarkres/quarkres.go',
+];
+const directories = ['PanSou "api/search"', '夸克 搜索 "api/search" PanSou', '网盘搜索 公共 API PanSou "api/search"', 'PanSou 公共 部署 搜索 API', '夸克 网盘搜索 "api/search"', 'PanSou 网盘搜索 在线 服务'].map(q => 'https://www.bing.com/search?' + new URLSearchParams({ format: 'rss', q }));
 const searchFields = ['kw', 'cloud_types', 'res', 'src', 'conc', 'channels', 'plugins', 'refresh'];
 const sensitive = key => /cookie|authorization|password|secret|api.?key|(?:^|_)token(?:$|_)/i.test(key);
 const failure = (message, status = 502, local = false) => Object.assign(new Error(message), { status, quarkSafe: true, quarkPoolReason: message, ...(local ? { quarkPoolLocal: true } : {}) });
@@ -80,9 +85,9 @@ function shares(data, at) {
     if (!value || typeof value !== 'object') return;
     title = String(value.work_title || value.title || value.name || value.file_name || title || value.note || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 300);
     publishedAt = timestamp(value.publishedAt ?? value.published_at ?? value.datetime ?? value.date, at) ?? publishedAt;
-    const link = (!value.type || value.type === 'quark') && share(value.url || value.link, value.password || '');
+    const link = (!value.type || value.type === 'quark') && (!value.pan || value.pan === 'quark') && share(value.url || value.link || value.share_url, value.password || value.access_code || '');
     if (link) mergeShare(found, { ...link, name: title, ...(publishedAt ? { publishedAt } : {}) });
-    for (const key of ['results', 'links', 'data', 'merged_by_type', 'quark', 'list']) if (value[key] !== undefined) visit(value[key], title, depth + 1, publishedAt);
+    for (const key of ['results', 'links', 'data', 'merged_by_type', 'quark', 'list', 'items']) if (value[key] !== undefined) visit(value[key], title, depth + 1, publishedAt);
   }
   visit(data);
   return [...found.values()];
@@ -92,9 +97,9 @@ function compatible(body, at) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return;
   const payload = data.data && typeof data.data === 'object' ? data.data : data;
   if (data.error || data.success === false || data.code !== undefined && ![0, 200, '0', '200'].includes(data.code)) return;
-  if (Object.hasOwn(payload, 'results') && !Array.isArray(payload.results) || Object.hasOwn(payload, 'merged_by_type') && (!payload.merged_by_type || typeof payload.merged_by_type !== 'object' || Array.isArray(payload.merged_by_type))) return;
+  if (Object.hasOwn(payload, 'results') && !Array.isArray(payload.results) || Object.hasOwn(payload, 'items') && !Array.isArray(payload.items) || Object.hasOwn(payload, 'merged_by_type') && (!payload.merged_by_type || typeof payload.merged_by_type !== 'object' || Array.isArray(payload.merged_by_type))) return;
   if (payload === data.data && !Array.isArray(payload) && payload.total === 0 && [0, 200, '0', '200'].includes(data.code) && !['results', 'merged_by_type', 'list'].some(key => Object.hasOwn(payload, key))) return [];
-  if (!Array.isArray(payload) && !Array.isArray(payload.results) && !Array.isArray(payload.list) && !(payload.merged_by_type && typeof payload.merged_by_type === 'object' && !Array.isArray(payload.merged_by_type))) return;
+  if (!Array.isArray(payload) && !Array.isArray(payload.results) && !Array.isArray(payload.list) && !Array.isArray(payload.items) && !(payload.merged_by_type && typeof payload.merged_by_type === 'object' && !Array.isArray(payload.merged_by_type))) return;
   return shares(data, at);
 }
 function rssShares(body, at) {
@@ -134,7 +139,7 @@ const result = (rows, query, reason) => {
 
 export function createQuarkSearchPool({ store, request = createQuarkSearchRequest(), discoveryRequest = networkRequest, googleSearch = searchGoogleQuark, now = Date.now } = {}) {
   if (!store?.meta || !store?.setMeta) throw new TypeError('Search pool requires store metadata');
-  let state = { candidates: [], lastDiscovery: 0, lastHealth: 0, healthCursor: 0, discoveryCursor: 0, discoveryError: '' };
+  let state = { candidates: [], retired: [], lastDiscovery: 0, lastHealth: 0, healthCursor: 0, discoveryCursor: 0, discoveryError: '' };
   let active = 0, timer, started = false, stopping = false, discoveryJob, currentPrimary;
   const waiting = [], jobs = new Set(), recent = new Map();
   try {
@@ -147,18 +152,34 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           const url = row.automatic === false ? endpoint(row.url, true) : candidate(row.url);
           state.candidates.push({ url, automatic: row.automatic !== false, source: row.automatic === false ? '手动配置' : row.source === '官方项目' ? '官方项目' : '公开目录',
             status: ['healthy', 'pending', 'paused'].includes(row.status) ? row.status : 'pending', failures: Math.min(8, Math.max(0, Number(row.failures) || 0)),
-            addedAt: Math.max(0, Math.min(now(), Number(row.addedAt) || 0)), checkedAt: Math.max(0, Math.min(now(), Number(row.checkedAt) || 0)), retryAt: Math.max(0, Math.min(now() + HEALTH_INTERVAL, Number(row.retryAt) || 0)) });
+            addedAt: Math.max(0, Math.min(now(), Number(row.addedAt) || 0)), checkedAt: Math.max(0, Math.min(now(), Number(row.checkedAt) || 0)), retryAt: Math.max(0, Math.min(now() + HEALTH_INTERVAL, Number(row.retryAt) || 0)),
+            ...(Number.isSafeInteger(row.firstFailedAt) && row.firstFailedAt > 0 && row.firstFailedAt <= now() ? { firstFailedAt: row.firstFailedAt } : {}) });
         } catch { /* Saved endpoints are revalidated before reuse. */ }
+      }
+      for (const row of Array.isArray(saved.retired) ? saved.retired.slice(-8) : []) {
+        try { if (Number.isSafeInteger(row.expires) && row.expires > now() && row.expires <= now() + 7 * DAY) state.retired.push({ url: candidate(row.url), expires: row.expires }); }
+        catch { /* Invalid retirement records never suppress configured interfaces. */ }
       }
     }
   } catch { state.discoveryError = '已保存的搜索接口记录无法读取'; }
   const persist = () => { if (!stopping) store.setMeta(KEY, JSON.stringify(state)); };
+  function prune() {
+    const before = state.candidates.length, retired = state.retired.length;
+    state.retired = state.retired.filter(row => row.expires > now());
+    state.candidates = state.candidates.filter(row => {
+      if (!row.automatic || row.url === SIDECAR || row.url === currentPrimary || row.status !== 'paused' || row.failures < 3 || !row.firstFailedAt || row.checkedAt - row.firstFailedAt < DAY) return true;
+      state.retired = [...state.retired.filter(item => item.url !== row.url), { url: row.url, expires: now() + 7 * DAY }].slice(-8); return false;
+    });
+    return state.candidates.length !== before || state.retired.length !== retired;
+  }
   function add(url, source, automatic = true) {
+    if (automatic && state.retired.some(row => row.url === url && row.expires > now())) return;
+    if (!automatic) state.retired = state.retired.filter(row => row.url !== url);
     const existing = state.candidates.find(row => row.url === url);
-    if (existing) { if (automatic) { existing.automatic = true; existing.source = source; } return existing; }
-    state.candidates = state.candidates.filter(row => row.url === currentPrimary || !row.automatic || row.status === 'healthy' || row.failures < 3 && now() - row.addedAt < 7 * DAY);
+    if (existing) { if (!automatic) { existing.automatic = false; existing.source = source; } else if (existing.automatic) existing.source = source; return existing; }
+    prune();
     if (state.candidates.length >= 8) {
-      const removable = state.candidates.filter(row => row.url !== currentPrimary && (row.automatic && row.status !== 'healthy' || !row.automatic)).sort((a, b) => a.addedAt - b.addedAt);
+      const removable = state.candidates.filter(row => row.url !== currentPrimary && row.url !== SIDECAR && row.automatic && (row.status !== 'healthy' || !automatic)).sort((a, b) => Number(a.status === 'healthy') - Number(b.status === 'healthy') || a.addedAt - b.addedAt);
       if (!removable.length) return;
       state.candidates.splice(state.candidates.indexOf(removable[0]), 1);
     }
@@ -181,7 +202,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
     });
   }
   function release() { const next = waiting.shift(); if (next) next.resolve(); else active--; }
-  function text(url, duration, transport = request, maxBytes = 2 * 1024 * 1024, deadline = now() + duration) {
+  function text(url, duration, transport = request, maxBytes = 2 * 1024 * 1024, deadline = now() + duration, followRedirects = false) {
     return track(async () => {
       await slot(deadline);
       let response, timeout, remaining = 0, reading = false, expired = false;
@@ -189,7 +210,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
         if (stopping || deadline <= now()) throw failure('公开搜索已停止或超时', 503, true);
         remaining = Math.max(1, Math.min(duration, deadline - now()));
         const work = (async () => {
-          response = await transport(url, { method: 'GET', timeout: remaining, followRedirects: false, headers: { accept: 'application/json, application/rss+xml, text/plain', 'user-agent': 'VipVideo-Web-quark-search' } });
+          response = await transport(url, { method: 'GET', timeout: remaining, followRedirects, headers: { accept: 'application/json, application/rss+xml, text/plain', 'user-agent': 'VipVideo-Web-quark-search' } });
           if (expired) { response.destroy(); throw failure('公开搜索超时', 504); }
           if (response.statusCode !== 200) throw failure('搜索接口返回 HTTP ' + (Number.isInteger(response.statusCode) && response.statusCode >= 100 && response.statusCode <= 599 ? response.statusCode : 502));
           reading = true;
@@ -202,22 +223,26 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
   }
   function checked(row, links) {
     if (stopping) return;
-    row.checkedAt = now(); row.failures = 0; row.retryAt = 0; delete row.error;
+    row.checkedAt = now(); row.failures = 0; row.retryAt = 0; delete row.error; delete row.firstFailedAt;
     if (links.length) row.status = 'healthy'; else if (row.status !== 'healthy') row.status = 'pending';
     persist();
   }
   function failed(row, cause) {
     if (stopping || cause?.quarkPoolLocal) return;
+    row.firstFailedAt ??= now();
     row.checkedAt = now(); row.failures = Math.min(8, row.failures + 1); row.status = 'paused';
     const delay = row.url === SIDECAR ? Math.min(60_000, 10_000 * 2 ** (row.failures - 1)) : Math.min(HEALTH_INTERVAL, 15 * 60_000 * 2 ** (row.failures - 1));
-    row.retryAt = now() + delay; row.error = '接口未通过搜索验证，已暂时避开'; persist();
+    row.retryAt = now() + delay; row.error = '接口未通过搜索验证，已暂时避开'; prune(); persist();
   }
   function apiUrl(base, keyword) {
     const url = new URL(base);
-    for (const [key, value] of Object.entries({ kw: keyword, cloud_types: 'quark', res: 'results', conc: '1' })) url.searchParams.set(key, value);
+    const params = ['www.pansousuo.com', 'pansousuo.com'].includes(url.hostname) ? { q: keyword, pan: 'quark', sort: 'latest' } : { kw: keyword, cloud_types: 'quark', res: 'results', conc: '1' };
+    for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
     return url.href;
   }
   async function verifyCandidates() {
+    if (stopping) return;
+    if (prune()) persist();
     const rows = state.candidates.filter(row => row.automatic && row.retryAt <= now() && (row.status !== 'healthy' || now() - row.checkedAt >= HEALTH_INTERVAL));
     for (let count = 0; count < Math.min(2, rows.length) && !stopping; count++) {
       const row = rows[(state.healthCursor + count) % rows.length];
@@ -240,21 +265,25 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
     if (stopping || state.lastDiscovery && now() - state.lastDiscovery < DAY) return Promise.resolve(status());
     discoveryJob = track(async () => {
       state.lastDiscovery = now(); state.discoveryError = '';
-      const directories = [...sources.slice(0, 2), sources[2 + state.discoveryCursor++ % (sources.length - 2)]];
-      for (const url of directories) {
+      const pages = [...sources, deployments[state.discoveryCursor % deployments.length], directories[state.discoveryCursor++ % directories.length]];
+      for (const url of pages) {
         if (stopping) break;
         try {
           const body = await text(url, 2500, discoveryRequest, 512 * 1024);
           if (stopping) break;
           const found = [];
-          if (url === sources[0]) {
-            const homepage = JSON.parse(body).homepage;
-            if (typeof homepage === 'string' && homepage) { const published = new URL(endpoint(homepage)); published.pathname = '/api/search'; published.search = ''; found.push(published.href); }
+          if (url.startsWith('https://api.github.com/')) {
+            const metadata = JSON.parse(body);
+            for (const { homepage } of Array.isArray(metadata.items) ? metadata.items.slice(0, 5) : [metadata]) {
+              try { if (typeof homepage === 'string' && homepage) { const published = new URL(endpoint(homepage)); published.pathname = '/api/search'; published.search = ''; found.push(published.href); } }
+              catch { /* A bad published homepage must not hide other deployments. */ }
+            }
           }
           for (const match of body.replace(/&amp;/g, '&').matchAll(/https?:\/\/[^\s<>"'()\\]+/gi)) found.push(match[0].replace(/[.,;\]}]+$/, ''));
-          for (const value of found.slice(0, 40)) { try { add(candidate(value), sources.slice(0, 2).includes(url) ? '官方项目' : '公开目录'); } catch { /* Only explicitly published public API endpoints become candidates. */ } }
+          for (const value of found.slice(0, 40)) { try { add(candidate(value), sources.includes(url) ? '官方项目' : '公开目录'); } catch { /* Only explicitly published public API endpoints become candidates. */ } }
         } catch { if (stopping) break; state.discoveryError = '部分公开接口目录暂不可访问，保留现有接口'; }
       }
+      for (const url of publishedApis) add(url, '公开目录');
       await verifyCandidates(); persist(); return status();
     });
     discoveryJob.then(() => { discoveryJob = undefined; }, () => { discoveryJob = undefined; });
@@ -335,7 +364,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
         }
         const fallback = new URL('https://www.bing.com/search'); fallback.search = new URLSearchParams({ q: query.title + ' site:pan.quark.cn/s', format: 'rss' }).toString();
         const pages = await Promise.allSettled([
-          googleSearch(query.title, { aliases: query.aliases, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline)), deadline, now }),
+          googleSearch(query.title, { aliases: query.aliases, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), true), deadline, now }),
           text(fallback.href, Math.max(1, deadline - now()), request, 2 * 1024 * 1024, deadline).then(body => rssShares(body, now())),
         ]);
         if (stopping) throw failure('公开搜索已停止', 503, true);

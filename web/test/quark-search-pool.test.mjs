@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable, PassThrough } from 'node:stream';
+import { EventEmitter } from 'node:events';
 import { createQuarkSearchPool } from '../lib/quark-search-pool.mjs';
 import { createQuarkSearchRequest } from '../lib/quark-search.mjs';
 import { createRequest, readText } from '../lib/network.mjs';
+import { searchGoogleQuark } from '../lib/quark-google-search.mjs';
 
 const KEY = 'quark-search-pool-v1';
 const official = 'https://so.252035.xyz/api/search', backup = 'https://backup.example/api/search';
@@ -30,12 +32,126 @@ function fixture({ request, discoveryRequest, googleSearch = async () => { throw
 const savedBackup = now => ({ candidates: [{ url: backup, automatic: true, status: 'healthy', addedAt: now - 100, checkedAt: now - 1, failures: 0, retryAt: 0 }] });
 const lookup = async (pool, url = 'https://manual.example/api/search?kw=电影') => JSON.parse(await readText(await pool.request(url, { headers: { Cookie: 'user-cookie', Authorization: 'user-token' } })));
 
+test('scheduled maintenance removes only automatic endpoints with failures spanning a day without new discovery', async t => {
+  const day = 86_400_000, clock = 4 * day;
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: clock });
+  const row = (url, changes = {}) => ({ url, automatic: true, status: 'paused', failures: 3, addedAt: day, firstFailedAt: day, checkedAt: 2 * day, retryAt: clock + 60_000, ...changes });
+  const f = fixture({ saved: { lastDiscovery: clock, candidates: [
+    row('https://expired.example/api/search'),
+    row('https://transient.example/api/search', { firstFailedAt: clock - 1000, checkedAt: clock }),
+    row('https://manual.example/api/search', { automatic: false }),
+    row('http://pansou:8888/api/search', { automatic: false }),
+  ] } });
+  try {
+    f.pool.start(); t.mock.timers.tick(0); await flush();
+    const rows = f.pool.status().candidates;
+    assert.ok(!rows.some(row => row.apiUrl.includes('expired.example')));
+    for (const part of ['transient.example', 'manual.example', 'pansou:8888']) assert.ok(rows.some(row => row.apiUrl.includes(part)));
+    assert.equal(f.discoveryCalls.length, 0);
+    assert.ok(!JSON.parse(f.metadata.get(KEY)).candidates.some(row => row.url.includes('expired.example')));
+  } finally { await f.pool.stop(); }
+});
+
+test('removed public interfaces stay retired for seven days while an explicit manual configuration remains usable', async () => {
+  let clock = 4 * 86_400_000;
+  const retiredUrl = 'https://expired.example/api/search';
+  const f = fixture({ now: () => clock, saved: { retired: [{ url: retiredUrl, expires: clock + 7 * 86_400_000 }] }, discoveryRequest: url => response(url.includes('api.github.com') ? JSON.stringify({ homepage: 'https://expired.example/' }) : retiredUrl) });
+  try {
+    await f.pool.discover(); assert.ok(!f.pool.status().candidates.some(row => row.apiUrl === retiredUrl));
+    const data = await lookup(f.pool, retiredUrl + '?kw=电影'); assert.equal(data.results.length, 1);
+    const saved = JSON.parse(f.metadata.get(KEY));
+    assert.equal(saved.candidates.find(row => row.url === retiredUrl).automatic, false);
+    assert.ok(!saved.retired.some(row => row.url === retiredUrl));
+    clock += 86_400_000; await f.pool.discover();
+    assert.equal(JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === retiredUrl).automatic, false);
+  } finally { await f.pool.stop(); }
+});
+
+test('successful search clears the automatic endpoint failure window before later failures', async () => {
+  let clock = 4 * 86_400_000;
+  const f = fixture({ now: () => clock, saved: { candidates: [{ ...savedBackup(clock).candidates[0], failures: 2, firstFailedAt: clock - 86_400_000 }] } });
+  try {
+    await lookup(f.pool);
+    const row = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === backup);
+    assert.equal(row.failures, 0); assert.equal(row.firstFailedAt, undefined);
+  } finally { await f.pool.stop(); }
+});
+
+test('rotating public repository metadata discovers deployment APIs but never calls an unverified candidate in the foreground', async () => {
+  let clock = 4 * 86_400_000;
+  const f = fixture({ now: () => clock, discoveryRequest: url => {
+    if (url.includes('/search/repositories')) return response(JSON.stringify({ items: [
+      { homepage: 'https://deployed.example/' }, { homepage: 'http://127.0.0.1/' }, { homepage: 'https://user:secret@unsafe.example/' },
+    ] }));
+    return response(url.includes('api.github.com') ? '{}' : '');
+  } });
+  try {
+    await f.pool.discover();
+    assert.ok(f.discoveryCalls.some(call => call.url.includes('/search/repositories')));
+    assert.ok(f.pool.status().candidates.some(row => row.apiUrl === 'https://deployed.example/api/search'));
+    assert.ok(f.pool.status().candidates.every(row => !/127\.0\.0\.1|unsafe/.test(row.apiUrl)));
+    const saved = JSON.parse(f.metadata.get(KEY)), pending = saved.candidates.find(row => row.url.includes('deployed.example'));
+    pending.status = 'pending';
+    const foreground = fixture({ now: () => clock, saved });
+    try { await lookup(foreground.pool); assert.ok(!foreground.calls.some(call => call.url.includes('deployed.example'))); }
+    finally { await foreground.pool.stop(); }
+    assert.ok(f.discoveryCalls.length <= 4); assert.ok(f.calls.length <= 2);
+  } finally { await f.pool.stop(); }
+});
+
+test('documented Pansousuo API uses q and pan and validates items share URLs and access codes', async () => {
+  const f = fixture({ request: url => {
+    const parsed = new URL(url);
+    assert.equal(parsed.searchParams.get('q'), '遮天'); assert.equal(parsed.searchParams.get('pan'), 'quark'); assert.equal(parsed.searchParams.get('sort'), 'latest');
+    assert.equal(parsed.searchParams.has('kw'), false);
+    return response(JSON.stringify({ items: [
+      { title: '遮天 4K', pan: 'quark', share_url: quarkUrl, access_code: 'abcd' },
+      { title: '遮天', pan: 'baidu', share_url: quarkUrl },
+      { title: '遮天', pan: 'quark', share_url: 'http://127.0.0.1/private' },
+      { title: '遮天', pan: 'quark', share_url: 'https://user:secret@pan.quark.cn/s/abcdef123456' },
+    ], total: 4 }));
+  } });
+  try {
+    const data = await lookup(f.pool, 'https://www.pansousuo.com/api/search?kw=遮天');
+    assert.equal(data.results.length, 1); assert.equal(data.results[0].name, '遮天 4K'); assert.equal(data.results[0].url, quarkUrl + '?pwd=abcd');
+  } finally { await f.pool.stop(); }
+});
+
+test('Google reader follows public regional redirects with DNS checks and no household credentials', async () => {
+  for (const target of ['https://www.google.com.hk/search', 'http://127.0.0.1/private', 'https://rebound.example/search']) {
+    const calls = [], lookups = [];
+    const transport = (url, options, callback) => {
+      const outgoing = new EventEmitter();
+      outgoing.destroy = error => { if (error) queueMicrotask(() => outgoing.emit('error', error)); };
+      outgoing.end = () => queueMicrotask(() => {
+        calls.push({ url: url.href, headers: options.headers });
+        const incoming = url.hostname === 'www.google.com' ? response('', 301) : response(`<a href="${quarkUrl}">电影 夸克资源</a>`);
+        if (url.hostname === 'www.google.com') incoming.headers.location = target;
+        callback(incoming);
+      });
+      return outgoing;
+    };
+    const guarded = createRequest({ lookup: async hostname => {
+      lookups.push(hostname); return [{ address: hostname === 'rebound.example' ? '192.168.1.2' : '8.8.8.8', family: 4 }];
+    }, httpRequest: transport, httpsRequest: transport });
+    const search = createQuarkSearchRequest({ request: guarded });
+    const f = fixture({ request: (url, options) => search(url, options), googleSearch: searchGoogleQuark });
+    try {
+      const data = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?kw=电影', { webSearch: true, headers: { Cookie: 'secret-cookie', Authorization: 'secret-token' } })));
+      if (target.includes('google.com.hk')) { assert.equal(data.results.length, 1); assert.ok(lookups.includes('www.google.com.hk')); }
+      else { assert.equal(data.results.length, 0); assert.match(data.reason, /安全检查拒绝/); assert.ok(!calls.some(call => call.url === target)); }
+      assert.ok(calls.every(call => !/secret-cookie|secret-token|cookie|authorization/i.test(JSON.stringify(call.headers))));
+      assert.ok(f.calls.filter(call => call.url.includes('bing.com')).every(call => call.options.followRedirects === false));
+    } finally { await f.pool.stop(); }
+  }
+});
+
 test('public metadata, README and RSS add bounded candidates and only compatible searches with Quark links establish health', async () => {
   const f = fixture({ request: url => response(new URL(url).hostname === 'so.252035.xyz' ? '{"status":"ok","auth_enabled":false}' : json()) });
   try {
     await f.pool.discover();
     const status = f.pool.status();
-    assert.equal(f.discoveryCalls.length, 3); assert.equal(f.calls.length, 2);
+    assert.equal(f.discoveryCalls.length, 4); assert.equal(f.calls.length, 2);
     assert.ok(status.candidates.some(row => row.apiUrl === 'https://readme.example/api/search' && row.status === 'pending'));
     assert.ok(status.candidates.some(row => row.apiUrl === 'https://rss.example/api/search' && row.status === 'pending'));
     assert.ok(status.candidates.some(row => row.apiUrl === official && row.status === 'paused'));
@@ -43,7 +159,7 @@ test('public metadata, README and RSS add bounded candidates and only compatible
     assert.equal(status.healthy, 1); assert.equal(status.suspended, 1);
     assert.ok(f.calls.every(call => new URL(call.url).searchParams.get('conc') === '1'));
     assert.ok([...f.calls, ...f.discoveryCalls].every(call => !/user-cookie|user-token|authorization|cookie/i.test(JSON.stringify(call.options))));
-    await f.pool.discover(); assert.equal(f.discoveryCalls.length, 3);
+    await f.pool.discover(); assert.equal(f.discoveryCalls.length, 4);
   } finally { await f.pool.stop(); }
 });
 
@@ -219,7 +335,8 @@ test('public discovery and query URLs reject credentials, private literals and D
   try {
     for (const url of ['http://127.0.0.1/api/search?kw=x', 'http://PANSOU:8888/api/search?kw=x', 'http://pansou:8889/api/search?kw=x', 'https://public.example/api/search?kw=x&token=secret', 'https://user:secret@public.example/api/search?kw=x']) await assert.rejects(lookup(f.pool, url));
     assert.equal(publicCalls, 0);
-    await f.pool.discover(); assert.equal(f.pool.status().candidates.length, 1);
+    await f.pool.discover(); assert.equal(f.pool.status().candidates.length, 3);
+    assert.ok(f.pool.status().candidates.every(row => [official, 'https://pansou.252035.xyz/api/search', 'https://www.pansousuo.com/api/search'].includes(row.apiUrl)));
     const rebound = await lookup(f.pool, 'https://rebind.example/api/search?kw=x');
     assert.deepEqual(rebound.results, []); assert.match(rebound.reason, /安全检查拒绝/);
     assert.equal(JSON.stringify(f.pool.status()).includes('secret'), false);
@@ -451,21 +568,21 @@ test('unmatched APIs automatically use Google and its reads cannot exceed the re
   } finally { await f.pool.stop(); }
 });
 
-test('daily public discovery rotates wider Chinese queries while retaining at most three directory requests', async () => {
+test('daily public discovery rotates wider Chinese queries and deployment sources with four bounded directory requests', async () => {
   let clock = Date.now();
   const f = fixture({ now: () => clock });
   try {
     const queries = [];
-    for (let day = 0; day < 4; day++) {
+    for (let day = 0; day < 7; day++) {
       const before = f.discoveryCalls.length;
-      await f.pool.discover(); assert.equal(f.discoveryCalls.length - before, 3);
+      await f.pool.discover(); assert.equal(f.discoveryCalls.length - before, 4);
       queries.push(new URL(f.discoveryCalls.at(-1).url).searchParams.get('q'));
-      await f.pool.discover(); assert.equal(f.discoveryCalls.length - before, 3);
+      await f.pool.discover(); assert.equal(f.discoveryCalls.length - before, 4);
       clock += DAY + 1;
     }
-    assert.equal(new Set(queries.slice(0, 3)).size, 3); assert.equal(queries[0], queries[3]);
+    assert.equal(new Set(queries.slice(0, 6)).size, 6); assert.equal(queries[0], queries[6]);
     assert.ok(queries.some(query => query.includes('夸克'))); assert.ok(queries.some(query => query.includes('网盘搜索')));
-    assert.equal(JSON.parse(f.metadata.get(KEY)).discoveryCursor, 4);
+    assert.equal(JSON.parse(f.metadata.get(KEY)).discoveryCursor, 7);
     assert.ok(f.pool.status().candidates.length <= 8);
   } finally { await f.pool.stop(); }
 });

@@ -9,7 +9,7 @@ import { createQuark } from '../lib/quark.mjs';
 
 const COOKIE = '__kp=synthetic-account-A-secret; __pus=synthetic-login; __puus=synthetic-session';
 const COOKIE_B = '__kp=synthetic-account-B-secret; __pus=synthetic-login-B; __puus=synthetic-session-B';
-const DAY = 86400000, GIB = 1024 ** 3;
+const DAY = 86400000, GIB = 1024 ** 3, DAILY_BYTES = 3_000_000_000_000;
 const detail = { source: 'fixture', id: '1', title: '影片', year: '2026', category: 'movie', quarkShares: ['https://pan.quark.cn/s/abcdef123456'], lines: [{ episodes: [{ name: '正片', type: 'mp4', url: 'https://media.example/movie.mp4' }] }] };
 function reply(data, { code = 0, status = 200, http = 200, headers = {}, finalUrl } = {}) { return Object.assign(Readable.from([Buffer.from(JSON.stringify({ code, status, data }))]), { statusCode: http, headers, finalUrl }); }
 function textReply(value) { return Object.assign(Readable.from([Buffer.from(value)]), { statusCode: 200, headers: {} }); }
@@ -120,8 +120,37 @@ test('a pre-existing same-name root directory is not adopted before this applica
     }
   };
   const result = await service.prepare(detail, { ...selected, line: 0, episode: 0 });
-  assert.equal(result.status, 'error'); assert.match(result.reason, /无法确认/); assert.equal(state.saved, 0);
+  assert.equal(result.status, 'error'); assert.match(result.reason, /同名但未登记/); assert.equal(state.saved, 0);
   assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 0); assert.deepEqual(state.deletes, []);
+});
+
+test('missing, renamed and conflicting registered folders report safe reasons without recreating or deleting files', async t => {
+  for (const mode of ['missing', 'renamed', 'conflicting']) await t.test(mode, async t => {
+    const { service, state, connect, select, save } = await fixture(t); await connect();
+    assert.equal((await save()).status, 'ready');
+    if (mode === 'missing') state.folders.delete('A');
+    else if (mode === 'renamed') state.folders.get('A').file_name = 'user-renamed-private-directory';
+    else state.beforeRequest = call => call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') === '0' ? reply({ list: [state.folders.get('A'), state.folders.get('A')] }) : undefined;
+    const result = await service.prepare(detail, { ...await select(), line: 0, episode: 0 });
+    assert.equal(result.status, 'error'); assert.match(result.reason, mode === 'conflicting' ? /目录记录冲突/ : /已登记目录未找到或已改名、移动/);
+    assert.ok(!result.reason.includes('private-directory'));
+    assert.equal(state.saved, 1); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+    assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+  });
+});
+
+test('an incomplete root directory listing reports its bound and cannot authorize a new managed folder', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect(); const selected = await select(); let pages = 0;
+  state.beforeRequest = call => {
+    if (call.path !== '/file/sort' || new URL(call.value).searchParams.get('pdir_fid') !== '0') return;
+    const page = ++pages;
+    return Object.assign(Readable.from([JSON.stringify({ code: 0, status: 200, data: { list: Array.from({ length: 100 }, (_, index) => ({ fid: `private-${page}-${index}`, file_name: 'private-user-directory', file: false, pdir_fid: '0' })) }, metadata: { _total: 601 } })]), { statusCode: 200, headers: {} });
+  };
+  const result = await service.prepare(detail, { ...selected, line: 0, episode: 0 });
+  assert.equal(result.status, 'error'); assert.match(result.reason, /根目录列表超过核验范围/); assert.equal(pages, 6);
+  assert.ok(!result.reason.includes('private-user-directory'));
+  assert.equal(state.saved, 0); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 0);
+  assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
 });
 
 test('revoking the viewing authorization during directory indexing cancels all later reads and transfers', async t => {
@@ -236,7 +265,7 @@ test('partially failed listings still evict old share candidates at the cache li
 test('defaults are disconnected and all automatic cloud mutations are disabled', async t => {
   const { service, state } = await fixture(t); const settings = await service.settings();
   assert.equal(settings.configured, false); assert.equal(settings.enabled, false); assert.equal(settings.autoSave, false); assert.equal(settings.cleanupEnabled, false); assert.equal(settings.retentionDays, 7);
-  assert.equal(settings.maxDailyTransfers, 100); assert.equal(settings.maxDailyBytes, 20 * GIB); assert.equal(state.calls.length, 0);
+  assert.equal(settings.maxDailyTransfers, 100); assert.equal(settings.maxDailyBytes, DAILY_BYTES); assert.equal(state.calls.length, 0);
   assert.equal((await service.cleanup()).checked, 0); assert.equal((await service.prepare(detail, { auto: true })).status, 'error'); assert.equal(state.saved, 0);
 });
 
@@ -249,7 +278,7 @@ test('the old default limit upgrades once to 100 without resetting later choices
   const settings = await migrated.settings(), after = JSON.parse(metadata.get('quark-settings-v1'));
   assert.equal(settings.maxDailyTransfers, 100); assert.equal(settings.retentionDays, 30);
   assert.equal(settings.account.connected, true); assert.deepEqual(after.account, before.account);
-  assert.equal(after.installId, before.installId); assert.equal(settings.maxDailyBytes, 20 * GIB);
+  assert.equal(after.installId, before.installId); assert.equal(settings.maxDailyBytes, DAILY_BYTES);
   await migrated.configure({ maxDailyTransfers: 10 }); await migrated.stop();
   const reopened = createQuark(options); t.after(() => reopened.stop());
   assert.equal((await reopened.settings()).maxDailyTransfers, 10);
@@ -261,6 +290,35 @@ test('the old default limit upgrades once to 100 without resetting later choices
     assert.equal((await custom.settings()).maxDailyTransfers, limit); await custom.stop();
   }
   assert.equal(state.saved, 0); assert.deepEqual(state.deletes, []);
+});
+
+test('the old default daily bytes upgrade once to 3 TB without losing other migrations or account data', async t => {
+  const { service, options, metadata, state, connect } = await fixture(t);
+  await connect({ maxDailyTransfers: 10, maxDailyBytes: 20 * GIB, retentionDays: 30 }); await service.stop();
+  metadata.delete('quark-transfer-default-100-v1'); metadata.delete('quark-transfer-bytes-3tb-v1');
+  const before = JSON.parse(metadata.get('quark-settings-v1'));
+  const migrated = createQuark(options); t.after(() => migrated.stop());
+  const settings = await migrated.settings(), after = JSON.parse(metadata.get('quark-settings-v1'));
+  assert.equal(settings.maxDailyBytes, DAILY_BYTES); assert.equal(settings.maxDailyTransfers, 100);
+  assert.equal(after.maxDailyBytes, DAILY_BYTES); assert.equal(after.maxDailyTransfers, 100);
+  assert.equal(settings.retentionDays, 30); assert.deepEqual(after.account, before.account); assert.equal(after.installId, before.installId);
+  await migrated.configure({ maxDailyBytes: 20 * GIB }); await migrated.stop();
+  const reopened = createQuark(options); t.after(() => reopened.stop());
+  assert.equal((await reopened.settings()).maxDailyBytes, 20 * GIB); await reopened.stop();
+  for (const limit of [1024 * 1024, 60 * GIB, DAILY_BYTES]) {
+    metadata.delete('quark-transfer-bytes-3tb-v1');
+    metadata.set('quark-settings-v1', JSON.stringify({ ...after, maxDailyBytes: limit }));
+    const custom = createQuark(options); t.after(() => custom.stop());
+    assert.equal((await custom.settings()).maxDailyBytes, limit); await custom.stop();
+  }
+  assert.equal(state.saved, 0); assert.deepEqual(state.deletes, []);
+});
+
+test('3 TB daily byte settings persist and reject values beyond the supported budget', async t => {
+  const { service, options, connect } = await fixture(t); await connect({ maxDailyBytes: DAILY_BYTES });
+  for (const limit of [DAILY_BYTES + 1, DAILY_BYTES + 0.5, Number.MAX_SAFE_INTEGER + 1]) await assert.rejects(() => service.configure({ maxDailyBytes: limit }), /容量/);
+  await service.stop(); const reopened = createQuark(options); t.after(() => reopened.stop());
+  assert.equal((await reopened.settings()).maxDailyBytes, DAILY_BYTES);
 });
 
 test('100 daily transfers persist across restart, reject invalid settings and stop the 101st transfer before saving', async t => {
@@ -582,6 +640,20 @@ test('quota counts total daily bytes, never charges reuse and rejects unknown or
   state.source = [sourceVideo('second')]; const second = await select(); assert.match((await service.prepare(detail, second)).reason, /上限/); assert.equal(state.saved, 1);
   for (const size of [0, NaN, 21 * GIB]) { state.source = [sourceVideo('unknown', '影片.2026.mp4', size)]; const selected = await select(); assert.equal((await service.prepare(detail, selected)).status, 'error'); }
   await service.configure({ maxDailyTransfers: 10, maxDailyBytes: 5 * 1024 * 1024 }); state.source = [sourceVideo('bytes-limit')]; const selected = await select(); assert.match((await service.prepare(detail, selected)).reason, /上限/);
+});
+
+test('the default daily budget permits large files up to exactly 3 TB and still enforces total bytes', async t => {
+  const { service, state, connect, select, save } = await fixture(t); await connect();
+  let used = 0, count = 0;
+  while (used < DAILY_BYTES) {
+    const size = Math.min(100 * GIB, DAILY_BYTES - used);
+    state.source = [sourceVideo('quota-' + count, '影片.2026.mp4', size)];
+    assert.equal((await save()).status, 'ready'); used += size; count++;
+  }
+  assert.equal(used, DAILY_BYTES); assert.equal(state.saved, count);
+  assert.equal((await service.prepare(detail, await select())).status, 'ready'); assert.equal(state.saved, count);
+  state.source = [sourceVideo('over-three-tb', '影片.2026.mp4', 1024 * 1024)];
+  assert.match((await service.prepare(detail, await select())).reason, /上限/); assert.equal(state.saved, count);
 });
 
 test('official desktop playback protocol accepts completed accessible video_info and keeps the matching media User-Agent', async t => {
