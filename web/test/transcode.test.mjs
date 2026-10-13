@@ -29,6 +29,7 @@ async function fixture(options = {}) {
     calls.push({ command, args, options: spawnOptions });
     assert.equal(spawnOptions.shell, false); assert.equal(spawnOptions.windowsHide, true);
     const child = new EventEmitter(); child.stderr = new PassThrough(); child.signals = []; children.push(child);
+    if (options.pid !== undefined) child.pid = options.pid;
     child.exit = code => { if (child.finished) return; child.finished = true; child.emit('exit', code); };
     child.kill = signal => { child.signals.push(signal); if (!options.ignoreKill || signal === 'SIGKILL') queueMicrotask(() => child.exit(0)); return true; };
     setImmediate(async () => {
@@ -115,7 +116,7 @@ test('lazy availability is shared, disabled mode never starts a process, and mis
   finally { await missing.close(); }
 });
 
-test('software output uses a private bridge, bounded HLS window, two threads and unmodified playback timestamps', async () => {
+test('software output uses a private bridge, bounded HLS window, one thread and unmodified playback timestamps', async () => {
   const f = await fixture({ env: { FFMPEG_PATH: 'custom-ffmpeg' }, run: async ({ child, args, write }) => { child.stderr.write('Duration: 00:01:'); child.stderr.write('30.50, start: 0\n'); await write(); } });
   try {
     const result = await start(f.service, { position: 12.5, speed: 1.5 });
@@ -123,6 +124,7 @@ test('software output uses a private bridge, bounded HLS window, two threads and
     const { command, args } = f.calls[1]; assert.equal(command, 'custom-ffmpeg'); assert.equal(args[args.indexOf('-readrate') + 1], '1.5'); assert.equal(args[args.indexOf('-ss') + 1], '12.5'); assert.equal(args[args.indexOf('-protocol_whitelist') + 1], 'http,tcp,crypto'); assert.match(args[args.indexOf('-i') + 1], /^http:\/\/127\.0\.0\.1:\d+\/api\/media\/asset\.m3u8\?token=/); assert.equal(args.includes(url), false);
     assert.equal(args[args.indexOf('-hls_time') + 1], '2'); assert.equal(args[args.indexOf('-hls_list_size') + 1], '30'); assert.equal(args[args.indexOf('-hls_flags') + 1], 'delete_segments+temp_file'); assert.ok(args.includes('libx264')); assert.ok(args.includes('aac')); assert.equal(args.includes('-atempo'), false); assert.equal(args.some(value => value.includes('setpts')), false); assert.equal((await f.service.status()).running, true);
     assert.equal(args[args.indexOf('-r') + 1], '30'); assert.equal(args[args.indexOf('-maxrate') + 1], '3500k'); assert.equal(args[args.indexOf('-bufsize') + 1], '7000k');
+    assert.ok(args.every((value, index) => !['-threads', '-filter_threads'].includes(value) || args[index + 1] === '1'));
   } finally { await f.close(); }
 });
 
@@ -179,9 +181,52 @@ test('single-task ownership rejects other devices and a same-device seek stops a
 });
 
 test('hardware failure before its first segment falls back once to software within the startup deadline', async () => {
-  const hardware = await fixture({ gpu: true, env: { TRANSCODE_ACCEL: 'auto' }, run: async ({ child, args, write }) => { if (args.includes('h264_vaapi')) { child.stderr.write('hardware rejected https://secret.example/video?token=hidden'); child.exit(1); } else await write(); } });
+  const hardware = await fixture({ gpu: true, env: { TRANSCODE_ACCEL: 'auto', TRANSCODE_ALLOW_SOFTWARE: 'true' }, run: async ({ child, args, write }) => { if (args.includes('h264_vaapi')) { child.stderr.write('hardware rejected https://secret.example/video?token=hidden'); child.exit(1); } else await write(); } });
   try { const result = await start(hardware.service); assert.equal(result.acceleration, 'software'); assert.equal(hardware.calls.length, 3); assert.ok(hardware.calls[1].args.includes('h264_vaapi')); assert.ok(hardware.calls[2].args.includes('libx264')); }
   finally { await hardware.close(); }
+});
+
+test('strict VAAPI and the Plex protection setting never select software for missing GPUs', async () => {
+  for (const env of [{ TRANSCODE_ACCEL: 'vaapi' }, { TRANSCODE_ACCEL: 'auto', TRANSCODE_ALLOW_SOFTWARE: 'false' }, { TRANSCODE_ACCEL: 'software', TRANSCODE_ALLOW_SOFTWARE: 'false' }]) {
+    const f = await fixture({ env });
+    try {
+      await assert.rejects(start(f.service), statusError(503));
+      assert.equal(f.calls.filter(call => call.args.includes('-i')).length, 0);
+      assert.deepEqual(await readdir(f.root), []);
+    } finally { await f.close(); }
+  }
+});
+
+test('strict VAAPI and the Plex protection setting preserve hardware errors without CPU fallback', async () => {
+  for (const env of [{ TRANSCODE_ACCEL: 'vaapi', TRANSCODE_ALLOW_SOFTWARE: 'true' }, { TRANSCODE_ACCEL: 'auto', TRANSCODE_ALLOW_SOFTWARE: 'false' }]) {
+    const f = await fixture({ gpu: true, env, run: async ({ child }) => { child.stderr.write('hardware rejected https://secret.example/video?token=hidden'); child.exit(1); } });
+    try {
+      await assert.rejects(start(f.service), statusError(502));
+      const encoders = f.calls.filter(call => call.args.includes('-i'));
+      assert.equal(encoders.length, 1); assert.ok(encoders[0].args.includes('h264_vaapi'));
+      assert.equal(f.logs.join('\n').includes('secret.example'), false);
+      assert.deepEqual(await readdir(f.root), ['gpu']);
+    } finally { await f.close(); }
+  }
+});
+
+test('Linux children run at low priority while Windows launches stay hidden without Unix priority changes', async () => {
+  for (const platform of ['linux', 'win32']) {
+    const priorities = [], f = await fixture({ pid: 123456, di: { platform, setPriority: (pid, priority) => priorities.push([pid, priority]) } });
+    try {
+      await start(f.service);
+      assert.deepEqual(priorities, platform === 'linux' ? [[123456, 19], [123456, 19]] : []);
+      assert.ok(f.calls.every(call => call.options.windowsHide));
+    } finally { await f.close(); }
+  }
+});
+
+test('priority adjustment failures retain playback and sanitize diagnostic links', async () => {
+  const f = await fixture({ pid: 123456, di: { platform: 'linux', setPriority() { throw new Error('denied https://secret.example/video?token=hidden'); } } });
+  try {
+    assert.equal((await start(f.service)).acceleration, 'software');
+    assert.equal(f.logs.length, 2); assert.equal(f.logs.join('\n').includes('secret.example'), false);
+  } finally { await f.close(); }
 });
 
 test('VAAPI uses hardware frames and bounded VBR while an absent device selects software directly', async () => {

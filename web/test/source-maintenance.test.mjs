@@ -63,6 +63,95 @@ test('new subscription sources must pass actual media validation and large feeds
   await service.stop();
 });
 
+test('subscription observers receive structured failure reasons after commit and can unsubscribe', async () => {
+  const store = memoryStore(config({ subscriptions: [subscription()] }));
+  let mode = 'missing', clock = 1_000, seen = [];
+  const service = createSourceMaintenance({ store, now: () => ++clock, request: feedRequest(() => {
+    if (mode === 'missing') return response('missing', 404);
+    if (mode === 'forbidden') return response('forbidden', 403);
+    if (mode === 'quota') return response('limited', 429);
+    if (mode === 'invalid') return response('broken JSON');
+    return response(feed());
+  }) });
+  const unsubscribe = service.observeSubscriptions(result => {
+    assert.equal(service.status().subscriptions[0].checkedAt, result.checkedAt);
+    seen.push(structuredClone(result)); result.error = 'listener-local mutation';
+  });
+  for (mode of ['missing', 'forbidden', 'quota', 'invalid', 'valid']) await service.update();
+  assert.deepEqual(seen.map(row => row.reason || 'ok'), ['not_found', 'forbidden', 'rate_limit', 'invalid', 'ok']);
+  assert.deepEqual(seen.slice(0, 3).map(row => row.httpStatus), [404, 403, 429]);
+  assert.equal(service.status().subscriptions[0].error, '');
+  assert.equal(seen[4].status, 'ok');
+  unsubscribe(); await service.update(); assert.equal(seen.length, 5);
+  assert.throws(() => service.observeSubscriptions(null), TypeError);
+  await service.stop();
+});
+
+test('an intact subscription with temporarily unplayable samples remains a successful subscription observation', async () => {
+  const store = memoryStore(config({ subscriptions: [subscription()] })), seen = [];
+  const service = createSourceMaintenance({ store, request: feedRequest(() => response(feed(source('new')))),
+    playability: { check: async () => ({ playable: false, error: '暂时无法读取媒体' }) } });
+  service.observeSubscriptions(result => seen.push(result));
+  await service.update();
+  assert.equal(store.config().sources.length, 0);
+  assert.equal(seen[0].status, 'ok'); assert.equal(seen[0].reason, undefined);
+  await service.stop();
+});
+
+test('low background updates validate six APIs serially while manual updates retain two workers and the normal budget', async () => {
+  const store = memoryStore(config({ subscriptions: [subscription()] }));
+  const remote = feed(...Array.from({ length: 25 }, (_, i) => source(`low${i}`)));
+  let active = 0, maximum = 0, checks = 0;
+  const service = createSourceMaintenance({ store, backgroundMode: 'low', request: feedRequest(() => response(remote)),
+    playability: { check: async () => {
+      checks++; active++; maximum = Math.max(maximum, active);
+      await new Promise(setImmediate); active--; return { playable: true };
+    } } });
+  await service.update({ force: false });
+  assert.equal(checks, 6); assert.equal(maximum, 1); assert.equal(store.config().sources.length, 6);
+  checks = 0; maximum = 0;
+  await service.update();
+  assert.equal(checks, 19); assert.equal(maximum, 2); assert.equal(store.config().sources.length, 25);
+  assert.equal(service.status().backgroundMode, 'low');
+  assert.equal(service.status().probeIntervalMinutes, 60);
+  assert.equal(service.status().updateIntervalMinutes, 360);
+  await service.stop();
+});
+
+test('low automatic probes and updates share one operation queue and stop cancels queued work', async () => {
+  const store = memoryStore(config({ sources: [source('a'), source('b')], subscriptions: [subscription()] }));
+  let release, requested = [];
+  const service = createSourceMaintenance({ store, backgroundMode: 'low', request: async url => {
+    requested.push(url.hostname);
+    if (url.hostname === 'a.example') await new Promise(resolve => { release = resolve; });
+    return url.pathname.endsWith('.json') ? response(feed()) : response({ list: [] });
+  } });
+  const probing = service.probe({ force: false }), updating = service.update({ force: false });
+  await flush(); assert.deepEqual(requested, ['a.example']);
+  const stopping = service.stop(); release();
+  await Promise.all([probing, updating, stopping]);
+  assert.deepEqual(requested, ['a.example']);
+});
+
+test('low scheduling probes hourly and updates every six hours while manual probes still use two workers', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1_000 });
+  const store = memoryStore(config({ sources: [source('a'), source('b')], subscriptions: [subscription()] }));
+  let active = 0, maximum = 0, probes = 0, updates = 0;
+  const service = createSourceMaintenance({ store, backgroundMode: 'low', request: async url => {
+    if (url.pathname.endsWith('.json')) { updates++; return response(feed()); }
+    probes++; active++; maximum = Math.max(maximum, active);
+    await new Promise(setImmediate); active--; return response({ list: [] });
+  } });
+  service.start(); service.start(); t.mock.timers.tick(0); await flush(); await flush();
+  assert.equal(probes, 2); assert.equal(updates, 1); assert.equal(maximum, 1);
+  t.mock.timers.tick(30 * 60_000); await flush(); assert.equal(probes, 2);
+  t.mock.timers.tick(30 * 60_000); await flush(); await flush(); assert.equal(probes, 4); assert.equal(updates, 1);
+  maximum = 0; await service.probe(); assert.equal(maximum, 2);
+  t.mock.timers.tick(5 * 60 * 60_000); await flush(); await flush(); assert.equal(updates, 2);
+  await service.stop(); const count = probes;
+  t.mock.timers.tick(24 * 60 * 60_000); await flush(); assert.equal(probes, count); assert.equal(updates, 2);
+});
+
 test('subscription refresh repairs JSONC and compatible TVBox sites before checking and adding APIs', async () => {
   const store=memoryStore(config({subscriptions:[subscription()]}));
   const maintenance=createSourceMaintenance({store,request:feedRequest(()=>response('{ /* comment */ "sites": [ {"key":"fixed","name":"可用源","type":1,"api":"fixed.example:8443/vod?token=1&amp;v=2",}, {"key":"spider","type":3,"api":"csp_Unsupported"}, ], }'))});

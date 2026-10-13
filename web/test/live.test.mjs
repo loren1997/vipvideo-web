@@ -11,6 +11,48 @@ import { DatabaseSync } from 'node:sqlite';
 const source = { id: 'one', name: '公开电视源', url: 'https://tv.example/channels/list.m3u', enabled: true };
 const response = (body, statusCode = 200) => Object.assign(Readable.from([body]), { statusCode, headers: {}, finalUrl: source.url });
 
+test('low background probing limits network work while manual probing keeps its normal budget', async () => {
+  const config = { liveSources: [source] }, checked = [];
+  let active = 0, peak = 0;
+  const live = createLive({ backgroundMode: 'low',
+    request: async () => response('#EXTM3U\n' + Array.from({ length: 30 }, (_, i) => `#EXTINF:-1,频道${i}\nhttps://tv.example/${i}.m3u8`).join('\n')),
+    playability: { async check({ url }) {
+      peak = Math.max(peak, ++active); checked.push(url);
+      await new Promise(resolve => setTimeout(resolve, 1)); active--;
+      return { playable: true, checkedAt: Date.now() };
+    } },
+  });
+  try {
+    await live.probe(config, { background: true });
+    assert.equal(checked.length, 5); assert.equal(peak, 1);
+    const listing = await live.list(config);
+    assert.equal(listing.probeIntervalMs, 60_000); assert.equal(listing.probeBudget, 5);
+    await live.probe(config);
+    assert.equal(checked.length, 25); assert.equal(peak, 2);
+    assert.equal(checked[5], 'https://tv.example/5.m3u8');
+  } finally { await live.stop(); }
+});
+
+test('live page polling cannot accelerate the low background probe timer', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const config = { liveSources: [source] }, metadata = new Map(), checked = [];
+  const store = { config: () => config, meta: key => metadata.get(key), setMeta: (key, value) => metadata.set(key, value) };
+  const live = createLive({ store, backgroundMode: 'low',
+    request: async () => response('#EXTM3U\n' + Array.from({ length: 30 }, (_, i) => `#EXTINF:-1,频道${i}\nhttps://tv.example/${i}.m3u8`).join('\n')),
+    playability: { async check({ url }) { checked.push(url); return { playable: true, checkedAt: Date.now() }; } },
+  });
+  try {
+    await live.list(config); live.start(); t.mock.timers.tick(0);
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(checked.length, 5);
+    for (let i = 0; i < 3; i++) {
+      await live.list(config); t.mock.timers.tick(19_999);
+      await new Promise(resolve => setImmediate(resolve)); assert.equal(checked.length, 5);
+    }
+    t.mock.timers.tick(3); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(checked.length, 10);
+  } finally { await live.stop(); }
+});
+
 test('M3U preserves query parameters, quoted commas and channel classification while dropping unsupported addresses', () => {
   const channels = parsePlaylist(`#EXTM3U
 #EXTINF:-1 tvg-id="CCTV1.cn@HD" tvg-logo="https://tv.example/logo.png" group-title="央视,综合",CCTV-1 (1080p)

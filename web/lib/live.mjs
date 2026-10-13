@@ -99,7 +99,10 @@ export function parsePlaylist(body, source) {
 }
 
 export function createLive({ store, request = networkRequest, now = Date.now, logger = console,
+  backgroundMode = process.env.BACKGROUND_MODE,
   playability = createPlayability({ request, now }) } = {}) {
+  const lowBackground = backgroundMode === 'low';
+  const probeInterval = lowBackground ? 60_000 : PROBE_INTERVAL;
   let cache, probeJob, timer, started = false, stopping = false;
   let loading = 0; const loadWaiting = [];
   let health = { sources: {}, streams: {}, cursor: 0, lastProbe: 0 };
@@ -204,7 +207,7 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
       if (candidates.length) channel.preferredLine = candidates[0].line;
     }
     const urls = [...new Set(copy.channels.flatMap(channel => channel.streams.map(stream => stream.url)))];
-    Object.assign(copy, { probing: !!probeJob || !!cache?.promise, checkedStreams: urls.filter(url => health.streams[url]?.checkedAt <= now() && now() - health.streams[url].checkedAt < HEALTH_AGE).length, totalStreams: urls.length, lastProbe: health.lastProbe });
+    Object.assign(copy, { backgroundMode: lowBackground ? 'low' : 'normal', probeIntervalMs: probeInterval, probeBudget: lowBackground ? 5 : 20, probing: !!probeJob || !!cache?.promise, checkedStreams: urls.filter(url => health.streams[url]?.checkedAt <= now() && now() - health.streams[url].checkedAt < HEALTH_AGE).length, totalStreams: urls.length, lastProbe: health.lastProbe });
     copy.channels.sort((a, b) => Number(b.streams.some(stream => stream.status === 'ok')) - Number(a.streams.some(stream => stream.status === 'ok')));
     copy.channels = copy.channels.slice(0, PLAYLIST_LIMIT);
     return copy;
@@ -227,18 +230,18 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
   }
   async function takeSlot() { if (loading >= 2) await new Promise(done => loadWaiting.push(done)); else loading++; }
   function releaseSlot() { const next = loadWaiting.shift(); if (next) next(); else loading--; }
-  function schedule(delay = PROBE_INTERVAL) {
+  function schedule(delay = probeInterval) {
     if (!started || stopping) return;
     clearTimeout(timer);
     timer = setTimeout(async () => {
-      try { await service.probe(store.config()); }
+      try { await service.probe(store.config(), { background: true }); }
       catch (error) { logger.error('直播源自动探测失败', error); }
       finally {
         const pending = cache?.result?.channels.some(channel => channel.streams.some(stream => {
           const record = health.streams[stream.url];
           return !record || record.checkedAt > now() || now() - record.checkedAt >= (record.status === 'ok' ? 30 * 60_000 : 10 * 60_000);
         }));
-        schedule(pending ? PROBE_INTERVAL : 60_000);
+        schedule(pending ? probeInterval : 60_000);
       }
     }, delay);
     timer.unref?.();
@@ -263,7 +266,7 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
       const signature = JSON.stringify(sources);
       if (cache?.signature === signature && cache.result && !refresh) {
         if (cache.expires <= now() && !cache.promise) service.list(config, { refresh: true }).catch(error => logger.error('直播列表后台更新失败', error));
-        if (started && !probeJob) schedule(0);
+        if (started && !lowBackground && !probeJob) schedule(0);
         return view(cache.result);
       }
       if (cache?.signature === signature && cache.promise) return view(await cache.promise);
@@ -318,7 +321,7 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
       if (entry.result && !refresh) { entry.promise.catch(error => logger.error('直播列表后台更新失败', error)); return view(entry.result); }
       return view(await entry.promise);
     },
-    async probe(config) {
+    async probe(config, { background = false } = {}) {
       if (stopping) return;
       if (probeJob) return probeJob;
       probeJob = (async () => {
@@ -340,12 +343,13 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
           pools[pool].push({ url: candidate.url, index });
         }
         let nextCursor = health.cursor;
-        const take = (pool, quota) => { while (pools[pool].length && quota-- > 0 && sample.length < 20) { const candidate = pools[pool].shift(); if (selected.has(candidate.url)) { quota++; continue; } selected.add(candidate.url); sample.push(candidate.url); if (pool === 'normal' || !pools.normal.length) nextCursor = candidate.index + 1; } };
-        take('rescue', 6); take('normal', 12); take('upgrade', 4);
+        const lowProbe = lowBackground && background, limit = lowProbe ? 5 : 20;
+        const take = (pool, quota) => { while (pools[pool].length && quota-- > 0 && sample.length < limit) { const candidate = pools[pool].shift(); if (selected.has(candidate.url)) { quota++; continue; } selected.add(candidate.url); sample.push(candidate.url); if (pool === 'normal' || !pools.normal.length) nextCursor = candidate.index + 1; } };
+        take('rescue', lowProbe ? 1 : 6); take('normal', lowProbe ? 3 : 12); take('upgrade', lowProbe ? 1 : 4);
         take('normal', 20); take('rescue', 20); take('upgrade', 20);
         if (!sample.length) return service.status(config);
         let next = 0;
-        await Promise.all(Array.from({ length: Math.min(2, sample.length) }, async () => {
+        await Promise.all(Array.from({ length: Math.min(lowProbe ? 1 : 2, sample.length) }, async () => {
           while (unchanged() && next < sample.length) {
             const url = sample[next++], began = now(), before = health.streams[url];
             await takeSlot();

@@ -141,6 +141,18 @@ progress::-moz-progress-bar { background:var(--accent); }
 .link-history-item p { font-size:11px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .settings-section { border:1px solid var(--line); background:var(--surface); border-radius:11px; padding:23px; margin-bottom:22px; }
 .settings-section > .muted { margin:5px 0 18px; }
+.settings-directory { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; align-items:start; }
+details.settings-section { padding:0; margin:0; min-width:0; overflow:hidden; }
+details.settings-section[open] { grid-column:1 / -1; padding-bottom:18px; }
+.settings-summary { cursor:pointer; padding:14px 18px; color:var(--accent); }
+.settings-summary h2 { display:inline; font-size:16px; color:var(--text); }
+.settings-summary-info { display:block; margin-top:3px; color:var(--muted); font-size:11px; }
+.settings-summary:focus-visible { outline:2px solid var(--accent); outline-offset:-3px; border-radius:10px; }
+details.settings-section[open] > .settings-summary { border-bottom:1px solid var(--line); margin-bottom:16px; }
+details.settings-section > :not(summary) { margin-left:18px; margin-right:18px; }
+details.settings-section > .muted { margin:6px 18px 18px; }
+details.settings-section .section-heading { justify-content:flex-end; margin-top:12px; }
+@media(max-width:640px) { .settings-directory { grid-template-columns:minmax(0,1fr); gap:9px; } .settings-summary { padding:8px 14px; font-size:15px; line-height:1.3; } .settings-summary h2 { font-size:15px; } .settings-summary-info { margin-top:2px; font-size:10px; line-height:1.4; } details.settings-section > :not(summary), details.settings-section > .muted { margin-left:14px; margin-right:14px; } }
 .config-list { display:flex; flex-direction:column; gap:12px; margin-top:18px; }
 .config-row { border:1px solid var(--line); border-radius:8px; background:#141c29; padding:15px; }
 .config-fields { display:grid; grid-template-columns:1fr 1.3fr 2.5fr; gap:12px; }

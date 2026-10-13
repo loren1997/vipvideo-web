@@ -25,6 +25,43 @@ test('optional Quark search companion preserves Compose settings and becomes hea
   assert.equal(config.services.pansou.ports?.length || 0, 0);
   assert.equal(config.services.pansou.read_only, true);
   assert.equal(config.services.pansou.volumes?.some(row => row.target === '/app/data') || false, false);
+  assert.equal(config.services.pansou.cpus, 0.25);
+  assert.equal(config.services.pansou.mem_limit, 384 * 1024 * 1024);
+  assert.equal(config.services.pansou.memswap_limit, config.services.pansou.mem_limit);
+  assert.equal(config.services.pansou.environment.GOMAXPROCS, '1');
+  assert.equal(config.services.pansou.environment.ASYNC_MAX_BACKGROUND_WORKERS, '1');
+  assert.equal(config.services.web.cpus, 1);
+  assert.equal(config.services.web.mem_limit, 768 * 1024 * 1024);
+  assert.equal(config.services.web.memswap_limit, config.services.web.mem_limit);
+  const protectedBase = JSON.parse(execFileSync('docker', ['compose', '-f', 'docker-compose.yml', '-f', 'compose.plex-safe.yaml', 'config', '--format', 'json'], {
+    cwd: root, windowsHide: true, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
+  }));
+  assert.deepEqual(Object.keys(protectedBase.services), Object.keys(baseline.services));
+  assert.equal(protectedBase.services.web.environment.APP_PASSWORD, baseline.services.web.environment.APP_PASSWORD);
+  assert.deepEqual(protectedBase.services.web.ports, baseline.services.web.ports);
+  assert.deepEqual(protectedBase.services.web.volumes, baseline.services.web.volumes);
+  assert.equal(protectedBase.services.web.environment.TRANSCODE_ALLOW_SOFTWARE, 'false');
+  assert.equal(protectedBase.services.web.environment.BACKGROUND_MODE, 'low');
+  assert.equal(protectedBase.services.web.devices?.length || 0, baseline.services.web.devices?.length || 0);
+  const combined = JSON.parse(execFileSync('docker', ['compose', ...files, '-f', 'compose.gpu.yaml', '-f', 'compose.plex-safe.yaml', 'config', '--format', 'json'], {
+    cwd: root, windowsHide: true, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, RENDER_GID: '109' },
+  }));
+  assert.equal(combined.services.web.environment.APP_PASSWORD, baseline.services.web.environment.APP_PASSWORD);
+  assert.deepEqual(combined.services.web.ports, baseline.services.web.ports);
+  assert.deepEqual(combined.services.web.volumes, baseline.services.web.volumes);
+  assert.equal(combined.services.web.environment.QUARK_SEARCH_API, 'http://pansou:8888/api/search');
+  assert.equal(combined.services.web.environment.TRANSCODE_ACCEL, 'vaapi');
+  assert.equal(combined.services.web.environment.TRANSCODE_ALLOW_SOFTWARE, 'false');
+  assert.equal(combined.services.web.environment.BACKGROUND_MODE, 'low');
+  assert.ok(combined.services.web.devices.some(device => device.source === '/dev/dri' && device.target === '/dev/dri'));
+  assert.ok(combined.services.web.group_add.includes('109'));
+  assert.equal(combined.services.web.cpus, 1);
+  assert.equal(combined.services.web.cpu_shares, 256);
+  assert.equal(combined.services.web.mem_limit, 768 * 1024 * 1024);
+  assert.equal(combined.services.web.memswap_limit, combined.services.web.mem_limit);
+  assert.equal(combined.services.web.pids_limit, 128);
+  assert.equal(combined.services.web.blkio_config.weight, 100);
+  assert.deepEqual(combined.services.web.tmpfs, ['/tmp:size=128m,mode=1777']);
   try {
     compose(['up', '-d', 'pansou']);
     let healthy = false;

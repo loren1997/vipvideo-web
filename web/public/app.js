@@ -16,6 +16,7 @@ let toastTimer;
 let historyQueue = Promise.resolve();
 let quarkProgressQueue = Promise.resolve();
 let importWarnings = [];
+const openSettingsSections = new Set();
 const defaultPreferences = { introSeconds: 0, outroSeconds: 0, autoNext: true, speed: 1, danmakuEnabled: true, skipAds: false, adRanges: [] };
 const sourceSuccess = new Map();
 const playabilityCache = new Map();
@@ -1061,7 +1062,7 @@ async function renderLive(params, stamp) {
         liveSnapshot = { sources: sourcesAtEntry, at: Date.now(), data: result }; draw(result); refresh.disabled = false;
         const pending = Number.isFinite(result.checkedStreams) && Number.isFinite(result.totalStreams) && result.checkedStreams < result.totalStreams;
         let delay = 30000;
-        if (result.probing || pending) delay = ++updates <= 3 ? 1000 : 3000;
+        if (result.backgroundMode !== 'low' && (result.probing || pending)) delay = ++updates <= 3 ? 1000 : 3000;
         else updates = 0;
         await new Promise(resolve => setTimeout(resolve, delay));
         if (!valid(request)) return;
@@ -1801,8 +1802,15 @@ function formatDate(value) {
   const date = new Date(value); return Number.isFinite(date.getTime()) ? date.toLocaleString('zh-CN', { hour12: false }) : '尚未运行';
 }
 
+function settingsSection(title, overview, className = '') {
+  const panel = node('details', undefined, `settings-section ${className}`.trim()); panel.open = openSettingsSections.has(title);
+  const summary = node('summary', undefined, 'settings-summary'); summary.tabIndex = 0; summary.append(node('h2', title), node('small', overview, 'settings-summary-info')); panel.append(summary);
+  panel.addEventListener('toggle', () => { if (panel.isConnected) { if (panel.open) openSettingsSections.add(title); else openSettingsSections.delete(title); } });
+  return panel;
+}
+
 function maintenancePanel(stamp) {
-  const panel = node('section', undefined, 'settings-section'); panel.append(node('h2', '影视源维护'), node('p', '服务端每 30 分钟检测影视接口并刷新直播列表，轮换抽样最多 20 条直播线路；每 6 小时更新启用的订阅，每 15 分钟尝试发现公开的新订阅。检测通过不代表所有内容都能播放，播放器只展示当前已验证可用的选项。修改配置后请先保存，再手动更新或发现订阅。', 'muted'));
+  const panel = settingsSection('影视源维护', '检测接口、更新订阅与发现新源'); panel.append(node('p', '服务端根据后台模式定期检测影视接口、刷新直播列表并分批探测线路，更新订阅和发现公开的新订阅。检测通过不代表所有内容都能播放，播放器只展示当前已验证可用的选项。修改配置后请先保存，再手动更新或发现订阅。', 'muted'));
   panel.append(node('p', '发现的新源通过验证后自动加入。影视源连续失败 3 次且距首次失败至少 1 小时后会自动隔离，暂停参与搜索；后台重试成功后自动恢复。隔离保留配置，不会硬删除你添加的影视源。', 'muted'));
   const actions = node('div', undefined, 'settings-actions');
   const status = node('div', '正在读取维护状态…', 'maintenance-status'); status.setAttribute('aria-live', 'polite');
@@ -1811,9 +1819,13 @@ function maintenancePanel(stamp) {
     status.replaceChildren();
     const running = typeof data.running === 'object' && data.running ? Object.values(data.running).some(Boolean) : Boolean(data.running);
     status.append(node('p', `${running ? '维护任务正在运行 · ' : ''}最近检测：${formatDate(data.lastProbe)} · 最近订阅更新：${formatDate(data.lastUpdate)}`, 'maintenance-summary'));
+    const schedule = [(data.backgroundMode || data.discovery?.backgroundMode) === 'low' ? '低负载模式' : '', Number.isFinite(data.probeIntervalMinutes) ? `后台检测每 ${data.probeIntervalMinutes} 分钟` : '', Number.isFinite(data.updateIntervalMinutes) ? `订阅更新每 ${data.updateIntervalMinutes} 分钟` : '', Number.isFinite(data.discovery?.intervalMinutes) ? `订阅发现每 ${data.discovery.intervalMinutes} 分钟` : ''].filter(Boolean);
+    if (schedule.length) status.append(node('p', schedule.join(' · '), 'maintenance-summary'));
     if (data.discovery) {
       const found = data.discovery.candidates || [];
       status.append(node('p', `${data.discovery.running ? '正在发现新订阅 · ' : ''}最近发现：${formatDate(data.discovery.lastDiscovery)} · 新增 ${found.filter(item => item.added).length} 个订阅`, 'maintenance-summary'));
+      if (data.discovery.retiredCount) status.append(node('p', `已撤下 ${data.discovery.retiredCount} 个持续失效的自动订阅，仍按退避复查；用户添加或修改的配置不会自动撤下。`, 'maintenance-summary'));
+      for (const item of data.discovery.retired || []) status.append(node('p', `${item.name || item.id}：已撤下${item.reason ? ` · ${item.reason}` : ''}${item.retryAt ? ` · 下次复查：${formatDate(item.retryAt)}` : ''}`, 'muted'));
       for (const item of found.filter(item => item.added || item.error || item.reason || item.httpStatus)) {
         const code = Number(item.httpStatus), reason = code === 403 ? 'HTTP 403：访问受限或限流' : code === 404 ? 'HTTP 404：配置路径不存在' : code ? `HTTP ${code}` : '';
         status.append(node('p', `${item.name || item.url}：${item.added ? '验证通过，已自动加入订阅' : [reason, item.reason, item.error].filter(Boolean).join(' · ')}${item.retryAt ? ` · 下次重试：${formatDate(item.retryAt)}` : ''}`, item.error || code >= 400 ? 'maintenance-error' : 'muted'));
@@ -1858,7 +1870,7 @@ function maintenancePanel(stamp) {
 }
 
 function quarkSettingsPanel(stamp) {
-  const panel = node('section', undefined, 'settings-section quark-settings'); panel.append(node('h2', '夸克网盘'), node('p', '仅为点开的影片或当前选中单集准备匹配视频，准备好后由你选择切换。自动清理只处理本应用管理、已看完且达到保留期限的文件，保留天数可改或关闭；其他目录和未看完文件不会删除。', 'muted'));
+  const panel = settingsSection('夸克网盘', '账号连接、当前单集准备与到期清理', 'quark-settings'); panel.append(node('p', '仅为点开的影片或当前选中单集准备匹配视频，准备好后由你选择切换。自动清理只处理本应用管理、已看完且达到保留期限的文件，保留天数可改或关闭；其他目录和未看完文件不会删除。', 'muted'));
   const status = node('p', '正在读取账号状态…', 'muted'); status.setAttribute('aria-live', 'polite'); panel.append(status);
   const fields = node('div', undefined, 'quark-settings-fields'), inputs = {};
   for (const [key, label] of [['enabled', '启用夸克'], ['autoSave', '自动准备当前单集'], ['cleanupEnabled', '定期清理已看完文件']]) {
@@ -1867,7 +1879,7 @@ function quarkSettingsPanel(stamp) {
   const retentionLabel = node('label', '看完后保留天数'), retention = node('input'); retention.type = 'number'; retention.min = '1'; retention.step = '1'; retention.value = '7'; retention.setAttribute('aria-label', '夸克看完后保留天数'); retentionLabel.append(retention); fields.append(retentionLabel);
   const searchLabel = node('label', '资源搜索接口（可选）'), search = node('input'); search.type = 'url'; search.placeholder = 'https://…'; search.setAttribute('aria-label', '夸克资源搜索接口'); searchLabel.append(search); fields.append(searchLabel);
   const cookieLabel = node('label', '官方网页登录 Cookie'), cookie = node('input'); cookie.type = 'password'; cookie.autocomplete = 'off'; cookie.placeholder = '留空保留已连接账号'; cookie.setAttribute('aria-label', '夸克账号 Cookie'); cookieLabel.append(cookie); fields.append(cookieLabel);
-  panel.append(fields, node('p', '首次连接时填写你在夸克官方网页登录后取得的 Cookie。保存后清空此输入，账号凭证不会回填或包含在配置导出中。', 'muted'));
+  panel.append(fields, node('p', '首次连接时，复制夸克官方网页文件列表请求 Request Headers 的 Cookie 完整值，支持 Cookie: 前缀。保存后清空此输入，账号凭证不会回填或包含在配置导出中。', 'muted'));
   const actions = node('div', undefined, 'settings-actions'); panel.append(actions);
   for (const input of [...Object.values(inputs), retention, search, cookie]) input.disabled = true;
   let data = null, version = 0;
@@ -1935,12 +1947,13 @@ function renderSettings() {
       const link = node('a'); link.href = url; link.download = 'vipvideo-config.json'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); notify('配置已导出，不包含密码和观看记录');
     } catch (error) { notify(error.message, true); }
   }, 'button');
-  tools.append(save, exportConfig); page.append(tools, node('p', '新增、排序、停用后，点击「保存全部设置」。数据由家庭内所有设备共用。', 'settings-note'));
-  const display = node('section', undefined, 'settings-section'); display.append(node('h2', '分类显示'));
+  tools.append(save); page.append(tools, node('p', `${draft.sources.length} 个影视源 · ${draft.subscriptions.length} 个订阅 · ${draft.liveSources.length} 个直播源。按需展开设置；新增、排序、停用后点击「保存全部设置」。`, 'settings-note'));
+  const sections = node('div', undefined, 'settings-directory'); page.append(sections);
+  const display = settingsSection('分类显示', draft.showAdult ? '三级分类已显示 · 全家庭共用' : '三级分类已隐藏 · 全家庭共用');
   const adultLabel = node('label', '显示“三级”分类', 'display-option');
   const adultCheckbox = node('input'); adultCheckbox.type = 'checkbox'; adultCheckbox.checked = draft.showAdult === true; adultCheckbox.setAttribute('aria-label', '显示“三级”分类'); adultCheckbox.addEventListener('change', () => { draft.showAdult = adultCheckbox.checked; });
-  adultLabel.prepend(adultCheckbox); display.append(adultLabel, node('p', '敏感电影、电视剧和动漫集中到该分类。关闭后，相关搜索、收藏和观看记录会隐藏，重新开启后恢复显示。此设置由家庭内所有设备共用。', 'muted')); page.append(display);
-  const importer = node('section', undefined, 'settings-section'); importer.append(node('h2', '导入资源配置'), node('p', '支持 MoonTV / KatelyaTV 的 api_site 等影视源 JSON，以及本应用导出的配置。服务端校正常见配置格式和地址，按标识合并。', 'muted'));
+  adultLabel.prepend(adultCheckbox); display.append(adultLabel, node('p', '敏感电影、电视剧和动漫集中到该分类。关闭后，相关搜索、收藏和观看记录会隐藏，重新开启后恢复显示。此设置由家庭内所有设备共用。', 'muted')); sections.append(display);
+  const importer = settingsSection('导入资源配置', '导入 / 导出 JSON 配置与添加内置源'); importer.append(node('p', '支持 MoonTV / KatelyaTV 的 api_site 等影视源 JSON，以及本应用导出的配置。服务端校正常见配置格式和地址，按标识合并。', 'muted'));
   const file = node('input', undefined, 'import-file'); file.type = 'file'; file.accept = '.json,application/json'; file.setAttribute('aria-label', '选择配置 JSON 文件');
   const json = node('textarea', undefined, 'config-json'); json.rows = 5; json.spellcheck = false; json.setAttribute('aria-label', '配置 JSON'); json.placeholder = '{"api_site":{"example":{"name":"示例影视源","api":"https://example.com/api.php/provide/vod/"}}}';
   file.addEventListener('change', async () => {
@@ -1952,7 +1965,7 @@ function renderSettings() {
     catch (error) { notify(`导入失败：${error.message}`, true); }
     finally { importButton.disabled = false; }
   }, 'button');
-  const importActions = node('div', undefined, 'settings-actions'); importActions.append(importButton, presetButton());
+  const importActions = node('div', undefined, 'settings-actions'); importActions.append(importButton, presetButton(), exportConfig);
   importer.append(file, json, importActions);
   if (importWarnings.length) {
     const warnings = node('div', undefined, 'notice import-warnings'); warnings.setAttribute('role', 'status');
@@ -1960,16 +1973,17 @@ function renderSettings() {
     for (const message of importWarnings) warnings.append(node('p', message));
     importer.append(warnings);
   }
-  page.append(importer);
-  page.append(maintenancePanel(routeVersion));
-  page.append(quarkSettingsPanel(routeVersion));
-  const descriptions = { sources: ['影视源', '填写 AppleCMS JSON 接口；搜索时只查询启用的源。', 'api'], subscriptions: ['影视源订阅', '填写 api_site JSON 配置订阅地址，按源标识合并。启用后服务端每 6 小时更新，也可立即手动更新。', 'url'], liveSources: ['电视直播源', '填写 M3U / M3U8 频道列表地址；频道及线路由服务端读取，播放时可手动切换。', 'url'], platforms: ['平台入口', '首页展示的视频平台链接，不作为聚合搜索源。', 'url'], parsers: ['解析线路', '填写带 ?url= 等参数的视频解析地址前缀，也支持 {url} 占位符。', 'url'] };
+  sections.append(importer);
+  sections.append(maintenancePanel(routeVersion));
+  sections.append(quarkSettingsPanel(routeVersion));
+  const descriptions = { sources: ['影视源', '填写 AppleCMS JSON 接口；搜索时只查询启用的源。', 'api'], subscriptions: ['影视源订阅', '填写 api_site JSON 配置订阅地址，按源标识合并。启用后服务端定期更新，也可立即手动更新。', 'url'], liveSources: ['电视直播源', '填写 M3U / M3U8 频道列表地址；频道及线路由服务端读取，播放时可手动切换。', 'url'], platforms: ['平台入口', '首页展示的视频平台链接，不作为聚合搜索源。', 'url'], parsers: ['解析线路', '填写带 ?url= 等参数的视频解析地址前缀，也支持 {url} 占位符。', 'url'] };
   for (const [kind, [title, description, urlKey]] of Object.entries(descriptions)) {
-    const panel = node('section', undefined, 'settings-section');
-    const heading = node('div', undefined, 'section-heading'); heading.append(node('h2', title), button('＋ 添加', () => { draft[kind].push({ id: `${kind.slice(0, -1)}-${Date.now()}`, name: '', [urlKey]: '', enabled: true, ...(kind === 'platforms' ? { category: '视频' } : {}) }); drawRows(); }, 'button small'));
+    const panel = settingsSection(title, `${draft[kind].length} 项配置 · 按需新增、编辑与排序`);
+    const heading = node('div', undefined, 'section-heading'); heading.append(button('＋ 添加', () => { draft[kind].push({ id: `${kind.slice(0, -1)}-${Date.now()}`, name: '', [urlKey]: '', enabled: true, ...(kind === 'platforms' ? { category: '视频' } : {}) }); drawRows(); }, 'button small'));
     panel.append(heading, node('p', description, 'muted'));
     const list = node('div', undefined, 'config-list'); panel.append(list);
     const drawRows = () => {
+      panel.querySelector('.settings-summary-info').textContent = `${draft[kind].length} 项配置 · 按需新增、编辑与排序`;
       list.replaceChildren();
       if (!draft[kind].length) { list.append(node('p', '暂无配置，点击添加或导入配置。', 'muted')); return; }
       draft[kind].forEach((item, index) => {
@@ -1983,7 +1997,7 @@ function renderSettings() {
         controls.append(up, down, button('删除', () => { draft[kind].splice(index, 1); drawRows(); }, 'button subtle small danger')); row.append(fields, controls); list.append(row);
       });
     };
-    drawRows(); page.append(panel);
+    drawRows(); sections.append(panel);
   }
   content.replaceChildren(page);
 }

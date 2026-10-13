@@ -1,0 +1,14 @@
+services:
+  web:
+    environment:
+      BACKGROUND_MODE: low
+      TRANSCODE_ALLOW_SOFTWARE: "false"
+    cpus: 1.0
+    cpu_shares: 256
+    mem_limit: 768m
+    memswap_limit: 768m
+    pids_limit: 128
+    blkio_config:
+      weight: 100
+    tmpfs:
+      - /tmp:size=128m,mode=1777

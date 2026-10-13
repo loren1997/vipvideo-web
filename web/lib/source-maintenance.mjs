@@ -21,8 +21,10 @@ function validAppleCms(body) {
 }
 
 export function createSourceMaintenance({ store, catalog, initialSources = [], request = networkRequest, now = Date.now, logger = console,
-  playability = createPlayability({ request, now }) }) {
+  playability = createPlayability({ request, now }), backgroundMode = process.env.BACKGROUND_MODE }) {
   catalog ??= createCatalog({ request });
+  const low = backgroundMode === 'low', probeInterval = low ? 60 * 60_000 : PROBE_INTERVAL;
+  let backgroundJob = Promise.resolve();
   let saved;
   try { saved = JSON.parse(store.meta(META_KEY) || '{}'); } catch { saved = {}; }
   if (!saved || typeof saved !== 'object' || Array.isArray(saved)) saved = {};
@@ -39,6 +41,7 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
   let stopping = false;
   let activeRequests = 0;
   const waiting = [];
+  const subscriptionObservers = new Set();
   const persist = () => store.setMeta(META_KEY, JSON.stringify(state));
 
   function status() {
@@ -51,10 +54,11 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
         status: item.enabled === false ? 'disabled' : current?.status || 'unknown',
         latencyMs: current?.latencyMs ?? null, checkedAt: current?.checkedAt ?? 0, error: current?.error || '',
         ...(key === 'api' ? { failures: current?.failures || 0, firstFailureAt: current?.firstFailureAt || 0, retryAt: current?.retryAt || 0 } : {}),
-        ...(key === 'url' ? { added: current?.added || 0, updated: current?.updated || 0, skipped: current?.skipped || 0 } : {}),
+        ...(key === 'url' ? { added: current?.added || 0, updated: current?.updated || 0, skipped: current?.skipped || 0, ...(current?.reason ? { reason: current.reason } : {}), ...(current?.httpStatus ? { httpStatus: current.httpStatus } : {}) } : {}),
       };
     });
     return structuredClone({ running: Boolean(probeJob || updateJob), lastProbe: state.lastProbe, lastUpdate: state.lastUpdate,
+      backgroundMode: low ? 'low' : 'normal', probeIntervalMinutes: probeInterval / 60_000, updateIntervalMinutes: UPDATE_INTERVAL / 60_000,
       sources: rows(config.sources, state.sources, 'api'), subscriptions: rows(config.subscriptions || [], state.subscriptions, 'url') });
   }
 
@@ -73,7 +77,10 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
       const result = (async () => {
         response = await request(url, { timeout: 8000, headers: { Accept: 'application/json' } });
         if (expired) { response.destroy(); throw new Error('请求超时（8 秒）'); }
-        if (response.statusCode < 200 || response.statusCode >= 300) { response.destroy(); throw new Error(`请求返回 HTTP ${response.statusCode}`); }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          const code = response.statusCode, limited = code === 429 || code === 403 && (String(response.headers?.['x-ratelimit-remaining']) === '0' || response.headers?.['retry-after'] !== undefined);
+          response.destroy(); throw Object.assign(new Error(`请求返回 HTTP ${code}`), { httpStatus: code, reason: limited ? 'rate_limit' : code === 404 ? 'not_found' : code === 403 ? 'forbidden' : 'network' });
+        }
         const raw = await readText(response, maxBytes);
         return repair ? raw : JSON.parse(raw);
       })();
@@ -115,7 +122,7 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
   async function runProbe(force) {
     const sources = store.config().sources.filter(source => source.enabled !== false);
     let cursor = 0;
-    await Promise.all(Array.from({ length: Math.min(2, sources.length) }, async () => {
+    await Promise.all(Array.from({ length: Math.min(low && !force ? 1 : 2, sources.length) }, async () => {
       while (cursor < sources.length && !stopping) {
         const source = sources[cursor++];
         const previous = state.sources[source.id]?.api === source.api ? state.sources[source.id] : null;
@@ -134,7 +141,7 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
     persist();
   }
 
-  async function runUpdate() {
+  async function runUpdate(force) {
     const subscriptions = (store.config().subscriptions || []).filter(item => item.enabled !== false);
     for (const subscription of subscriptions) {
       if (stopping) break;
@@ -152,10 +159,13 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
       let updated = 0;
       let skipped = 0;
       let error = '';
+      let reason, httpStatus, stage = 'fetch';
       try {
         const body = await jsonRequest(subscription.url, 1024 * 1024, true);
+        stage = 'format';
         const window = subscriptionWindow(body, previous?.windowCursor || 0);
         const remote = importConfig(validateConfig(emptyConfig()), window.config).sources;
+        stage = 'update';
         const snapshot = store.config();
         const activeSubscription = (snapshot.subscriptions || []).find(item => item.id === subscription.id);
         if (!activeSubscription || activeSubscription.enabled === false || activeSubscription.url !== subscription.url) throw new Error('订阅已变更或停用，本次结果未应用');
@@ -167,14 +177,14 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
         };
         const candidates = [];
         let pageOffset = Number.isSafeInteger(previous?.pageOffset) && previous.pageOffset < remote.length ? previous.pageOffset : 0;
-        while (pageOffset < remote.length && candidates.length < 20) {
+        while (pageOffset < remote.length && candidates.length < (low && !force ? 6 : 20)) {
           const source = remote[pageOffset++];
           if (eligible(source)) candidates.push(source);
         }
         const checked = new Map();
         let next = 0;
-        // shortcut: 每次订阅更新最多验证20个新地址，后续更新继续发现，避免大订阅占满NAS。
-        await Promise.all(Array.from({ length: Math.min(2, candidates.length) }, async () => {
+        // shortcut: 每次最多验证20个新地址；低负载自动更新最多6个，后续继续当前窗口。
+        await Promise.all(Array.from({ length: Math.min(low && !force ? 1 : 2, candidates.length) }, async () => {
           while (!stopping && next < candidates.length) {
             const source = candidates[next++];
             checked.set(source.id, await checkApi(source, { playback: true }));
@@ -201,14 +211,19 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
         store.setConfig(validateConfig({ ...latest, sources }));
         previous = { ...previous, discoveryCursor: 0, windowCursor: pageOffset >= remote.length ? window.nextCursor : previous?.windowCursor || 0,
           pageOffset: pageOffset >= remote.length ? 0 : pageOffset };
-      } catch (cause) { error = errorText(cause); }
+      } catch (cause) { error = errorText(cause); reason = cause?.reason || (stage === 'format' ? 'invalid' : 'network'); httpStatus = cause?.httpStatus; }
       state.subscriptions[subscription.id] = {
         url: subscription.url, status: error ? 'error' : 'ok', latencyMs: Math.max(0, now() - start), checkedAt: now(), error,
+        ...(reason ? { reason } : {}), ...(httpStatus ? { httpStatus } : {}),
         owned: error ? previous?.owned || {} : owned, initialized: previous?.initialized === true,
         discoveryCursor: previous?.discoveryCursor || 0,
         windowCursor: previous?.windowCursor || 0, pageOffset: previous?.pageOffset || 0,
         added: error ? 0 : added, updated: error ? 0 : updated, skipped,
       };
+      if (!stopping) for (const listener of subscriptionObservers) {
+        try { listener(structuredClone({ id: subscription.id, name: subscription.name, ...state.subscriptions[subscription.id] })); }
+        catch (cause) { logger.error?.('订阅检查监听失败', cause); }
+      }
     }
     if (!stopping) state.lastUpdate = now();
     persist();
@@ -216,24 +231,32 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
 
   function probe({ force = true } = {}) {
     if (stopping) return Promise.resolve(status());
-    if (!probeJob) probeJob = runProbe(force).finally(() => { probeJob = null; }).then(status);
+    if (!probeJob) {
+      const operation = () => stopping ? undefined : runProbe(force);
+      probeJob = (low && !force ? backgroundJob.then(operation) : operation()).finally(() => { probeJob = null; }).then(status);
+      if (low && !force) backgroundJob = probeJob.catch(() => {});
+    }
     return probeJob;
   }
 
-  function update() {
+  function update({ force = true } = {}) {
     if (stopping) return Promise.resolve(status());
-    if (!updateJob) updateJob = runUpdate().finally(() => { updateJob = null; }).then(status);
+    if (!updateJob) {
+      const operation = () => stopping ? undefined : runUpdate(force);
+      updateJob = (low && !force ? backgroundJob.then(operation) : operation()).finally(() => { updateJob = null; }).then(status);
+      if (low && !force) backgroundJob = updateJob.catch(() => {});
+    }
     return updateJob;
   }
 
   function schedule(kind) {
     if (!started) return;
     const probeMode = kind === 'probe';
-    const interval = probeMode ? PROBE_INTERVAL : UPDATE_INTERVAL;
+    const interval = probeMode ? probeInterval : UPDATE_INTERVAL;
     const last = probeMode ? state.lastProbe : state.lastUpdate;
     const delay = last ? Math.max(0, Math.min(interval, last + interval - now())) : 0;
     const timer = setTimeout(async () => {
-      try { await (probeMode ? probe({ force: false }) : update()); }
+      try { await (probeMode ? probe({ force: false }) : update({ force: false })); }
       catch (error) { logger.error?.(`影视源${probeMode ? '探测' : '订阅更新'}失败：${errorText(error)}`); }
       finally { schedule(kind); }
     }, delay);
@@ -251,8 +274,10 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
   async function stop() {
     started = false; stopping = true;
     clearTimeout(probeTimer); clearTimeout(updateTimer);
-    await Promise.allSettled([probeJob, updateJob].filter(Boolean));
+    await Promise.allSettled([probeJob, updateJob, backgroundJob].filter(Boolean));
   }
 
-  return { status, probe, update, verify: checkApi, availableConfig, start, stop };
+  return { status, probe, update, verify: checkApi, availableConfig, start, stop,
+    observeSubscriptions(listener) { if (typeof listener !== 'function') throw new TypeError('订阅监听必须是函数'); subscriptionObservers.add(listener); return () => subscriptionObservers.delete(listener); },
+  };
 }

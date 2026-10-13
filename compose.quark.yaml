@@ -22,16 +22,18 @@ services:
       PLUGIN_TIMEOUT: "6"
       ASYNC_PLUGIN_ENABLED: "true"
       ASYNC_RESPONSE_TIMEOUT: "4"
-      ASYNC_MAX_BACKGROUND_WORKERS: "2"
+      ASYNC_MAX_BACKGROUND_WORKERS: "1"
       ASYNC_MAX_BACKGROUND_TASKS: "8"
       ASYNC_LOG_ENABLED: "false"
       CACHE_ENABLED: "true"
       CACHE_PATH: /app/cache
       CACHE_MAX_SIZE: "32"
       CACHE_TTL: "60"
-      GOMAXPROCS: "2"
-    cpus: 0.5
+      GOMAXPROCS: "1"
+    cpus: 0.25
+    cpu_shares: 128
     mem_limit: 384m
+    memswap_limit: 384m
     pids_limit: 64
     read_only: true
     cap_drop:

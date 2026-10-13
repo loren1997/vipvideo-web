@@ -5,6 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { createSourceDiscovery } from '../lib/source-discovery.mjs';
+import { createSourceMaintenance } from '../lib/source-maintenance.mjs';
 import { createStore } from '../lib/store.mjs';
 import { repairImport, subscriptionWindow } from '../lib/import-repair.mjs';
 import { importConfig } from '../lib/config.mjs';
@@ -22,8 +23,8 @@ function memoryStore(initial=empty){
   let config=structuredClone(initial);const metadata=new Map();
   return{metadata,config:()=>config,setConfig(value){config=structuredClone(value);return config;},meta:key=>metadata.get(key),setMeta:(key,value)=>metadata.set(key,value)};
 }
-function fixture({store=memoryStore(),files=new Map(),curated={subscriptions:[],liveSources:[]},forks=[],searchVod=[],searchTv=[],rssVod=[],rssTv=[],verify,play,override,now=()=>1000}={}){
-  const seen=[],verified=[],played=[],errors=[];let updates=0,active=0,maxActive=0;
+function fixture({store=memoryStore(),files=new Map(),curated={subscriptions:[],liveSources:[]},forks=[],searchVod=[],searchTv=[],rssVod=[],rssTv=[],verify,play,override,now=()=>1000,backgroundMode='normal',maintenance:providedMaintenance}={}){
+  const seen=[],verified=[],played=[],errors=[],listeners=new Set();let updates=0,active=0,maxActive=0;
   const request=async(input,options)=>{
     const url=String(input),parsed=new URL(url);seen.push(url);assert.equal(options.timeout,8000);assert.equal(options.headers.Authorization,undefined);
     active++;maxActive=Math.max(maxActive,active);await new Promise(done=>setImmediate(done));active--;
@@ -35,10 +36,10 @@ function fixture({store=memoryStore(),files=new Map(),curated={subscriptions:[],
     if(files.has(url))return response(files.get(url),200,url);
     return response('not found',404,url);
   };
-  const maintenance={status:()=>({sources:[]}),async verify(source,options){verified.push(source);assert.deepEqual(options,{playback:true});return verify?verify(source):{api:source.api,status:'ok',playable:true,checkedAt:now()};},async update(){updates++;}};
+  const maintenance=providedMaintenance||{status:()=>({sources:[]}),async verify(source,options){verified.push(source);assert.deepEqual(options,{playback:true});return verify?verify(source):{api:source.api,status:'ok',playable:true,checkedAt:now()};},async update(){updates++;},observeSubscriptions(listener){listeners.add(listener);return()=>listeners.delete(listener);}};
   const playability={async check(episode){played.push(episode);return play?play(episode):{playable:episode.url.includes('/live.m3u8'),checkedAt:now()};}};
-  const service=createSourceDiscovery({store,maintenance,playability,request,now,logger:{error:(...value)=>errors.push(value)}});
-  return{service,store,seen,verified,played,errors,maintenance,playability,request,get updates(){return updates;},get maxActive(){return maxActive;}};
+  const service=createSourceDiscovery({store,maintenance,playability,request,now,backgroundMode,logger:{error:(...value)=>errors.push(value)}});
+  return{service,store,seen,verified,played,errors,maintenance,playability,request,emitSubscription(result){for(const listener of listeners)listener(result);},get listeners(){return listeners.size;},get updates(){return updates;},get maxActive(){return maxActive;}};
 }
 
 test('unconfigured public forks are verified before automatic subscription and share a concurrent discovery cycle',async()=>{
@@ -317,4 +318,81 @@ test('background windows support bounded JSONC object and array formats without 
   assert.throws(()=>subscriptionWindow({sources:Array.from({length:2001},(_,i)=>({...rows[0],id:'s'+i}))}),/2000/);
   assert.throws(()=>subscriptionWindow({sources:[...rows,{...rows[0]}]}),/重复/);
   const bad={api_site:{safe:{name:'普通',api:'http://127.0.0.1/private'}}};assert.throws(()=>subscriptionWindow(bad),/内网|公网|不允许|公共/);
+});
+
+const DAY=24*60*60_000;
+const hardResult=(row,checkedAt,reason='not_found')=>({...row,status:'error',reason,checkedAt,...(reason==='not_found'?{httpStatus:404}:{})});
+
+test('only an untouched automatic subscription retires after three real hard failures spanning seven days',async()=>{
+  let clock=1000;const url='https://feeds.example/lifecycle.json',f=fixture({now:()=>clock,curated:{subscriptions:[{name:'可信自动订阅',url}],liveSources:[]},files:new Map([[url,payload()]])});
+  await f.service.discover();const row=f.store.config().subscriptions[0];assert.ok(row);assert.equal(f.service.status().retiredCount,0);
+  clock=1001;f.emitSubscription(hardResult(row,clock));f.emitSubscription(hardResult(row,clock));
+  assert.equal(JSON.parse(f.store.meta('source-discovery-v1')).managed[url].hardFailures,1);
+  clock+=3*DAY;f.emitSubscription(hardResult(row,clock,'invalid'));assert.equal(f.store.config().subscriptions.length,1);
+  clock=1001+7*DAY;f.emitSubscription(hardResult(row,clock));assert.equal(f.store.config().subscriptions.length,0);
+  const status=f.service.status();assert.equal(status.retiredCount,1);assert.equal(status.retired[0].id,row.id);assert.equal(status.retired[0].name,row.name);assert.equal(status.retired[0].retryAt,clock+DAY);assert.match(status.retired[0].reason,/404.*7/);
+  assert.equal(JSON.parse(f.store.meta('source-discovery-v1')).managed[url].blocked,false);await f.service.stop();
+});
+
+test('short-lived 404s and success reset the hard chain instead of deleting an automatic subscription',async()=>{
+  let clock=1000;const url='https://feeds.example/temporary.json',f=fixture({now:()=>clock,curated:{subscriptions:[{name:'短暂失效',url}],liveSources:[]},files:new Map([[url,payload()]])});await f.service.discover();const row=f.store.config().subscriptions[0];
+  for(const day of[0,2,6]){clock=1001+day*DAY;f.emitSubscription(hardResult(row,clock));}assert.equal(f.service.status().retiredCount,0);assert.equal(f.store.config().subscriptions.length,1);
+  clock++;f.emitSubscription({...row,status:'ok',checkedAt:clock});assert.equal(JSON.parse(f.store.meta('source-discovery-v1')).managed[url].hardFailures,0);
+  clock=1001+10*DAY;f.emitSubscription(hardResult(row,clock));assert.equal(f.store.config().subscriptions.length,1);assert.equal(JSON.parse(f.store.meta('source-discovery-v1')).managed[url].firstHardFailureAt,clock);await f.service.stop();
+});
+
+test('network errors, forbidden responses and quota limits cannot count as subscription hard retirement',async()=>{
+  let clock=1000;const url='https://feeds.example/network.json',f=fixture({now:()=>clock,curated:{subscriptions:[{name:'临时网络',url}],liveSources:[]},files:new Map([[url,payload()]])});await f.service.discover();const row=f.store.config().subscriptions[0];
+  for(const [reason,httpStatus]of[['network',503],['forbidden',403],['rate_limit',429],['invalid',403]]){
+    clock++;f.emitSubscription(hardResult(row,clock));clock+=DAY;f.emitSubscription(hardResult(row,clock));clock+=7*DAY;f.emitSubscription({...row,status:'error',reason,httpStatus,checkedAt:clock});
+    assert.equal(f.store.config().subscriptions.length,1);assert.equal(f.service.status().retiredCount,0);assert.equal(JSON.parse(f.store.meta('source-discovery-v1')).managed[url].hardFailures,0);
+  }
+  await f.service.stop();
+});
+
+test('handwritten, renamed, disabled, edited and user-deleted subscriptions are never retired or automatically recreated',async t=>{
+  for(const change of['handwritten','rename','disable','url','delete'])await t.test(change,async()=>{
+    let clock=1000;const url='https://feeds.example/'+change+'.json',store=memoryStore(change==='handwritten'?{...empty,subscriptions:[{id:'manual',name:'我的订阅',url,enabled:true}]}:empty);
+    const options={store,now:()=>clock,curated:{subscriptions:[{name:'自动候选',url}],liveSources:[]},files:new Map([[url,payload()]])};const f=fixture(options);await f.service.discover();const original=structuredClone(store.config().subscriptions[0]);
+    const next=change==='rename'?{...original,name:'我改过名称'}:change==='disable'?{...original,enabled:false}:change==='url'?{...original,url:'https://other.example/manual.json'}:original;
+    store.setConfig({...store.config(),subscriptions:change==='delete'?[]:[next]});
+    for(const day of[0,3,7]){clock=1001+day*DAY;f.emitSubscription(hardResult(original,clock));}
+    assert.deepEqual(store.config().subscriptions,change==='delete'?[]:[next]);assert.equal(f.service.status().retiredCount,0);await f.service.stop();
+    const restarted=fixture(options);await restarted.service.discover();assert.deepEqual(store.config().subscriptions,change==='delete'?[]:[next]);assert.equal(restarted.verified.length,0);await restarted.service.stop();
+  });
+});
+
+test('retired subscriptions persist across restart and require actual media proof before restoration',async()=>{
+  let clock=1000;const url='https://feeds.example/recover.json',store=memoryStore(),options={store,now:()=>clock,curated:{subscriptions:[{name:'恢复候选',url}],liveSources:[]},files:new Map([[url,payload()]])};
+  const f=fixture(options);await f.service.discover();const original=store.config().subscriptions[0];for(const day of[0,3,7]){clock=1001+day*DAY;f.emitSubscription(hardResult(original,clock));}await f.service.stop();
+  let playable=false;const restarted=fixture({...options,curated:{subscriptions:[],liveSources:[]},verify:source=>({api:source.api,status:'ok',playable})});assert.equal(restarted.service.status().retiredCount,1);
+  const calls=restarted.seen.length;await restarted.service.discover();assert.equal(restarted.seen.slice(calls).includes(url),false);assert.equal(store.config().subscriptions.length,0);
+  clock+=DAY+1;await restarted.service.discover();assert.equal(store.config().subscriptions.length,0);assert.equal(restarted.service.status().retiredCount,1);assert.equal(restarted.verified.length,1);
+  playable=true;clock+=DAY+1;await restarted.service.discover();assert.deepEqual(store.config().subscriptions,[original]);assert.equal(restarted.service.status().retiredCount,0);assert.equal(JSON.parse(store.meta('source-discovery-v1')).managed[url].hardFailures,0);await restarted.service.stop();
+});
+
+test('manual maintenance updates publish typed failures and drive automatic retirement without a new discovery run',async()=>{
+  let clock=1000,failed=false,f;const url='https://feeds.example/controller.json',store=memoryStore();
+  const maintenance=createSourceMaintenance({store,now:()=>clock,request:async(input,options)=>new URL(input).hostname==='catalog.example'?response({code:1,list:[{vod_id:1,vod_name:'普通样例'}]}):f.request(input,options),catalog:{detail:async()=>({lines:[{episodes:[{url:'https://media.example/sample.mp4',type:'mp4'}]}]})},playability:{check:async()=>({playable:true})},logger:{error:()=>{}}});
+  f=fixture({store,maintenance,now:()=>clock,curated:{subscriptions:[{name:'真实维护连接',url}],liveSources:[]},files:new Map([[url,payload()]]),override:address=>failed&&address===url?response('missing',404,address):undefined});
+  await f.service.discover();assert.equal(store.config().subscriptions.length,1);failed=true;
+  for(const day of[0,3,7]){clock=1001+day*DAY;await maintenance.update();}assert.equal(store.config().subscriptions.length,0);assert.equal(f.service.status().retiredCount,1);
+  await f.service.stop();await maintenance.stop();
+});
+
+test('automatic TV subscriptions also retire on a persistent missing playlist and restore only playable lists',async()=>{
+  let clock=1000,missing=false;const url='https://feeds.example/live-list.m3u',f=fixture({now:()=>clock,curated:{subscriptions:[],liveSources:[{name:'自动电视',url}]},files:new Map([[url,playlist]]),override:address=>missing&&address===url?response('missing',404,address):undefined});
+  await f.service.discover();const row=structuredClone(f.store.config().liveSources[0]);missing=true;
+  for(const day of[0,3,7]){clock=1001+day*DAY;await f.service.discover();}assert.equal(f.store.config().liveSources.length,0);assert.equal(f.service.status().retiredCount,1);assert.equal(f.service.status().retired[0].kind,'live');
+  missing=false;clock+=DAY+1;await f.service.discover();assert.deepEqual(f.store.config().liveSources,[row]);assert.equal(f.service.status().retiredCount,0);await f.service.stop();
+});
+
+test('low-load automatic discovery uses one worker and a smaller budget while manual discovery retains its full budget',async t=>{
+  t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});const subscriptions=Array.from({length:10},(_,i)=>({name:'低负载候选'+i,url:'https://feeds.example/low-'+i+'.json'}));
+  const options={backgroundMode:'low',now:Date.now,curated:{subscriptions,liveSources:[]},files:new Map(subscriptions.map((row,i)=>[row.url,{api_site:Object.fromEntries(Array.from({length:3},(_,j)=>['s'+j,{name:'接口',api:'https://api.example/'+i+'-'+j}]))}])),verify:source=>({api:source.api,status:'error',playable:false})};
+  const automatic=fixture(options);automatic.service.start();t.mock.timers.tick(0);for(let i=0;i<80;i++)await new Promise(done=>setImmediate(done));
+  assert.equal(automatic.service.status().intervalMinutes,60);assert.equal(automatic.service.status().backgroundMode,'low');assert.equal(automatic.maxActive,1);assert.ok(automatic.seen.length<=12);assert.ok(automatic.verified.length<=6);
+  const calls=automatic.seen.length;t.mock.timers.tick(59*60_000);for(let i=0;i<10;i++)await new Promise(done=>setImmediate(done));assert.equal(automatic.seen.length,calls);
+  await automatic.service.stop();assert.equal(automatic.listeners,0);
+  const manual=fixture(options);await manual.service.discover();assert.equal(manual.maxActive,2);assert.equal(manual.verified.length,20);assert.ok(manual.seen.length<=24);await manual.service.stop();
 });

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { get } from 'node:http';
+import { createConnection } from 'node:net';
 import { gunzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
@@ -17,6 +18,27 @@ const detail = { key: 'film', source: 'demo', id: '1', title: '测试影片', ye
   lines: [{ name: '线路', episodes: [{ name: '正片', url: 'https://media.example/video.m3u8?token=abc', type: 'hls' }] }] };
 const catalog = { async search() { return { groups: [{ ...detail, items: [{ source: 'demo', id: '1' }] }], failedSources: [] }; },
   async detail() { return detail; } };
+
+test('incomplete HTTP requests time out with 408 while malformed requests remain rejected', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vipvideo-timeout-'));
+  const app = createApp({ password: 'test-password', dataDir, initialConfig: empty, catalog });
+  app.server.requestTimeout = 100; app.server.headersTimeout = 50; app.server.connectionsCheckingInterval = 25;
+  await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const exchange = request => new Promise((resolve, reject) => {
+    const socket = createConnection({ host: '127.0.0.1', port: app.server.address().port });
+    let response = '';
+    const timer = setTimeout(() => { socket.destroy(); reject(new Error('HTTP error response did not close the connection')); }, 2000);
+    socket.on('connect', () => socket.write(request));
+    socket.on('data', chunk => { response += chunk; });
+    socket.on('error', error => { clearTimeout(timer); reject(error); });
+    socket.on('end', () => { clearTimeout(timer); socket.end(); resolve(response); });
+  });
+  const expired = await exchange('GET /api/config HTTP/1.1\r\nHost: localhost\r\n');
+  assert.match(expired, /^HTTP\/1\.1 408 Request Timeout\r\n/);
+  assert.match(expired, /\r\nConnection: close\r\n/i);
+  assert.match(await exchange('INVALID REQUEST\r\n\r\n'), /^HTTP\/1\.1 400 Bad Request\r\n/);
+});
 
 test('ad inspection resolves configured episodes and preserves ranges for older clients', async t => {
   const source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };

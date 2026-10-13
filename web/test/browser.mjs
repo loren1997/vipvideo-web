@@ -162,6 +162,7 @@ const output = resolve('test-results');
 await mkdir(output, { recursive: true });
 const defaults = JSON.parse(readFileSync(fileURLToPath(new URL('../defaults.json', import.meta.url)), 'utf8'));
 const app = createApp({ password: 'browser-test-password', dataDir: directory, catalog, initialConfig: { ...defaults, sources: [], parsers: [], subscriptions: [], liveSources: [], showAdult: false } });
+const failedConfigReads = [];
 await new Promise(ok => app.server.listen(0, '127.0.0.1', ok));
 const base = `http://127.0.0.1:${app.server.address().port}`;
 const candidates = [process.env.BROWSER_EXECUTABLE, chromium.executablePath(),
@@ -287,11 +288,11 @@ try {
           app.store.setConfig({ ...latest, subscriptions: [...latest.subscriptions.filter(item => item.id !== 'discovered-fixture'), { id: 'discovered-fixture', name: '新发现订阅样例', url: 'https://subscriptions.example/discovered.json', enabled: true }] });
         } else maintenance.statusReads++;
         const latest = app.store.config();
-        return route.fulfill({ json: { running: false, lastProbe: maintenance.checkedAt, lastUpdate: maintenance.updatedAt,
+        return route.fulfill({ json: { running: false, backgroundMode: 'low', probeIntervalMinutes: 60, updateIntervalMinutes: 360, lastProbe: maintenance.checkedAt, lastUpdate: maintenance.updatedAt,
           sources: latest.sources.map(item => ({ ...item, status: item.enabled === false ? 'disabled' : maintenanceHealth && item.id === 'third' ? maintenanceHealth === 'restored' ? 'ok' : 'quarantined' : maintenance.checkedAt ? item.id === 'third' ? 'error' : 'ok' : 'unknown', failures: maintenanceHealth && maintenanceHealth !== 'restored' && item.id === 'third' ? 3 : 0, firstFailureAt: maintenanceHealth && item.id === 'third' ? Date.now() - 3600000 : null, retryAt: maintenanceHealth && maintenanceHealth !== 'restored' && item.id === 'third' ? Date.now() + 1800000 : null, latencyMs: maintenance.checkedAt ? 35 : null, checkedAt: maintenance.checkedAt, error: maintenanceHealth === 'restored' ? '' : maintenance.checkedAt && item.id === 'third' ? '固定检测失败' : '' })),
           subscriptions: (latest.subscriptions || []).map(item => ({ ...item, status: item.enabled === false ? 'disabled' : maintenance.updatedAt ? 'ok' : 'unknown', checkedAt: maintenance.updatedAt, lastUpdate: maintenance.updatedAt, error: '' })),
           liveSources: (latest.liveSources || []).map(item => ({ ...item, status: item.enabled === false ? 'disabled' : maintenance.checkedAt ? 'ok' : 'unknown', latencyMs: 12, checkedAt: maintenance.checkedAt, error: '' })),
-          discovery: { running: false, lastDiscovery: maintenance.discoverCount ? Date.now() : null, candidates: maintenanceHealth ? [{ name: '公开配置403样例', url: 'https://subscriptions.example/forbidden.json', status: 'error', httpStatus: 403, reason: '公开下载暂时受限', error: '固定403', retryAt: Date.now() + 1800000 }, { name: '公开配置404样例', url: 'https://subscriptions.example/missing.json', status: 'error', httpStatus: 404, reason: '上游路径已变更', error: '固定404' }, { name: '新发现订阅样例', url: 'https://subscriptions.example/discovered.json', status: 'ok', added: true }] : maintenance.discoverCount ? [{ name: '新发现订阅样例', url: 'https://subscriptions.example/discovered.json', status: 'ok', added: true }] : [] },
+          discovery: { running: false, backgroundMode: 'low', intervalMinutes: 60, lastDiscovery: maintenance.discoverCount ? Date.now() : null, retiredCount: maintenanceHealth ? 1 : 0, retired: maintenanceHealth ? [{ id: 'retired-fixture', name: '自动订阅撤下样例', kind: 'vod', reason: '跨7天连续404', retryAt: Date.now() + 86400000 }] : [], candidates: maintenanceHealth ? [{ name: '公开配置403样例', url: 'https://subscriptions.example/forbidden.json', status: 'error', httpStatus: 403, reason: '公开下载暂时受限', error: '固定403', retryAt: Date.now() + 1800000 }, { name: '公开配置404样例', url: 'https://subscriptions.example/missing.json', status: 'error', httpStatus: 404, reason: '上游路径已变更', error: '固定404' }, { name: '新发现订阅样例', url: 'https://subscriptions.example/discovered.json', status: 'ok', added: true }] : maintenance.discoverCount ? [{ name: '新发现订阅样例', url: 'https://subscriptions.example/discovered.json', status: 'ok', added: true }] : [] },
         } });
       }
       if (parsed.origin === base && parsed.pathname === '/api/player/preferences') {
@@ -338,7 +339,7 @@ try {
         liveRequests.push(url);
         if (liveProgress) liveProgress.reads++;
         const available = (app.store.config().liveSources || []).some(item => item.enabled !== false) ? channels : [];
-        return route.fulfill({ json: { channels: parsed.searchParams.get('verified') === '1' ? available.filter(channel => channel.streams.some(stream => stream.status === 'ok')) : available, failedSources: liveFailures, probing: liveProgress?.probing || false, checkedStreams: liveProgress?.checkedStreams ?? (liveProgress?.probing ? 2 : 5), totalStreams: liveProgress?.totalStreams ?? 6, lastProbe: Date.now() } });
+        return route.fulfill({ json: { channels: parsed.searchParams.get('verified') === '1' ? available.filter(channel => channel.streams.some(stream => stream.status === 'ok')) : available, failedSources: liveFailures, ...(liveProgress?.backgroundMode ? { backgroundMode: liveProgress.backgroundMode } : {}), probing: liveProgress?.probing || false, checkedStreams: liveProgress?.checkedStreams ?? (liveProgress?.probing ? 2 : 5), totalStreams: liveProgress?.totalStreams ?? 6, lastProbe: Date.now() } });
       }
       if (parsed.origin === base && parsed.pathname === '/api/live/playback') {
         liveRequests.push(url);
@@ -359,6 +360,9 @@ try {
     const page = await value.newPage();
     page.setDefaultTimeout(10000);
     page.on('pageerror', error => errors.push(error.message));
+    page.on('response', async response => {
+      if (new URL(response.url()).pathname === '/api/config' && response.request().method() === 'GET' && response.status() >= 400) failedConfigReads.push({ contextId, status: response.status(), contentType: response.headers()['content-type'] || '', body: (await response.text().catch(error => error.message)).slice(0, 500) });
+    });
     await page.goto(base + initialHash);
     // WAV只验证原生媒体事件，不冒充可被Hls.js解码的MPEG-TS。
     if (nativeMedia) await page.evaluate(() => { window.Hls = { isSupported: () => false, Events: { ERROR: 'hlsError', MANIFEST_PARSED: 'hlsManifestParsed' } }; });
@@ -366,6 +370,13 @@ try {
     await page.locator('#login-form button').click();
     await page.locator('#app-view').waitFor({ state: 'visible' });
     return { value, page, contextId };
+  }
+  async function openSettingsSection(page, title) {
+    const panel = page.locator('details.settings-section').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    try { await panel.waitFor(); }
+    catch (error) { console.error('SETTINGS_SECTION_DIAGNOSTIC', JSON.stringify({ title, state: await page.evaluate(() => ({ href: location.href, appHidden: document.querySelector('#app-view').hidden, loginHidden: document.querySelector('#login-view').hidden, busy: document.querySelector('#content').getAttribute('aria-busy'), headings: [...document.querySelectorAll('h2')].map(item => item.textContent), content: document.querySelector('#content')?.textContent.slice(0, 1000) })), auth: await (await page.request.get(base + '/api/auth')).json(), failedConfigReads, errors })); throw error; }
+    if (!(await panel.evaluate(element => element.open))) await panel.locator(':scope > summary').click();
+    await until(() => panel.evaluate(element => element.open), `展开设置分区 ${title}`); return panel;
   }
   async function verifyBitstreamInitialLevel() {
     const channel = { id: 'initial-level-satellite', name: '码流起始层样例', category: '卫视', group: '起始层样例', preferredLine: 0, streams: [{ name: '已验证H264动态主清单', status: 'ok', type: 'hls', url: 'https://fixtures.example/initial-level-master.m3u8?session=fixture', quality: { width: 1920, height: 1080, source: 'bitstream' } }] };
@@ -500,10 +511,12 @@ try {
   async function verifyQuarantineStatus() {
     let isolated; const before = app.store.config(); maintenanceHealth = true;
     try {
-      isolated = await context({ width: 1440, height: 1000 }, true, false, '#settings'); const p = isolated.page;
+      isolated = await context({ width: 1440, height: 1000 }, true, false, '#settings'); const p = isolated.page; await openSettingsSection(p, '影视源维护');
       const row = p.locator('.maintenance-row').filter({ has: p.getByText('第三源', { exact: true }) });
       await row.getByText('已隔离', { exact: true }).waitFor(); await row.getByText(/连续失败 3 次/).waitFor(); await row.getByText(/首次失败.*下次重试/).waitFor();
       await p.locator('.maintenance-status').getByText(/HTTP 403：访问受限或限流/).waitFor(); await p.locator('.maintenance-status').getByText(/HTTP 404：配置路径不存在/).waitFor();
+      await p.locator('.maintenance-status').getByText(/已撤下 1 个持续失效的自动订阅/).waitFor(); await p.locator('.maintenance-status').getByText(/自动订阅撤下样例.*跨7天连续404.*下次复查/).waitFor();
+      await p.locator('.maintenance-status').getByText(/低负载模式.*后台检测每 60 分钟.*订阅更新每 360 分钟.*订阅发现每 60 分钟/).waitFor();
       assert.deepEqual(app.store.config().sources, before.sources, '隔离展示不会删除或停用用户配置');
       maintenanceHealth = 'restored'; await p.getByRole('button', { name: '立即检测影视源', exact: true }).click(); await row.getByText('可用', { exact: true }).waitFor(); assert.equal(await row.getByText('已隔离', { exact: true }).count(), 0);
       await p.getByRole('button', { name: '发现新订阅', exact: true }).click(); await p.locator('.maintenance-status').getByText(/验证通过，已自动加入订阅/).waitFor();
@@ -516,7 +529,7 @@ try {
   async function verifyQuarkFlow() {
     let isolated; const previousMode = transcodeMode, previousDuration = transcodeDuration;
     try {
-      isolated = await context({ width: 1440, height: 1000 }, true, false, '#settings'); const p = isolated.page;
+      isolated = await context({ width: 1440, height: 1000 }, true, false, '#settings'); const p = isolated.page; await openSettingsSection(p, '夸克网盘');
       await p.getByLabel('夸克账号 Cookie', { exact: true }).waitFor(); await until(() => p.getByLabel('夸克账号 Cookie', { exact: true }).isEnabled(), '账号设置加载完成');
       assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).inputValue(), ''); assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).getAttribute('type'), 'password'); assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).getAttribute('autocomplete'), 'off');
       await p.getByLabel('启用夸克', { exact: true }).check(); await p.getByLabel('自动准备当前单集', { exact: true }).check(); await p.getByLabel('定期清理已看完文件', { exact: true }).check(); await p.getByLabel('夸克看完后保留天数', { exact: true }).fill('3'); await p.getByLabel('夸克账号 Cookie', { exact: true }).fill('quark-fixture-secret-cookie');
@@ -538,6 +551,10 @@ try {
         };
       });
       const decoded = fragment => until(() => p.locator('video').evaluate((video, fragment) => video.readyState >= 2 && video.currentSrc.includes(fragment), fragment).catch(() => false), `网盘媒体 ${fragment}`);
+      async function retryQuark() {
+        const previous = await p.locator('video').elementHandle(); await p.getByRole('button', { name: '重试夸克播放', exact: true }).click();
+        await until(() => p.locator('video').evaluate((video, old) => video !== old, previous).catch(() => false), '重试后挂载新网盘播放器'); await previous.dispose();
+      }
       const beforePrepare = quarkRequests.filter(request => request.path === '/api/quark/prepare').length;
       await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await decoded('quark-first-1'); await p.getByRole('button', { name: '夸克播放', exact: true }).waitFor();
       assert.equal(await p.locator('video').evaluate(video => video.currentSrc.includes('/api/quark/')), false, '准备完成不打断普通播放');
@@ -553,7 +570,7 @@ try {
       await p.screenshot({ path: join(output, 'desktop-quark-player.png'), fullPage: true }); await p.setViewportSize({ width: 390, height: 844 }); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1); await p.screenshot({ path: join(output, 'mobile-quark-player.png'), fullPage: true });
       const beforeFailure = playabilityReports.length, networkJobs = transcodeStarts.length;
       await p.locator('video').evaluate(video => { Object.defineProperty(video, 'error', { value: { code: 2 }, configurable: true }); video.dispatchEvent(new Event('error')); delete video.error; }); await p.locator('.player-note').getByText(/夸克播放中断/).waitFor(); assert.equal(playabilityReports.length, beforeFailure, '云网络故障不停用原来源'); assert.equal(transcodeStarts.length, networkJobs, '云网络错误不启动兼容');
-      await p.getByRole('button', { name: '重试夸克播放', exact: true }).click(); await decoded('/api/quark/media/share-fixture-file-1'); await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 5; });
+      await retryQuark(); await decoded('/api/quark/media/share-fixture-file-1'); await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 5; });
       transcodeMode = 'enabled'; transcodeDuration = 30; const decodeJobs = transcodeStarts.length;
       await p.locator('video').evaluate(video => { Object.defineProperty(video, 'error', { value: { code: 4 }, configurable: true }); video.dispatchEvent(new Event('error')); video.dispatchEvent(new Event('error')); delete video.error; }); await decoded('/api/transcode/');
       assert.equal(transcodeStarts.length, decodeJobs + 1, '明确解码错误只自动兼容一次'); assert.equal(transcodeStarts.at(-1).quarkAsset, 'share-fixture-file-1'); assert.equal(transcodeStarts.at(-1).source, undefined); assert.ok(transcodeStarts.at(-1).position >= 5, '云解码回退沿用原片绝对进度'); assert.equal(playabilityReports.length, beforeFailure);
@@ -569,11 +586,11 @@ try {
       const beforeOutro = quarkProgress.length; await p.locator('video').evaluate(async video => { video.pause(); video.currentTime = 26; try { await video.play(); } catch (error) { if (error.name !== 'AbortError') throw error; } video.dispatchEvent(new Event('timeupdate')); video.dispatchEvent(new Event('timeupdate')); }); await decoded('quark-first-2');
       await until(() => quarkProgress.slice(beforeOutro).some(body => body.assetId === 'share-fixture-file-1' && body.ended && body.position === 30 && body.duration === 30), '跳片尾逻辑完成完整原时长快照保留旧asset'); assert.equal(quarkProgress.slice(beforeOutro).filter(body => body.assetId === 'share-fixture-file-1' && body.ended && body.position === 30).length, 1, '重复timeupdate不重复标完成');
       await p.getByRole('button', { name: '夸克播放', exact: true }).click(); await decoded('/api/quark/media/share-fixture-file-2'); await p.locator('video').evaluate(video => video.pause());
-      quarkMode = 'requires'; transcodeMode = 'enabled'; transcodeDuration = 1200; const jobs = transcodeStarts.length; await p.getByRole('button', { name: '重试夸克播放', exact: true }).click(); await decoded('/api/transcode/');
+      quarkMode = 'requires'; transcodeMode = 'enabled'; transcodeDuration = 1200; const jobs = transcodeStarts.length; await retryQuark(); await decoded('/api/transcode/');
       assert.equal(transcodeStarts.slice(jobs)[0].quarkAsset, 'share-fixture-file-2'); assert.equal(transcodeStarts.slice(jobs)[0].source, undefined, '兼容任务使用cloud asset而非原源URL');
       await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 2; }); await until(() => quarkProgress.some(body => body.assetId === 'share-fixture-file-2' && body.position >= 2 && body.duration === 1200), '云兼容进度仍是原片绝对时间');
       for (const type of ['avi', 'mpegts']) {
-        quarkMode = type; const count = transcodeStarts.length; await p.getByRole('button', { name: '重试夸克播放', exact: true }).click(); await decoded('/api/transcode/'); await until(() => transcodeStarts.length === count + 1, `${type}云文件直接兼容`);
+        quarkMode = type; const count = transcodeStarts.length; await retryQuark(); await decoded('/api/transcode/'); await until(() => transcodeStarts.length === count + 1, `${type}云文件直接兼容`);
         assert.equal(transcodeStarts.at(-1).quarkAsset, 'share-fixture-file-2'); assert.equal(transcodeStarts.at(-1).source, undefined); await p.locator('video').evaluate(video => video.pause());
       }
       quarkMode = 'ambiguous'; await p.locator('nav a[href="#home"]').click(); const ambiguousStarts = quarkRequests.filter(request => request.path === '/api/quark/prepare').length; await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await decoded('quark-first-2'); await p.getByLabel('夸克视频文件', { exact: true }).waitFor();
@@ -581,9 +598,49 @@ try {
       await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-2'); await p.getByRole('button', { name: '转存所选单集', exact: true }).click(); await p.getByRole('button', { name: '夸克播放', exact: true }).waitFor(); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').at(-1).body.auto, false);
       await p.locator('nav a[href="#home"]').click(); quarkMode = 'pending'; quarkAssets.delete('share-fixture-file-2'); await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await p.getByRole('button', { name: '刷新准备状态', exact: true }).waitFor(); const pendingRequests = quarkRequests.filter(request => request.path === '/api/quark/prepare').length; await p.waitForTimeout(150); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').length, pendingRequests, 'pending不无穷轮询/重复转存'); await p.getByRole('button', { name: '刷新准备状态', exact: true }).click(); await p.getByRole('button', { name: '夸克播放', exact: true }).waitFor();
       await p.locator('nav a[href="#home"]').click(); holdQuarkResources = true; await p.evaluate(() => { location.hash = '#detail?source=first&id=quark'; }); await until(() => Boolean(releaseQuarkResources), '资源查询等待中'); await p.locator('nav a[href="#favorites"]').click(); holdQuarkResources = false; releaseQuarkResources(); releaseQuarkResources = null; await p.getByRole('heading', { name: '我的收藏', exact: true }).waitFor(); assert.equal(await p.locator('#quark-resources').count(), 0, '旧网盘异步响应不能接管新路由');
-      await p.locator('nav a[href="#settings"]').click(); await until(() => p.getByRole('button', { name: '断开夸克账号', exact: true }).isEnabled(), '账号状态同步'); const fileCount = quarkSettings.managedFiles, deletes = quarkRequests.filter(request => request.path === '/api/quark/cleanup').length; await p.getByRole('button', { name: '断开夸克账号', exact: true }).click(); await until(() => quarkSettings.configured === false, '账号断连'); assert.equal(quarkSettings.managedFiles, fileCount); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/cleanup').length, deletes, '断连不删除云文件');
+      await p.locator('nav a[href="#settings"]').click(); await openSettingsSection(p, '夸克网盘'); await until(() => p.getByRole('button', { name: '断开夸克账号', exact: true }).isEnabled(), '账号状态同步'); const fileCount = quarkSettings.managedFiles, deletes = quarkRequests.filter(request => request.path === '/api/quark/cleanup').length; await p.getByRole('button', { name: '断开夸克账号', exact: true }).click(); await until(() => quarkSettings.configured === false, '账号断连'); assert.equal(quarkSettings.managedFiles, fileCount); assert.equal(quarkRequests.filter(request => request.path === '/api/quark/cleanup').length, deletes, '断连不删除云文件');
       console.log('PASS 夸克异步只准备当前集/歧义手选/幂等pending刷新、不打断普通流、共享收藏进度和ended旧asset快照、严格广告/原源报告隔离、云兼容、手机桌面与请求取消（固定契约）');
     } finally { holdQuarkResources = false; releaseQuarkResources?.(); releaseQuarkResources = null; transcodeMode = previousMode; transcodeDuration = previousDuration; quarkMode = 'matched'; quarkSettings.configured = false; quarkSettings.account = { connected: false, label: '' }; await isolated?.value.close(); }
+  }
+
+  async function verifyCompactSettings() {
+    const before = app.store.config(); let isolated;
+    try {
+      isolated = await context({ width: 1440, height: 1000 }, true, false, '#settings'); const p = isolated.page;
+      const panels = p.locator('details.settings-section'); await panels.first().waitFor(); assert.equal(await panels.count(), 9); assert.equal(await p.locator('details.settings-section[open]').count(), 0, '长列表默认收起');
+      const desktopHeight = await p.locator('.settings-directory').evaluate(element => element.getBoundingClientRect().height); assert.ok(desktopHeight < 650, '桌面首屏为简短设置目录');
+      await p.screenshot({ path: join(output, 'desktop-settings-compact.png'), fullPage: true });
+      await p.setViewportSize({ width: 390, height: 844 }); const phoneHeight = await p.locator('.settings-directory').evaluate(element => element.getBoundingClientRect().height); assert.ok(phoneHeight < 850, '手机设置目录无需翻多页'); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1);
+      await p.screenshot({ path: join(output, 'mobile-settings-compact.png'), fullPage: true });
+      await panels.evaluateAll(elements => elements.forEach(element => { element.open = true; })); await p.waitForTimeout(50);
+      const expandedHeight = await p.locator('.settings-directory').evaluate(element => element.getBoundingClientRect().height); assert.ok(expandedHeight > phoneHeight * 3, '折叠后高度明显少于完整展开列表');
+      await panels.evaluateAll(elements => elements.forEach(element => { element.open = false; })); await p.waitForTimeout(50);
+      const sources = panels.filter({ has: p.getByRole('heading', { name: '影视源', exact: true }) }); await sources.locator(':scope > summary').focus(); await p.keyboard.press('Enter'); await until(() => sources.evaluate(element => element.open), '遥控器Enter展开源分区');
+      await sources.getByRole('button', { name: '＋ 添加', exact: true }).click(); const index = before.sources.length + 1;
+      await p.getByLabel(`影视源 ${index} 唯一标识`, { exact: true }).fill('settings-fold-fixture'); await p.getByLabel(`影视源 ${index} 显示名称`, { exact: true }).fill('设置展开样例'); await p.getByLabel(`影视源 ${index} 地址`, { exact: true }).fill('https://api.example.com/settings-fold'); assert.equal(await sources.evaluate(element => element.open), true, '新增仍留在当前展开分区');
+      await p.getByRole('button', { name: '保存全部设置', exact: true }).click(); await until(() => app.store.config().sources.some(item => item.id === 'settings-fold-fixture'), '展开分区新增正常保存'); await p.getByLabel(`影视源 ${index} 显示名称`, { exact: true }).waitFor(); assert.equal(await sources.evaluate(element => element.open), true, '保存重绘保留源分区展开'); assert.equal(await p.locator('details.settings-section[open]').count(), 1);
+      await openSettingsSection(p, '影视源维护'); await sources.evaluate(element => { window.__settingsPanelBeforeRefresh = element; }); await p.getByRole('button', { name: '发现新订阅', exact: true }).click(); await until(() => sources.evaluate(element => element !== window.__settingsPanelBeforeRefresh), '后端配置刷新实际重绘设置分区'); await p.locator('.maintenance-status').getByText(/验证通过，已自动加入订阅/).waitFor(); assert.equal(await sources.evaluate(element => element.open), true, '后端配置刷新保留正在编辑分区展开'); assert.equal(await p.locator('details.settings-section[open]').count(), 2);
+      await openSettingsSection(p, '夸克网盘'); await p.getByText(/Request Headers 的 Cookie 完整值，支持 Cookie: 前缀/).waitFor(); assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).getAttribute('type'), 'password'); assert.equal(await p.getByLabel('夸克账号 Cookie', { exact: true }).inputValue(), '');
+      await p.locator('nav a[href="#home"]').click(); await p.locator('nav a[href="#settings"]').click(); await sources.locator(':scope > summary').waitFor(); assert.equal(await sources.evaluate(element => element.open), true, '返回设置保留展开选择');
+      console.log(`PASS 设置目录默认折叠/按需展开、遥控Enter、新增保存与维护刷新保留展开、Cookie完整请求头帮助及手机桌面明显减高 ${JSON.stringify({ desktopHeight, phoneHeight, expandedHeight })}`);
+    } finally { await isolated?.value.close(); app.store.setConfig(before); }
+  }
+
+  async function verifyLowLoadLive() {
+    const previous = liveProgress; let isolated; liveProgress = { backgroundMode: 'low', probing: true, checkedStreams: 2, totalStreams: 7, reads: 0 };
+    try {
+      isolated = await context({ width: 1440, height: 1000 }); const p = isolated.page; await p.clock.install();
+      await p.getByRole('button', { name: '电视直播', exact: true }).click(); await p.locator('.resource-progress').filter({ hasText: '已检查 2/7' }).waitFor();
+      const reads = () => apiReads.filter(item => item.contextId === isolated.contextId && item.path === '/api/live').length;
+      const probes = () => apiReads.filter(item => item.contextId === isolated.contextId && item.path === '/api/live/probe').length;
+      const card = p.locator('.channel-card').first(); await card.waitFor(); await card.evaluate(element => { window.__lowLiveCard = element; }); assert.equal(reads(), 1); assert.equal(probes(), 0);
+      await p.clock.fastForward(4000); assert.equal(reads(), 1, '低负载即使pending也不每1/3秒请求');
+      await p.clock.fastForward(26000); await until(() => reads() === 2, '低负载30秒同步'); assert.equal(await card.evaluate(element => element === window.__lowLiveCard), true, '低频同步仍保留频道卡片DOM');
+      await p.getByRole('button', { name: '刷新频道', exact: true }).click(); await until(() => probes() === 1, '低负载手动探测仍即时'); await until(() => p.getByRole('button', { name: '刷新频道', exact: true }).isEnabled(), '手动探测完成');
+      await p.clock.fastForward(4000); assert.equal(reads(), 2, '手动刷新后仍使用30秒巡检');
+      const stopped = reads(); await p.locator('nav a[href="#home"]').click(); await p.clock.fastForward(30000); assert.equal(reads(), stopped, '离开低负载直播取消同步');
+      console.log('PASS 低负载直播pending仍30秒同步、首4秒单请求、保留卡片DOM、手动刷新即时与离页取消（独立时钟）');
+    } finally { liveProgress = previous; await isolated?.value.close(); }
   }
 
   const { page } = await context({ width: 1440, height: 1000 });
@@ -596,6 +653,7 @@ try {
   console.log('PASS 桌面登录与初始空配置');
 
   await page.locator('nav a[href="#settings"]').click();
+  await openSettingsSection(page, '导入资源配置');
   await page.locator('textarea[aria-label="配置 JSON"]').fill(JSON.stringify({ api_site: {
     first: { name: '第一源', api: 'https://api.example.com/first' }, second: { name: '第二源', api: 'https://api.example.com/second' },
     third: { name: '第三源', api: 'https://api.example.com/third' }, fourth: { name: '第四源', api: 'https://api.example.com/fourth' },
@@ -616,7 +674,7 @@ try {
   await until(() => page.locator('#toast').textContent().then(text => text.includes('内置影视源已添加')), '添加内置源反馈');
   assert.equal(await page.locator('.import-warnings').count(), 0, '无警告的新导入清除上次提示');
   assert.equal(app.store.config().sources.length, 4, '添加内置源应按标识合并，保留其它自定义源');
-  await page.getByLabel('影视源 1 地址', { exact: true }).fill('api.example.com/first?tag=1&amp;x=2');
+  await openSettingsSection(page, '影视源'); await page.getByLabel('影视源 1 地址', { exact: true }).fill('api.example.com/first?tag=1&amp;x=2');
   await page.getByRole('button', { name: '保存全部设置', exact: true }).click();
   await until(() => app.store.config().sources[0].api === 'https://api.example.com/first?tag=1&x=2', '服务端修复无协议地址及HTML参数转义');
   await until(() => page.getByLabel('影视源 1 地址', { exact: true }).inputValue().then(value => value === 'https://api.example.com/first?tag=1&x=2'), '修复地址回填设置表单');
@@ -824,6 +882,7 @@ try {
 
   async function setAdultVisible(target, enabled) {
     await target.locator('nav a[href="#settings"]').click();
+    await openSettingsSection(target, '分类显示');
     await target.getByLabel('显示“三级”分类', { exact: true }).setChecked(enabled);
     await target.getByRole('button', { name: '保存全部设置', exact: true }).click();
     await until(() => app.store.config().showAdult === enabled, '家庭三级显示设置保存');
@@ -926,6 +985,7 @@ try {
   console.log('PASS 综艺栏目点播、无凭证豆瓣评分和出处、评分不阻塞播放、缺评分官方搜索');
 
   await page.locator('nav a[href="#settings"]').click();
+  await openSettingsSection(page, '影视源订阅');
   const subscriptions = page.locator('.settings-section').filter({ has: page.getByRole('heading', { name: '影视源订阅', exact: true }) });
   for (const [index, id, name] of [[1, 'main-subscription', '测试订阅'], [2, 'extra-subscription', '备用订阅']]) {
     await subscriptions.getByRole('button', { name: '＋ 添加', exact: true }).click();
@@ -936,6 +996,7 @@ try {
   await subscriptions.locator('.config-row').nth(1).getByRole('button', { name: '↑ 上移', exact: true }).click();
   await subscriptions.locator('.config-row').nth(0).getByRole('checkbox').uncheck();
   const liveSources = page.locator('.settings-section').filter({ has: page.getByRole('heading', { name: '电视直播源', exact: true }) });
+  await openSettingsSection(page, '电视直播源');
   await liveSources.getByRole('button', { name: '＋ 添加', exact: true }).click();
   await page.getByLabel('电视直播源 1 唯一标识', { exact: true }).fill('fixture-live');
   await page.getByLabel('电视直播源 1 显示名称', { exact: true }).fill('测试直播源');
@@ -944,6 +1005,7 @@ try {
   await until(() => app.store.config().liveSources?.length === 1 && app.store.config().subscriptions?.length === 2, '直播源与订阅持久配置');
   assert.deepEqual(app.store.config().subscriptions.map(item => [item.id, item.enabled]), [['extra-subscription', false], ['main-subscription', true]]);
   assert.equal(app.store.config().showAdult, false, '新增配置不能覆盖共享显示偏好');
+  await openSettingsSection(page, '影视源维护');
   await page.getByRole('button', { name: '立即检测影视源', exact: true }).click();
   await until(() => page.locator('.maintenance-status').textContent().then(text => text.includes('固定检测失败')), '检测结果持久展示');
   assert.equal(maintenance.probeCount, 1);
@@ -1515,8 +1577,16 @@ try {
   await verifyAdSkipping();
   await verifyQuarantineStatus();
   await verifyQuarkFlow();
+  await verifyCompactSettings();
+  await verifyLowLoadLive();
 
+  // 回到原始独立无界面标签，结束已验收的其他会话，模拟用户实际回到该页操作。
+  assert.equal((await (await page.request.get(base + '/api/auth')).json()).authenticated, true, '原会话仍有效，不通过重新登录恢复');
+  for (const completed of browser.contexts()) if (completed !== page.context()) await completed.close();
+  await page.bringToFront();
   await page.locator('nav a[href="#settings"]').click();
+  await page.waitForURL('**/#settings');
+  await openSettingsSection(page, '解析线路');
   const parsers = page.locator('.settings-section').filter({ has: page.getByRole('heading', { name: '解析线路', exact: true }) });
   try { await parsers.getByRole('heading', { name: '解析线路', exact: true }).waitFor(); }
   catch (error) { console.error('SETTINGS_RENDER_DIAGNOSTIC', JSON.stringify({ state: await page.evaluate(() => ({ href: location.href, headings: [...document.querySelectorAll('h2')].map(item => item.textContent), content: document.querySelector('#content')?.textContent.slice(0, 1000) })), errors })); throw error; }

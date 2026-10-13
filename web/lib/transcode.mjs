@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { access, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat } from 'node:fs/promises';
 import { constants, createReadStream } from 'node:fs';
 import { createServer } from 'node:http';
-import { tmpdir } from 'node:os';
+import { setPriority as nodeSetPriority, tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { validateUrl } from './network.mjs';
@@ -15,9 +15,10 @@ const failure = (message, status = 502, cause) => Object.assign(new Error(messag
 const wait = milliseconds => new Promise(done => setTimeout(done, milliseconds));
 const diagnostics = value => String(value).replace(/https?:\/\/[^\s'"<>]+/gi, '[媒体链接]').replace(/[\x00-\x08\x0b-\x1f]/g, '').slice(-4096);
 
-export function createTranscoder({ media, spawn = nodeSpawn, env = process.env, now = Date.now, tmpRoot = tmpdir(), device = '/dev/dri/renderD128', startupTimeout = 20_000, probeTimeout = 3000, killTimeout = 1500, idleTimeout = 120_000, pollInterval = 50, logger = console } = {}) {
+export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeSetPriority, platform = process.platform, env = process.env, now = Date.now, tmpRoot = tmpdir(), device = '/dev/dri/renderD128', startupTimeout = 20_000, probeTimeout = 3000, killTimeout = 1500, idleTimeout = 120_000, pollInterval = 50, logger = console } = {}) {
   const enabled = String(env.TRANSCODE_ENABLED ?? 'true').toLowerCase() !== 'false';
   const preference = ['auto', 'software', 'vaapi'].includes(env.TRANSCODE_ACCEL) ? env.TRANSCODE_ACCEL : 'auto';
+  const allowSoftware = String(env.TRANSCODE_ALLOW_SOFTWARE ?? 'true').toLowerCase() !== 'false';
   const executable = env.FFMPEG_PATH || 'ffmpeg';
   let current, available, availability, availabilityAttempt, closed = false, lastError;
 
@@ -29,6 +30,10 @@ export function createTranscoder({ media, spawn = nodeSpawn, env = process.env, 
     child.once('error', error => settle(null, error));
     child.once('exit', code => settle(code, null));
     child.stderr?.on('data', chunk => { attempt.stderr = (attempt.stderr + String(chunk)).slice(-16_384); onStderr?.(String(chunk)); });
+    if (platform === 'linux' && Number.isInteger(child.pid) && child.pid > 0) {
+      try { setPriority(child.pid, 19); }
+      catch (error) { if (error.code !== 'ESRCH') logger.error('降低兼容播放进程优先级失败', diagnostics(error.message)); }
+    }
     return attempt;
   }
   async function terminate(attempt) {
@@ -130,13 +135,13 @@ export function createTranscoder({ media, spawn = nodeSpawn, env = process.env, 
   }
   function argumentsFor(task, acceleration) {
     const scale = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
-    return ['-hide_banner', '-loglevel', 'info', '-nostats', '-nostdin', '-threads', '2', '-filter_threads', '2',
+    return ['-hide_banner', '-loglevel', 'info', '-nostats', '-nostdin', '-threads', '1', '-filter_threads', '1',
       ...(acceleration === 'vaapi' ? ['-hwaccel', 'vaapi', '-hwaccel_device', device, '-hwaccel_output_format', 'vaapi'] : []),
       '-protocol_whitelist', 'http,tcp,crypto', '-readrate', String(task.speed), '-ss', String(task.position), '-f', inputFormats[task.type],
       ...(task.type === 'hls' ? ['-allowed_extensions', 'ALL'] : []), '-i', task.input,
       '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn', '-vf', acceleration === 'vaapi' ? "scale_vaapi=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12" : `${scale},format=yuv420p`,
       '-c:v', acceleration === 'vaapi' ? 'h264_vaapi' : 'libx264', ...(acceleration === 'vaapi' ? ['-rc_mode', 'VBR', '-b:v', '2500k'] : ['-preset', 'veryfast', '-crf', '23']),
-      '-maxrate', '3500k', '-bufsize', '7000k', '-r', '30', '-threads', '2', '-force_key_frames', 'expr:gte(t,n_forced*2)', '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+      '-maxrate', '3500k', '-bufsize', '7000k', '-r', '30', '-threads', '1', '-force_key_frames', 'expr:gte(t,n_forced*2)', '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
       '-f', 'hls', '-hls_time', '2', '-hls_list_size', '30', '-hls_flags', 'delete_segments+temp_file', '-hls_segment_filename', join(task.dir, 'segment%06d.ts'), join(task.dir, 'index.m3u8')];
   }
   async function ready(task, deadline) {
@@ -172,7 +177,11 @@ export function createTranscoder({ media, spawn = nodeSpawn, env = process.env, 
         task.dir = await mkdtemp(join(tmpRoot, 'vipvideo-transcode-')); assertValid(task);
         task.input = await bridge(task); assertValid(task);
         let acceleration = 'software';
-        if (preference !== 'software') try { await access(device, constants.R_OK | constants.W_OK); acceleration = 'vaapi'; } catch { /* 没有可访问的 GPU 时使用软件编码。 */ }
+        if (preference !== 'software') {
+          try { await access(device, constants.R_OK | constants.W_OK); acceleration = 'vaapi'; }
+          catch { if (preference === 'vaapi' || !allowSoftware) throw failure('GPU 不可访问，已停止兼容播放以避免软件编码，请检查核显映射与权限', 503); }
+        }
+        if (acceleration === 'software' && !allowSoftware) throw failure('软件兼容编码已关闭，请使用可用的核显或切换播放线路', 503);
         const deadline = now() + startupTimeout;
         for (;;) {
           assertValid(task);
@@ -187,7 +196,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, env = process.env, 
           try { await ready(task, deadline); break; }
           catch (error) {
             const files = await readdir(task.dir).catch(() => []);
-            if (acceleration !== 'vaapi' || files.some(file => /^segment\d{6,12}\.ts$/.test(file)) || !valid(task) || now() >= deadline) throw error;
+            if (preference === 'vaapi' || !allowSoftware || acceleration !== 'vaapi' || files.some(file => /^segment\d{6,12}\.ts$/.test(file)) || !valid(task) || now() >= deadline) throw error;
             await terminate(task.attempt); await removeOutput(task); await mkdir(task.dir, { mode: 0o700 }); acceleration = 'software';
           }
         }

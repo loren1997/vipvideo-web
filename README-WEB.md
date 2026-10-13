@@ -71,16 +71,18 @@ docker compose -f compose.yaml logs --tail=100 web
 
 播放器先尝试直连、受限媒体转发和同影片换源；仍无法播放时会尝试“兼容播放”，也可手动点击该按钮。服务端把当前剧集转为浏览器常见的 H.264/AAC HLS，最多 720p，并保留原影片进度。兼容播放每台服务器同时只运行一个任务；其他设备占用时会提示。没有请求达 120 秒后回收任务与临时分片，收藏、进度和配置仍保存在数据卷。
 
-默认 `TRANSCODE_ACCEL=auto`：有权限读写 `/dev/dri/renderD128` 时先尝试 VAAPI，启动阶段初始化或编码失败后改用 CPU；没有设备时直接使用 CPU。软件编码限制为两条线程，解码和滤镜也限制并发；实际 CPU 消耗仍取决于输入编码、分辨率和倍速，高码率或高分辨率输入可能无法实时处理。arm64 镜像提供软件模式，未安装 x86 Intel 驱动。
+默认 `TRANSCODE_ACCEL=auto` 且 `TRANSCODE_ALLOW_SOFTWARE=true`：有权限读写 `/dev/dri/renderD128` 时先尝试 VAAPI，启动阶段初始化或编码失败后改用 CPU；没有设备时直接使用 CPU。软件编码、解码和滤镜限制为单线程，Linux 上 FFmpeg 使用 nice 19 降低竞争优先级；实际 CPU 消耗仍取决于输入编码、分辨率和倍速，高码率或高分辨率输入可能无法实时处理。arm64 镜像提供软件模式，未安装 x86 Intel 驱动。`compose.gpu.yaml` 现在强制 `vaapi`，设备缺失、权限不足或硬件编码失败时直接提示失败。
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `TRANSCODE_ENABLED` | `true` | `false` 关闭兼容播放 |
-| `TRANSCODE_ACCEL` | `auto` | `auto` 自动选择，`software` 强制 CPU，`vaapi` 尝试 Intel VAAPI |
+| `TRANSCODE_ACCEL` | `auto` | `auto` 自动选择，`software` 强制 CPU，`vaapi` 必须使用 Intel VAAPI |
+| `TRANSCODE_ALLOW_SOFTWARE` | `true` | `false` 禁止 CPU 软件编码，包括自动回退和显式软件模式 |
+| `BACKGROUND_MODE` | `normal` | `low` 降低后台探测频率、每轮预算及并发 |
 | `FFMPEG_PATH` | `ffmpeg` | FFmpeg 可执行文件路径 |
 | `RENDER_GID` | 留空 | 仅 GPU Compose 配置使用；填写 Ubuntu render 设备的数字 GID |
 
-从源码部署时在 `.env` 设置前三项。直接镜像部署时可在 `docker-compose.yml` 的 `environment` 修改前三项；默认配置无需 GPU，也能启动。
+从源码部署时在 `.env` 设置这些选项。直接镜像部署时可在 `docker-compose.yml` 的 `environment` 修改；默认配置无需 GPU，也能启动。
 
 ### PVE → Ubuntu Docker 的 i3-8100T
 
@@ -100,7 +102,7 @@ docker compose -f docker-compose.yml -f compose.gpu.yaml up -d
 docker compose -f docker-compose.yml -f compose.gpu.yaml ps
 ```
 
-从源码部署时把上面命令的 `docker-compose.yml` 换成 `compose.yaml`，首次启动加入 `--build`。GPU 配置仅映射 `/dev/dri` 并补充数字组；服务继续以 `node` 用户运行。无需 `privileged`、root 或放宽设备为所有人可写。升级和重启时继续使用相同的两个 `-f` 文件。
+从源码部署时把上面命令的 `docker-compose.yml` 换成 `compose.yaml`，首次启动加入 `--build`。GPU 配置映射 `/dev/dri`、补充数字组并强制使用 VAAPI；服务继续以 `node` 用户运行。无需 `privileged`、root 或放宽设备为所有人可写。升级和重启时继续使用相同的两个 `-f` 文件。
 
 可在容器内运行两秒合成画面检查硬件编码；命令无窗口、无音频，也不生成影片文件：
 
@@ -112,11 +114,40 @@ docker compose -f docker-compose.yml -f compose.gpu.yaml exec -T web \
   -vf format=nv12,hwupload -c:v h264_vaapi -f null -
 ```
 
-命令失败时保留错误输出，检查 GID、设备权限和 iHD 驱动；应用的 `auto` 模式仍会回退软件转码。播放时会显示当前兼容模式。
+命令失败时保留错误输出，检查 GID、设备权限和 iHD 驱动；使用 GPU 配置时不会回退软件转码。播放时会显示当前兼容模式。
 
 跳转或修改倍速会重新建立兼容流。FFmpeg 的 `readrate` 只控制输入读取节奏，输出时间戳保持原速度，由浏览器完成倍速播放；直播兼容播放固定为 1 倍且不提供跳转。临时 HLS 只保留约一分钟的滑动窗口，长时间暂停后恢复或跳到窗口外需重新建立任务。第三方解析网页、DRM 内容和无法读取的源不支持兼容转码。
 
+### 与 Plex 共用 NAS 时
+
+启用 [compose.plex-safe.yaml](compose.plex-safe.yaml)：本应用限制为 1 核 CPU、768 MiB 内存、128 个进程，禁用 swap，降低 CPU / 磁盘竞争权重；转码分片放在 128 MiB 内存临时目录。软件编码与 CPU 回退关闭，硬件不可用时提示失败；直连和普通媒体转发仍可使用。可选 PanSou 配置降低至 0.25 核、单后台 worker、384 MiB 内存。
+
+保护模式将影视接口后台检测和公开订阅发现改为每 60 分钟，订阅刷新保持每 6 小时；直播后台每轮结束至少等待 60 秒，一轮最多 5 条、单并发，直播页面每 30 秒刷新检测结果。手动检测、更新、搜索和点开频道仍保留主动验证能力。减少后台扫描会延长首次发现频道和新订阅的时间。
+
+**只拉新镜像不会修改你 NAS 上的 Compose 限额。** 保留现有 `docker-compose.yml` 内的密码、端口和数据卷，在同一目录下载额外配置后叠加启动：
+
+```sh
+curl -fL -o compose.plex-safe.yaml https://raw.githubusercontent.com/loren1997/vipvideo-web/main/compose.plex-safe.yaml
+docker compose -f docker-compose.yml -f compose.plex-safe.yaml pull
+docker compose -f docker-compose.yml -f compose.plex-safe.yaml up -d
+```
+
+已使用核显、PanSou 的部署，继续带上原来的配置文件，并更新它们以应用严格硬件模式和 PanSou 新限额：
+
+```sh
+curl -fL -o compose.gpu.yaml https://raw.githubusercontent.com/loren1997/vipvideo-web/main/compose.gpu.yaml
+curl -fL -o compose.quark.yaml https://raw.githubusercontent.com/loren1997/vipvideo-web/main/compose.quark.yaml
+docker compose -f docker-compose.yml -f compose.gpu.yaml -f compose.quark.yaml -f compose.plex-safe.yaml pull
+docker compose -f docker-compose.yml -f compose.gpu.yaml -f compose.quark.yaml -f compose.plex-safe.yaml up -d
+```
+
+仅保留你实际使用的 `-f` 文件；核显部署继续使用原来正确的 `RENDER_GID`。没有新增 `.env` 要求。以后升级使用相同的完整 `-f` 列表；撤销保护时去掉 `compose.plex-safe.yaml` 并重新 `up -d`，无需删除数据卷。
+
+CPU / 内存限额会实际限制本应用；权重效果取决于宿主内核与 cgroup。核显和网络仍与 Plex 共享，不能保证完全消除卡顿，过小内存或临时目录预算可能终止本应用的兼容播放。可用 `docker stats --no-stream`、Plex 播放信息和宿主 GPU / 网络监控定位实际竞争来源，再调整保护文件中的配额；没有实测这台 NAS 的资源瓶颈。
+
 ## 配置影视源与播放
+
+资源设置使用可折叠分组，长列表默认收起；桌面采用双列，手机采用单列。分组标题显示数量与状态，保存、更新或返回设置后保留本次浏览器会话中的展开状态；键盘和电视遥控器可以聚焦标题后按确认键展开。
 
 首次启动已配置爱坤、暴风和豪华三个源。旧版本升级时，仅为没有影视源的旧配置初始化一次内置源；已有自定义配置保持不变。也可以在设置页点击“添加内置影视源”，按源标识合并；删除或停用源后不会在每次重启时强制恢复。
 
@@ -178,6 +209,10 @@ HLS 优先使用支持 MSE 的 HLS.js，浏览器不支持时再尝试原生 HLS
 每 15 分钟进行一轮有界的公开订阅发现：读取 [subscription-presets.json 订阅目录](web/subscription-presets.json)、MoonTV / KatelyaTV 配置与少量 forks，结合 GitHub 一般公开仓库搜索和 Bing RSS 公开网页搜索；最多读取两页结果中的显式配置链接，不执行网页脚本、不递归抓站。本轮最多 24 次目录 / 搜索 / 配置请求、20 个候选、2 个并发，最多新增 4 个订阅，每类订阅上限 20 个。未知候选轮换检查，游标存入 SQLite，重启后继续，避免前面的失效地址挡住后续候选。限流、超时、需要验证或格式不兼容的结果会跳过并保留原因。它能拓展已知项目之外的候选，不能保证发现全网所有源或持续找到可用地址。
 
 影视订阅按不超过 200 项的窗口校验后，抽查最多 3 个接口，至少一个接口及其样例影片媒体均通过验证才自动加入；直播列表抽查最多 3 条线路，至少一条通过有限媒体探测才自动加入。目录中的 LunaTV-config、vbskycn 和 TVBox 公开直播汇总来自不同项目，经过配置解析及少量接口 / 媒体抽样；订阅被加入不代表其全部影片或频道可播放。
+
+自动发现的订阅会持续复查。连续至少 3 次明确返回 404 或配置格式失效，且从首次明确失效已持续至少 7 天时，才从启用配置中自动撤下；维护状态保留原因与恢复检查记录。撤下后随发现周期按退避策略重试，重新通过接口和样例媒体验证才自动恢复。短暂超时、403、429、接口或媒体样例失败不触发退订，已有影视源配置也不会随订阅撤下被删除。
+
+只自动撤下本版本记录了原始配置、且仍未经修改的自动订阅。你手动添加、停用、删除、改名或修改地址的订阅，以及旧版本缺少来源凭据的订阅，都按你的设置保留；明确删除的订阅不会被自动发现重新加入。
 
 大订阅按窗口继续检查（最多 2000 个候选），每个订阅每轮轮换验证最多 20 个新增或变更的 API，只有接口及样例媒体探测都通过的地址才加入或替换；已配置影视源上限仍是 200，后续更新继续处理剩余候选。它维护自己引入的源；已有的自定义接口不会被接管，用户修改的名称、接口、停用与删除选择会保留，远端移除的源也不会强制删除。订阅或候选验证失败时保留旧配置，合并前重新读取设置，避免覆盖更新期间的修改。已删除、停用或改址的自动发现订阅不会再次强制添加。手动配置导入仍按标识合并，可以用于明确替换接口。升级时初始化订阅和直播配置一次，之后删除不会在每次启动时重新添加。
 
@@ -331,6 +366,8 @@ docker buildx build --platform linux/amd64,linux/arm64 --tag vipvideo-web:local 
 首次部署前，确认 [发布工作流](https://github.com/loren1997/vipvideo-web/actions/workflows/docker-publish.yml) 已成功完成双平台运行检查。本仓库镜像已可匿名拉取；自行 Fork 的发布仓库仍需配置自己的包可见性。工作流不修改 GitHub 包可见性，也不保存家庭访问密码。
 
 ## 验证与已知范围
+
+本轮设置折叠、Cookie 格式兼容、自动订阅撤下 / 恢复、Plex 保护与 HTTP 超时处理通过 Node.js 24 全套测试：本地 379 项通过、1 项 Docker 集成测试因本机无 Docker 跳过；40 组无界面浏览器完整流程通过。Docker 合并配置、PanSou 健康状态、双架构转码、容器重建及备份恢复由发布 Actions 验证。真实 NAS 的 CPU / 核显 / 网络竞争和真实夸克账号仍需部署后验证。
 
 本轮广告与夸克更新已通过 Node.js 24 下 352 项模块 / 接口测试及 39 组完整无界面浏览器流程（另有 AVI / TS 与云盘原生解码失败自动兼容等专项），覆盖明确 HLS 广告标记、安全导入窗口、源隔离恢复、账号加密、当前单集匹配与转存去重、停止任务排空、完成进度与过期清理，以及 Cookie / SSRF / 注销期间竞态。容器流水线还检查双架构 MP4、AES-128 HLS、MKV、AVI 与 MPEG-TS 兼容播放，以及可选 PanSou 助手的 Compose 合并和健康状态。真实夸克账号、会员速度和 NAS 硬件解码需部署后验证。
 

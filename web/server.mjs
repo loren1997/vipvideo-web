@@ -485,7 +485,6 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   });
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
-  server.on('clientError', (_error, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
   return {
     server, store, maintenance: sourceService, live: liveService, discovery: discoveryService, quark: quarkService,
     async close() { cloudMedia.invalidate(); await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.(), transcodeService.close?.(), quarkService.stop?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },

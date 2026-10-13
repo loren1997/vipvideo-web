@@ -89,7 +89,7 @@ try {
   const media = createMedia({ request: fixtureRequest });
   const cloudMedia = createMedia({ request: fixtureRequest, proxyPath: '/api/quark/media/ci-cloud-lease' });
   transcoder = createTranscoder({ media, tmpRoot: jobs, startupTimeout: 60000, probeTimeout: 10000,
-    env: { ...process.env, TRANSCODE_ENABLED: 'true', TRANSCODE_ACCEL: 'software', FFMPEG_PATH: executable } });
+    env: { ...process.env, TRANSCODE_ENABLED: 'true', TRANSCODE_ACCEL: 'software', TRANSCODE_ALLOW_SOFTWARE: 'true', FFMPEG_PATH: executable } });
   const status = await transcoder.status();
   assert.equal(status.available, true); assert.equal(status.enabled, true);
   server = createServer(async (req, res) => {

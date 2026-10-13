@@ -79,6 +79,36 @@ test('config plus authenticated root listing verifies Cookie before AES-GCM pers
   await service.clearAccount(); assert.equal((await service.settings()).configured, false); assert.equal(state.deletes.length, 0);
 });
 
+test('request Cookie copies support prefixes, token names and repeated pairs while requiring remote account verification', async t => {
+  const { service, state, metadata } = await fixture(t);
+  const samples = [
+    [' Cookie: ' + COOKIE + ' ; ', COOKIE],
+    ['cookie: __puus=synthetic-session', '__puus=synthetic-session'],
+    ['new.session=synthetic-session; __puus=synthetic-session', 'new.session=synthetic-session; __puus=synthetic-session'],
+    ['__puus=first-synthetic; __puus=second-synthetic', '__puus=first-synthetic; __puus=second-synthetic'],
+  ];
+  for (const [input, expected] of samples) {
+    const before = state.calls.length;
+    assert.equal((await service.configure({ cookie: input, enabled: true })).configured, true);
+    assert.deepEqual(state.calls.slice(before).map(call => call.path), ['/config', '/file/sort']);
+    assert.ok(state.calls.slice(before).every(call => call.options.headers.cookie === expected));
+  }
+  const saved = metadata.get('quark-settings-v1');
+  state.beforeRequest = call => call.path === '/file/sort' ? reply(null, { code: 401, status: 401 }) : null;
+  await assert.rejects(service.configure({ cookie: '__puus=expired-synthetic' }), /拒绝|登录/);
+  assert.equal(metadata.get('quark-settings-v1'), saved);
+  assert.equal(state.saved, 0); assert.equal(state.deletes.length, 0);
+});
+
+test('malformed Cookie and header injection are rejected before any network call', async t => {
+  const { service, state, metadata } = await fixture(t);
+  for (const cookie of ['Cookie:', 'Cookie: ; ;', 'Set-Cookie: __puus=x; HttpOnly', '[{"name":"__puus","value":"x"}]',
+    '__puus=x\r\nHost: evil', '__puus=x\tHost:evil', '__puus=x\u0001', '__puus=x\u007f', 'not-a-cookie']) {
+    await assert.rejects(service.configure({ cookie }), error => error.status === 400 && /Cookie 格式无效/.test(error.message));
+  }
+  assert.equal(state.calls.length, 0); assert.equal(metadata.has('quark-settings-v1'), false);
+});
+
 test('anonymous config success is insufficient and invalid Cookie/settings are never persisted', async t => {
   const { service, state, metadata } = await fixture(t);
   state.beforeRequest = call => call.path === '/file/sort' ? reply(null, { code: 401, status: 401 }) : null;

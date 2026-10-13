@@ -5,6 +5,7 @@ import { parsePlaylist } from './live.mjs';
 import { repairAddress, subscriptionWindow } from './import-repair.mjs';
 
 const KEY='source-discovery-v1', INTERVAL=15*60_000;
+const RETIRE_AFTER=7*24*60*60_000;
 const roots=[['Stardm0','MoonTV'],['katelya77','KatelyaTV']];
 const directory='https://raw.githubusercontent.com/loren1997/vipvideo-web/main/web/subscription-presets.json';
 const empty={sources:[],platforms:[],parsers:[],subscriptions:[],liveSources:[]};
@@ -63,9 +64,11 @@ function links(value,hint,name) {
   return kind?[{name:cleanTitle(name),url:url.href,kind,status:'pending',added:false}]:[];
 }
 
-export function createSourceDiscovery({store,maintenance,playability,request=networkRequest,now=Date.now,logger=console}={}) {
+export function createSourceDiscovery({store,maintenance,playability,request=networkRequest,now=Date.now,logger=console,backgroundMode=process.env.BACKGROUND_MODE}={}) {
   if(!store?.config||!store?.setConfig||!store?.meta||!store?.setMeta||!maintenance?.verify||!maintenance?.update||!playability?.check)throw new Error('自动发现需要配置、影视验证和可播放性模块');
-  let state={lastDiscovery:0,discoveryCursor:0,candidates:[],managed:Object.create(null),backoff:Object.create(null),paths:Object.create(null),sourceCursor:Object.create(null)};
+  let state={lastDiscovery:0,discoveryCursor:0,liveLifecycleCursor:0,candidates:[],managed:Object.create(null),backoff:Object.create(null),paths:Object.create(null),sourceCursor:Object.create(null)};
+  const low=backgroundMode==='low',interval=low?60*60_000:INTERVAL;
+  let limits={http:24,verify:20,parallel:2,add:4};
   let job,timer,started=false,stopping=false,active=0,httpCount=0;const waiting=[];
   try{
     const saved=store.meta(KEY);
@@ -75,11 +78,19 @@ export function createSourceDiscovery({store,maintenance,playability,request=net
       if(!data||typeof data!=='object'||Array.isArray(data))throw fail('自动发现记录格式不正确');
       if(Number.isFinite(data.lastDiscovery)&&data.lastDiscovery>=0)state.lastDiscovery=data.lastDiscovery;
       if(Number.isSafeInteger(data.discoveryCursor)&&data.discoveryCursor>=0)state.discoveryCursor=data.discoveryCursor;
+      if(Number.isSafeInteger(data.liveLifecycleCursor)&&data.liveLifecycleCursor>=0)state.liveLifecycleCursor=data.liveLifecycleCursor;
       if(Array.isArray(data.candidates))state.candidates=data.candidates.slice(0,20).filter(row=>row&&typeof row.name==='string'&&typeof row.status==='string').flatMap(row=>{
         try{return[{name:cleanTitle(row.name),url:publicUrl(row.url),kind:['vod','live','provider'].includes(row.kind)?row.kind:'vod',status:row.status.slice(0,30),added:row.added===true,...(row.error?{error:String(row.error).slice(0,300)}:{}),...failureFields(row)}];}catch{return[];}
       });
       if(data.managed&&typeof data.managed==='object'&&!Array.isArray(data.managed))for(const[url,record]of Object.entries(data.managed)){
-        try{if(record&&typeof record.id==='string'&&record.id.length<=200)state.managed[publicUrl(url)]={id:record.id,kind:record.kind==='live'?'live':'vod',blocked:record.blocked===true,...(record.target?{target:publicUrl(record.target)}:{})};}catch{/* 已保存的不可信地址不会用于发现或恢复。 */}
+        try{if(record&&typeof record.id==='string'&&record.id.length<=200)state.managed[publicUrl(url)]={
+          id:record.id,kind:record.kind==='live'?'live':'vod',blocked:record.blocked===true,...(record.target?{target:publicUrl(record.target)}:{}),
+          ...(record.automatic===true&&typeof record.name==='string'&&record.name.length<=200?{automatic:true,name:record.name}:{}),
+          hardFailures:Number.isSafeInteger(record.hardFailures)&&record.hardFailures>=0?Math.min(record.hardFailures,1000):0,
+          firstHardFailureAt:Number.isFinite(record.firstHardFailureAt)&&record.firstHardFailureAt>=0?record.firstHardFailureAt:0,
+          lastCheckedAt:Number.isFinite(record.lastCheckedAt)&&record.lastCheckedAt>=0?record.lastCheckedAt:0,
+          ...(Number.isFinite(record.retiredAt)&&record.retiredAt>0?{retiredAt:record.retiredAt,retiredReason:String(record.retiredReason||'订阅持续失效').slice(0,300)}:{}),
+        };}catch{/* 已保存的不可信地址不会用于发现或恢复。 */}
       }
       for(const[url,record]of Object.entries(data.backoff||{}).slice(-200))try{
         if(record&&['rate_limit','forbidden','not_found','invalid','network'].includes(record.reason)&&Number.isFinite(record.retryAt)&&record.retryAt>=0)state.backoff[publicUrl(url)]={...failureFields(record),error:String(record.error||'公开配置暂不可访问').slice(0,300),failures:Math.min(8,Math.max(1,Number(record.failures)||1)),at:Number(record.at)||0};
@@ -92,33 +103,74 @@ export function createSourceDiscovery({store,maintenance,playability,request=net
     }
   }catch(error){logger.error('自动发现记录无法读取',error);}
   const persist=()=>store.setMeta(KEY,JSON.stringify(state));
-  const status=()=>structuredClone({running:!!job,lastDiscovery:state.lastDiscovery,candidates:state.candidates.slice(0,20)});
+  const status=()=>{
+    const retired=Object.entries(state.managed).filter(([,record])=>record.automatic&&record.retiredAt&&!record.blocked&&!record.target).map(([url,record])=>({id:record.id,name:record.name,url,kind:record.kind,retiredAt:record.retiredAt,reason:record.retiredReason,retryAt:state.backoff[url]?.retryAt||0}));
+    return structuredClone({running:!!job,lastDiscovery:state.lastDiscovery,candidates:state.candidates.slice(0,20),retiredCount:retired.length,retired:retired.slice(0,20),backgroundMode:low?'low':'normal',intervalMinutes:interval/60_000});
+  };
   const sameUrl=(row,url)=>{try{return publicUrl(row.url)===url;}catch{return false;}};
   function reconcile(config){
     for(const[url,record]of Object.entries(state.managed)){
-      const found=(record.kind==='live'?config.liveSources||[]:config.subscriptions||[]).find(row=>sameUrl(row,record.target||url));
-      if(!found||found.enabled===false)record.blocked=true;else{record.id=found.id;record.blocked=false;}
+      const rows=record.kind==='live'?config.liveSources||[]:config.subscriptions||[],found=rows.find(row=>sameUrl(row,record.target||url));
+      if(record.target&&state.managed[record.target]?.retiredAt&&!found){
+        const replacement=rows.find(row=>sameUrl(row,url)),target=state.managed[record.target];
+        if(replacement){record.blocked=true;target.blocked=true;target.automatic=false;}
+        else record.blocked=target.blocked===true;
+        continue;
+      }
+      if(record.automatic){
+        const untouched=found&&found.enabled!==false&&found.id===record.id&&found.name===record.name;
+        if(untouched){if(record.retiredAt){record.automatic=false;delete record.retiredAt;delete record.retiredReason;}record.blocked=false;}
+        else if(!record.retiredAt||found||rows.some(row=>row.id===record.id)){record.blocked=true;record.automatic=false;}
+      }else if(!found||found.enabled===false)record.blocked=true;
+      else{record.id=found.id;record.blocked=false;}
     }
   }
   function configured(row){
     const config=store.config();reconcile(config);
     const target=state.managed[row.url]?.target||row.url;
-    const vod=(config.subscriptions||[]).find(item=>sameUrl(item,target)),tv=(config.liveSources||[]).find(item=>sameUrl(item,target)),found=vod||tv;
-    if(found){state.managed[row.url]={id:found.id,kind:vod?'vod':'live',blocked:found.enabled===false,...(target!==row.url?{target}:{})};row.status=found.enabled===false?'disabled':'existing';return true;}
+    const vod=(config.subscriptions||[]).find(item=>sameUrl(item,target)||sameUrl(item,row.url)),tv=(config.liveSources||[]).find(item=>sameUrl(item,target)||sameUrl(item,row.url)),found=vod||tv;
+    if(found){state.managed[row.url]={...state.managed[row.url],id:found.id,kind:vod?'vod':'live',blocked:found.enabled===false,...(target!==row.url?{target}:{})};row.status=found.enabled===false?'disabled':'existing';return true;}
     if(state.managed[row.url]?.blocked){row.status='skipped';row.error='此订阅已由用户删除、停用或更改';return true;}
     return false;
   }
+  function subscriptionResult(result){
+    if(stopping||!result||typeof result.url!=='string'||!['ok','error'].includes(result.status))return;
+    let url;try{url=publicUrl(result.url);}catch{return;}
+    const record=state.managed[url];if(!record?.automatic||record.target||result.id!==record.id||record.kind!==(result.kind==='live'?'live':'vod'))return;
+    reconcile(store.config());
+    if(record.blocked||!record.automatic){persist();return;}
+    const checkedAt=Number(result.checkedAt);
+    if(!Number.isFinite(checkedAt)||checkedAt<=record.lastCheckedAt||checkedAt>now())return;
+    record.lastCheckedAt=checkedAt;
+    const hard=result.reason==='not_found'&&result.httpStatus===404||result.reason==='invalid'&&(result.httpStatus===undefined||result.httpStatus>=200&&result.httpStatus<300);
+    if(result.status==='ok'||!hard){
+      record.hardFailures=0;record.firstHardFailureAt=0;persist();return;
+    }
+    if(!record.hardFailures)record.firstHardFailureAt=checkedAt;
+    record.hardFailures=Math.min(1000,(record.hardFailures||0)+1);
+    if(!record.retiredAt&&record.hardFailures>=3&&checkedAt-record.firstHardFailureAt>=RETIRE_AFTER){
+      const current=store.config(),field=record.kind==='live'?'liveSources':'subscriptions',rows=current[field]||[];
+      const untouched=rows.find(row=>row.id===record.id&&sameUrl(row,url)&&row.name===record.name&&row.enabled!==false);
+      if(untouched){
+        store.setConfig(validateConfig({...current,[field]:rows.filter(row=>row!==untouched)}));
+        record.retiredAt=checkedAt;record.retiredReason=result.reason==='not_found'?'订阅连续返回 404 且持续至少 7 天':'订阅配置连续无效且持续至少 7 天';
+        state.backoff[url]={reason:result.reason,error:record.retiredReason,retryAt:checkedAt+24*60*60_000,failures:1,at:checkedAt};
+      }
+    }
+    persist();
+  }
+  let unsubscribe=maintenance.observeSubscriptions?.(subscriptionResult);
   async function text(url,maxBytes=1024*1024){
     url=publicUrl(String(url));
     const saved=state.backoff[url];
     if(saved?.retryAt>now())throw Object.assign(fail(saved.error),failureFields(saved),{fromCache:true});
-    if(active>=2)await new Promise(resolve=>waiting.push(resolve));else active++;
+    if(active>=limits.parallel)await new Promise(resolve=>waiting.push(resolve));else active++;
     let response,timer,expired=false;
     try{
       if(stopping)throw fail('自动发现已停止');
       const quota=state.backoff[new URL(url).origin+'/'];
       if(new URL(url).hostname==='api.github.com'&&quota?.reason==='rate_limit'&&quota.retryAt>now())throw Object.assign(fail(quota.error),failureFields(quota),{fromCache:true});
-      if(httpCount>=24)throw fail('本轮公开配置请求次数已达到上限');httpCount++;
+      if(httpCount>=limits.http)throw fail('本轮公开配置请求次数已达到上限');httpCount++;
       const parsed=validateUrl(url);
       return await Promise.race([
         (async()=>{
@@ -142,7 +194,7 @@ export function createSourceDiscovery({store,maintenance,playability,request=net
         new Promise((_,reject)=>{timer=setTimeout(()=>{expired=true;response?.destroy();reject(fail('公开配置请求超时（8 秒）'));},8000);}),
       ]);
     }catch(error){
-      if(!stopping&&!error.fromCache&&httpCount<=24&&!/次数已达到上限/.test(errorText(error))){
+      if(!stopping&&!error.fromCache&&httpCount<=limits.http&&!/次数已达到上限/.test(errorText(error))){
         const failures=Math.min(8,(state.backoff[url]?.failures||0)+1);
         if(!error.reason)error.reason='network';
         if(!error.retryAt)error.retryAt=now()+Math.min(6*60*60_000,INTERVAL*2**(failures-1));
@@ -170,12 +222,14 @@ export function createSourceDiscovery({store,maintenance,playability,request=net
     const target=publicUrl('https://raw.githubusercontent.com/'+[owner,repo,branch,selected.path].join('/'));
     return target===url?null:target;
   }
-  async function run(){
+  async function run({force=true}={}){
+    limits=low&&!force?{http:12,verify:6,parallel:1,add:2}:{http:24,verify:20,parallel:2,add:4};
     httpCount=0;
     const baseline=store.config();reconcile(baseline);
     for(const[kind,rows]of[['vod',baseline.subscriptions||[]],['live',baseline.liveSources||[]]])for(const row of rows){
-      try{state.managed[publicUrl(row.url)]={id:row.id,kind,blocked:row.enabled===false};}catch{/* 无效的现有链接不用于恢复。 */}
+      try{const url=publicUrl(row.url);state.managed[url]={...state.managed[url],id:row.id,kind,blocked:row.enabled===false};}catch{/* 无效的现有链接不用于恢复。 */}
     }
+    for(const result of maintenance.status?.().subscriptions||[])subscriptionResult(result);
     // 在首次联网前登记用户配置，抓取期间的删除也必须保留。
     persist();
     const providers=[],seeds=roots.map(([owner,repo])=>links('https://raw.githubusercontent.com/'+owner+'/'+repo+'/main/config.json','vod',owner+'/'+repo)[0]);
@@ -224,7 +278,18 @@ export function createSourceDiscovery({store,maintenance,playability,request=net
         try{searched.push(...links(new URL(decodeXml(match[2]),result.url).href,page.kind,page.title));}catch{/* 只提取显式配置地址，不递归浏览网页。 */}
       }
     },256*1024)));
-    const unique=new Map(curated.concat(seeds,searched,github,forks).filter(Boolean).map(row=>{
+    const activeLive=Object.entries(state.managed).filter(([,record])=>record.automatic&&record.kind==='live'&&!record.retiredAt&&!record.blocked&&!record.target);
+    const liveStart=activeLive.length?state.liveLifecycleCursor%activeLive.length:0;
+    const liveChecks=Array.from({length:Math.min(limits.parallel,activeLive.length)},(_,index)=>activeLive[(liveStart+index)%activeLive.length]);
+    state.liveLifecycleCursor=activeLive.length?(liveStart+liveChecks.length)%activeLive.length:0;
+    await Promise.all(liveChecks.map(async([url,record])=>{
+      let result={id:record.id,url,kind:'live',status:'ok'};
+      try{const body=await text(url);if(!parsePlaylist(body.body,{id:record.id,name:record.name,url:body.url}).length)throw Object.assign(fail('电视订阅没有有效的公共频道列表'),{reason:'invalid'});}
+      catch(error){if(error.fromCache)return;result={...result,status:'error',reason:error.reason||'network',...(error.httpStatus?{httpStatus:error.httpStatus}:{})};}
+      subscriptionResult({...result,checkedAt:now()});
+    }));
+    const retired=Object.entries(state.managed).filter(([,record])=>record.automatic&&record.retiredAt&&!record.blocked&&!record.target).map(([url,record])=>({name:record.name.replace(/^自动发现 · /,''),url,kind:record.kind,status:'pending',added:false,recovering:true}));
+    const unique=new Map(curated.concat(seeds,searched,github,forks,retired).filter(Boolean).map(row=>{
       const resolved=state.paths[row.url];
       return[resolved?.url||row.url,resolved?{...row,originalUrl:row.url,url:resolved.url}:row];
     }));
@@ -233,14 +298,14 @@ export function createSourceDiscovery({store,maintenance,playability,request=net
     const limit=20-Math.min(20,providers.length),start=unknown.length?state.discoveryCursor%unknown.length:0;
     const selected=Array.from({length:Math.min(limit,unknown.length)},(_,index)=>unknown[(start+index)%unknown.length]);
     // 请求预算耗尽后的候选留到下一轮，避免固定前缀的死链接长期挡住新订阅。
-    state.discoveryCursor=unknown.length?(start+Math.min(selected.length,Math.max(0,24-httpCount)))%unknown.length:0;
+    state.discoveryCursor=unknown.length?(start+Math.min(selected.length,Math.max(0,limits.http-httpCount)))%unknown.length:0;
     const rows=selected.concat(existing.slice(0,limit-selected.length));state.candidates=providers.slice(0,20).concat(rows);
     const checks=new Map(),known=maintenance.status?.().sources||[];let cursor=0,added=0,verificationCount=0;
     function verify(source){
       if(!checks.has(source.api)){
         const present=store.config().sources.some(item=>item.enabled!==false&&item.api===source.api);
         const healthy=known.find(item=>item.api===source.api&&item.status==='ok'&&Number.isFinite(item.checkedAt)&&item.checkedAt<=now()&&now()-item.checkedAt<=6*60*60_000);
-        checks.set(source.api,present&&healthy?.playable===true?Promise.resolve(healthy):verificationCount>=20?Promise.resolve({status:'pending',error:'本轮接口验证已达到上限'}):(verificationCount++,Promise.resolve().then(()=>maintenance.verify(source,{playback:true}))));
+        checks.set(source.api,present&&healthy?.playable===true?Promise.resolve(healthy):verificationCount>=limits.verify?Promise.resolve({status:'pending',error:'本轮接口验证已达到上限'}):(verificationCount++,Promise.resolve().then(()=>maintenance.verify(source,{playback:true}))));
       }
       return checks.get(source.api);
     }
@@ -249,12 +314,13 @@ export function createSourceDiscovery({store,maintenance,playability,request=net
       const window=subscriptionWindow(body,page),sources=importConfig(empty,window.config).sources;
       return{sources,offset:offset<sources.length?offset:0,page,nextCursor:window.nextCursor,total:window.total,warnings:window.warnings};
     }
-    await Promise.all(Array.from({length:2},async()=>{
+    await Promise.all(Array.from({length:limits.parallel},async()=>{
       while(!stopping&&cursor<rows.length){
         const row=rows[cursor++],field=row.kind==='live'?'liveSources':'subscriptions';
         if(configured(row))continue;
-        if(added>=4||(store.config()[field]||[]).length>=20){row.status='skipped';row.error='本轮或当前订阅数量已达到上限';continue;}
+        if(added>=limits.add||(store.config()[field]||[]).length>=20){row.status='skipped';row.error='本轮或当前订阅数量已达到上限';continue;}
         row.status='checking';
+        let configValidated=false;
         try{
           const original=row.originalUrl||row.url;let loaded;
           try{loaded=await text(row.url);}catch(error){
@@ -269,6 +335,7 @@ export function createSourceDiscovery({store,maintenance,playability,request=net
           let usable=false;
           if(row.kind==='vod'){
             const repaired=importedSources(loaded.body,row.url);
+            configValidated=true;
             if(repaired.warnings?.length)row.warnings=repaired.warnings.slice(0,10);
             const sources=repaired.sources;
             const sorted=[...new Map(sources.map(source=>[source.api,source])).values()];
@@ -283,6 +350,7 @@ export function createSourceDiscovery({store,maintenance,playability,request=net
             for(const old of Object.keys(state.sourceCursor).slice(0,-200))delete state.sourceCursor[old];
           }else{
             const channels=parsePlaylist(loaded.body,{id:autoId(row.url),name:row.name,url:loaded.url});
+            configValidated=channels.length>0;
             for(const episode of channels.flatMap(channel=>channel.streams).slice(0,3)){if(stopping)break;if((await playability.check(episode))?.playable){usable=true;break;}}
           }
           if(stopping){row.status='skipped';row.error='自动发现已停止';continue;}
@@ -290,26 +358,29 @@ export function createSourceDiscovery({store,maintenance,playability,request=net
           if(original!==row.url&&configured({...row,url:original})){row.status='skipped';row.error='原订阅已由用户删除、停用或更改';continue;}
           if(configured(row))continue;
           const latest=store.config();
-          if(added>=4||(latest[field]||[]).length>=20){row.status='skipped';row.error='本轮或当前订阅数量已达到上限';continue;}
+          if(added>=limits.add||(latest[field]||[]).length>=20){row.status='skipped';row.error='本轮或当前订阅数量已达到上限';continue;}
           const id=autoId(row.url);
           if((latest[field]||[]).some(item=>item.id===id))throw fail('订阅标识已被使用，本次结果未应用');
-          store.setConfig(validateConfig({...latest,[field]:[...(latest[field]||[]),{id,name:'自动发现 · '+row.name,url:row.url,enabled:true}]}));
-          state.managed[row.url]={id,kind:row.kind,blocked:false};
+          const name=row.recovering&&state.managed[original]?.name||'自动发现 · '+row.name;
+          store.setConfig(validateConfig({...latest,[field]:[...(latest[field]||[]),{id,name,url:row.url,enabled:true}]}));
+          state.managed[row.url]={id,name,kind:row.kind,blocked:false,automatic:true,hardFailures:0,firstHardFailureAt:0,lastCheckedAt:0};
           if(original!==row.url)state.managed[original]={id,kind:row.kind,blocked:false,target:row.url};
           row.status='added';row.added=true;added++;persist();
-        }catch(error){row.status='error';row.error=errorText(error);if(!error.reason)error.reason='invalid';Object.assign(row,failureFields(error));}
+        }catch(error){row.status='error';row.error=errorText(error);if(!error.reason)error.reason=configValidated?'network':'invalid';Object.assign(row,failureFields(error));
+          const record=state.managed[row.url];if(row.recovering&&record?.retiredAt&&!error.fromCache)state.backoff[row.url]={...failureFields(error),error:row.error,retryAt:Math.max(error.retryAt||0,now()+24*60*60_000),failures:1,at:now()};
+        }
       }
     }));
-    if(added&&!stopping)try{await maintenance.update();}catch(error){logger.error('自动发现后的影视源更新失败',error);}
+    if(added&&!stopping)try{await maintenance.update({force});}catch(error){logger.error('自动发现后的影视源更新失败',error);}
     state.lastDiscovery=now();reconcile(store.config());persist();
   }
-  function discover(){
+  function discover(options={}){
     if(stopping)return Promise.resolve(status());
     if(job)return job;
-    job=(async()=>{try{await run();}finally{job=undefined;}return status();})();return job;
+    job=(async()=>{try{await run(options);}finally{job=undefined;}return status();})();return job;
   }
   return{status,discover,
-    start(){if(started)return;started=true;stopping=false;const schedule=delay=>{if(!started)return;timer=setTimeout(async()=>{try{await discover();}catch(error){logger.error('公开影视源自动发现失败',error);}finally{schedule(INTERVAL);}},delay);timer.unref?.();};schedule(0);},
-    async stop(){started=false;stopping=true;clearTimeout(timer);await Promise.allSettled([job].filter(Boolean));},
+    start(){if(started)return;started=true;stopping=false;unsubscribe??=maintenance.observeSubscriptions?.(subscriptionResult);const schedule=delay=>{if(!started)return;timer=setTimeout(async()=>{try{await discover({force:false});}catch(error){logger.error('公开影视源自动发现失败',error);}finally{schedule(interval);}},delay);timer.unref?.();};schedule(0);},
+    async stop(){started=false;stopping=true;clearTimeout(timer);unsubscribe?.();unsubscribe=undefined;await Promise.allSettled([job].filter(Boolean));},
   };
 }

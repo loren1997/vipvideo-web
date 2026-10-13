@@ -27,9 +27,11 @@ function share(value, password = '') {
 }
 
 function cookieInput(value) {
-  if (typeof value !== 'string' || !value.trim() || value.length > 8192 || /[\r\n\u0000]/.test(value)) throw failure('Cookie 格式无效', 400);
-  const parts = value.split(';').map(part => part.trim()).filter(Boolean), keys = new Set();
-  if (parts.some(part => { const match = /^([A-Za-z0-9_-]+)=([^;\r\n]*)$/.exec(part); if (!match || keys.has(match[1])) return true; keys.add(match[1]); return false; }) || ![...keys].some(key => ['__kp', '__pus', '__kps', '__uid', 'uid'].includes(key))) throw failure('Cookie 缺少有效账号登录字段', 400);
+  if (typeof value !== 'string' || !value.trim() || value.length > 8192 || /[\u0000-\u001f\u007f]/.test(value)) throw failure('Cookie 格式无效，请复制 Request Headers 中的完整 Cookie 值', 400);
+  const parts = value.trim().replace(/^cookie\s*:\s*/i, '').split(';').map(part => part.trim()).filter(Boolean);
+  if (!parts.length || parts.some(part => !/^[!#$%&'*+\-.^_`|~A-Za-z0-9]+=[\x20-\x7e]*$/.test(part))) {
+    throw failure('Cookie 格式无效，应为 key=value; key=value，请勿粘贴 JSON、Set-Cookie 或其他请求头', 400);
+  }
   return parts.join('; ');
 }
 
