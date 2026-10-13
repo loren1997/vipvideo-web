@@ -4,6 +4,7 @@ import { createQuarkSearchRequest } from './quark-search.mjs';
 import { searchGoogleQuark } from './quark-google-search.mjs';
 
 const KEY = 'quark-search-pool-v1', DAY = 86_400_000, HEALTH_INTERVAL = 6 * 60 * 60_000;
+const RECALL_KEY = 'quark-search-recall-v2';
 const OFFICIAL = 'https://so.252035.xyz/api/search';
 const sources = [
   'https://api.github.com/repos/fish2018/pansou-web',
@@ -48,7 +49,6 @@ function mergeShare(rows, row) {
   const link = share(row.url, row.password || ''); if (!link) return;
   row = { ...row, ...link };
   const key = new URL(row.url).pathname, previous = rows.get(key);
-  if (!previous && rows.size >= 30) return;
   const codeDate = row[passwordDate] ?? row.publishedAt ?? 0, previousCodeDate = previous?.[passwordDate] ?? previous?.publishedAt ?? 0;
   const replace = !previous || row.password && (!previous.password || codeDate > previousCodeDate);
   const selected = replace ? { ...row } : previous, date = Math.max(row.publishedAt || 0, previous?.publishedAt || 0);
@@ -59,10 +59,10 @@ function mergeShare(rows, row) {
 function shares(data, at) {
   const found = new Map(); let visited = 0;
   function visit(value, title = '', depth = 0, publishedAt) {
-    if (++visited > 10_000 || depth > 6 || found.size >= 30) return;
-    if (Array.isArray(value)) { for (const item of value.slice(0, 100)) visit(item, title, depth + 1, publishedAt); return; }
+    if (++visited > 10_000 || depth > 6) return;
+    if (Array.isArray(value)) { for (const item of value.slice(0, 500)) visit(item, title, depth + 1, publishedAt); return; }
     if (!value || typeof value !== 'object') return;
-    title = String(value.work_title || value.title || value.name || value.file_name || value.note || title).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 300);
+    title = String(value.work_title || value.title || value.name || value.file_name || title || value.note || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 300);
     publishedAt = timestamp(value.publishedAt ?? value.published_at ?? value.datetime ?? value.date, at) ?? publishedAt;
     const link = (!value.type || value.type === 'quark') && share(value.url || value.link, value.password || '');
     if (link) mergeShare(found, { ...link, name: title, ...(publishedAt ? { publishedAt } : {}) });
@@ -76,40 +76,41 @@ function compatible(body, at) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return;
   const payload = data.data && typeof data.data === 'object' ? data.data : data;
   if (data.error || data.success === false || data.code !== undefined && ![0, 200, '0', '200'].includes(data.code)) return;
-  if (!Array.isArray(payload.results) && !(payload.merged_by_type && typeof payload.merged_by_type === 'object' && !Array.isArray(payload.merged_by_type))) return;
+  if (!Array.isArray(payload) && !Array.isArray(payload.results) && !Array.isArray(payload.list) && !(payload.merged_by_type && typeof payload.merged_by_type === 'object' && !Array.isArray(payload.merged_by_type))) return;
   return shares(data, at);
 }
 function rssShares(body, at) {
   if (!/<rss\b/i.test(body) || /<!DOCTYPE\b|<!ENTITY\b|captcha|安全验证/i.test(body)) throw failure('公开网页搜索暂不可用');
-  const rows = new Map();
+  const rows = new Map(); let visited = 0;
   for (const item of body.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)) {
+    if (++visited > 500) break;
     const title = (/<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(item[1])?.[1] || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/<[^>]*>/g, '').replace(/&(?:amp|quot|apos|lt|gt);/g, value => ({ '&amp;': '&', '&quot;': '"', '&apos;': "'", '&lt;': '<', '&gt;': '>' })[value]).slice(0, 300);
     const publishedAt = timestamp(/<pubDate\b[^>]*>([\s\S]*?)<\/pubDate>/i.exec(item[1])?.[1]?.trim(), at);
     for (const match of item[1].replace(/&amp;/g, '&').matchAll(/https:\/\/pan\.quark\.cn\/s\/[a-z0-9]{6,32}(?:\?pwd=[a-z0-9]{1,16})?/gi)) {
       const link = share(match[0]);
       if (link) mergeShare(rows, { ...link, name: title, ...(publishedAt ? { publishedAt } : {}) });
-      if (rows.size >= 30) break;
+      if (rows.size >= 10_000) break;
     }
-    if (rows.size >= 30) break;
+    if (rows.size >= 10_000) break;
   }
   return [...rows.values()];
 }
 const normalized = value => value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-function queryTerms(keyword, values) {
-  const dated = /^(.*?)\s+((?:19|20)\d{2})$/.exec(keyword), title = dated?.[1] || keyword;
+function queryTerms(keyword, values, yearHint) {
+  const hinted = /^(?:19|20)\d{2}$/.test(String(yearHint || ''));
+  const dated = yearHint !== undefined ? undefined : /^(.*?)\s+((?:19|20)\d{2})$/.exec(keyword), title = dated?.[1] || keyword;
   const aliases = (Array.isArray(values) ? values.slice(0, 10) : []).filter(value => typeof value === 'string' && value.trim() && value.length <= 300 && !/[\u0000-\u001f\u007f]/.test(value)).slice(0, 2).map(value => value.trim());
-  return { words: [...new Set([keyword, title, ...aliases])], titles: [...new Set([title, ...aliases].map(normalized).filter(Boolean))].map(word => ({ word, pattern: /^[a-z0-9]+$/.test(word) ? new RegExp('(?:^|[^a-z0-9])' + word.split('').join('[^a-z0-9]*') + '(?:$|[^a-z0-9])', 'i') : undefined })), year: dated?.[2] };
+  const year = hinted ? String(yearHint) : dated?.[2];
+  return { title, aliases, words: [...new Set([title, ...aliases, ...(year ? [title + ' ' + year] : [])])], titles: [...new Set([title, ...aliases].map(normalized).filter(Boolean))].map(word => ({ word, pattern: /^[a-z0-9]+$/.test(word) ? new RegExp('(?:^|[^a-z0-9])' + word.split('').join('[^a-z0-9]*') + '(?:$|[^a-z0-9])', 'i') : undefined })), year };
 }
-function matching(rows, query) {
-  return rows.filter(row => {
-    const title = normalized(row.name || '');
-    if (!query.titles.some(({ word, pattern }) => title.includes(word) && (!pattern || pattern.test((row.name || '').normalize('NFKC'))))) return false;
-    const years = [...(row.name || '').matchAll(/(?:^|[^\d])((?:19|20)\d{2})(?!\d)/g)].map(match => match[1]);
-    return !query.year || !years.length || years.includes(query.year);
-  });
+function relevance(row, query) {
+  const title = normalized(row.name || '');
+  return query?.titles.some(({ word, pattern }) => title.includes(word) && (!pattern || pattern.test((row.name || '').normalize('NFKC')))) ? 1 : 0;
 }
-const result = rows => {
-  const body = JSON.stringify({ results: [...rows].sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0)) });
+const ranked = (rows, query) => [...rows].sort((a, b) => relevance(b, query) - relevance(a, query) || (b.publishedAt || 0) - (a.publishedAt || 0));
+const result = (rows, query, reason) => {
+  const found = ranked(rows, query).slice(0, 30).sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0)).map(row => ({ ...row, name: row.name || '未提供资源标题' }));
+  const body = JSON.stringify({ results: found, ...(reason ? { reason } : {}) });
   return Object.assign(Readable.from([body]), { statusCode: 200, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } });
 };
 
@@ -257,11 +258,16 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
         if (!keyword) throw failure('搜索关键词不能为空', 400);
         currentPrimary = web ? undefined : base;
         const primary = web ? undefined : add(base, '手动配置', false), deadline = now() + 7500;
-        const query = queryTerms(keyword, _options.aliases), cacheKey = JSON.stringify([base, keyword, query.words, web]);
+        if (primary && store.meta(RECALL_KEY) !== '1') {
+          store.setMeta(RECALL_KEY, '1');
+          if (!primary.automatic && primary.status === 'paused') { primary.status = 'pending'; primary.retryAt = 0; persist(); }
+        }
+        const query = queryTerms(keyword, _options.aliases, _options.year), cacheKey = JSON.stringify([base, keyword, query.words, query.year, web]);
         for (const [key, entry] of recent) if (entry.expires <= now()) recent.delete(key);
         const cached = recent.get(cacheKey);
-        if (cached?.rows.size) return result([...cached.rows.values()]);
+        if (cached?.rows.size) return result([...cached.rows.values()], query, cached.reason);
         const entry = { rows: new Map(), expires: now() + 2 * 60_000 };
+        const notes = new Set(), report = message => { notes.add(message); entry.reason = [...notes].join('；'); };
         recent.set(cacheKey, entry); while (recent.size > 32) recent.delete(recent.keys().next().value);
         const merge = rows => {
           if (stopping || entry.expires <= now()) return;
@@ -269,6 +275,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
             const { publishedAt: rawDate, ...item } = row, publishedAt = timestamp(rawDate, now());
             mergeShare(entry.rows, { ...item, ...(publishedAt ? { publishedAt } : {}) });
           }
+          entry.rows = new Map(ranked(entry.rows.values(), query).slice(0, 30).map(row => [new URL(row.url).pathname, row]));
         };
         const backups = state.candidates.filter(row => row.automatic && row.url !== base && row.status === 'healthy' && row.retryAt <= now()).sort((a, b) => b.checkedAt - a.checkedAt);
         const selected = web ? [] : [...(primary && primary.retryAt <= now() ? [primary] : []), ...backups].slice(0, 2);
@@ -279,8 +286,8 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
             try {
               const links = compatible(await text(apiUrl(row.url, word), 5500, request, 2 * 1024 * 1024, deadline - 1800), now());
               if (links === undefined) throw failure('搜索接口格式不兼容'); valid = true; checked(row, links);
-              const matched = matching(links, query); merge(matched); if (matched.length) return matched;
-            } catch (cause) { failed(row, cause); break; }
+              merge(links); const matched = links.filter(link => relevance(link, query)); if (matched.length) return matched;
+            } catch (cause) { failed(row, cause); report(cause?.quarkPoolLocal ? '夸克搜索繁忙，请稍后重试' : '部分夸克搜索接口暂不可用'); break; }
           }
           return [];
         }));
@@ -295,16 +302,16 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           try { await Promise.race([Promise.allSettled(attempts), new Promise(done => { timer = setTimeout(done, Math.max(1, Math.min(150, deadline - now()))); })]); }
           finally { clearTimeout(timer); }
           if (stopping) throw failure('公开搜索已停止', 503, true);
-          return result([...entry.rows.values()]);
+          return result([...entry.rows.values()], query, entry.reason);
         }
-        const fallback = new URL('https://www.bing.com/search'); fallback.search = new URLSearchParams({ q: (query.year ? query.words[1] : keyword) + ' site:pan.quark.cn/s', format: 'rss' }).toString();
+        const fallback = new URL('https://www.bing.com/search'); fallback.search = new URLSearchParams({ q: query.title + ' site:pan.quark.cn/s', format: 'rss' }).toString();
         const pages = await Promise.allSettled([
-          googleSearch(keyword, { read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline)), deadline, now }),
+          googleSearch(query.title, { aliases: query.aliases, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline)), deadline, now }),
           text(fallback.href, Math.max(1, deadline - now()), request, 2 * 1024 * 1024, deadline).then(body => rssShares(body, now())),
         ]);
         if (stopping) throw failure('公开搜索已停止', 503, true);
-        for (const page of pages) if (page.status === 'fulfilled') { valid = true; merge(matching(page.value, query)); }
-        if (valid) return result([...entry.rows.values()]);
+        for (const [index, page] of pages.entries()) if (page.status === 'fulfilled') { valid = true; merge(page.value); } else report(index === 0 ? 'Google 公开搜索暂不可用' : 'Bing 公开搜索暂不可用');
+        if (valid) return result([...entry.rows.values()], query, entry.reason);
         throw failure('公开搜索接口和网页搜索暂不可用，请稍后重试');
       });
     },

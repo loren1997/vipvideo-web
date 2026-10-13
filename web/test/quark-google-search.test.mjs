@@ -32,6 +32,46 @@ test('Google requests the title plus Quark and best-effort date order, following
   for (const call of input.calls) { assert.equal(call.maxBytes, 512 * 1024); assert.equal(call.deadline, time + 3000); assert.ok(call.duration <= 1800); }
 });
 
+test('a release-year hint never removes matching Google resources which omit that year', async () => {
+  const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': article(link('https://pan.quark.cn/s/abcdef1')) });
+  const rows = await searchGoogleQuark(title + ' 2026', input);
+  assert.equal(rows.length, 1, 'previously the strict title-plus-year filter discarded this fixture before reading the page');
+  assert.equal(input.calls.length, 2);
+  assert.equal(new URL(input.calls[0].url).searchParams.get('q'), title + ' 夸克');
+});
+
+test('clean titles discover ongoing series collections without confusing publication dates with release years', async t => {
+  for (const [keyword, queryTitle, pageTitle] of [
+    ['遮天 2023', '遮天', '遮天 动漫合集 更新至160集 2026'],
+    ['一念永恒', '一念永恒', '一念永恒 完结季 全季合集 2026'],
+    ['希望2026', '希望2026', '希望2026 高清资源'],
+  ]) await t.test(keyword, async () => {
+    const input = fixture(link('https://posts.example/series', pageTitle), { 'https://posts.example/series': `<title>${pageTitle}</title><article><time datetime="2026-10-13"></time>${link('https://pan.quark.cn/s/abcdef1', queryTitle + ' 夸克全集')}</article>` });
+    const rows = await searchGoogleQuark(keyword, input);
+    assert.equal(new URL(input.calls[0].url).searchParams.get('q'), queryTitle + ' 夸克');
+    assert.equal(rows.length, 1); assert.equal(rows[0].publishedAt, Date.parse('2026-10-13'));
+  });
+});
+
+test('explicit aliases can match public page titles while unrelated titles remain excluded', async () => {
+  const input = fixture(link('https://posts.example/movie', 'Test Movie 资源') + link('https://posts.example/unrelated', 'Unrelated Movie 资源'), {
+    'https://posts.example/movie': '<title>Test Movie 全集</title><a href="https://pan.quark.cn/s/abcdef1">Test Movie 下载</a>',
+  });
+  const rows = await searchGoogleQuark(title + ' 2026', { ...input, aliases: ['Test Movie', '', null] });
+  assert.equal(rows.length, 1); assert.equal(rows[0].name, 'Test Movie 下载');
+  assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/movie']);
+});
+
+test('a canonical title containing a spaced year-like number is preserved without confusing its release year', async () => {
+  const input = fixture(link('https://posts.example/2049', '银翼杀手 2049（2017）夸克资源') + link('https://posts.example/1982', '银翼杀手（1982）夸克资源'), {
+    'https://posts.example/2049': '<title>银翼杀手 2049（2017）4K资源</title><article><a href="https://pan.quark.cn/s/abcdef1">银翼杀手2049 夸克高清</a></article>',
+  });
+  const rows = await searchGoogleQuark(' 银翼杀手 2049 ', { ...input, titleOnly: true });
+  assert.equal(new URL(input.calls[0].url).searchParams.get('q'), '银翼杀手 2049 夸克');
+  assert.equal(rows.length, 1); assert.equal(rows[0].name, '银翼杀手2049 夸克高清');
+  assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/2049']);
+});
+
 test('HTML entities, direct Google links, visible share text and nearby extraction codes produce canonical shares', async () => {
   const input = fixture(link('https://pan.quark.cn/s/direct1?pwd=A1B2&amp;utm_source=google') + link('https://posts.example/movie'), {
     'https://posts.example/movie': article(`<meta property="article:published_time" content="2026-10-13T12:00:00+08:00">

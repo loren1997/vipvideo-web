@@ -240,7 +240,7 @@ test('stop waits for current jobs, scheduled discovery stays single flight, and 
   await assert.rejects(lookup(f.pool), /公开搜索已停止/);
 });
 
-test('a year-specific miss retries the complete title and excludes other titles or explicit conflicting years', async () => {
+test('complete titles are queried before year hints and weak or conflicting-year candidates stay visible', async () => {
   const f = fixture({ request: url => {
     const word = new URL(url).searchParams.get('kw');
     if (word === '电影 2026') return response(json('https://pan.quark.cn/s/wrong123456', '其他电影 2025'));
@@ -253,12 +253,12 @@ test('a year-specific miss retries the complete title and excludes other titles 
   } });
   try {
     const result = await lookup(f.pool, 'https://manual.example/api/search?kw=' + encodeURIComponent('电影 2026'));
-    assert.deepEqual(result.results.map(row => row.url), [quarkUrl]);
-    assert.deepEqual(f.calls.map(call => new URL(call.url).searchParams.get('kw')), ['电影 2026', '电影']);
+    assert.deepEqual(result.results.map(row => row.url), [quarkUrl, 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/other123456']);
+    assert.deepEqual(f.calls.map(call => new URL(call.url).searchParams.get('kw')), ['电影']);
   } finally { await f.pool.stop(); }
 });
 
-test('only explicit bounded aliases extend matching and English titles require complete word boundaries', async () => {
+test('explicit bounded aliases improve candidate ranking and English titles require complete word boundaries for relevance', async () => {
   const f = fixture({ request: url => {
     const word = new URL(url).searchParams.get('kw');
     return response(word === 'IT' ? JSON.stringify({ results: [
@@ -270,8 +270,8 @@ test('only explicit bounded aliases extend matching and English titles require c
   try {
     const url = 'https://manual.example/api/search?kw=' + encodeURIComponent('小丑回魂 2017');
     const result = JSON.parse(await readText(await f.pool.request(url, { aliases: [null, 'IT', 'Bad\nAlias', '第二个别名', '不应搜索'], headers: { Cookie: 'user-cookie' } })));
-    assert.deepEqual(result.results.map(row => row.url), [quarkUrl]);
-    assert.deepEqual(f.calls.map(call => new URL(call.url).searchParams.get('kw')), ['小丑回魂 2017', '小丑回魂', 'IT']);
+    assert.deepEqual(result.results.map(row => row.url), [quarkUrl, 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/wrong123456']);
+    assert.deepEqual(f.calls.map(call => new URL(call.url).searchParams.get('kw')), ['小丑回魂', 'IT']);
     assert.ok(f.calls.every(call => !JSON.stringify(call.options).includes('user-cookie')));
   } finally { await f.pool.stop(); }
 });
@@ -340,7 +340,7 @@ test('concurrent requests for one film both receive their results while the cach
   } finally { await f.pool.stop(); }
 });
 
-test('RSS fallback matches titles and years without accepting an unrelated or unnamed share', async () => {
+test('RSS fallback ranks complete titles while retaining legal weak and unnamed candidates for review', async () => {
   const f = fixture({ request: url => response(url.includes('bing.com') ? '<rss><channel>' +
     `<item><title><![CDATA[电影 (2026) 4K]]></title><link>${quarkUrl}?pwd=1234</link></item>` +
     '<item><title>电影 2025</title><link>https://pan.quark.cn/s/old12345678</link></item>' +
@@ -348,7 +348,8 @@ test('RSS fallback matches titles and years without accepting an unrelated or un
     '<item><link>https://pan.quark.cn/s/unnamed12345</link></item></channel></rss>' : '{"results":[]}') });
   try {
     const result = await lookup(f.pool, 'https://manual.example/api/search?kw=' + encodeURIComponent('电影 2026'));
-    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234']);
+    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/wrong123456', 'https://pan.quark.cn/s/unnamed12345']);
+    assert.equal(result.results.at(-1).name, '未提供资源标题');
     assert.equal(new URL(f.calls.at(-1).url).searchParams.get('q'), '电影 site:pan.quark.cn/s');
   } finally { await f.pool.stop(); }
 });
@@ -382,7 +383,7 @@ test('explicit web lookup skips APIs, shares two network slots and merges Google
     peak = Math.max(peak, ++active); await new Promise(done => setImmediate(done)); active--;
     return response(url.includes('bing.com') ? `<rss><channel><item><title>电影 2026</title><pubDate>Tue, 01 Sep 2026 00:00:00 GMT</pubDate><link>${quarkUrl}?pwd=1234</link></item><item><title>电影 4K</title><link>https://pan.quark.cn/s/unknown12345</link></item></channel></rss>` : '<html>public index</html>');
   }, googleSearch: async (keyword, { read, deadline, now }) => {
-    googleCalls++; assert.equal(keyword, '电影 2026'); assert.equal(deadline - now(), 7500);
+    googleCalls++; assert.equal(keyword, '电影'); assert.equal(deadline - now(), 7500);
     await read('https://www.google.com/search?q=' + encodeURIComponent(keyword), 3000, 512 * 1024, deadline);
     await read('https://index.example/movie', 3000, 512 * 1024, deadline);
     return [
@@ -396,8 +397,8 @@ test('explicit web lookup skips APIs, shares two network slots and merges Google
     const result = JSON.parse(await readText(await f.pool.request(url, { webSearch: true, headers: { Cookie: 'user-cookie' } })));
     assert.equal(googleCalls, 1); assert.equal(peak, 2);
     assert.ok(f.calls.every(call => !/manual\.example|backup\.example/.test(call.url)));
-    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/unknown12345']);
-    assert.deepEqual(result.results.map(row => row.publishedAt), [latest, older, undefined]);
+    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/wrong123456', 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/unknown12345']);
+    assert.deepEqual(result.results.map(row => row.publishedAt), [latest, latest, older, undefined]);
   } finally { await f.pool.stop(); }
 });
 
@@ -523,6 +524,123 @@ test('future dates are discarded before web results merge and cached ordering', 
     assert.equal(result.results[0].url, 'https://pan.quark.cn/s/recent123456');
     assert.deepEqual(result.results.map(row => row.publishedAt), [recent, undefined, undefined]);
     assert.deepEqual(JSON.parse(await readText(await f.pool.request(url, { webSearch: true }))), result);
+  } finally { await f.pool.stop(); }
+});
+
+test('discovery retains valid Quark candidates for real catalogue naming variations and incomplete API metadata', async () => {
+  const cases = [
+    ['quality note', '遮天', { results: [{ title: '遮天 全季合集', links: [{ type: 'quark', url: quarkUrl, note: '4K1080P' }] }] }, '遮天'],
+    ['missing title', '遮天', { results: [{ links: [{ type: 'quark', url: quarkUrl }] }] }, '未提供资源标题'],
+    ['mixed collection years', '遮天', { results: [{ title: '遮天 动画持续更新至EP150 全季合集2022-2026', url: quarkUrl }] }, '遮天'],
+    ['season status suffix', '一念永恒 完结季', { results: [{ title: '一念永恒 第一二三季合集', url: quarkUrl }] }, '一念永恒'],
+    ['abbreviated catalogue name', '转生成为哥布林有什么问题吗？', { results: [{ title: '转生成为哥布林', url: quarkUrl }] }, '转生成为哥布林'],
+    ['recognizable data array', '遮天', { code: 200, data: [{ title: '遮天 全季合集', url: quarkUrl }] }, '遮天'],
+    ['target after first 30 links', '遮天', { results: [...Array.from({ length: 30 }, (_, index) => ({ title: '公开资源' + index, url: 'https://pan.quark.cn/s/abcdef' + String(index).padStart(6, '0') })), { title: '遮天 全季合集', url: quarkUrl }] }, '遮天'],
+    ['target after first 100 rows', '遮天', { results: [...Array.from({ length: 100 }, () => ({ title: '其他记录', links: [{ type: 'baidu', url: 'https://example.org' }] })), { title: '遮天 全季合集', url: quarkUrl }] }, '遮天'],
+  ];
+  for (const [label, keyword, body, expectedName] of cases) {
+    const f = fixture({ request: url => response(url.includes('bing.com') ? rss() : JSON.stringify(body)) });
+    try {
+      const result = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?' + new URLSearchParams({ kw: keyword }), { year: '2023' })));
+      assert.ok(result.results.length > 0, label); assert.ok(result.results.length <= 30, label);
+      assert.equal(result.results[0].url, quarkUrl, label); assert.ok(result.results[0].name.includes(expectedName), label);
+    } finally { await f.pool.stop(); }
+  }
+});
+
+test('canonical titles keep numeric endings when an explicit release year is supplied', async () => {
+  for (const title of ['银翼杀手 2049', '希望2026']) {
+    const f = fixture({ request: url => response(url.includes('bing.com') ? rss() : json(undefined, title)) });
+    try {
+      const url = 'https://manual.example/api/search?' + new URLSearchParams({ kw: title });
+      const result = JSON.parse(await readText(await f.pool.request(url, { year: title.startsWith('银翼') ? '2017' : '2026' })));
+      assert.equal(result.results.length, 1); assert.equal(new URL(f.calls[0].url).searchParams.get('kw'), title);
+      assert.equal(f.calls.length, 1);
+    } finally { await f.pool.stop(); }
+  }
+});
+
+test('canonical web titles and explicit aliases reach Google without stripping numeric endings twice', async () => {
+  const f = fixture({ request: () => response('<rss><channel></channel></rss>'), googleSearch: async (title, options) => {
+    assert.equal(title, '银翼杀手 2049'); assert.equal(options.titleOnly, true);
+    assert.deepEqual(options.aliases, ['Blade Runner 2049']);
+    return [{ name: '银翼杀手 2049', url: quarkUrl }];
+  } });
+  try {
+    const url = 'https://manual.example/api/search?' + new URLSearchParams({ kw: '银翼杀手 2049' });
+    const result = JSON.parse(await readText(await f.pool.request(url, { year: '2017', aliases: ['Blade Runner 2049'], webSearch: true })));
+    assert.equal(result.results.length, 1);
+    assert.equal(new URL(f.calls[0].url).searchParams.get('q'), '银翼杀手 2049 site:pan.quark.cn/s');
+  } finally { await f.pool.stop(); }
+});
+
+test('an explicit unknown year still marks a numeric-ending title as canonical and stays separate from legacy queries', async () => {
+  const f = fixture();
+  try {
+    const url = 'https://manual.example/api/search?' + new URLSearchParams({ kw: '银翼杀手 2049' });
+    const canonical = JSON.parse(await readText(await f.pool.request(url, { year: '' })));
+    assert.equal(canonical.results.length, 1);
+    assert.equal(new URL(f.calls[0].url).searchParams.get('kw'), '银翼杀手 2049');
+    await f.pool.request(url, { year: '' }); assert.equal(f.calls.length, 1);
+    const legacy = JSON.parse(await readText(await f.pool.request(url)));
+    assert.equal(legacy.results.length, 1);
+    assert.equal(new URL(f.calls[1].url).searchParams.get('kw'), '银翼杀手');
+    assert.equal(f.calls.length, 2);
+  } finally { await f.pool.stop(); }
+});
+
+test('weak candidates remain visible while a necessary explicit alias is still searched', async () => {
+  const f = fixture({ request: url => response(new URL(url).searchParams.get('kw') === 'IT' ? json(quarkUrl, 'IT (2017)') : json('https://pan.quark.cn/s/weak12345678', '网盘资源链接')) });
+  try {
+    const result = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?' + new URLSearchParams({ kw: '小丑回魂' }), { year: '2017', aliases: ['IT'] })));
+    assert.deepEqual(f.calls.map(call => new URL(call.url).searchParams.get('kw')), ['小丑回魂', 'IT']);
+    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/weak12345678?pwd=1234']);
+  } finally { await f.pool.stop(); }
+});
+
+test('empty API searches expose fixed web failures instead of disguising them as a plain no-result response', async () => {
+  const f = fixture({ request: url => response(url.includes('bing.com') ? 'blocked user-cookie' : '{"results":[]}', url.includes('bing.com') ? 403 : 200), googleSearch: async () => { throw new Error('private upstream failure user-token'); } });
+  try {
+    const result = await lookup(f.pool);
+    assert.deepEqual(result.results, []); assert.equal(result.reason, 'Google 公开搜索暂不可用；Bing 公开搜索暂不可用');
+    assert.equal(/user-cookie|user-token|private upstream|https?:/i.test(result.reason), false);
+    assert.equal(f.pool.status().candidates.find(row => row.apiUrl.includes('manual.example')).status, 'pending');
+  } finally { await f.pool.stop(); }
+});
+
+test('upgrading retries the current paused manual API once while preserving automatic backoff and failed restart backoff', async () => {
+  const clock = Date.now(), manual = 'https://manual.example/api/search';
+  const saved = { candidates: [
+    { url: manual, automatic: false, status: 'paused', failures: 3, addedAt: clock - 1000, checkedAt: clock - 100, retryAt: clock + 6 * 60 * 60_000 },
+    { url: backup, automatic: true, status: 'paused', failures: 2, addedAt: clock - 1000, checkedAt: clock - 100, retryAt: clock + 60 * 60_000 },
+  ] };
+  const f = fixture({ saved, now: () => clock, request: url => response(url.includes('bing.com') ? '<rss><channel></channel></rss>' : 'offline', url.includes('bing.com') ? 200 : 503) });
+  let restarted;
+  try {
+    await lookup(f.pool);
+    assert.equal(f.calls.filter(call => call.url.includes('manual.example')).length, 1);
+    assert.equal(f.metadata.get('quark-search-recall-v2'), '1');
+    const failed = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === manual);
+    assert.equal(failed.failures, 4); assert.equal(failed.status, 'paused'); assert.ok(failed.retryAt > clock);
+    const automatic = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === backup);
+    assert.equal(automatic.failures, 2); assert.equal(automatic.retryAt, clock + 60 * 60_000); assert.equal(automatic.status, 'paused');
+    await f.pool.stop();
+    const calls = [];
+    restarted = createQuarkSearchPool({ store: f.store, now: () => clock, googleSearch: async () => [], request: async url => { calls.push(url); return response('<rss><channel></channel></rss>'); } });
+    await lookup(restarted);
+    assert.ok(calls.every(url => !url.includes('manual.example') && !url.includes('backup.example')));
+    assert.equal(JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === manual).failures, 4);
+  } finally { await f.pool.stop(); await restarted?.stop(); }
+});
+
+test('a successful one-time manual API retry clears failure count through normal health validation', async () => {
+  const clock = Date.now();
+  const f = fixture({ now: () => clock, saved: { candidates: [{ url: 'https://manual.example/api/search', automatic: false, status: 'paused', failures: 5, addedAt: clock - 1000, checkedAt: clock - 100, retryAt: clock + 60 * 60_000 }] } });
+  try {
+    assert.equal((await lookup(f.pool)).results.length, 1);
+    const current = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url.includes('manual.example'));
+    assert.equal(current.status, 'healthy'); assert.equal(current.failures, 0); assert.equal(current.retryAt, 0);
+    assert.equal(f.metadata.get('quark-search-recall-v2'), '1');
   } finally { await f.pool.stop(); }
 });
 

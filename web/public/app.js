@@ -1208,8 +1208,8 @@ async function playQuark(current, assetId, valid = () => true) {
 
 function mountQuark(current) {
   const host = $('#quark-resources'); if (!host || !current.catalog) return;
-  const panel = node('section', undefined, 'quark-resources'); panel.append(node('h3', `夸克 · ${current.episodeName || current.detail.title}`));
-  const feedback = node('p', '正在读取当前集的网盘设置…', 'muted'); feedback.setAttribute('aria-live', 'polite');
+  const panel = node('section', undefined, 'quark-resources'); panel.append(node('h3', `夸克 · ${current.detail.title}`));
+  const feedback = node('p', '正在按作品名称查找夸克分享…', 'muted'); feedback.setAttribute('aria-live', 'polite');
   const choices = node('div', undefined, 'quark-choices'), result = node('div', undefined, 'quark-ready'); panel.append(feedback, choices, result); host.replaceChildren(panel);
   const state = current.quarkState ||= { resources: [], files: [], version: 0 };
   const valid = () => player === current && current.stamp === routeVersion && host.contains(panel);
@@ -1284,7 +1284,7 @@ function mountQuark(current) {
       const query = new URLSearchParams(playbackSelection(current.detail, current.line, current.episode)); if (webSearch) query.set('web', '1');
       const data = await api(`/api/quark/resources?${query}`, { timeoutMs: 35000 }); if (!currentSearch()) return;
       state.resources = Array.isArray(data.resources) ? data.resources : []; shareSelect.disabled = false; shareSelect.replaceChildren();
-      if (!state.resources.length) { feedback.textContent = data.reason || '当前集暂未找到可用夸克分享，普通播放不受影响。'; choices.replaceChildren(); return; }
+      if (!state.resources.length) { feedback.textContent = data.reason || `暂未找到“${current.detail.title}”的夸克分享，普通播放不受影响。`; choices.replaceChildren(); return; }
       for (const resource of state.resources) { const dated = Number.isSafeInteger(resource.publishedAt) && resource.publishedAt > 0 ? ` · 页面日期 ${new Date(resource.publishedAt).toLocaleDateString('zh-CN')}` : ''; const option = node('option', (resource.name || resource.id) + dated); option.value = resource.id; shareSelect.append(option); }
       choices.replaceChildren(shareField, fileField, actions);
       void loadFiles(!webSearch && settings.autoSave === true && current.flow.quarkAutomatic !== false);

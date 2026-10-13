@@ -52,11 +52,13 @@ function published(html, now) {
   }
 }
 
-export async function searchGoogleQuark(keyword, { read, deadline, now = Date.now } = {}) {
+export async function searchGoogleQuark(keyword, { read, deadline, now = Date.now, aliases = [], titleOnly = false } = {}) {
   if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 1000 || typeof read !== 'function') return [];
-  const term = normalize(keyword), end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, now() + 3000);
+  const title = titleOnly === true ? keyword.trim() : keyword.trim().replace(/\s+(?:19|20)\d{2}$/, ''), term = normalize(title);
+  const end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, now() + 3000);
   if (!term || end <= now()) return [];
-  const relevant = name => normalize(name).includes(term);
+  const terms = [term, ...(Array.isArray(aliases) ? aliases.slice(0, 10) : []).filter(value => typeof value === 'string' && value.length <= 300 && !/[\u0000-\u001f\u007f]/.test(value)).map(normalize).filter(Boolean)];
+  const relevant = name => terms.some(term => normalize(name).includes(term));
   const rows = new Map(), passwordDates = new Map();
   const add = (url, name, publishedAt) => {
     if (!url || !relevant(name)) return;
@@ -76,7 +78,7 @@ export async function searchGoogleQuark(keyword, { read, deadline, now = Date.no
     } catch { if (required) throw new Error('Google 公开搜索暂不可用，请稍后重试'); return ''; }
   };
   const search = new URL('https://www.google.com/search');
-  search.search = new URLSearchParams({ q: `${keyword.trim()} 夸克`, hl: 'zh-CN', num: '10', tbs: 'sbd:1' }).toString();
+  search.search = new URLSearchParams({ q: `${title} 夸克`, hl: 'zh-CN', num: '10', tbs: 'sbd:1' }).toString();
   // Google can ignore date sorting or require CAPTCHA; never bypass either restriction.
   const html = visible(await load(search.href, 1200, true)), pages = new Map();
   for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)) {

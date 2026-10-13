@@ -46,12 +46,21 @@ function accountId(config, root, cookie) {
 }
 
 function detailInfo(detail, options = {}) {
-  const title = name(detail?.title || detail?.name), year = String(detail?.year || '').slice(0, 4);
-  if (!title) throw failure('影片详情缺少名称', 400);
-  const key = hash(JSON.stringify([String(detail.source || ''), String(detail.id || ''), title, year]));
+  const rawTitle = name(detail?.title || detail?.name), year = String(detail?.year || '').slice(0, 4);
+  if (!rawTitle) throw failure('影片详情缺少名称', 400);
+  const key = hash(JSON.stringify([String(detail.source || ''), String(detail.id || ''), rawTitle, year]));
+  const series = detail.type === 'series' || ['tv', 'anime'].includes(detail.category) || Array.isArray(detail.lines) && detail.lines.some(line => line.episodes?.length > 1);
+  let title = rawTitle.normalize('NFKC');
+  if (series) for (let count = 0; count < 6; count++) {
+    const cleaned = title.replace(/(?:\s*[(\[【]?\s*(?:更新至\s*第?\s*[零〇一二两三四五六七八九十百\d]+\s*[集话]?|第[零〇一二两三四五六七八九十百\d]+[集话季]|(?:全|共)\d+集|\d+集全|完结季|国语|粤语|普通话|双语|中字|中英字幕)|[\s._-]+[(\[【]?\s*(?:s\d{1,2}(?:[ ._-]*e\d{1,3})?|(?:episode|ep|e)[ ._-]*\d{1,3}|\d{1,2}x\d{1,3}|完结|全集|高清|超清|日语|英语|1080p|2160p|4k|HD))\s*[)\]】]?\s*$/i, '').trim();
+    if (cleaned === title || cleaned.length < 2) break; title = cleaned;
+  }
+  let searchTitle = title;
+  if (!series) for (let count = 0; count < 4; count++) { const cleaned = searchTitle.replace(/\s*[(\[【]?\s*(?:国语|粤语|普通话|双语|中字|中英字幕|高清|超清)\s*[)\]】]?\s*$/i, '').trim(); if (cleaned === searchTitle || cleaned.length < 2) break; searchTitle = cleaned; }
+  const aliases = [...new Set([...(searchTitle !== rawTitle ? [rawTitle] : []), ...(Array.isArray(detail.aliases) ? detail.aliases.slice(0, 10) : [])].filter(value => typeof value === 'string' && value.trim().length >= 2 && value.length <= 300 && !/[\u0000-\u001f\u007f]/.test(value) && episodeNumber(value) === undefined && !/更新至/.test(value)).map(value => value.trim()).filter(value => normalized(value) !== normalized(searchTitle)))].slice(0, 2);
   const line = options.line ?? 0, index = options.episode ?? 0;
   const selected = Number.isInteger(line) && line >= 0 && Number.isInteger(index) && index >= 0 ? detail.lines?.[line]?.episodes?.[index] : undefined;
-  return { title, year: /^(?:19|20)\d{2}$/.test(year) ? year : '', key, selected, line, index, season: detail.season };
+  return { title, searchTitle: searchTitle.length >= 2 ? searchTitle : title, aliases, series, titleSeason: seasonNumber(rawTitle), year: /^(?:19|20)\d{2}$/.test(year) ? year : '', key, selected, line, index, season: detail.season };
 }
 
 function number(value) {
@@ -75,17 +84,17 @@ const normalized = value => String(value).normalize('NFKC').toLowerCase().replac
 function matches(info, file) {
   if (!info.selected || info.title.length < 2) return false;
   const parts = [...file.path, file.name], title = normalized(info.title);
-  const suffix = /^(?:(?:19|20)\d{2}|s\d{1,2}(?:e\d{1,3})?|(?:episode|ep|e)\d{1,3}|\d{1,2}x\d{1,3}|第[零〇一二两三四五六七八九十百\d]+[季集话]|(?:480|720|1080|2160)p|[48]k|hdr|dv|dolby|webdl|webrip|bluray|bdrip|[hx]26[45]|aac|ac3|国语|中字|中英字幕|正片|高清|超清|完整版|全集|完结|全\d+集)*$/i;
+  const suffix = /^(?:(?:19|20)\d{2}|s\d{1,2}(?:e\d{1,3})?|(?:episode|ep|e)\d{1,3}|\d{1,2}x\d{1,3}|(?:更新至第?)?[零〇一二两三四五六七八九十百\d]+[集话]|第[零〇一二两三四五六七八九十百\d]+[季集话]|(?:480|720|1080|2160)p|[48]k|hdr|dv|dolby|webdl|webrip|bluray|bdrip|[hx]26[45]|aac|ac3|国语|中字|中英字幕|正片|高清|超清|完整版|全集|完结季|完结|全\d+集)*$/i;
   if (!parts.some(part => { const stem = normalized(part.replace(/\.[a-z0-9]{2,5}$/i, '')); return stem.startsWith(title) && suffix.test(stem.slice(title.length)); })) return false;
   const years = parts.flatMap(part => [...part.matchAll(/(?:19|20)\d{2}/g)].map(match => match[0]));
   if (info.year && (!years.includes(info.year) || years.some(year => year !== info.year))) return false;
   const wantedEpisode = episodeNumber(info.selected.name);
   if (wantedEpisode === null) return false;
-  const wantedSeasons = [Number.isInteger(info.season) ? info.season : undefined, seasonNumber(info.title), seasonNumber(info.selected.name)].filter(value => value !== undefined), season = wantedSeasons[0];
+  const wantedSeasons = [Number.isInteger(info.season) ? info.season : undefined, info.titleSeason, seasonNumber(info.selected.name)].filter(value => value !== undefined), season = wantedSeasons[0];
   const seasons = parts.map(seasonNumber).filter(value => value !== undefined);
   if (wantedSeasons.some(value => value === null || value !== season) || seasons.some(value => value === null || season === undefined || value !== season) || season > 1 && !seasons.length) return false;
   if (wantedEpisode !== undefined) return episodeNumber(file.name.replace(/\.[^.]+$/, '')) === wantedEpisode;
-  return info.index === 0 && /^(?:正片|电影|完整版|全集)$/i.test(info.selected.name || '') && episodeNumber(file.name.replace(/\.[^.]+$/, '')) === undefined;
+  return !info.series && info.index === 0 && /^(?:正片|电影|完整版|全集)$/i.test(info.selected.name || '') && episodeNumber(file.name.replace(/\.[^.]+$/, '')) === undefined;
 }
 
 export function createQuark({ store, dataDir, request = networkRequest, searchRequest = networkRequest, defaultSearchApi = '', now = Date.now } = {}) {
@@ -254,15 +263,17 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     for (const link of (Array.isArray(provided) ? provided : [provided]).slice(0, 20)) { const row = addShare(info, link); if (row) rows.set(row.id, row); }
     let reason;
     const cached = searches.get(info.key);
+    if (cached && cached.expires > now()) reason = cached.reason;
     if (cached && cached.expires > now()) for (const row of cached.rows) { const existing = shares.get(row.id); if (existing) { const fresh = addShare(info, existing, existing.name); rows.set(fresh.id, fresh); } }
     if (!cached || cached.expires <= now() || options.webSearch === true) {
+      reason = undefined;
       let response, timeout, expired = false;
       try {
         const configured = config.searchApi || defaultSearchApi;
         const target = configured ? new URL(searchUrl(configured)) : new URL('https://www.bing.com/search');
-        if (configured) { target.searchParams.set('kw', info.title + (info.year ? ' ' + info.year : '')); target.searchParams.set('cloud_types', 'quark'); target.searchParams.set('res', 'results'); target.searchParams.set('conc', '2'); }
-        else { target.searchParams.set('q', info.title + (info.year ? ' ' + info.year : '') + ' site:pan.quark.cn/s'); target.searchParams.set('format', 'rss'); }
-        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, aliases: detail.aliases, webSearch: options.webSearch === true, headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
+        if (configured) { target.searchParams.set('kw', info.searchTitle); target.searchParams.set('cloud_types', 'quark'); target.searchParams.set('res', 'results'); target.searchParams.set('conc', '2'); }
+        else { target.searchParams.set('q', info.searchTitle + ' site:pan.quark.cn/s'); target.searchParams.set('format', 'rss'); }
+        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, year: info.year, aliases: info.aliases, webSearch: options.webSearch === true, headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
         const body = await Promise.race([fetch, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('公开夸克搜索超时', 504)); }, 8000); })]);
         let visited = 0;
         const found = [], visit = (value, label = '', depth = 0) => {
@@ -275,9 +286,9 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
             for (const [field, item] of Object.entries(value).slice(0, 30)) if (['links', 'results', 'data', 'merged_by_type', 'quark', 'list'].includes(field)) visit(item, title, depth + 1);
           }
         };
-        try { visit(JSON.parse(body)); } catch { visit(body); }
+        try { const result = JSON.parse(body); visit(result); if (typeof result?.reason === 'string') reason = name(result.reason); } catch { visit(body); }
         for (const link of found) { const row = addShare(info, link, link.name); if (row) rows.set(row.id, row); }
-        searches.set(info.key, { rows: [...rows.values()], expires: now() + 60000 }); while (searches.size > 64) searches.delete(searches.keys().next().value);
+        searches.set(info.key, { rows: [...rows.values()], ...(reason ? { reason } : {}), expires: now() + 60000 }); while (searches.size > 64) searches.delete(searches.keys().next().value);
       } catch (cause) { reason = publicReason(cause); }
       finally { expired = true; clearTimeout(timeout); response?.destroy(); }
     }

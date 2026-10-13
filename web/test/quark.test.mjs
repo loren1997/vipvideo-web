@@ -349,7 +349,7 @@ test('public search preserves PanSou password/work title, validates shares and n
   const { service, state, connect } = await fixture(t, { defaultSearchApi: 'https://search.example/api/search' }); await connect();
   state.searchBody = JSON.stringify({ total: 2, results: [{ title: '合集', links: [{ type: 'quark', url: 'https://pan.quark.cn/s/aaaabbbbcccc', password: 'Ab12', work_title: '影片 2026' }, { type: 'baidu', url: 'https://pan.quark.cn.evil/s/abcdef123456' }] }] });
   const film = { ...detail, quarkShares: [] }, result = await service.resources(film); assert.equal(result.resources.length, 1); assert.equal(result.resources[0].name, '影片 2026'); assert.equal(result.resources[0].url, 'https://pan.quark.cn/s/aaaabbbbcccc?pwd=Ab12');
-  const target = new URL(state.searchCalls[0].value); assert.equal(target.searchParams.get('kw'), '影片 2026'); assert.equal(target.searchParams.get('cloud_types'), 'quark'); assert.equal(target.searchParams.get('conc'), '2');
+  const target = new URL(state.searchCalls[0].value); assert.equal(target.searchParams.get('kw'), '影片'); assert.equal(state.searchCalls[0].options.year, '2026'); assert.equal(target.searchParams.get('cloud_types'), 'quark'); assert.equal(target.searchParams.get('conc'), '2');
   const list = await service.files(film, { shareId: result.resources[0].id }); assert.ok(list.files[0].id); const token = state.calls.find(call => call.path === '/share/sharepage/token'); assert.equal(token.body.passcode, 'Ab12'); assert.equal(token.options.headers.cookie, COOKIE);
   for (const bad of ['http://127.0.0.1/a', 'https://pan.quark.cn.evil/s/abcdef123456', 'https://evil.example/s/abcdef123456', 'file:///a', 'https://user:pw@pan.quark.cn/s/abcdef123456']) assert.equal((await service.resources({ ...detail, id: bad, quarkShares: [bad] })).resources.length, 1); // Only the safe search result survives.
 });
@@ -366,6 +366,80 @@ test('file candidates expose opaque IDs only and complete exact movie evidence p
   const selected = await select(); assert.equal(selected.files.files[0].match, true); assert.match(selected.fileId, /^[a-f0-9]{32}$/); assert.ok(!JSON.stringify(selected.files).includes('synthetic-file-token')); assert.ok(!JSON.stringify(selected.files).includes('share-video'));
   const result = await service.prepare(detail, { shareId: selected.shareId, line: 0, episode: 0, auto: true }); assert.equal(result.status, 'ready'); assert.equal(result.saved, true); assert.equal(result.category, 'movie'); assert.equal(state.saved, 1);
   const save = state.calls.find(call => call.path === '/share/sharepage/save'); assert.deepEqual(save.body.fid_list, ['share-video']); assert.notEqual(save.body.to_pdir_fid, '0');
+});
+
+test('series searches use complete work titles without episode/update suffixes and keep the selected episode for file matching', async t => {
+  for (const [title, query, fileTitle] of [
+    ['遮天', '遮天'], ['遮天 第42集', '遮天'], ['遮天 EP42', '遮天'], ['遮天 S01E42', '遮天'], ['遮天 更新至第56集', '遮天'], ['遮天（更新至第56集） 高清', '遮天'],
+    ['一念永恒 完结季', '一念永恒', '一念永恒 完结季'], ['转生成为哥布林有什么问题吗？', '转生成为哥布林有什么问题吗?'], ['希望2026', '希望2026'],
+  ]) await t.test(title, async t => {
+    const { service, state, connect } = await fixture(t, { defaultSearchApi: 'https://search.example/api/search' }); await connect({ autoSave: true });
+    const series = { ...detail, id: title, title, type: 'series', category: 'anime', lines: [{ episodes: [{ name: '第12集' }, { name: '第13集' }] }] };
+    state.source = [sourceVideo('twelve', (fileTitle || query) + '.2026.EP12.mkv'), sourceVideo('thirteen', (fileTitle || query) + '.2026.EP13.mkv')];
+    assert.equal((await service.prepare(series, { auto: true, episode: 0 })).status, 'ready');
+    assert.equal((await service.prepare(series, { auto: true, episode: 1 })).status, 'ready');
+    assert.equal(state.searchCalls.length, 1); assert.equal(new URL(state.searchCalls[0].value).searchParams.get('kw'), query); assert.equal(state.searchCalls[0].options.year, '2026');
+    assert.equal(state.searchCalls[0].options.aliases.some(value => /第(?:12|13|42|56)集|更新至/.test(value)), false);
+    assert.deepEqual(state.calls.filter(call => call.path === '/share/sharepage/save').map(call => call.body.fid_list), [['twelve'], ['thirteen']]);
+  });
+});
+
+test('a series share folder update count never replaces the exact episode number selected inside it', async t => {
+  const { service, state, connect } = await fixture(t); await connect({ autoSave: true });
+  const series = { ...detail, title: '遮天 更新至第56集', type: 'series', category: 'anime', lines: [{ episodes: [{ name: '第12集' }] }] };
+  state.source = [sourceVideo('twelve', '012.mkv'), sourceVideo('latest', '056.mkv')];
+  state.beforeRequest = call => call.path === '/share/sharepage/detail' ? reply({ list: new URL(call.value).searchParams.get('pdir_fid') === '0' ? [{ fid: 'updated-folder', file_name: '遮天.2026.更新至56集', file: false }] : state.source }) : undefined;
+  assert.equal((await service.prepare(series, { auto: true })).status, 'ready');
+  assert.deepEqual(state.calls.find(call => call.path === '/share/sharepage/save').body.fid_list, ['twelve']);
+});
+
+test('canonical series searches retain raw-title binding, original year and explicitly known season for automatic transfer', async t => {
+  for (const [title, fileName, season, expected] of [
+    ['遮天第2季', '遮天.2026.S02E12.mkv', undefined, 'ready'],
+    ['遮天 第二季 更新至第56集', '遮天.2026.S02E12.mkv', undefined, 'ready'],
+    ['遮天第2季', '遮天.2026.S01E12.mkv', undefined, 'needsSelection'],
+    ['遮天第2季', '遮天.2026.S02E12.mkv', 1, 'needsSelection'],
+    ['遮天第2季', '遮天.2025.S02E12.mkv', undefined, 'needsSelection'],
+    ['一念永恒 完结季', '一念永恒.2026.S02E12.mkv', undefined, 'needsSelection'],
+  ]) await t.test(title + ' / ' + fileName + ' / ' + season, async t => {
+    const { service, state, connect } = await fixture(t, { defaultSearchApi: 'https://search.example/api/search' }); await connect({ autoSave: true });
+    const series = { ...detail, id: 'season', title, type: 'series', category: 'anime', season, lines: [{ episodes: [{ name: '第12集' }] }] };
+    state.source = [sourceVideo('season-twelve', fileName)];
+    assert.equal((await service.prepare(series, { auto: true })).status, expected);
+    assert.equal(new URL(state.searchCalls[0].value).searchParams.get('kw'), title.startsWith('遮天') ? '遮天' : '一念永恒');
+    assert.equal(state.saved, expected === 'ready' ? 1 : 0);
+  });
+  const { service, state, connect, select } = await fixture(t); await connect();
+  const series = { ...detail, title: '遮天 更新至第56集', type: 'series', category: 'anime', lines: [{ episodes: [{ name: '第12集' }] }] };
+  state.source = [sourceVideo('twelve', '遮天.2026.EP12.mkv')]; const selected = await select(series);
+  assert.equal((await service.prepare({ ...series, title: '遮天 第12集' }, selected)).status, 'error'); assert.equal(state.saved, 0);
+});
+
+test('generic main-feature labels in known series never auto-transfer a season pack as a movie', async t => {
+  for (const metadata of [{ type: 'series', category: 'movie' }, { category: 'tv' }, { category: 'anime' }, { category: 'movie', multiple: true }]) await t.test(JSON.stringify(metadata), async t => {
+    const { service, state, connect } = await fixture(t); await connect({ autoSave: true });
+    const series = { ...detail, title: '遮天', ...metadata, lines: [{ episodes: [{ name: '正片' }, ...(metadata.multiple ? [{ name: '正片' }] : [])] }] };
+    state.source = [sourceVideo('pack', '遮天.2026.全集.mkv')];
+    assert.equal((await service.prepare(series, { auto: true })).status, 'needsSelection'); assert.equal(state.saved, 0);
+  });
+});
+
+test('movie query language suffixes become search aliases while exact file-title checks and embedded numeric titles remain intact', async t => {
+  const { service, state, connect } = await fixture(t, { defaultSearchApi: 'https://search.example/api/search' }); await connect({ autoSave: true });
+  const film = { ...detail, title: '一个部门的诞生国语', type: 'movie' };
+  state.source = [sourceVideo('base-title', '一个部门的诞生.2026.mp4')]; assert.equal((await service.prepare(film, { auto: true })).status, 'needsSelection');
+  state.source = [sourceVideo('exact-title', '一个部门的诞生国语.2026.mp4')]; assert.equal((await service.prepare(film, { auto: true })).status, 'ready');
+  assert.equal(new URL(state.searchCalls[0].value).searchParams.get('kw'), '一个部门的诞生'); assert.deepEqual(state.searchCalls[0].options.aliases, ['一个部门的诞生国语']);
+  await service.resources({ ...film, id: 'movie-aliases', aliases: ['正式别名', 'Another Title'] }); assert.deepEqual(state.searchCalls.at(-1).options.aliases, ['一个部门的诞生国语', '正式别名']);
+  await service.resources({ ...detail, id: 'numeric-title', title: '希望2026', type: 'movie' }); assert.equal(new URL(state.searchCalls.at(-1).value).searchParams.get('kw'), '希望2026');
+});
+
+test('safe pool reasons survive empty result caching without exposing arbitrary remote error fields', async t => {
+  const { service, state } = await fixture(t); const film = { ...detail, quarkShares: [] };
+  state.searchBody = JSON.stringify({ results: [], reason: '\u0000Google 公开搜索暂不可用；' + '网络失败'.repeat(100), error: 'remote raw error must stay hidden', message: 'remote secret message' });
+  const first = await service.resources(film); assert.equal(first.resources.length, 0); assert.ok(first.reason.startsWith('Google')); assert.ok(first.reason.length <= 300); assert.equal(first.reason.includes('remote'), false);
+  assert.deepEqual(await service.resources(film), first); assert.equal(state.searchCalls.length, 1);
+  state.searchBody = JSON.stringify({ results: [] }); const refreshed = await service.resources(film, { webSearch: true }); assert.equal(refreshed.reason, undefined);
 });
 
 test('automatic single-episode transfers recognize bounded episode notation and Chinese hundreds through the share listing', async t => {

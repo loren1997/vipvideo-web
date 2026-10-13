@@ -249,6 +249,7 @@ try {
             { id: 'share-old', name: '当前片已有公开资源', url: 'https://pan.quark.cn/s/old123456', publishedAt: Date.UTC(2025, 8, 20) },
             { id: 'share-undated', name: '当前片无日期资源', url: 'https://pan.quark.cn/s/nodate123' },
           ] } });
+          if (quarkMode === 'search-empty') return route.fulfill({ json: { resources: [], reason: '搜索渠道暂不可用：API 返回非 JSON；Google 暂不可访问。' } });
           if (quarkChoicesFixture) return route.fulfill({ json: { resources: ['first', 'second'].map(id => ({ id: `share-${id}`, name: `${id === 'first' ? '第一' : '第二'}份分享 · 4K HQ 60FPS 高码率 DTS 环绕声 内嵌简英字幕 ${'完整长标题'.repeat(12)}`, url: `https://pan.quark.cn/s/${id}` })), reason: '' } });
           return route.fulfill({ json: { resources: [{ id: 'share-fixture', name: '当前片分享样例', url: 'https://pan.quark.cn/s/fixture' }], reason: '' } });
         }
@@ -548,13 +549,15 @@ try {
   }
 
   async function verifyQuarkPublicSearch() {
-    const before = structuredClone(quarkSettings); let isolated;
+    const before = structuredClone(quarkSettings), previousMode = quarkMode; let isolated;
     try {
       Object.assign(quarkSettings, { configured: true, enabled: true, autoSave: false, account: { connected: true, label: '测试账号' } });
+      quarkMode = 'search-empty';
       isolated = await context({ width: 1440, height: 1000 }, true, false, '#detail?source=first&id=quark'); const p = isolated.page;
       const more = p.getByRole('button', { name: '查找更多公开资源', exact: true });
       await until(() => more.isEnabled(), '主动公开资源搜索可用');
-      await until(() => p.getByLabel('夸克视频文件', { exact: true }).isEnabled(), '普通资源列表就绪');
+      await p.getByRole('heading', { name: '夸克 · 网盘当前集样例', exact: true }).waitFor();
+      await p.locator('#quark-resources').getByText(/API 返回非 JSON；Google 暂不可访问/).waitFor();
       const prepares = quarkRequests.filter(request => request.path === '/api/quark/prepare').length;
       quarkSettings.autoSave = true; await more.click();
       await until(() => p.getByLabel('夸克分享资源', { exact: true }).locator('option').count().then(count => count === 3), '更多公开资源显示');
@@ -566,8 +569,8 @@ try {
       holdQuarkResources = true; await more.click(); await until(() => Boolean(releaseQuarkResources), '更多资源等待中');
       await p.locator('nav a[href="#home"]').click(); releaseQuarkResources(); releaseQuarkResources = null; holdQuarkResources = false;
       await p.waitForTimeout(100); assert.equal(await p.locator('#quark-resources').count(), 0, '离开页面后迟到搜索不接管页面');
-      console.log('PASS 主动Google和网页资源查询、页面日期显示、无日期末尾、不自动转存新发现、离页迟到结果取消');
-    } finally { holdQuarkResources = false; releaseQuarkResources?.(); releaseQuarkResources = null; Object.assign(quarkSettings, before); await isolated?.value.close(); }
+      console.log('PASS 夸克按作品显示、空结果保留渠道失败原因、主动Google和网页资源查询、页面日期显示、不自动转存新发现、离页迟到结果取消');
+    } finally { holdQuarkResources = false; releaseQuarkResources?.(); releaseQuarkResources = null; quarkMode = previousMode; Object.assign(quarkSettings, before); await isolated?.value.close(); }
   }
 
   async function verifyQuarkChoices() {
