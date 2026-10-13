@@ -26,13 +26,13 @@ test('optional Quark search companion preserves Compose settings and becomes hea
   assert.equal(config.services.pansou.read_only, true);
   assert.equal(config.services.pansou.volumes?.some(row => row.target === '/app/data') || false, false);
   assert.equal(config.services.pansou.cpus, 0.25);
-  assert.equal(config.services.pansou.mem_limit, 384 * 1024 * 1024);
-  assert.equal(config.services.pansou.memswap_limit, config.services.pansou.mem_limit);
+  assert.equal(Number(config.services.pansou.mem_limit), 384 * 1024 * 1024);
+  assert.equal(Number(config.services.pansou.memswap_limit), Number(config.services.pansou.mem_limit));
   assert.equal(config.services.pansou.environment.GOMAXPROCS, '1');
   assert.equal(config.services.pansou.environment.ASYNC_MAX_BACKGROUND_WORKERS, '1');
   assert.equal(config.services.web.cpus, 1);
-  assert.equal(config.services.web.mem_limit, 768 * 1024 * 1024);
-  assert.equal(config.services.web.memswap_limit, config.services.web.mem_limit);
+  assert.equal(Number(config.services.web.mem_limit), 768 * 1024 * 1024);
+  assert.equal(Number(config.services.web.memswap_limit), Number(config.services.web.mem_limit));
   const protectedBase = JSON.parse(execFileSync('docker', ['compose', '-f', 'docker-compose.yml', '-f', 'compose.plex-safe.yaml', 'config', '--format', 'json'], {
     cwd: root, windowsHide: true, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
   }));
@@ -57,8 +57,8 @@ test('optional Quark search companion preserves Compose settings and becomes hea
   assert.ok(combined.services.web.group_add.includes('109'));
   assert.equal(combined.services.web.cpus, 1);
   assert.equal(combined.services.web.cpu_shares, 256);
-  assert.equal(combined.services.web.mem_limit, 768 * 1024 * 1024);
-  assert.equal(combined.services.web.memswap_limit, combined.services.web.mem_limit);
+  assert.equal(Number(combined.services.web.mem_limit), 768 * 1024 * 1024);
+  assert.equal(Number(combined.services.web.memswap_limit), Number(combined.services.web.mem_limit));
   assert.equal(combined.services.web.pids_limit, 128);
   assert.equal(combined.services.web.blkio_config.weight, 100);
   assert.deepEqual(combined.services.web.tmpfs, ['/tmp:size=128m,mode=1777']);
