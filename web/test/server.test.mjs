@@ -85,6 +85,24 @@ test('cloud routes protect account data, resolve trusted selections and proxy on
   assert.equal((await call(playback.url, undefined, cookie)).status, 403);
 });
 
+test('Quark account authentication errors remain distinct from a revoked household session', async t => {
+  const source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
+  let upstreamStatus = 401;
+  const quark = { files: async () => { throw Object.assign(new Error('夸克账号需要重新连接'), { status: upstreamStatus, quarkSafe: true, quarkAuth: true }); } };
+  const { call, login } = await running(t, { initialConfig: { ...empty, sources: [source] }, quark });
+  const path = '/api/quark/files?source=demo&id=1&shareId=share&line=0&episode=0';
+  const anonymous = await call(path); assert.equal(anonymous.status, 401);
+  assert.equal((await anonymous.json()).quarkAuth, undefined);
+  const cookie = await login(), expiredCloud = await call(path, undefined, cookie);
+  assert.equal(expiredCloud.status, 401); assert.equal((await expiredCloud.json()).quarkAuth, true);
+  assert.equal((await (await call('/api/auth', undefined, cookie)).json()).authenticated, true);
+  upstreamStatus = 403; const denied = await call(path, undefined, cookie);
+  assert.equal(denied.status, 403); assert.equal((await denied.json()).quarkAuth, undefined);
+  await call('/api/auth/logout', {}, cookie);
+  const loggedOut = await call(path, undefined, cookie); assert.equal(loggedOut.status, 401);
+  assert.equal((await loggedOut.json()).quarkAuth, undefined);
+});
+
 test('logout during delayed film lookup prevents a subsequent cloud transfer', async t => {
   let release, entered, transfers = 0;
   const pending = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { entered = resolve; });

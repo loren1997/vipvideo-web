@@ -34,8 +34,8 @@ async function fixture(t, extra = {}) {
       return Object.assign(reply({ list: rows.slice((page - 1) * size, page * size) }), { });
     }
     if (path === '/file' && options.method === 'POST') { assert.equal(body.pdir_fid, '0'); assert.match(body.file_name, /^VipVideo-[a-f0-9]{32}$/); const folder = { fid: 'app-folder-' + account, file_name: body.file_name, file: false, pdir_fid: '0' }; state.folders.set(account, folder); return reply({ fid: folder.fid }); }
-    if (path === '/share/sharepage/token') { assert.equal(options.headers.cookie, undefined); return reply({ stoken: 'synthetic-share-token' }); }
-    if (path === '/share/sharepage/detail') { assert.equal(options.headers.cookie, undefined); return reply({ list: state.source }); }
+    if (path === '/share/sharepage/token') return reply({ stoken: 'synthetic-share-token' });
+    if (path === '/share/sharepage/detail') return reply({ list: state.source });
     if (path === '/share/sharepage/save') {
       assert.equal(body.fid_list.length, 1); assert.equal(body.fid_token_list.length, 1); assert.equal(body.to_pdir_fid, state.folders.get(account)?.fid);
       const source = state.source.find(file => file.fid === body.fid_list[0]); assert.ok(source && source.file);
@@ -62,11 +62,156 @@ async function fixture(t, extra = {}) {
   return { service, options, state, metadata, store, dataDir, request, connect, select, save, userFolder, userFile };
 }
 
+test('connected share requests use the stored Cookie only at the fixed official API; anonymous and disabled accounts do not', async t => {
+  const { service, state, connect, select } = await fixture(t);
+  await select();
+  assert.ok(state.calls.filter(call => call.path.startsWith('/share/')).every(call => call.options.headers.cookie === undefined));
+  await connect(); state.calls.length = 0;
+  state.beforeRequest = call => call.path.startsWith('/share/') && call.options.headers.cookie !== COOKIE ? reply({}, { http: 403 }) : undefined;
+  const listing = await select(); assert.equal(listing.files.files.length, 1);
+  const shared = state.calls.filter(call => call.path.startsWith('/share/'));
+  assert.deepEqual(shared.map(call => call.path), ['/share/sharepage/token', '/share/sharepage/detail']);
+  for (const call of shared) {
+    assert.equal(call.options.headers.cookie, COOKIE); assert.equal(call.options.followRedirects, false);
+    const target = new URL(call.value); assert.equal(target.origin, 'https://drive.quark.cn');
+    assert.equal(target.searchParams.get('pr'), 'ucpro'); assert.equal(target.searchParams.get('fr'), 'pc');
+    assert.equal(call.options.headers.referer, 'https://pan.quark.cn/'); assert.ok(!call.value.includes(COOKIE));
+  }
+  assert.ok(!JSON.stringify(listing).includes(COOKIE)); assert.equal(state.saved, 0); assert.deepEqual(state.deletes, []);
+  state.beforeRequest = null; await service.configure({ enabled: false }); state.calls.length = 0; await select();
+  assert.ok(state.calls.filter(call => call.path.startsWith('/share/')).every(call => call.options.headers.cookie === undefined));
+  assert.ok(state.searchCalls.every(call => call.options.headers.cookie === undefined));
+});
+
+test('share failures distinguish authentication, denied access and throttling without leaking upstream messages or retrying', async t => {
+  const { service, state, metadata, connect, select } = await fixture(t); await connect();
+  const savedConfig = metadata.get('quark-settings-v1');
+  assert.ok(savedConfig);
+  for (const channel of ['http', 'json']) for (const status of [401, 403, 429]) {
+    const before = state.calls.length;
+    state.beforeRequest = call => call.path === '/share/sharepage/token' ? reply({ message: COOKIE }, channel === 'http' ? { http: status } : { code: 1, status }) : undefined;
+    await assert.rejects(select(), error => {
+      assert.equal(error.status, status); assert.equal(error.quarkAuth === true, status === 401);
+      assert.ok(!error.message.includes(COOKIE));
+      if (status !== 401) assert.match(error.message, new RegExp(String(status)));
+      if (status === 403) assert.doesNotMatch(error.message, /登录已失效/);
+      return true;
+    });
+    assert.equal(state.calls.length - before, 1, 'denials and throttling must not trigger automatic retries');
+    assert.equal(metadata.get('quark-settings-v1'), savedConfig);
+  }
+  assert.equal((await service.settings()).account.connected, true);
+  assert.equal(state.saved, 0); assert.deepEqual(state.deletes, []); assert.equal(state.folders.size, 0);
+});
+
+test('share reads cancel after account changes, shutdown or revoked authorization without continuing the old listing', async t => {
+  for (const stage of ['token', 'detail']) for (const action of ['disconnect', 'disable', 'switch', 'stop']) await t.test(`${stage}-${action}`, async t => {
+    const { service, state, connect, select } = await fixture(t); await connect();
+    let release, entered; const reached = new Promise(resolve => { entered = resolve; });
+    state.beforeRequest = async call => {
+      if (call.path !== `/share/sharepage/${stage}`) return;
+      entered(); await new Promise(resolve => { release = resolve; });
+      return stage === 'token' ? reply({ stoken: 'synthetic-old-token' }) : reply({ list: [sourceVideo()] });
+    };
+    const rejected = assert.rejects(select(), error => error.status === 409);
+    await reached;
+    let stopping;
+    try {
+      if (action === 'disconnect') await service.clearAccount();
+      else if (action === 'disable') await service.configure({ enabled: false });
+      else if (action === 'switch') await connect({ cookie: COOKIE_B });
+      else stopping = service.stop();
+    } finally { release(); }
+    await rejected; await stopping;
+    assert.equal(state.calls.filter(call => call.path === '/share/sharepage/detail').length, stage === 'token' ? 0 : 1);
+    assert.equal(state.saved, 0); assert.equal(state.folders.size, 0); assert.deepEqual(state.deletes, []);
+  });
+  const { service, state } = await fixture(t);
+  const shares = await service.resources(detail); state.calls.length = 0;
+  await assert.rejects(service.files(detail, { shareId: shares.resources[0].id, valid: () => false }), error => error.status === 409);
+  assert.equal(state.calls.length, 0);
+});
+
+test('old share selections cannot transfer after account replacement or disconnection', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect();
+  const selected = await select(); await connect({ cookie: COOKIE_B });
+  assert.equal((await service.prepare(detail, selected)).status, 'error');
+  const next = await select(); await service.clearAccount(); await connect({ cookie: COOKIE_B });
+  assert.equal((await service.prepare(detail, next)).status, 'error');
+  assert.equal(state.saved, 0); assert.equal(state.folders.size, 0);
+});
+
+test('partially failed listings still evict old share candidates at the cache limit', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect();
+  const oldest = await select();
+  for (let batch = 0; batch < 3; batch++) {
+    state.beforeRequest = call => {
+      if (call.path !== '/share/sharepage/detail') return;
+      const page = Number(new URL(call.value).searchParams.get('_page'));
+      if (page === 5) return reply({}, { http: 403 });
+      return Object.assign(Readable.from([JSON.stringify({ code: 0, status: 200, data: { list: Array.from({ length: 100 }, (_, i) => sourceVideo(`batch-${batch}-page-${page}-${i}`)) }, metadata: { _total: 600 } })]), { statusCode: 200, headers: {} });
+    };
+    await assert.rejects(select(), error => error.status === 403);
+  }
+  state.beforeRequest = null;
+  assert.equal((await service.prepare(detail, oldest)).status, 'error');
+  assert.equal(state.saved, 0); assert.equal(state.folders.size, 0);
+});
+
 test('defaults are disconnected and all automatic cloud mutations are disabled', async t => {
   const { service, state } = await fixture(t); const settings = await service.settings();
   assert.equal(settings.configured, false); assert.equal(settings.enabled, false); assert.equal(settings.autoSave, false); assert.equal(settings.cleanupEnabled, false); assert.equal(settings.retentionDays, 7);
-  assert.equal(settings.maxDailyTransfers, 10); assert.equal(settings.maxDailyBytes, 20 * GIB); assert.equal(state.calls.length, 0);
+  assert.equal(settings.maxDailyTransfers, 100); assert.equal(settings.maxDailyBytes, 20 * GIB); assert.equal(state.calls.length, 0);
   assert.equal((await service.cleanup()).checked, 0); assert.equal((await service.prepare(detail, { auto: true })).status, 'error'); assert.equal(state.saved, 0);
+});
+
+test('the old default limit upgrades once to 100 without resetting later choices or the encrypted account', async t => {
+  const { service, options, metadata, state, connect } = await fixture(t);
+  await connect({ maxDailyTransfers: 10, retentionDays: 30 }); await service.stop();
+  metadata.delete('quark-transfer-default-100-v1');
+  const before = JSON.parse(metadata.get('quark-settings-v1'));
+  const migrated = createQuark(options); t.after(() => migrated.stop());
+  const settings = await migrated.settings(), after = JSON.parse(metadata.get('quark-settings-v1'));
+  assert.equal(settings.maxDailyTransfers, 100); assert.equal(settings.retentionDays, 30);
+  assert.equal(settings.account.connected, true); assert.deepEqual(after.account, before.account);
+  assert.equal(after.installId, before.installId); assert.equal(settings.maxDailyBytes, 20 * GIB);
+  await migrated.configure({ maxDailyTransfers: 10 }); await migrated.stop();
+  const reopened = createQuark(options); t.after(() => reopened.stop());
+  assert.equal((await reopened.settings()).maxDailyTransfers, 10);
+  await reopened.stop();
+  for (const limit of [1, 25, 50, 100]) {
+    metadata.delete('quark-transfer-default-100-v1');
+    metadata.set('quark-settings-v1', JSON.stringify({ ...before, maxDailyTransfers: limit }));
+    const custom = createQuark(options); t.after(() => custom.stop());
+    assert.equal((await custom.settings()).maxDailyTransfers, limit); await custom.stop();
+  }
+  assert.equal(state.saved, 0); assert.deepEqual(state.deletes, []);
+});
+
+test('100 daily transfers persist across restart, reject invalid settings and stop the 101st transfer before saving', async t => {
+  const { service, options, metadata, state, connect, save } = await fixture(t);
+  await connect({ maxDailyTransfers: 100 }); await save();
+  const settings = metadata.get('quark-settings-v1');
+  for (const value of [0, 101, 1.5, '100']) await assert.rejects(service.configure({ maxDailyTransfers: value }), error => error.status === 400);
+  assert.equal(metadata.get('quark-settings-v1'), settings);
+  await service.stop();
+  const registry = JSON.parse(metadata.get('quark-registry-v1')), first = registry.assets[0];
+  registry.assets = [first, ...Array.from({ length: 98 }, (_, i) => ({ ...first, id: (i + 1).toString(16).padStart(32, '0'), fid: 'historical-' + i }))];
+  metadata.set('quark-registry-v1', JSON.stringify(registry));
+  const reopened = createQuark(options); t.after(() => reopened.stop());
+  assert.equal((await reopened.settings()).maxDailyTransfers, 100);
+  const prepare = async fid => {
+    state.source = [sourceVideo(fid)];
+    const shares = await reopened.resources(detail), shareId = shares.resources[0].id;
+    const files = await reopened.files(detail, { shareId });
+    return reopened.prepare(detail, { shareId, fileId: files.files[0].id });
+  };
+  assert.equal((await prepare('hundredth')).status, 'ready');
+  assert.equal(JSON.parse(metadata.get('quark-registry-v1')).assets.length, 100);
+  const count = state.saved;
+  const denied = await prepare('hundred-and-first');
+  assert.equal(denied.status, 'error'); assert.match(denied.reason, /上限/);
+  assert.equal(state.saved, count); assert.deepEqual(state.deletes, []);
 });
 
 test('config plus authenticated root listing verifies Cookie before AES-GCM persistence and masked output', async t => {
@@ -130,7 +275,7 @@ test('public search preserves PanSou password/work title, validates shares and n
   state.searchBody = JSON.stringify({ total: 2, results: [{ title: '合集', links: [{ type: 'quark', url: 'https://pan.quark.cn/s/aaaabbbbcccc', password: 'Ab12', work_title: '影片 2026' }, { type: 'baidu', url: 'https://pan.quark.cn.evil/s/abcdef123456' }] }] });
   const film = { ...detail, quarkShares: [] }, result = await service.resources(film); assert.equal(result.resources.length, 1); assert.equal(result.resources[0].name, '影片 2026'); assert.equal(result.resources[0].url, 'https://pan.quark.cn/s/aaaabbbbcccc?pwd=Ab12');
   const target = new URL(state.searchCalls[0].value); assert.equal(target.searchParams.get('kw'), '影片 2026'); assert.equal(target.searchParams.get('cloud_types'), 'quark'); assert.equal(target.searchParams.get('conc'), '2');
-  const list = await service.files(film, { shareId: result.resources[0].id }); assert.ok(list.files[0].id); const token = state.calls.find(call => call.path === '/share/sharepage/token'); assert.equal(token.body.passcode, 'Ab12'); assert.equal(token.options.headers.cookie, undefined);
+  const list = await service.files(film, { shareId: result.resources[0].id }); assert.ok(list.files[0].id); const token = state.calls.find(call => call.path === '/share/sharepage/token'); assert.equal(token.body.passcode, 'Ab12'); assert.equal(token.options.headers.cookie, COOKIE);
   for (const bad of ['http://127.0.0.1/a', 'https://pan.quark.cn.evil/s/abcdef123456', 'https://evil.example/s/abcdef123456', 'file:///a', 'https://user:pw@pan.quark.cn/s/abcdef123456']) assert.equal((await service.resources({ ...detail, id: bad, quarkShares: [bad] })).resources.length, 1); // Only the safe search result survives.
 });
 

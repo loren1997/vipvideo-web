@@ -130,7 +130,7 @@ async function api(path, options = {}) {
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    if (response.status === 401 && !path.includes('/auth/login')) showLogin();
+    if (response.status === 401 && data.quarkAuth !== true && !path.includes('/auth/login')) showLogin();
     const error = new Error(data.error || data.message || `请求失败（${response.status}）`);
     error.status = response.status;
     error.adultHidden = response.status === 403 && error.message.includes('三级内容已隐藏');
@@ -1229,29 +1229,38 @@ function mountQuark(current) {
       if (data.needsSelection) { feedback.textContent = data.reason || '无法唯一匹配当前集，请核对并选择一个视频文件。'; return; }
       ready(data); feedback.textContent = '普通线路继续播放，准备好后可手动切换。转存不会提高原视频画质。';
     } catch (error) { if (valid() && version === state.version) feedback.textContent = `夸克准备未完成：${error.message}`; }
-    finally { if (valid() && version === state.version) transfer.disabled = !fileSelect.value; }
+    finally { if (valid() && version === state.version) transfer.disabled = !state.files.some(file => file.id === fileSelect.value); }
   }
   const shareSelect = node('select'); shareSelect.setAttribute('aria-label', '夸克分享资源');
   const fileSelect = node('select'); fileSelect.setAttribute('aria-label', '夸克视频文件');
+  const shareField = node('label', undefined, 'quark-choice'); shareField.append(node('span', '分享资源'), shareSelect);
+  const fileField = node('label', undefined, 'quark-choice'); fileField.append(node('span', '视频文件'), fileSelect);
   const transfer = button('转存所选单集', () => { const resource = state.resources.find(value => value.id === shareSelect.value), file = state.files.find(value => value.id === fileSelect.value); if (resource && file) void prepare(resource, file); }, 'button small'); transfer.disabled = true;
   const publicLink = externalLink('查看公开分享 ↗', '', 'button subtle small');
+  const actions = node('div', undefined, 'quark-actions'); actions.append(transfer, publicLink);
+  function filePlaceholder(message) {
+    const option = node('option', message); option.value = ''; fileSelect.replaceChildren(option); fileSelect.disabled = true; fileSelect.title = message; state.files = []; transfer.disabled = true;
+  }
+  filePlaceholder('请先选择分享资源');
   async function loadFiles(automatic = false) {
     const resource = state.resources.find(value => value.id === shareSelect.value); if (!resource || !valid()) return;
-    const version = ++state.version; fileSelect.replaceChildren(); transfer.disabled = true; feedback.textContent = '正在核对当前集的视频文件…';
+    const version = ++state.version; filePlaceholder('正在读取视频文件…'); result.replaceChildren(); shareSelect.title = resource.name || resource.id; feedback.textContent = '正在核对当前集的视频文件…';
     const safe = httpUrl(resource.url); if (safe) { publicLink.href = safe; publicLink.removeAttribute('aria-disabled'); } else publicLink.removeAttribute('href');
     try {
       const data = await api(`/api/quark/files?${new URLSearchParams({ ...playbackSelection(current.detail, current.line, current.episode), shareId: resource.id })}`, { timeoutMs: 35000 });
       if (!valid() || version !== state.version) return;
       state.files = Array.isArray(data.files) ? data.files : [];
-      const blank = node('option', '请选择当前集视频'); blank.value = ''; fileSelect.append(blank);
+      if (!state.files.length) { filePlaceholder('此分享暂无匹配的视频文件'); feedback.textContent = data.reason || '此分享未找到当前集的视频文件，请选择其他分享资源。'; return; }
+      const blank = node('option', '请选择当前集视频'); blank.value = '';
+      fileSelect.replaceChildren(blank); fileSelect.disabled = false;
       for (const file of state.files) { const option = node('option', `${file.name} · ${fileSize(file.size)}${file.match ? ' · 匹配当前集' : ''}`); option.value = file.id; fileSelect.append(option); }
       const matching = state.files.filter(file => file.match === true);
-      fileSelect.value = !data.ambiguous && matching.length === 1 ? matching[0].id : ''; transfer.disabled = !fileSelect.value;
+      fileSelect.value = !data.ambiguous && matching.length === 1 ? matching[0].id : ''; transfer.disabled = !fileSelect.value; fileSelect.title = state.files.find(file => file.id === fileSelect.value)?.name || '请选择当前集视频';
       feedback.textContent = fileSelect.value ? '已核对当前集。准备后仍由你选择切换播放。' : '请核对文件名，只选择当前要看的单集；匹配不明确时不会自动转存。';
       if (automatic && state.resources.length === 1 && !data.ambiguous && matching.length === 1) void prepare(resource, matching[0], true);
-    } catch (error) { if (valid() && version === state.version) feedback.textContent = `网盘文件暂时不可用：${error.message}`; }
+    } catch (error) { if (valid() && version === state.version) { filePlaceholder('文件读取失败，请重试或切换分享'); feedback.textContent = `网盘文件暂时不可用：${error.message}`; result.replaceChildren(button('重试读取文件', () => void loadFiles(), 'button small')); } }
   }
-  shareSelect.addEventListener('change', () => void loadFiles()); fileSelect.addEventListener('change', () => { transfer.disabled = !fileSelect.value; });
+  shareSelect.addEventListener('change', () => void loadFiles()); fileSelect.addEventListener('change', () => { const file = state.files.find(value => value.id === fileSelect.value); transfer.disabled = !file; fileSelect.title = file?.name || '请选择当前集视频'; });
   async function load() {
     try {
       const settings = await api('/api/quark/settings'); if (!valid()) return;
@@ -1261,7 +1270,7 @@ function mountQuark(current) {
       state.resources = Array.isArray(data.resources) ? data.resources : []; shareSelect.replaceChildren();
       if (!state.resources.length) { feedback.textContent = data.reason || '当前集暂未找到可用夸克分享，普通播放不受影响。'; return; }
       for (const resource of state.resources) { const option = node('option', resource.name || resource.id); option.value = resource.id; shareSelect.append(option); }
-      choices.replaceChildren(shareSelect, fileSelect, transfer, publicLink);
+      choices.replaceChildren(shareField, fileField, actions);
       void loadFiles(settings.autoSave === true);
     } catch (error) { if (valid()) { feedback.textContent = `夸克资源暂时不可用：${error.message}`; choices.replaceChildren(button('重试夸克资源', () => void load(), 'button small')); } }
   }
@@ -1877,20 +1886,21 @@ function quarkSettingsPanel(stamp) {
     const field = node('label', label, 'player-option'), input = node('input'); input.type = 'checkbox'; input.setAttribute('aria-label', label); field.prepend(input); fields.append(field); inputs[key] = input;
   }
   const retentionLabel = node('label', '看完后保留天数'), retention = node('input'); retention.type = 'number'; retention.min = '1'; retention.step = '1'; retention.value = '7'; retention.setAttribute('aria-label', '夸克看完后保留天数'); retentionLabel.append(retention); fields.append(retentionLabel);
+  const dailyLabel = node('label', '每日最多转存次数'), dailyTransfers = node('input'); dailyTransfers.type = 'number'; dailyTransfers.min = '1'; dailyTransfers.max = '100'; dailyTransfers.step = '1'; dailyTransfers.required = true; dailyTransfers.value = '100'; dailyTransfers.setAttribute('aria-label', '每日最多转存次数'); dailyLabel.append(dailyTransfers); fields.append(dailyLabel);
   const searchLabel = node('label', '资源搜索接口（可选）'), search = node('input'); search.type = 'url'; search.placeholder = 'https://…'; search.setAttribute('aria-label', '夸克资源搜索接口'); searchLabel.append(search); fields.append(searchLabel);
   const cookieLabel = node('label', '官方网页登录 Cookie'), cookie = node('input'); cookie.type = 'password'; cookie.autocomplete = 'off'; cookie.placeholder = '留空保留已连接账号'; cookie.setAttribute('aria-label', '夸克账号 Cookie'); cookieLabel.append(cookie); fields.append(cookieLabel);
   panel.append(fields, node('p', '首次连接时，复制夸克官方网页文件列表请求 Request Headers 的 Cookie 完整值，支持 Cookie: 前缀。保存后清空此输入，账号凭证不会回填或包含在配置导出中。', 'muted'));
   const actions = node('div', undefined, 'settings-actions'); panel.append(actions);
-  for (const input of [...Object.values(inputs), retention, search, cookie]) input.disabled = true;
+  for (const input of [...Object.values(inputs), retention, dailyTransfers, search, cookie]) input.disabled = true;
   let data = null, version = 0;
   const valid = request => stamp === routeVersion && panel.isConnected && request === version;
   function draw(next) {
     data = next; for (const [key, input] of Object.entries(inputs)) input.checked = next[key] === true;
-    for (const input of [...Object.values(inputs), retention, search, cookie]) input.disabled = false; save.disabled = false;
-    retention.value = String(next.retentionDays || 7); search.value = next.searchApi || '';
+    for (const input of [...Object.values(inputs), retention, dailyTransfers, search, cookie]) input.disabled = false; save.disabled = false;
+    retention.value = String(next.retentionDays || 7); dailyTransfers.value = String(next.maxDailyTransfers ?? 100); search.value = next.searchApi || '';
     const count = Number.isFinite(next.managedFiles) ? next.managedFiles : Array.isArray(next.managedFiles) ? next.managedFiles.length : Number.isFinite(next.managedFiles?.total) ? next.managedFiles.total : null;
     status.textContent = `${next.account?.connected ? `已连接 · ${next.account.label || '夸克账号'}` : '尚未连接夸克账号'}${count !== null ? ` · 管理 ${count} 个文件` : ''} · 最近清理：${formatDate(next.lastCleanup)}${next.lastError ? ` · ${next.lastError}` : ''}`;
-    limit.textContent = `每日转存上限：${next.maxDailyTransfers ?? 10} 次 / ${fileSize(next.maxDailyBytes ?? 21474836480)}。转存保留源文件画质，不会自动提升分辨率。`;
+    limit.textContent = `每日转存上限：${next.maxDailyTransfers ?? 100} 次 / ${fileSize(next.maxDailyBytes ?? 21474836480)}。转存保留源文件画质，不会自动提升分辨率。`;
     disconnect.disabled = !next.account?.connected; cleanup.disabled = !next.account?.connected;
   }
   async function load() {
@@ -1899,10 +1909,10 @@ function quarkSettingsPanel(stamp) {
     catch (error) { if (valid(request)) status.textContent = `夸克设置暂时不可用：${error.message}`; }
   }
   const save = button('保存夸克设置', async () => {
-    if (!retention.reportValidity() || !search.reportValidity() || retention.value === '') return;
+    if (!retention.reportValidity() || !dailyTransfers.reportValidity() || !search.reportValidity() || retention.value === '') return;
     const request = ++version; save.disabled = true;
     try {
-      const next = await api('/api/quark/settings', { method: 'PUT', body: { ...Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.checked])), retentionDays: Number(retention.value), searchApi: search.value.trim(), ...(cookie.value.trim() ? { cookie: cookie.value.trim() } : {}) }, timeoutMs: 35000 });
+      const next = await api('/api/quark/settings', { method: 'PUT', body: { ...Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.checked])), retentionDays: Number(retention.value), maxDailyTransfers: Number(dailyTransfers.value), searchApi: search.value.trim(), ...(cookie.value.trim() ? { cookie: cookie.value.trim() } : {}) }, timeoutMs: 35000 });
       if (!valid(request)) return; cookie.value = ''; draw(next); notify('夸克设置已保存');
     } catch (error) { if (valid(request)) status.textContent = `夸克设置未保存：${error.message}`; }
     finally { if (valid(request)) save.disabled = false; }

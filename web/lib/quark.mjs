@@ -6,12 +6,13 @@ import { request as networkRequest, readText, validateUrl } from './network.mjs'
 const API = 'https://drive.quark.cn/1/clouddrive', REFERER = 'https://pan.quark.cn/';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const DAY = 86400000, GIB = 1024 ** 3, SIDECAR = 'http://pansou:8888/api/search';
-const defaults = { enabled: false, autoSave: false, cleanupEnabled: false, retentionDays: 7, maxDailyTransfers: 10, maxDailyBytes: 20 * GIB, searchApi: '' };
+const defaults = { enabled: false, autoSave: false, cleanupEnabled: false, retentionDays: 7, maxDailyTransfers: 100, maxDailyBytes: 20 * GIB, searchApi: '' };
 const id = () => randomBytes(16).toString('hex');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const validFid = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 const name = value => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 300) : '';
 const failure = (message, status = 502) => Object.assign(new Error(message), { status, quarkSafe: true });
+const accountFailure = message => Object.assign(failure(message, 401), { quarkAuth: true });
 const publicReason = error => error?.quarkSafe && typeof error.message === 'string' ? error.message : '夸克操作失败，请检查网络及登录状态后重试';
 const directory = file => file?.dir === true || file?.dir === 1 || file?.file === false || file?.file_type === 0;
 const video = file => !directory(file) && (file?.file === true || file?.dir === false || file?.dir === 0 || file?.file_type === 1 || file?.category === 1) && /\.(?:mp4|m4v|mkv|mov|webm|avi|ts|m2ts)$/i.test(file?.file_name || '');
@@ -39,7 +40,7 @@ function accountId(config, root, cookie) {
   const uid = config?.data?.uid ?? config?.data?.user_id ?? config?.data?.member_config?.uid ?? root?.data?.uid;
   if (typeof uid === 'string' && uid.length > 0 && uid.length <= 128 || Number.isSafeInteger(uid) && uid > 0) return hash('uid:' + uid);
   const stable = cookie.split(';').map(part => part.trim()).filter(part => /^(?:__kp|__pus|__kps|__uid|uid)=/.test(part)).sort().join(';');
-  if (!stable) throw failure('无法可靠确认夸克账号', 401);
+  if (!stable) throw accountFailure('无法可靠确认夸克账号');
   return hash('cookie:' + stable);
 }
 
@@ -85,9 +86,13 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   const parse = (key, fallback) => { try { const text = store.meta(key); return text && text.length <= 2 * 1024 * 1024 ? JSON.parse(text) : fallback; } catch { return fallback; } };
   const initial = parse('quark-settings-v1', {}), config = { ...defaults, installId: /^[a-f0-9]{32}$/.test(initial.installId || '') ? initial.installId : id() };
   for (const field of ['enabled', 'autoSave', 'cleanupEnabled']) if (typeof initial[field] === 'boolean') config[field] = initial[field];
-  for (const [field, minimum, maximum] of [['retentionDays', 1, 365], ['maxDailyTransfers', 1, 50], ['maxDailyBytes', 1024 * 1024, 100 * GIB]]) if (Number.isSafeInteger(initial[field]) && initial[field] >= minimum && initial[field] <= maximum) config[field] = initial[field];
+  for (const [field, minimum, maximum] of [['retentionDays', 1, 365], ['maxDailyTransfers', 1, 100], ['maxDailyBytes', 1024 * 1024, 100 * GIB]]) if (Number.isSafeInteger(initial[field]) && initial[field] >= minimum && initial[field] <= maximum) config[field] = initial[field];
   if (typeof initial.searchApi === 'string' && initial.searchApi.length <= 2048) config.searchApi = initial.searchApi;
   if (/^[a-f0-9]{64}$/.test(initial.account?.id || '') && ['iv', 'tag', 'ciphertext'].every(field => typeof initial.account[field] === 'string' && initial.account[field].length <= 16384)) config.account = { id: initial.account.id, iv: initial.account.iv, tag: initial.account.tag, ciphertext: initial.account.ciphertext };
+  if (store.meta('quark-transfer-default-100-v1') !== '1') {
+    if (initial.maxDailyTransfers === 10) { config.maxDailyTransfers = 100; store.setMeta('quark-settings-v1', JSON.stringify({ ...initial, maxDailyTransfers: 100 })); }
+    store.setMeta('quark-transfer-default-100-v1', '1');
+  }
   const savedRegistry = parse('quark-registry-v1', {});
   const folders = Object.fromEntries(Object.entries(savedRegistry.folders || {}).filter(([account, folder]) => /^[a-f0-9]{64}$/.test(account) && folder?.name === 'VipVideo-' + config.installId && (!folder.fid || validFid(folder.fid))));
   const registry = { folders, assets: Array.isArray(savedRegistry.assets) ? savedRegistry.assets.filter(asset => /^[a-f0-9]{32}$/.test(asset.id || '') && /^[a-f0-9]{64}$/.test(asset.account || '') && asset.managed === true && validFid(asset.parent) && typeof asset.name === 'string' && Number.isSafeInteger(asset.size) && asset.size > 0 && asset.size <= 100 * GIB && ['saving', 'ready', 'recycling', 'purging', 'deleted'].includes(asset.status) && (asset.status === 'saving' || validFid(asset.fid))).slice(0, 1000) : [], lastCleanup: savedRegistry.lastCleanup || null };
@@ -147,25 +152,32 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
           response = await request(target.href, { method, body: body === undefined ? undefined : JSON.stringify(body), followRedirects: false, timeout: 8000, headers: { accept: 'application/json', 'content-type': 'application/json', referer: REFERER, 'user-agent': UA, ...(credentials ? { cookie: credentials } : {}) } });
           response.on('error', () => {});
           if (expired) { response.destroy(); throw failure('夸克接口请求超过8秒', 504); }
-          if (response.statusCode !== 200 || response.finalUrl && new URL(response.finalUrl).origin !== new URL(API).origin) throw failure('夸克接口拒绝请求或登录已失效', response.statusCode === 401 || response.statusCode === 403 ? 401 : 502);
+          if (response.finalUrl && new URL(response.finalUrl).origin !== new URL(API).origin) throw failure('夸克接口返回了非官方目标，已停止请求');
+          if (response.statusCode !== 200) throw responseFailure(response.statusCode);
           const json = JSON.parse(await readText(response, 1024 * 1024));
-          if (json.code !== 0 || Number(json.status || 200) >= 400) throw failure('夸克接口拒绝请求，请检查账号权限及登录状态', [401, 403].includes(Number(json.status)) ? 401 : 502);
+          if (json.code !== 0 || Number(json.status || 200) >= 400) throw responseFailure(Number(json.status || 200));
           return json;
         })();
         return await Promise.race([task, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('夸克接口请求超过8秒', 504)); }, 8000); })]);
       } catch (cause) { if (cause.quarkSafe) throw cause; throw failure('夸克接口连接失败，请稍后重试'); }
       finally { expired = true; clearTimeout(timeout); response?.destroy(); }
     });
+    function responseFailure(status) {
+      if (status === 401) return accountFailure(credentials ? '夸克登录验证未通过，请在设置中更新网页登录 Cookie' : '此夸克分享需要登录，请在设置中连接并启用夸克账号');
+      if (status === 403) return failure('夸克接口拒绝访问（403），可能存在分享权限或访问限制，请到夸克官方页面确认', 403);
+      if (status === 429) return failure('夸克请求过于频繁（429），请稍后重试', 429);
+      return failure(path.startsWith('/share/sharepage/') ? '夸克分享暂时不可读取，可能已失效、需要提取码或受访问限制，请打开公开分享确认' : '夸克接口暂时不可用，请稍后重试');
+    }
   }
   async function verify(value) {
     const profile = await api('/config', { credentials: value });
     const root = await api('/file/sort', { credentials: value, query: { pdir_fid: '0', _page: '1', _size: '1', _fetch_total: '1' } });
-    if (!Array.isArray(root.data?.list)) throw failure('未能确认夸克账号登录状态', 401);
+    if (!Array.isArray(root.data?.list)) throw accountFailure('未能确认夸克账号登录状态');
     return accountId(profile, root, value);
   }
   async function snapshot() {
     const value = await unlock();
-    if (!config.enabled || !value || !config.account?.id) throw failure('请先在设置中连接并启用夸克账号', 401);
+    if (!config.enabled || !value || !config.account?.id) throw accountFailure('请先在设置中连接并启用夸克账号');
     return { cookie: value, account: config.account.id, epoch };
   }
   const current = context => {
@@ -196,10 +208,11 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw failure('夸克设置格式无效', 400);
     const next = { ...config };
     for (const field of ['enabled', 'autoSave', 'cleanupEnabled']) if (Object.hasOwn(input, field)) { if (typeof input[field] !== 'boolean') throw failure('夸克开关设置无效', 400); next[field] = input[field]; }
-    for (const [field, minimum, maximum] of [['retentionDays', 1, 365], ['maxDailyTransfers', 1, 50], ['maxDailyBytes', 1024 * 1024, 100 * GIB]]) if (Object.hasOwn(input, field)) { if (!Number.isSafeInteger(input[field]) || input[field] < minimum || input[field] > maximum) throw failure('夸克容量或保留期设置无效', 400); next[field] = input[field]; }
+    for (const [field, minimum, maximum] of [['retentionDays', 1, 365], ['maxDailyTransfers', 1, 100], ['maxDailyBytes', 1024 * 1024, 100 * GIB]]) if (Object.hasOwn(input, field)) { if (!Number.isSafeInteger(input[field]) || input[field] < minimum || input[field] > maximum) throw failure('夸克容量或保留期设置无效', 400); next[field] = input[field]; }
     if (Object.hasOwn(input, 'searchApi')) { if (typeof input.searchApi !== 'string' || input.searchApi.length > 2048) throw failure('公开搜索地址无效', 400); next.searchApi = input.searchApi ? searchUrl(input.searchApi) : ''; }
     if (Object.hasOwn(input, 'cookie')) {
       const value = cookieInput(input.cookie), generation = ++epoch;
+      candidates.clear();
       const account = await verify(value);
       if (generation !== epoch) throw failure('账号配置已被更新，本次验证已取消', 409);
       next.account = { id: account, ...await encrypt(value) };
@@ -210,6 +223,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   }
   async function clearAccount() {
     epoch++; cookie = ''; loaded = true; delete config.account; config.enabled = false; config.autoSave = false; config.cleanupEnabled = false;
+    candidates.clear();
     persist(); schedule(); return settings();
   }
   function addShare(info, link, label) {
@@ -265,13 +279,24 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   async function files(detail, options = {}) {
     const info = detailInfo(detail, options), resource = shares.get(options.shareId);
     if (!resource || resource.detail !== info.key || resource.expires <= now()) throw failure('分享资源已过期，请重新搜索', 404);
-    const token = await api('/share/sharepage/token', { method: 'POST', body: { pwd_id: resource.pwdId, passcode: resource.password } });
+    const generation = epoch, context = config.enabled && config.account ? await snapshot() : undefined;
+    if (context) context.valid = options.valid;
+    const guard = () => {
+      if (stopped || generation !== epoch) throw failure('夸克账号已变更或服务正在关闭，操作已取消', 409);
+      if (context) current(context);
+      else if (options.valid && options.valid() !== true) throw failure('影片观看授权已失效，已取消夸克操作', 409);
+    };
+    const read = (path, input) => context ? auth(context, path, input) : api(path, { ...input, guard });
+    guard();
+    const token = await read('/share/sharepage/token', { method: 'POST', body: { pwd_id: resource.pwdId, passcode: resource.password } });
+    guard();
     if (typeof token.data?.stoken !== 'string' || !token.data.stoken || token.data.stoken.length > 4096) throw failure('夸克分享已失效或需要提取码');
     const queue = [{ fid: '0', path: [], depth: 0, page: 1 }], found = [], visited = new Set(); let requests = 1, truncated = false;
     while (queue.length && requests < 6) {
       const folder = queue.shift(), key = folder.fid + ':' + folder.page;
       if (visited.has(key)) { truncated = true; continue; } visited.add(key); requests++;
-      const result = await api('/share/sharepage/detail', { query: { pwd_id: resource.pwdId, stoken: token.data.stoken, pdir_fid: folder.fid, _page: String(folder.page), _size: '100', _fetch_total: '1', ver: '2', force: '0' } });
+      const result = await read('/share/sharepage/detail', { query: { pwd_id: resource.pwdId, stoken: token.data.stoken, pdir_fid: folder.fid, _page: String(folder.page), _size: '100', _fetch_total: '1', ver: '2', force: '0' } });
+      guard();
       if (!Array.isArray(result.data?.list) || result.data.list.length > 100) throw failure('夸克分享目录格式无效');
       for (const row of result.data.list) {
         if (!validFid(row.fid) || !name(row.file_name)) continue;
@@ -280,12 +305,12 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
           const old = [...candidates.values()].find(file => file.detail === info.key && file.share === resource.id && file.fid === row.fid);
           const file = { id: old?.id || id(), detail: info.key, share: resource.id, fid: row.fid, parent: folder.fid, name: name(row.file_name), path: folder.path, size: Number(row.size), token: row.share_fid_token, stoken: token.data.stoken, expires: now() + 10 * 60000 };
           candidates.set(file.id, file); found.push(file);
+          while (candidates.size > 1000) candidates.delete(candidates.keys().next().value);
         }
       }
       const total = Number(result.metadata?._total); if (Number.isFinite(total) && total > folder.page * 100) queue.push({ ...folder, page: folder.page + 1 });
     }
     truncated ||= queue.length > 0;
-    while (candidates.size > 1000) candidates.delete(candidates.keys().next().value);
     const output = found.map(file => ({ id: file.id, name: file.name, size: Number.isSafeInteger(file.size) && file.size > 0 ? file.size : null, match: matches(info, file), episode: episodeNumber(file.name.replace(/\.[^.]+$/, '')) }));
     return { files: output, truncated, ambiguous: truncated || output.filter(file => file.match).length !== 1 };
   }
