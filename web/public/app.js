@@ -1680,7 +1680,10 @@ function playbackError(current) {
     current.note.textContent = '兼容播放中断，请点击“重新兼容播放”重试。'; current.note.className = 'player-note error-message';
     void stopTranscode(current.transcodeId); current.transcodeId = null; return;
   }
-  if (current.quarkAsset) { current.failed = true; current.note.textContent = '夸克播放中断。可重试夸克播放，或返回原线路；原影视源不会因此停用。'; current.note.className = 'player-note error-message'; return; }
+  if (current.quarkAsset) {
+    if ([3, 4].includes(current.video?.error?.code) && !current.requiresCompatibility && !current.flow.transcodeTried) { void startCompatibility(current, playPosition(current), true); return; }
+    current.failed = true; current.note.textContent = '夸克播放中断。可重试夸克播放，或返回原线路；原影视源不会因此停用。'; current.note.className = 'player-note error-message'; return;
+  }
   if (current.catalog) void recoverPlayback(current);
   else if (current.live) void recoverLive(current);
   else { current.note.textContent = '当前地址无法播放，请更换链接或打开原链接。'; current.note.className = 'player-note error-message'; }
