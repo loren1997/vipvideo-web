@@ -38,6 +38,10 @@ docker compose -f docker-compose.yml -f compose.quark.yaml exec -T pansou wget -
 
 使用 GPU 文件时，上述检查命令也加入 `-f compose.gpu.yaml`。健康检查仅证明助手运行，搜索仍依赖外部网站的可达性。
 
+搜索可用性修复无需修改 Compose 文件。PanSou 正常的零结果响应可能只有 `data: { total: 0 }`，应用会继续搜索其他渠道，不再将它误判为接口故障。某个片名的备用关键词耗尽剩余时间，也不会暂停此前已正常响应的接口。升级后会让已配置、被旧逻辑暂停的接口重新尝试一次；后续真实故障仍会退避，避免反复占用 NAS 资源。
+
+搜索全部失败时，影片页会分别显示接口超时、连接失败、HTTP 状态或暂时暂停等固定诊断，不显示账号凭证和上游原始错误。返回零条结果只代表本次查询没有命中，不能据此判断接口已失效；也不能保证存在对应的公开夸克分享。
+
 ## 资源与隐私
 
 附加文件使用[官方 PanSou API 镜像](https://github.com/fish2018/pansou)，固定摘要 `sha256:d371fe5caa87794414dd54cda063fcfc456d5013e18b65dbf1f6ca17f6299492`；2026-10-13 匿名核验包含 `linux/amd64` 和 `linux/arm64`，对应上游源码提交 `221665fb2c9279f22af4684ea2d8c0c331eac1cc`。

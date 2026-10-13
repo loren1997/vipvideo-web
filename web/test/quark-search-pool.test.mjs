@@ -155,9 +155,10 @@ test('a stalled RSS response cannot push API failover past 7.5 seconds', async t
   const stalled = [];
   const f = fixture({ saved: savedBackup(Date.now()), request: () => { const stream = Object.assign(new PassThrough(), { statusCode: 200, headers: {} }); stream.write('{'); stalled.push(stream); return stream; } });
   try {
-    const pending = assert.rejects(lookup(f.pool), /公开搜索接口和网页搜索暂不可用/); await flush();
+    const pending = lookup(f.pool); await flush();
     t.mock.timers.tick(5500); await flush(); assert.equal(stalled.length, 3);
-    t.mock.timers.tick(2000); await pending;
+    t.mock.timers.tick(2000); const result = await pending;
+    assert.deepEqual(result.results, []); assert.match(result.reason, /超时/);
     assert.equal(Date.now(), 8500); assert.ok(stalled.every(stream => stream.destroyed));
   } finally { await f.pool.stop(); }
 });
@@ -219,9 +220,11 @@ test('public discovery and query URLs reject credentials, private literals and D
     for (const url of ['http://127.0.0.1/api/search?kw=x', 'http://PANSOU:8888/api/search?kw=x', 'http://pansou:8889/api/search?kw=x', 'https://public.example/api/search?kw=x&token=secret', 'https://user:secret@public.example/api/search?kw=x']) await assert.rejects(lookup(f.pool, url));
     assert.equal(publicCalls, 0);
     await f.pool.discover(); assert.equal(f.pool.status().candidates.length, 1);
-    await assert.rejects(lookup(f.pool, 'https://rebind.example/api/search?kw=x'), /公开搜索接口和网页搜索暂不可用/);
+    const rebound = await lookup(f.pool, 'https://rebind.example/api/search?kw=x');
+    assert.deepEqual(rebound.results, []); assert.match(rebound.reason, /安全检查拒绝/);
     assert.equal(JSON.stringify(f.pool.status()).includes('secret'), false);
-    await assert.rejects(lookup(f.pool, 'http://pansou:8888/api/search?kw=x'), /公开搜索接口和网页搜索暂不可用/);
+    const sidecar = await lookup(f.pool, 'http://pansou:8888/api/search?kw=x');
+    assert.deepEqual(sidecar.results, []); assert.match(sidecar.reason, /连接失败/);
     assert.ok(f.calls.some(call => call.url.startsWith('http://pansou:8888/api/search?')));
   } finally { await f.pool.stop(); }
 });
@@ -602,7 +605,7 @@ test('empty API searches expose fixed web failures instead of disguising them as
   const f = fixture({ request: url => response(url.includes('bing.com') ? 'blocked user-cookie' : '{"results":[]}', url.includes('bing.com') ? 403 : 200), googleSearch: async () => { throw new Error('private upstream failure user-token'); } });
   try {
     const result = await lookup(f.pool);
-    assert.deepEqual(result.results, []); assert.equal(result.reason, 'Google 公开搜索暂不可用；Bing 公开搜索暂不可用');
+    assert.deepEqual(result.results, []); assert.equal(result.reason, 'Google 公开搜索：搜索服务连接失败；Bing 公开搜索：搜索接口返回 HTTP 403');
     assert.equal(/user-cookie|user-token|private upstream|https?:/i.test(result.reason), false);
     assert.equal(f.pool.status().candidates.find(row => row.apiUrl.includes('manual.example')).status, 'pending');
   } finally { await f.pool.stop(); }
@@ -617,8 +620,10 @@ test('upgrading retries the current paused manual API once while preserving auto
   const f = fixture({ saved, now: () => clock, request: url => response(url.includes('bing.com') ? '<rss><channel></channel></rss>' : 'offline', url.includes('bing.com') ? 200 : 503) });
   let restarted;
   try {
+    f.metadata.set('quark-search-recall-v2', '1');
     await lookup(f.pool);
     assert.equal(f.calls.filter(call => call.url.includes('manual.example')).length, 1);
+    assert.equal(f.metadata.get('quark-search-availability-v3'), '1');
     assert.equal(f.metadata.get('quark-search-recall-v2'), '1');
     const failed = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === manual);
     assert.equal(failed.failures, 4); assert.equal(failed.status, 'paused'); assert.ok(failed.retryAt > clock);
@@ -640,7 +645,117 @@ test('a successful one-time manual API retry clears failure count through normal
     assert.equal((await lookup(f.pool)).results.length, 1);
     const current = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url.includes('manual.example'));
     assert.equal(current.status, 'healthy'); assert.equal(current.failures, 0); assert.equal(current.retryAt, 0);
-    assert.equal(f.metadata.get('quark-search-recall-v2'), '1');
+    assert.equal(f.metadata.get('quark-search-availability-v3'), '1');
+  } finally { await f.pool.stop(); }
+});
+
+test('real PanSou omitted empty arrays preserve a usable API for the next film', async () => {
+  const f = fixture({ request: url => {
+    const parsed = new URL(url);
+    if (parsed.hostname.includes('bing.com')) return response('blocked', 403);
+    return response(parsed.searchParams.get('kw') === '电影' ? '{"code":0,"message":"success","data":{"total":0}}' : json(undefined, '遮天'));
+  } });
+  try {
+    const empty = await lookup(f.pool);
+    assert.deepEqual(empty.results, []); assert.ok(!/格式|JSON/.test(empty.reason));
+    assert.equal(f.pool.status().candidates.find(row => row.apiUrl.includes('manual.example')).status, 'pending');
+    assert.equal((await lookup(f.pool, 'https://manual.example/api/search?kw=遮天')).results.length, 1);
+    assert.equal(f.calls.filter(call => call.url.includes('manual.example')).length, 2);
+  } finally { await f.pool.stop(); }
+});
+
+test('an optional keyword exhausting its short budget cannot disable an API that already answered another keyword', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const f = fixture({ request: async url => {
+    const parsed = new URL(url), keyword = parsed.searchParams.get('kw');
+    if (parsed.hostname.includes('bing.com')) return response('blocked', 403);
+    if (keyword === '你我对抗全世界') { await new Promise(done => setTimeout(done, 4000)); return response('{"code":0,"message":"success","data":{"total":0,"results":[]}}'); }
+    if (keyword === '遮天') return response(json(undefined, '遮天'));
+    const stream = Object.assign(new PassThrough(), { statusCode: 200, headers: {} }); stream.write('{'); return stream;
+  } });
+  try {
+    const pending = f.pool.request('https://manual.example/api/search?kw=' + encodeURIComponent('你我对抗全世界'), { year: '2026' });
+    await flush(); t.mock.timers.tick(4000); await flush();
+    assert.equal(f.calls.filter(call => call.url.includes('manual.example'))[1].options.timeout, 1700);
+    t.mock.timers.tick(1700); await flush();
+    const first = JSON.parse(await readText(await pending));
+    assert.deepEqual(first.results, []); assert.match(first.reason, /超时/);
+    const primary = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url.includes('manual.example'));
+    assert.equal(primary.status, 'pending'); assert.equal(primary.failures, 0); assert.equal(primary.retryAt, 0);
+    assert.equal((await lookup(f.pool, 'https://manual.example/api/search?kw=遮天')).results.length, 1);
+    assert.equal(f.calls.filter(call => call.url.includes('manual.example')).length, 3);
+  } finally { await f.pool.stop(); }
+});
+
+test('only explicit valid PanSou zero-result responses can omit the arrays', async () => {
+  const invalid = [
+    { code: 0, data: { total: 0, results: null } },
+    { code: 0, data: { total: 0, merged_by_type: [] } },
+    { code: 0, data: { total: '0' } },
+    { code: 0, data: { total: 1 } },
+    { code: 500, message: 'private user-cookie', data: { total: 0 } },
+    { success: true, data: { total: 0 } },
+    { status: 'ok', total: 0, auth_enabled: false },
+  ];
+  for (const body of invalid) {
+    const f = fixture({ request: url => response(url.includes('bing.com') ? '<rss><channel></channel></rss>' : JSON.stringify(body)) });
+    try {
+      const result = await lookup(f.pool);
+      assert.deepEqual(result.results, []); assert.match(result.reason, /响应格式不兼容/);
+      assert.equal(result.reason.includes('user-cookie'), false);
+      assert.equal(f.pool.status().candidates.find(row => row.apiUrl.includes('manual.example')).status, 'paused');
+    } finally { await f.pool.stop(); }
+  }
+  const f = fixture({ request: () => response(JSON.stringify({ code: 0, data: { total: 0, results: [{ title: '电影', links: [{ type: 'quark', url: quarkUrl }] }] } })) });
+  try { assert.equal((await lookup(f.pool)).results.length, 1); }
+  finally { await f.pool.stop(); }
+});
+
+test('a genuine full-budget connection failure still backs off and the next film explains the retry window safely', async () => {
+  const f = fixture({ request: url => {
+    if (url.includes('bing.com')) return response('upstream private user-cookie', 503);
+    throw Object.assign(new Error('connect http://private.example user-token user-cookie'), { code: 'ECONNREFUSED' });
+  } });
+  try {
+    const first = await lookup(f.pool);
+    assert.deepEqual(first.results, []); assert.match(first.reason, /已配置搜索接口：搜索服务连接失败/);
+    assert.match(first.reason, /HTTP 503/);
+    const primary = f.pool.status().candidates.find(row => row.apiUrl.includes('manual.example'));
+    assert.equal(primary.status, 'paused'); assert.ok(primary.retryAt > Date.now());
+    const second = await lookup(f.pool, 'https://manual.example/api/search?kw=遮天');
+    assert.deepEqual(second.results, []); assert.match(second.reason, /15 分钟后重试/);
+    assert.equal(f.calls.filter(call => call.url.includes('manual.example')).length, 1);
+    assert.equal(/private\.example|user-token|user-cookie/.test(JSON.stringify([first, second])), false);
+  } finally { await f.pool.stop(); }
+});
+
+test('a first request with little budget left after queuing cannot pause an untested API', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const f = fixture({ request: async url => {
+    const parsed = new URL(url);
+    if (parsed.hostname.includes('bing.com')) return response('<rss><channel></channel></rss>');
+    if (parsed.hostname === 'short.example') throw Object.assign(new Error('private connection detail'), { code: 'ECONNREFUSED' });
+    await new Promise(done => setTimeout(done, 2700)); return response(json());
+  } });
+  try {
+    const pending = Promise.all(['https://busy1.example/api/search?kw=电影', 'https://busy2.example/api/search?kw=电影', 'https://short.example/api/search?kw=电影'].map(url => lookup(f.pool, url)));
+    await flush(); assert.equal(f.calls.length, 2);
+    t.mock.timers.tick(2700); await flush();
+    const results = await pending;
+    assert.deepEqual(results.map(row => row.results.length), [1, 1, 0]);
+    const short = f.calls.find(call => call.url.includes('short.example'));
+    assert.equal(short.options.timeout, 3000);
+    const state = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url.includes('short.example'));
+    assert.equal(state.status, 'pending'); assert.equal(state.failures, 0); assert.equal(state.retryAt, 0);
+  } finally { await f.pool.stop(); }
+});
+
+test('HTML search failures expose a fixed non-JSON diagnostic without echoing upstream content', async () => {
+  const f = fixture({ request: url => response(url.includes('bing.com') ? '<rss><channel></channel></rss>' : '<html>Cookie user-cookie Authorization user-token</html>') });
+  try {
+    const result = await lookup(f.pool);
+    assert.deepEqual(result.results, []); assert.match(result.reason, /搜索接口未返回 JSON/);
+    assert.equal(/user-cookie|user-token|Authorization|<html>/.test(result.reason), false);
   } finally { await f.pool.stop(); }
 });
 

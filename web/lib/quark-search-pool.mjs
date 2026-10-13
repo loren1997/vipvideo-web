@@ -4,7 +4,7 @@ import { createQuarkSearchRequest } from './quark-search.mjs';
 import { searchGoogleQuark } from './quark-google-search.mjs';
 
 const KEY = 'quark-search-pool-v1', DAY = 86_400_000, HEALTH_INTERVAL = 6 * 60 * 60_000;
-const RECALL_KEY = 'quark-search-recall-v2';
+const RECALL_KEY = 'quark-search-availability-v3';
 const OFFICIAL = 'https://so.252035.xyz/api/search';
 const sources = [
   'https://api.github.com/repos/fish2018/pansou-web',
@@ -13,7 +13,14 @@ const sources = [
 ];
 const searchFields = ['kw', 'cloud_types', 'res', 'src', 'conc', 'channels', 'plugins', 'refresh'];
 const sensitive = key => /cookie|authorization|password|secret|api.?key|(?:^|_)token(?:$|_)/i.test(key);
-const failure = (message, status = 502, local = false) => Object.assign(new Error(message), { status, quarkSafe: true, ...(local ? { quarkPoolLocal: true } : {}) });
+const failure = (message, status = 502, local = false) => Object.assign(new Error(message), { status, quarkSafe: true, quarkPoolReason: message, ...(local ? { quarkPoolLocal: true } : {}) });
+function safeFailure(cause, reading = false) {
+  if (cause?.quarkPoolReason) return cause;
+  const code = cause?.code || cause?.cause?.code;
+  if (code === 'ETIMEDOUT' || cause?.name === 'TimeoutError' || ['网盘搜索超时（8 秒）', '影视源请求超时', '影视源读取超时'].includes(cause?.message)) return failure('搜索请求超时', 504);
+  if (cause?.status === 403) return failure('搜索地址被安全检查拒绝', 403);
+  return failure(reading ? '搜索响应正文读取失败' : '搜索服务连接失败');
+}
 
 function endpoint(value, internal = false) {
   if (typeof value !== 'string' || value.length > 8192 || value.includes('#')) throw failure('搜索地址无效', 400);
@@ -72,10 +79,12 @@ function shares(data, at) {
   return [...found.values()];
 }
 function compatible(body, at) {
-  let data; try { data = JSON.parse(body); } catch { return; }
+  let data; try { data = JSON.parse(body); } catch { throw failure('搜索接口未返回 JSON'); }
   if (!data || typeof data !== 'object' || Array.isArray(data)) return;
   const payload = data.data && typeof data.data === 'object' ? data.data : data;
   if (data.error || data.success === false || data.code !== undefined && ![0, 200, '0', '200'].includes(data.code)) return;
+  if (Object.hasOwn(payload, 'results') && !Array.isArray(payload.results) || Object.hasOwn(payload, 'merged_by_type') && (!payload.merged_by_type || typeof payload.merged_by_type !== 'object' || Array.isArray(payload.merged_by_type))) return;
+  if (payload === data.data && !Array.isArray(payload) && payload.total === 0 && [0, 200, '0', '200'].includes(data.code) && !['results', 'merged_by_type', 'list'].some(key => Object.hasOwn(payload, key))) return [];
   if (!Array.isArray(payload) && !Array.isArray(payload.results) && !Array.isArray(payload.list) && !(payload.merged_by_type && typeof payload.merged_by_type === 'object' && !Array.isArray(payload.merged_by_type))) return;
   return shares(data, at);
 }
@@ -166,18 +175,20 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
   function text(url, duration, transport = request, maxBytes = 2 * 1024 * 1024, deadline = now() + duration) {
     return track(async () => {
       await slot(deadline);
-      let response, timeout, expired = false;
+      let response, timeout, remaining = 0, reading = false, expired = false;
       try {
         if (stopping || deadline <= now()) throw failure('公开搜索已停止或超时', 503, true);
-        const remaining = Math.max(1, Math.min(duration, deadline - now()));
+        remaining = Math.max(1, Math.min(duration, deadline - now()));
         const work = (async () => {
           response = await transport(url, { method: 'GET', timeout: remaining, followRedirects: false, headers: { accept: 'application/json, application/rss+xml, text/plain', 'user-agent': 'VipVideo-Web-quark-search' } });
           if (expired) { response.destroy(); throw failure('公开搜索超时', 504); }
-          if (response.statusCode !== 200) throw failure(response.statusCode === 401 || response.statusCode === 403 ? '公开接口需要认证或拒绝访问' : '公开搜索接口暂不可用');
+          if (response.statusCode !== 200) throw failure('搜索接口返回 HTTP ' + (Number.isInteger(response.statusCode) && response.statusCode >= 100 && response.statusCode <= 599 ? response.statusCode : 502));
+          reading = true;
           return await readText(response, maxBytes);
         })();
         return await Promise.race([work, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('公开搜索超时', 504)); }, remaining); })]);
-      } finally { expired = true; clearTimeout(timeout); response?.destroy(); release(); }
+      } catch (cause) { throw Object.assign(safeFailure(cause, reading), { searchBudgetMs: remaining }); }
+      finally { expired = true; clearTimeout(timeout); response?.destroy(); release(); }
     });
   }
   function checked(row, links) {
@@ -268,6 +279,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
         if (cached?.rows.size) return result([...cached.rows.values()], query, cached.reason);
         const entry = { rows: new Map(), expires: now() + 2 * 60_000 };
         const notes = new Set(), report = message => { notes.add(message); entry.reason = [...notes].join('；'); };
+        if (primary && primary.retryAt > now()) report('已配置搜索接口正在暂缓重试，约 ' + Math.ceil((primary.retryAt - now()) / 60_000) + ' 分钟后重试');
         recent.set(cacheKey, entry); while (recent.size > 32) recent.delete(recent.keys().next().value);
         const merge = rows => {
           if (stopping || entry.expires <= now()) return;
@@ -279,15 +291,20 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
         };
         const backups = state.candidates.filter(row => row.automatic && row.url !== base && row.status === 'healthy' && row.retryAt <= now()).sort((a, b) => b.checkedAt - a.checkedAt);
         const selected = web ? [] : [...(primary && primary.retryAt <= now() ? [primary] : []), ...backups].slice(0, 2);
-        let valid = false;
         const attempts = selected.map(row => track(async () => {
+          let answered = false;
           for (const [index, word] of query.words.entries()) {
             if (stopping || index && deadline - 1800 - now() < 250) break;
+            const budget = Math.min(5500, deadline - 1800 - now());
             try {
               const links = compatible(await text(apiUrl(row.url, word), 5500, request, 2 * 1024 * 1024, deadline - 1800), now());
-              if (links === undefined) throw failure('搜索接口格式不兼容'); valid = true; checked(row, links);
+              if (links === undefined) throw failure('搜索接口响应格式不兼容'); answered = true; checked(row, links);
               merge(links); const matched = links.filter(link => relevance(link, query)); if (matched.length) return matched;
-            } catch (cause) { failed(row, cause); report(cause?.quarkPoolLocal ? '夸克搜索繁忙，请稍后重试' : '部分夸克搜索接口暂不可用'); break; }
+            } catch (cause) {
+              // A short optional query does not establish a site-wide failure.
+              if (!answered && (cause?.searchBudgetMs ?? budget) >= 5000) failed(row, cause);
+              report((row === primary ? '已配置搜索接口：' : '备用搜索接口：') + safeFailure(cause).quarkPoolReason); break;
+            }
           }
           return [];
         }));
@@ -310,9 +327,8 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           text(fallback.href, Math.max(1, deadline - now()), request, 2 * 1024 * 1024, deadline).then(body => rssShares(body, now())),
         ]);
         if (stopping) throw failure('公开搜索已停止', 503, true);
-        for (const [index, page] of pages.entries()) if (page.status === 'fulfilled') { valid = true; merge(page.value); } else report(index === 0 ? 'Google 公开搜索暂不可用' : 'Bing 公开搜索暂不可用');
-        if (valid) return result([...entry.rows.values()], query, entry.reason);
-        throw failure('公开搜索接口和网页搜索暂不可用，请稍后重试');
+        for (const [index, page] of pages.entries()) if (page.status === 'fulfilled') merge(page.value); else report((index === 0 ? 'Google 公开搜索：' : 'Bing 公开搜索：') + safeFailure(page.reason).quarkPoolReason);
+        return result([...entry.rows.values()], query, entry.reason);
       });
     },
     status, discover,

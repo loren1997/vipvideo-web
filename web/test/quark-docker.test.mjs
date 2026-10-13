@@ -6,8 +6,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as wait } from 'node:timers/promises';
+import { Readable } from 'node:stream';
+import { createQuarkSearchPool } from '../lib/quark-search-pool.mjs';
+import { readText } from '../lib/network.mjs';
 
-test('optional Quark search companion preserves Compose settings and becomes healthy', {
+test('optional Quark search companion preserves Compose settings and accepts real search responses', {
   skip: process.env.GITHUB_ACTIONS !== 'true', timeout: 180_000,
 }, async () => {
   const root = fileURLToPath(new URL('../../', import.meta.url));
@@ -93,6 +96,32 @@ test('optional Quark search companion preserves Compose settings and becomes hea
     assert.ok(healthy, 'Optional PanSou companion must become healthy');
     const health = JSON.parse(compose(['exec', '-T', 'pansou', 'wget', '-qO-', 'http://127.0.0.1:8888/api/health']));
     assert.ok(health.status || health.success || health.code !== undefined);
+    // A nonexistent plugin checks the real search contract without contacting upstream resources.
+    const body = compose(['exec', '-T', 'pansou', 'wget', '-qO-',
+      'http://127.0.0.1:8888/api/search?kw=vipvideo-protocol-selfcheck&src=plugin&plugins=vipvideo_no_such_plugin_90d5&res=results&cloud_types=quark&conc=1']);
+    const wire = JSON.parse(body);
+    assert.equal(wire.code, 0);
+    assert.equal(wire.data.total, 0);
+    assert.equal(wire.data.results, undefined, 'Pinned PanSou omits empty results');
+    const metadata = new Map(); let primaryCalls = 0;
+    const pool = createQuarkSearchPool({
+      store: { meta: key => metadata.get(key), setMeta: (key, value) => metadata.set(key, value) },
+      googleSearch: async () => [],
+      request: async url => {
+        const primary = new URL(url).hostname === 'pansou';
+        if (primary) primaryCalls++;
+        return Object.assign(Readable.from([primary ? body : '<rss><channel></channel></rss>']), { statusCode: 200, headers: {} });
+      },
+    });
+    try {
+      for (const title of ['协议验收甲', '协议验收乙']) {
+        const url = new URL('http://pansou:8888/api/search'); url.searchParams.set('kw', title);
+        const parsed = JSON.parse(await readText(await pool.request(url.href)));
+        assert.deepEqual(parsed.results, []);
+        assert.doesNotMatch(parsed.reason || '', /格式|暂停|不可用/);
+      }
+      assert.equal(primaryCalls, 2, 'A valid empty response must keep the primary available for another title');
+    } finally { await pool.stop(); }
   } catch (error) {
     const log = spawnSync('docker', ['compose', '-p', name, ...files, 'logs', '--no-color', 'pansou'], {
       cwd: root, windowsHide: true, encoding: 'utf8', timeout: 10_000,
