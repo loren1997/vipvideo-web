@@ -3,6 +3,14 @@
     {
       "name": "LunaTV-config 常规影视订阅",
       "url": "https://raw.githubusercontent.com/hafrey1/LunaTV-config/main/jin18.json"
+    },
+    {
+      "name": "MoonTV 官方公开配置",
+      "url": "https://raw.githubusercontent.com/Stardm0/MoonTV/main/config.json"
+    },
+    {
+      "name": "KatelyaTV 官方公开配置",
+      "url": "https://raw.githubusercontent.com/katelya77/KatelyaTV/main/config.json"
     }
   ],
   "liveSources": [

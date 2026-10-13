@@ -7,6 +7,14 @@ const config = { sources: [{ id: 'a', name: '甲源', api: 'https://a.example/ap
 function response(list, extra = {}) { return Object.assign(Readable.from([Buffer.from(JSON.stringify({ list, ...extra }))]), { statusCode: 200, headers: {} }); }
 function video(id, title = '影片', year = '2026', extra = {}) { return { vod_id: id, vod_name: title, vod_year: year, vod_play_from: '直链', vod_play_url: '正片$https://cdn.example/v.mp4?token=a%2Fb&dollar=$keep', ...extra }; }
 
+test('detail extracts bounded public Quark shares without treating arbitrary URLs as resources', async () => {
+  const catalog = createCatalog({ request: async () => response([video(1, '影片', '2026', {
+    vod_content: '<a href="https://pan.quark.cn/s/ABC123456?pwd=test&amp;entry=source">资源</a> https://pan.quark.cn.evil/s/ABC123456 http://127.0.0.1/s/ABC123456',
+    vod_down_url: 'https://pan.quark.cn/s/ABC123456',
+  })]) });
+  assert.deepEqual((await catalog.detail(config, 'a', '1')).quarkShares, ['https://pan.quark.cn/s/ABC123456?pwd=test']);
+});
+
 test('genre uses each source category ID and enforces year even when the source ignores its filter', async () => {
   const calls = [];
   const single = { sources: [{ ...config.sources[0], api: 'https://a.example/api?token=keep&year=1990&class=stale&sort_direction=asc' }] };

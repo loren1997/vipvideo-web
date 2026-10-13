@@ -1,0 +1,49 @@
+services:
+  web:
+    environment:
+      QUARK_SEARCH_API: http://pansou:8888/api/search
+    depends_on:
+      pansou:
+        condition: service_healthy
+
+  pansou:
+    # Official image; the index includes linux/amd64 and linux/arm64 (checked 2026-10-13).
+    image: ghcr.io/fish2018/pansou@sha256:d371fe5caa87794414dd54cda063fcfc456d5013e18b65dbf1f6ca17f6299492
+    restart: unless-stopped
+    expose:
+      - "8888"
+    environment:
+      PORT: "8888"
+      AUTH_ENABLED: "false"
+      CHANNELS: Quark_Movies
+      ENABLED_PLUGINS: pansearch,quark4k,quarktv
+      CONCURRENCY: "2"
+      HTTP_MAX_CONNS: "4"
+      PLUGIN_TIMEOUT: "6"
+      ASYNC_PLUGIN_ENABLED: "true"
+      ASYNC_RESPONSE_TIMEOUT: "4"
+      ASYNC_MAX_BACKGROUND_WORKERS: "2"
+      ASYNC_MAX_BACKGROUND_TASKS: "8"
+      ASYNC_LOG_ENABLED: "false"
+      CACHE_ENABLED: "true"
+      CACHE_PATH: /app/cache
+      CACHE_MAX_SIZE: "32"
+      CACHE_TTL: "60"
+      GOMAXPROCS: "2"
+    cpus: 0.5
+    mem_limit: 384m
+    pids_limit: 64
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m
+      - /app/cache:size=64m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8888/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

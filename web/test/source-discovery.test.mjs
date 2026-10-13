@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { createSourceDiscovery } from '../lib/source-discovery.mjs';
 import { createStore } from '../lib/store.mjs';
+import { repairImport, subscriptionWindow } from '../lib/import-repair.mjs';
+import { importConfig } from '../lib/config.mjs';
 
 const empty={showAdult:false,sources:[],platforms:[],parsers:[],subscriptions:[],liveSources:[]};
 const directory='https://raw.githubusercontent.com/loren1997/vipvideo-web/main/web/subscription-presets.json';
@@ -33,7 +35,7 @@ function fixture({store=memoryStore(),files=new Map(),curated={subscriptions:[],
     if(files.has(url))return response(files.get(url),200,url);
     return response('not found',404,url);
   };
-  const maintenance={status:()=>({sources:[]}),async verify(source){verified.push(source);return verify?verify(source):{api:source.api,status:'ok',checkedAt:now()};},async update(){updates++;}};
+  const maintenance={status:()=>({sources:[]}),async verify(source,options){verified.push(source);assert.deepEqual(options,{playback:true});return verify?verify(source):{api:source.api,status:'ok',playable:true,checkedAt:now()};},async update(){updates++;}};
   const playability={async check(episode){played.push(episode);return play?play(episode):{playable:episode.url.includes('/live.m3u8'),checkedAt:now()};}};
   const service=createSourceDiscovery({store,maintenance,playability,request,now,logger:{error:(...value)=>errors.push(value)}});
   return{service,store,seen,verified,played,errors,maintenance,playability,request,get updates(){return updates;},get maxActive(){return maxActive;}};
@@ -137,7 +139,7 @@ test('deleted, disabled and URL-edited managed subscriptions remain tombstoned a
 test('before-write configuration races preserve household edits and do not recreate newly disabled URLs',async t=>{
   for(const disabled of [false,true])await t.test(disabled?'user disabled':'unrelated edit',async()=>{
     const entered=deferred(),release=deferred(),url='https://config.example/race.json';
-    const f=fixture({curated:{subscriptions:[{name:'竞态配置',url}],liveSources:[]},files:new Map([[url,payload()]]),verify:async source=>{entered.resolve();await release.promise;return{api:source.api,status:'ok'};}});
+    const f=fixture({curated:{subscriptions:[{name:'竞态配置',url}],liveSources:[]},files:new Map([[url,payload()]]),verify:async source=>{entered.resolve();await release.promise;return{api:source.api,status:'ok',playable:true};}});
     const pending=f.service.discover();await entered.promise;
     f.store.setConfig({...f.store.config(),showAdult:true,platforms:[{id:'household',name:'家庭自定义',url:'https://platform.example/',category:'video',enabled:true}],...(disabled?{subscriptions:[{id:'manual',name:'手动停用',url,enabled:false}]}:{})});release.resolve();
     await pending;assert.equal(f.store.config().showAdult,true);assert.equal(f.store.config().platforms[0].id,'household');assert.equal(f.store.config().subscriptions.length,1);
@@ -214,7 +216,7 @@ test('JSON, RSS and one-hop HTML response limits reject oversized bodies before 
 test('known healthy identical APIs can back a new subscription without redundant API requests',async()=>{
   const store=memoryStore({...empty,sources:[{id:'kept',name:'已验证影视',api:'https://catalog.example/api.php/provide/vod',enabled:true}]}),url='https://config.example/backup.json';
   const f=fixture({store,curated:{subscriptions:[{name:'备用公开配置',url}],liveSources:[]},files:new Map([[url,payload()]])});
-  f.maintenance.status=()=>({sources:[{api:'https://catalog.example/api.php/provide/vod',status:'ok',checkedAt:1000}]});
+  f.maintenance.status=()=>({sources:[{api:'https://catalog.example/api.php/provide/vod',status:'ok',playable:true,checkedAt:1000}]});
   await f.service.discover();assert.equal(f.verified.length,0);assert.equal(store.config().subscriptions.length,1);await f.service.stop();
 });
 
@@ -230,8 +232,8 @@ test('startup and fifteen-minute scheduling are idempotent, persist status and l
   const flush=async()=>{for(let i=0;i<25;i++)await new Promise(done=>setImmediate(done));};
   assert.equal(f.seen.length,0);f.service.start();f.service.start();t.mock.timers.tick(0);await flush();
   const first=f.seen.length;assert.ok(first>0);assert.equal(f.service.status().lastDiscovery,1000);
-  t.mock.timers.tick(15*60_000);await flush();assert.equal(f.seen.length,first*2);await f.service.stop();
-  t.mock.timers.tick(60*60_000);await flush();assert.equal(f.seen.length,first*2);
+  t.mock.timers.tick(15*60_000);await flush();const second=f.seen.length;assert.ok(second>first&&second<first*2);await f.service.stop();
+  t.mock.timers.tick(60*60_000);await flush();assert.equal(f.seen.length,second);
   const restarted=fixture({store,now:Date.now});assert.equal(restarted.service.status().lastDiscovery,901000);restarted.service.start();t.mock.timers.tick(0);await flush();assert.ok(restarted.seen.length>0);await restarted.service.stop();
 });
 
@@ -242,4 +244,77 @@ test('actual SQLite discovery status and deleted-subscription tombstones persist
     let f=fixture({...options,store});service=f.service;await service.discover();await service.stop();store.setConfig({...store.config(),subscriptions:[]});store.close();
     store=createStore(directoryPath,empty);f=fixture({...options,store});service=f.service;assert.equal(service.status().lastDiscovery,1000);await service.discover();assert.equal(store.config().subscriptions.length,0);assert.ok(!f.seen.includes(forkUrl));
   }finally{await service?.stop();store?.close();const target=resolve(directoryPath),root=resolve(tmpdir());assert.ok(target.startsWith(root+sep)&&target.split(sep).at(-1).startsWith('vipvideo-discovery-'));await rm(target,{recursive:true,force:true});}
+});
+
+test('GitHub quota errors honor Retry-After across restart without blocking other public providers',async()=>{
+  let clock=1000;const store=memoryStore(),raw='https://feeds.example/working.json';
+  const options={store,now:()=>clock,curated:{subscriptions:[{name:'独立配置',url:raw}],liveSources:[]},files:new Map([[raw,payload()]]),override:url=>{
+    if(new URL(url).hostname==='api.github.com')return Object.assign(response({message:'API rate limit exceeded'},403,url),{headers:{'x-ratelimit-remaining':'0','x-ratelimit-reset':'10','retry-after':'120'}});
+  }};
+  const first=fixture(options),result=await first.service.discover();
+  assert.equal(store.config().subscriptions.length,1);assert.ok(first.seen.filter(url=>new URL(url).hostname==='api.github.com').length<=2);
+  const errors=result.candidates.filter(row=>row.kind==='provider'&&row.reason==='rate_limit');assert.ok(errors.length>=1);assert.ok(errors.every(row=>row.httpStatus===403&&row.retryAt===121000));
+  await first.service.stop();const restarted=fixture({...options,override:undefined});await restarted.service.discover();
+  assert.equal(restarted.seen.filter(url=>new URL(url).hostname==='api.github.com').length,0);
+  clock=121001;await restarted.service.discover();assert.ok(restarted.seen.some(url=>new URL(url).hostname==='api.github.com'));await restarted.service.stop();
+});
+
+test('ordinary 403 and raw 404 remain distinct and failed raw URLs are not fetched every fifteen minutes',async()=>{
+  let clock=1000;const store=memoryStore(),raw='https://feeds.example/missing.json';
+  const options={store,now:()=>clock,curated:{subscriptions:[{name:'公开路径',url:raw}],liveSources:[]},override:url=>new URL(url).hostname==='api.github.com'?response('Access denied',403,url):undefined};
+  const f=fixture(options),result=await f.service.discover();
+  assert.ok(result.candidates.some(row=>row.kind==='provider'&&row.reason==='forbidden'&&row.httpStatus===403));
+  const failed=result.candidates.find(row=>row.url===raw);assert.equal(failed.reason,'not_found');assert.equal(failed.retryAt,1000+6*60*60_000);
+  const calls=f.seen.filter(url=>url===raw).length;clock+=15*60_000;await f.service.discover();assert.equal(f.seen.filter(url=>url===raw).length,calls);await f.service.stop();
+  const restarted=fixture(options);await restarted.service.discover();assert.equal(restarted.seen.filter(url=>url===raw).length,0);await restarted.service.stop();
+});
+
+test('a missing guessed GitHub path uses public default-branch metadata and an explicit config file then preserves deletion',async()=>{
+  const store=memoryStore(),fixed='https://raw.githubusercontent.com/ResearchUser/PublicConfig/develop/configs/sources.json';
+  const base='https://api.github.com/repos/ResearchUser/PublicConfig';
+  const options={store,curated:{subscriptions:[{name:'公开配置',url:forkUrl}],liveSources:[]},files:new Map([[fixed,payload()]]),override:url=>{
+    if(url===base)return response(repo('ResearchUser/PublicConfig',{default_branch:'develop',fork:false}),200,url);
+    if(url===base+'/contents?ref=develop')return response([{type:'file',path:'config.example.json',name:'config.example.json'},{type:'dir',path:'configs'}],200,url);
+    if(url===base+'/contents/configs?ref=develop')return response([{type:'file',path:'configs/sources.json',name:'sources.json',download_url:'https://untrusted.example/wrong.json'}],200,url);
+  }};
+  const f=fixture(options),result=await f.service.discover();
+  assert.equal(store.config().subscriptions.length,1);assert.equal(store.config().subscriptions[0].url,fixed);
+  assert.ok(result.candidates.some(row=>row.url===fixed&&row.added));assert.equal(f.seen.some(url=>url.includes('untrusted.example')),false);
+  const calls=f.seen.length;await f.service.discover();assert.equal(f.seen.slice(calls).includes(forkUrl),false);assert.equal(f.seen.slice(calls).includes(fixed),false);await f.service.stop();
+  store.setConfig({...store.config(),subscriptions:[]});const restarted=fixture(options);await restarted.service.discover();
+  assert.equal(store.config().subscriptions.length,0);assert.equal(restarted.seen.includes(fixed),false);assert.equal(restarted.verified.length,0);await restarted.service.stop();
+});
+
+test('source discovery requires positive media evidence and bounds new validations to twenty without skipping pending APIs',async()=>{
+  for(const playable of[undefined,false]){
+    const raw='https://feeds.example/no-media.json',f=fixture({curated:{subscriptions:[{name:'仅接口',url:raw}],liveSources:[]},files:new Map([[raw,payload()]]),verify:source=>({api:source.api,status:'ok',playable})});
+    await f.service.discover();assert.equal(f.store.config().subscriptions.length,0);await f.service.stop();
+  }
+  const subscriptions=Array.from({length:10},(_,i)=>({name:'公开配置'+i,url:'https://feeds.example/'+i+'.json'}));
+  const files=new Map(subscriptions.map((row,i)=>[row.url,{api_site:Object.fromEntries(Array.from({length:3},(_,j)=>['s'+j,{name:'接口'+j,api:'https://api.example/'+i+'-'+j}]))}]));
+  const f=fixture({curated:{subscriptions,liveSources:[]},files,verify:source=>({api:source.api,status:'error',playable:false})});await f.service.discover();
+  assert.equal(f.verified.length,20);assert.ok(f.seen.length<=24);
+  const saved=JSON.parse(f.store.metadata.get('source-discovery-v1'));assert.ok(Object.values(saved.sourceCursor).some(value=>value===0));await f.service.stop();
+});
+
+test('large background subscriptions retain a page until its actual checks finish and continue after restart',async()=>{
+  const raw='https://feeds.example/large.json',store=memoryStore();
+  const body={api_site:Object.fromEntries(Array.from({length:201},(_,i)=>['s'+i,{name:'接口'+i,api:'https://api.example/'+i}]))};
+  store.setMeta('source-discovery-v1',JSON.stringify({sourceCursor:{[raw]:198}}));
+  const options={store,curated:{subscriptions:[{name:'大型配置',url:raw}],liveSources:[]},files:new Map([[raw,body]]),verify:source=>({api:source.api,status:'error',playable:false})};
+  const first=fixture(options);await first.service.discover();assert.deepEqual(first.verified.map(row=>row.id),['s198','s199']);assert.equal(JSON.parse(store.meta('source-discovery-v1')).sourceCursor[raw],200);await first.service.stop();
+  const second=fixture({...options,verify:source=>({api:source.api,status:'ok',playable:true})});await second.service.discover();assert.deepEqual(second.verified.map(row=>row.id),['s200']);assert.equal(store.config().subscriptions.length,1);await second.service.stop();
+});
+
+test('background windows support bounded JSONC object and array formats without relaxing manual imports or URL validation',()=>{
+  const rows=Array.from({length:201},(_,i)=>({id:'s'+i,key:'s'+i,name:'接口'+i,api:'https://api.example/'+i,type:1}));
+  for(const[field,value]of[['api_site',Object.fromEntries(rows.map(row=>[row.id,row]))],['api_site',rows],['sites',rows],['sources',rows]]){
+    const body={ [field]:value,platforms:[{url:'http://127.0.0.1/private'}],parsers:[{url:'file:///bad'}] };
+    const first=subscriptionWindow('//公开订阅\n'+JSON.stringify(body),0);assert.equal(first.total,201);assert.equal(first.nextCursor,200);assert.equal(importConfig(empty,first.config).sources.length,200);
+    const last=subscriptionWindow(body,first.nextCursor);assert.equal(importConfig(empty,last.config).sources.length,1);assert.equal(last.nextCursor,0);
+    assert.equal(first.config.platforms?.length||0,0);assert.equal(first.config.parsers?.length||0,0);assert.throws(()=>repairImport({[field]:value}),/200/);
+  }
+  assert.throws(()=>subscriptionWindow({sources:Array.from({length:2001},(_,i)=>({...rows[0],id:'s'+i}))}),/2000/);
+  assert.throws(()=>subscriptionWindow({sources:[...rows,{...rows[0]}]}),/重复/);
+  const bad={api_site:{safe:{name:'普通',api:'http://127.0.0.1/private'}}};assert.throws(()=>subscriptionWindow(bad),/内网|公网|不允许|公共/);
 });

@@ -2,6 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { importConfig, validateConfig, validateRecord, validatePlayerPreferences } from '../lib/config.mjs';
 
+test('ad intervals require bounded explicit scopes and finite positions', () => {
+  const range = { scope: JSON.stringify(['source', '1', 'hls', '第1集']), start: 10, end: 30 };
+  assert.deepEqual(validatePlayerPreferences({ key: 'film', skipAds: true, adRanges: [range] }).adRanges, [range]);
+  for (const input of [{ skipAds: null }, { adRanges: null }, { adRanges: [{ ...range, end: 9 }] },
+    { adRanges: [{ ...range, end: 700 }] }, { adRanges: [{ ...range, start: NaN }] },
+    { adRanges: [{ ...range, scope: '' }] }, { adRanges: Array(21).fill(range) }]) {
+    assert.throws(() => validatePlayerPreferences({ key: 'film', ...input }), { status: 400 });
+  }
+});
+
 const config = () => ({ sources: [{ id: 'old', name: '旧源', api: 'https://example.com/api', enabled: false }],
   platforms: [{ id: 'home', name: '入口', url: 'https://example.com/', category: 'video', enabled: true }], parsers: [] });
 
@@ -51,7 +61,7 @@ test('subscriptions and live sources validate separately and survive a source-on
 });
 
 test('player preferences enforce meaningful durations, speeds and boolean switches', () => {
-  assert.deepEqual(validatePlayerPreferences({ key: 'film' }), { key: 'film', introSeconds: 0, outroSeconds: 0, autoNext: true, danmakuEnabled: true, speed: 1 });
+  assert.deepEqual(validatePlayerPreferences({ key: 'film' }), { key: 'film', introSeconds: 0, outroSeconds: 0, autoNext: true, danmakuEnabled: true, skipAds: false, adRanges: [], speed: 1 });
   assert.equal(validatePlayerPreferences({ key: 'film', speed: 3, introSeconds: 90, outroSeconds: 120 }).speed, 3);
   for (const input of [{ introSeconds: -1 }, { outroSeconds: 601 }, { introSeconds: 1.5 }, { outroSeconds: '30' }, { autoNext: 'false' }, { danmakuEnabled: null }, { speed: 9 }, { speed: '2' }]) {
     assert.throws(() => validatePlayerPreferences({ key: 'film', ...input }), { status: 400 });

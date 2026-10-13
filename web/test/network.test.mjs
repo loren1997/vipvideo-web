@@ -13,10 +13,10 @@ function transport(routes, calls) {
   return (url, options, callback) => {
     const outgoing = new EventEmitter();
     outgoing.destroy = error => queueMicrotask(() => outgoing.emit('error', error));
-    outgoing.end = () => queueMicrotask(() => {
+    outgoing.end = body => queueMicrotask(() => {
       options.lookup(url.hostname, { all: true }, (error, addresses) => {
         assert.equal(error, null);
-        calls.push({ url: url.href, options, addresses });
+        calls.push({ url: url.href, options, addresses, body });
         const incoming = routes[url.href]();
         outgoing.emit('response', incoming);
         callback(incoming);
@@ -25,6 +25,29 @@ function transport(routes, calls) {
     return outgoing;
   };
 }
+
+test('fixed-origin POST sends a bounded body and never follows redirects with credentials', async () => {
+  const calls = [];
+  const routes = { 'https://cloud.example/api': () => response('ok'), 'https://cloud.example/redirect': () => response('', 302, { location: 'https://other.example/capture' }) };
+  const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpsRequest: transport(routes, calls) });
+  const incoming = await request('https://cloud.example/api', { method: 'POST', body: '{"fid":"safe"}', followRedirects: false, headers: { Cookie: 'session=test' } });
+  assert.equal(await readText(incoming), 'ok'); assert.equal(calls[0].body, '{"fid":"safe"}');
+  await assert.rejects(request('https://cloud.example/redirect', { method: 'POST', body: '{}', headers: { Cookie: 'session=test' } }), /不允许重定向/);
+  assert.equal(calls.length, 2);
+  for (const options of [{ method: 'GET', body: 'bad' }, { method: 'POST', body: {} }, { method: 'POST', body: 'x'.repeat(65537) }]) await assert.rejects(request('https://cloud.example/api', options), { status: 400 });
+});
+
+test('cross-origin redirects strip sensitive headers and explicit redirect refusal reaches no new host', async () => {
+  const calls = [];
+  const routes = { 'https://cloud.example/start': () => response('', 302, { location: 'https://cdn.example/file' }), 'https://cdn.example/file': () => response('data') };
+  const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpsRequest: transport(routes, calls) });
+  const incoming = await request('https://cloud.example/start', { headers: { cOOkie: 'secret', Authorization: 'secret', 'Proxy-Authorization': 'secret', Range: 'bytes=0-10' } });
+  assert.equal(await readText(incoming), 'data');
+  assert.equal(calls[1].options.headers.cOOkie, undefined); assert.equal(calls[1].options.headers.Authorization, undefined);
+  assert.equal(calls[1].options.headers['Proxy-Authorization'], undefined); assert.equal(calls[1].options.headers.Range, 'bytes=0-10');
+  await assert.rejects(request('https://cloud.example/start', { followRedirects: false }), /不允许重定向/);
+  assert.equal(calls.length, 3);
+});
 
 test('rejects private, documentation, multicast and mapped private addresses', () => {
   for (const ip of ['0.1.2.3', '10.0.0.1', '100.64.0.1', '127.0.0.1', '169.254.1.1', '172.31.1.1', '192.168.0.1', '192.0.0.8', '192.0.2.1', '192.88.99.1', '198.18.0.1', '198.51.100.1', '203.0.113.1', '224.0.0.1', '255.255.255.255', '::1', '::', 'fe80::1', 'fc00::1', 'ff02::1', '2001:db8::1', '2001::1', '2002:7f00:1::', '3fff::1', '::ffff:127.0.0.1', '::ffff:c0a8:1', 'invalid']) assert.equal(isPublicAddress(ip), false, ip);

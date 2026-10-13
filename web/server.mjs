@@ -18,6 +18,10 @@ import { createPlayability } from './lib/playability.mjs';
 import { createSourceDiscovery } from './lib/source-discovery.mjs';
 import { repairImport } from './lib/import-repair.mjs';
 import { createTranscoder } from './lib/transcode.mjs';
+import { createAdMarkers } from './lib/ad-markers.mjs';
+import { createQuark } from './lib/quark.mjs';
+import { createQuarkSearchRequest } from './lib/quark-search.mjs';
+import { createQuarkMedia } from './lib/quark-media.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const defaults = JSON.parse(readFileSync(resolve(root, 'defaults.json'), 'utf8'));
@@ -49,7 +53,7 @@ function tokenFrom(req) {
 
 export function createApp({ password = process.env.APP_PASSWORD, dataDir = process.env.DATA_DIR ?? resolve(root, 'data'),
   catalog = createCatalog(), media = createMedia(), initialConfig = defaults, cookieSecure = process.env.COOKIE_SECURE === 'true',
-  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder } = {}) {
+  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder, adMarkers, quark, quarkMedia } = {}) {
   if (typeof password !== 'string' || password.length < 8 || password.length > 1024) throw new Error('APP_PASSWORD 必须设置，且长度为 8–1024 个字符');
   const initial = validateConfig(initialConfig);
   const store = createStore(dataDir, initial);
@@ -63,13 +67,17 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
     store.setConfig(validateConfig({ ...current, subscriptions: current.subscriptions ?? initial.subscriptions, liveSources: current.liveSources ?? initial.liveSources }));
     store.setMeta('source-services-v1', '1');
   }
-  const sourceService = maintenance ?? createSourceMaintenance({ store, catalog, initialSources: initial.sources, logger });
   const playabilityService = playability ?? createPlayability();
+  const sourceService = maintenance ?? createSourceMaintenance({ store, catalog, initialSources: initial.sources, logger, playability: playabilityService });
+  const availableConfig = snapshot => sourceService.availableConfig?.(snapshot) ?? snapshot;
+  const adService = adMarkers ?? createAdMarkers();
   const discoveryService = discovery ?? createSourceDiscovery({ store, maintenance: sourceService, playability: playabilityService, logger });
   const liveService = live ?? createLive({ store, logger, playability: playabilityService });
   const ratingService = ratings ?? createRatings({ store });
   const danmakuService = danmaku ?? createDanmaku({ store });
   const transcodeService = transcoder ?? createTranscoder({ media, logger });
+  const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: createQuarkSearchRequest(), defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
+  const cloudMedia = quarkMedia ?? createQuarkMedia({ quark: quarkService, visible: category => ensureVisible(category) });
   const salt = store.meta('password-salt') ?? randomBytes(16).toString('hex');
   const passwordHash = scryptSync(password, salt, 32);
   if (store.meta('password-hash') !== passwordHash.toString('hex')) store.clearSessions();
@@ -87,6 +95,28 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
     if (category === 'adult' && store.config().showAdult !== true) {
       throw Object.assign(new Error('三级内容已隐藏，请先在设置中开启显示'), { status: 403 });
     }
+  };
+  const requireSession = owner => {
+    if (!store.authenticated(owner)) throw Object.assign(new Error('登录会话已结束，请重新登录'), { status: 401 });
+  };
+  const cloudSelection = async (input, owner) => {
+    requireSession(owner);
+    const snapshot = store.config(), line = Number(input?.line ?? 0), episode = Number(input?.episode ?? 0);
+    if (!Number.isSafeInteger(line) || line < 0 || !Number.isSafeInteger(episode) || episode < 0) throw badRequest('请选择有效的剧集');
+    const source = snapshot.sources.find(item => item.id === input?.source && item.enabled !== false);
+    if (!source) throw badRequest('请选择启用的影视源');
+    const detail = await catalog.detail(availableConfig(snapshot), source.id, text(input?.id, '影片标识', 200));
+    ensureVisible(detail.category);
+    if (!detail.lines[line]?.episodes[episode]) throw badRequest('请选择有效的剧集');
+    const valid = () => {
+      requireSession(owner);
+      ensureVisible(detail.category);
+      if (!availableConfig(store.config()).sources.some(item => item.id === source.id && item.api === source.api && item.enabled !== false)) {
+        throw Object.assign(new Error('影视源已变更，请刷新后重试'), { status: 409 });
+      }
+      return true;
+    };
+    valid(); return { detail, options: { line, episode }, valid };
   };
 
   const server = http.createServer(async (req, res) => {
@@ -133,7 +163,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         }
         if (!authenticated) return json(res, 401, { error: '请先登录' });
         if (path === '/api/auth/logout' && method === 'POST') {
-          await readBody(req); store.logout(hashToken(token));
+          await readBody(req); store.logout(hashToken(token)); cloudMedia.revoke?.(hashToken(token));
           res.setHeader('Set-Cookie', cookie('', 0));
           return json(res, 200, { authenticated: false });
         }
@@ -148,6 +178,49 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         if (path === '/api/config/presets' && method === 'GET') {
           return json(res, 200, { api_site: Object.fromEntries(initial.sources.map(({ id, name, api }) => [id, { name, api }])) });
         }
+        if (path === '/api/quark/settings' && method === 'GET') return json(res, 200, await quarkService.settings());
+        if (path === '/api/quark/settings' && method === 'PUT') {
+          const result = await quarkService.configure(await readBody(req)); cloudMedia.invalidate();
+          return json(res, 200, result);
+        }
+        if (path === '/api/quark/account' && method === 'DELETE') {
+          await readBody(req); const result = await quarkService.clearAccount(); cloudMedia.invalidate();
+          return json(res, 200, result);
+        }
+        if (path === '/api/quark/cleanup' && method === 'POST') {
+          await readBody(req); return json(res, 200, await quarkService.cleanup());
+        }
+        if (['/api/quark/resources', '/api/quark/files'].includes(path) && method === 'GET') {
+          const input = Object.fromEntries(url.searchParams), selected = await cloudSelection(input, hashToken(token));
+          const result = path.endsWith('/files')
+            ? await quarkService.files(selected.detail, { ...selected.options, shareId: text(input.shareId, '夸克分享标识', 200) })
+            : await quarkService.resources(selected.detail, selected.options);
+          selected.valid(); return json(res, 200, result);
+        }
+        if (path === '/api/quark/prepare' && method === 'POST') {
+          const input = await readBody(req), selected = await cloudSelection(input, hashToken(token));
+          if (input.auto !== undefined && typeof input.auto !== 'boolean') throw badRequest('自动转存选项无效');
+          const options = { ...selected.options, valid: selected.valid, ...(input.auto === undefined ? {} : { auto: input.auto }),
+            ...(input.shareId === undefined ? {} : { shareId: text(input.shareId, '夸克分享标识', 200) }),
+            ...(input.fileId === undefined ? {} : { fileId: text(input.fileId, '夸克文件标识', 200) }) };
+          selected.valid(); const result = await quarkService.prepare(selected.detail, options); selected.valid();
+          return json(res, 200, result);
+        }
+        if (path === '/api/quark/playback' && method === 'POST') {
+          const input = await readBody(req), owner = hashToken(token);
+          requireSession(owner);
+          const lease = await cloudMedia.playback(text(input?.assetId, '夸克影片标识', 200), { owner, valid: () => store.authenticated(owner) });
+          requireSession(owner);
+          return json(res, 200, lease.response);
+        }
+        if (path === '/api/quark/progress' && method === 'POST') {
+          const input = await readBody(req);
+          return json(res, 200, await quarkService.progress(text(input?.assetId, '夸克影片标识', 200), {
+            position: input?.position, duration: input?.duration, ended: input?.ended,
+          }));
+        }
+        const cloudAsset = /^\/api\/quark\/media\/([a-f0-9]{32})$/.exec(path);
+        if (cloudAsset && ['GET', 'HEAD'].includes(method)) return await cloudMedia.serve(req, res, cloudAsset[1], url.searchParams.get('token'));
         if (path === '/api/transcode/status' && method === 'GET') return json(res, 200, await transcodeService.status());
         if (path === '/api/transcode/stop' && method === 'POST') {
           const body = await readBody(req);
@@ -163,8 +236,12 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
               typeof position !== 'number' || !Number.isFinite(position) || position < 0 || position > 86400 ||
               ![0.5, 0.75, 1, 1.25, 1.5, 2, 3].includes(speed)) throw badRequest('转码线路、进度或倍速不正确');
           const snapshot = store.config(), owner = hashToken(token);
-          let selected, category, unchanged;
-          if (body?.liveId !== undefined) {
+          let selected, category, unchanged, mediaOverride, proxyPath;
+          if (body?.quarkAsset !== undefined) {
+            const lease = await cloudMedia.playback(text(body.quarkAsset, '夸克影片标识', 200), { owner, valid: () => store.authenticated(owner) });
+            selected = lease.episode; category = lease.category; ensureVisible(category);
+            mediaOverride = lease.media; proxyPath = lease.proxyPath; unchanged = lease.valid;
+          } else if (body?.liveId !== undefined) {
             const result = await liveService.list(snapshot);
             const channel = result.channels.find(item => item.id === text(body.liveId, '频道标识', 200));
             selected = channel?.streams[line];
@@ -174,15 +251,15 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           } else {
             const source = snapshot.sources.find(item => item.id === body?.source && item.enabled !== false);
             if (!source) throw badRequest('请选择启用的影视源');
-            const detail = await catalog.detail(snapshot, source.id, text(body?.id, '影片标识', 200));
+            const detail = await catalog.detail(availableConfig(snapshot), source.id, text(body?.id, '影片标识', 200));
             category = detail.category; ensureVisible(category);
             selected = detail.lines[line]?.episodes[episode];
             unchanged = () => store.config().sources.some(item => item.id === source.id && item.api === source.api && item.enabled !== false);
           }
-          if (!selected || !['hls', 'mp4'].includes(selected.type)) throw badRequest('请选择有效的 HLS / MP4 媒体');
+          if (!selected || !['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'].includes(selected.type)) throw badRequest('请选择有效的媒体');
           if (!unchanged()) throw Object.assign(new Error('播放源已修改，请刷新后重试'), { status: 409 });
           const valid = () => store.authenticated(owner) && unchanged() && (category !== 'adult' || store.config().showAdult === true);
-          const result = await transcodeService.start({ episode: selected, position, speed, owner, valid });
+          const result = await transcodeService.start({ episode: selected, position, speed, owner, valid, ...(mediaOverride ? { mediaOverride, proxyPath } : {}) });
           if (!valid()) {
             await transcodeService.cancel(result.id, owner);
             ensureVisible(category);
@@ -240,7 +317,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           return json(res, 200, { ok: true });
         }
         if (path === '/api/ratings' && method === 'GET') {
-          const detail = await catalog.detail(store.config(), url.searchParams.get('source'), url.searchParams.get('id'));
+          const detail = await catalog.detail(availableConfig(store.config()), url.searchParams.get('source'), url.searchParams.get('id'));
           ensureVisible(detail.category);
           const result = await ratingService.get(detail);
           ensureVisible(detail.category);
@@ -251,7 +328,25 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           return json(res, 200, store.get('player-preferences', key) ?? validatePlayerPreferences({ key }));
         }
         if (path === '/api/player/preferences' && method === 'PUT') {
-          return json(res, 200, store.save('player-preferences', validatePlayerPreferences(await readBody(req))));
+          const input = await readBody(req);
+          const old = store.get('player-preferences', text(input?.key, '影片标识', 8192));
+          return json(res, 200, store.save('player-preferences', validatePlayerPreferences({ ...input,
+            skipAds: input.skipAds === undefined ? old?.skipAds : input.skipAds,
+            adRanges: input.adRanges === undefined ? old?.adRanges : input.adRanges })));
+        }
+        if (path === '/api/ads' && method === 'GET') {
+          const snapshot = store.config();
+          const line = Number(url.searchParams.get('line') ?? 0), episode = Number(url.searchParams.get('episode') ?? 0);
+          if (!Number.isSafeInteger(line) || !Number.isSafeInteger(episode) || line < 0 || episode < 0) throw badRequest('播放线路或剧集不正确');
+          const source = snapshot.sources.find(item => item.id === url.searchParams.get('source') && item.enabled !== false);
+          const detail = await catalog.detail(availableConfig(snapshot), url.searchParams.get('source'), url.searchParams.get('id'));
+          ensureVisible(detail.category);
+          const selected = detail.lines[line]?.episodes[episode];
+          if (!selected || !source) throw badRequest('请选择有效的影片、线路和剧集');
+          const result = await adService.inspect(selected);
+          ensureVisible(detail.category);
+          if (!store.config().sources.some(item => item.id === source.id && item.api === source.api && item.enabled !== false)) throw Object.assign(new Error('影视源已修改，请重新选择'), { status: 409 });
+          return json(res, 200, result);
         }
         if (['/api/danmaku', '/api/danmaku/binding'].includes(path) && method === 'GET') {
           const episode = url.searchParams.get('episode') ?? '0';
@@ -263,7 +358,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         if (path === '/api/browse' && method === 'GET') {
           const category = url.searchParams.get('category') ?? 'movie';
           const snapshot = store.config();
-          const result = await catalog.browse(snapshot, {
+          const result = await catalog.browse(availableConfig(snapshot), {
             category,
             page: url.searchParams.get('page') ?? '1',
             source: url.searchParams.get('source') ?? undefined,
@@ -278,7 +373,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           const q = url.searchParams.get('q')?.trim();
           if (!q || q.length > 100) throw badRequest('请输入 1–100 字的搜索内容');
           const snapshot = store.config();
-          const result = await catalog.search(snapshot, q, url.searchParams.get('progressive') === '1' ? { progressive: true } : {});
+          const result = await catalog.search(availableConfig(snapshot), q, url.searchParams.get('progressive') === '1' ? { progressive: true } : {});
           if (JSON.stringify(snapshot.sources) !== JSON.stringify(store.config().sources)) throw Object.assign(new Error('影视源已修改，请重新搜索'), { status: 409 });
           if (store.config().showAdult !== true) {
             result.groups = result.groups.flatMap(group => {
@@ -291,7 +386,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           return json(res, 200, result);
         }
         if (path === '/api/detail' && method === 'GET') {
-          const detail = await catalog.detail(store.config(), url.searchParams.get('source'), url.searchParams.get('id'));
+          const detail = await catalog.detail(availableConfig(store.config()), url.searchParams.get('source'), url.searchParams.get('id'));
           ensureVisible(detail.category);
           return json(res, 200, detail);
         }
@@ -299,7 +394,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           const line = Number(url.searchParams.get('line') ?? 0);
           const episode = Number(url.searchParams.get('episode') ?? 0);
           if (!Number.isSafeInteger(line) || !Number.isSafeInteger(episode) || line < 0 || episode < 0) throw badRequest('播放线路或剧集不正确');
-          const detail = await catalog.detail(store.config(), url.searchParams.get('source'), url.searchParams.get('id'));
+          const detail = await catalog.detail(availableConfig(store.config()), url.searchParams.get('source'), url.searchParams.get('id'));
           ensureVisible(detail.category);
           return json(res, 200, media.playback(detail, line, episode));
         }
@@ -310,7 +405,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           const snapshot = store.config();
           const source = snapshot.sources.find(item => item.id === body?.source && item.enabled !== false);
           if (!source) throw badRequest('请选择启用的影视源');
-          const detail = await catalog.detail(snapshot, body?.source, body?.id);
+          const detail = await catalog.detail(availableConfig(snapshot), body?.source, body?.id);
           ensureVisible(detail.category);
           const selected = detail.lines[line]?.episodes[episode];
           if (!selected || method === 'POST' && !['ok', 'error'].includes(body?.status)) throw badRequest('请选择有效的影片、剧集和播放状态');
@@ -392,8 +487,8 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   server.headersTimeout = 10_000;
   server.on('clientError', (_error, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
   return {
-    server, store, maintenance: sourceService, live: liveService, discovery: discoveryService,
-    async close() { await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.(), transcodeService.close?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
+    server, store, maintenance: sourceService, live: liveService, discovery: discoveryService, quark: quarkService,
+    async close() { cloudMedia.invalidate(); await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.(), transcodeService.close?.(), quarkService.stop?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
   };
 }
 
@@ -402,7 +497,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     const port = Number(process.env.PORT ?? 3000);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT 必须是 1–65535 的整数');
     const app = createApp();
-    app.server.listen(port, '0.0.0.0', () => { app.maintenance.start(); app.live.start?.(); app.discovery.start(); console.log(`VipVideo Web 正在监听端口 ${port}`); });
+    app.server.listen(port, '0.0.0.0', () => { app.maintenance.start(); app.live.start?.(); app.discovery.start(); app.quark.start?.(); console.log(`VipVideo Web 正在监听端口 ${port}`); });
     app.server.on('error', (error) => { console.error(error); process.exitCode = 1; app.store.close(); });
     let stopping = false;
     for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {

@@ -9,6 +9,7 @@ import { pipeline } from 'node:stream/promises';
 import { validateUrl } from './network.mjs';
 
 const speeds = new Set([0.5, 0.75, 1, 1.25, 1.5, 2, 3]);
+const inputFormats = { hls: 'hls', mp4: 'mov', mkv: 'matroska', webm: 'matroska', avi: 'avi', mpegts: 'mpegts' };
 const assetName = /^(?:index\.m3u8|segment\d{6,12}\.ts)$/;
 const failure = (message, status = 502, cause) => Object.assign(new Error(message, cause ? { cause } : undefined), { status });
 const wait = milliseconds => new Promise(done => setTimeout(done, milliseconds));
@@ -76,26 +77,26 @@ export function createTranscoder({ media, spawn = nodeSpawn, env = process.env, 
     task.idleTimer = setTimeout(() => { cleanup(task).catch(error => logger.error('清理兼容播放失败', diagnostics(error.message))); }, idleTimeout);
     task.idleTimer.unref?.();
   }
-  function signedPath(value, origin) {
+  function signedPath(value, origin, proxyPath = '/api/media') {
     const parsed = new URL(value, origin), token = parsed.searchParams.get('token');
-    if (parsed.origin !== origin || parsed.pathname !== '/api/media' || parsed.hash || [...parsed.searchParams].length !== 1 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(token || '')) throw failure('媒体清单包含不安全的转发地址');
+    if (parsed.origin !== origin || parsed.pathname !== proxyPath || parsed.hash || [...parsed.searchParams].length !== 1 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(token || '')) throw failure('媒体清单包含不安全的转发地址');
     let extension = 'ts';
     try {
       const data = JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString('utf8'));
       const suffix = new URL(data.url).pathname.match(/\.(m3u8|mp4|m4s|ts|aac|vtt|key)$/i)?.[1]?.toLowerCase();
-      extension = data.type === 'hls' ? 'm3u8' : data.type === 'mp4' ? 'mp4' : suffix || 'ts';
+      extension = data.type === 'hls' ? 'm3u8' : ['mp4', 'mkv', 'webm', 'avi'].includes(data.type) ? data.type : suffix || 'ts';
     } catch { throw failure('媒体清单转发凭证无效'); }
     return `${origin}/api/media/asset.${extension}?token=${token}`;
   }
-  function bridgeManifest(body, origin) {
+  function bridgeManifest(body, origin, proxyPath) {
     if (Buffer.byteLength(body) > 2 * 1024 * 1024 || !body.replace(/^\uFEFF/, '').trimStart().startsWith('#EXTM3U')) throw failure('兼容播放收到无效媒体清单');
     return body.split(/\r?\n/).map(line => {
       const trimmed = line.trim();
       if (!trimmed) return line;
-      if (!trimmed.startsWith('#')) return signedPath(trimmed, origin);
+      if (!trimmed.startsWith('#')) return signedPath(trimmed, origin, proxyPath);
       return line.replace(/\bURI\s*=\s*(?:"([^"]*)"|'([^']*)'|([^,\s]+))/gi, (_match, quoted, single, bare) => {
         if (single !== undefined || bare !== undefined) throw failure('媒体清单 URI 格式无效');
-        return `URI="${signedPath(quoted, origin)}"`;
+        return `URI="${signedPath(quoted, origin, proxyPath)}"`;
       });
     }).join('\n');
   }
@@ -104,18 +105,18 @@ export function createTranscoder({ media, spawn = nodeSpawn, env = process.env, 
       try {
         assertValid(task);
         const origin = task.origin, parsed = new URL(req.url, origin);
-        if (!['GET', 'HEAD'].includes(req.method) || parsed.origin !== origin || req.headers.host !== new URL(origin).host || !/^\/api\/media\/asset\.(?:m3u8|mp4|m4s|ts|aac|vtt|key)$/.test(parsed.pathname) || [...parsed.searchParams].length !== 1 || !parsed.searchParams.get('token')) throw failure('转发请求无效', 403);
+        if (!['GET', 'HEAD'].includes(req.method) || parsed.origin !== origin || req.headers.host !== new URL(origin).host || !/^\/api\/media\/asset\.(?:m3u8|mp4|mkv|webm|avi|m4s|ts|aac|vtt|key)$/.test(parsed.pathname) || [...parsed.searchParams].length !== 1 || !parsed.searchParams.get('token')) throw failure('转发请求无效', 403);
         const setHeader = res.setHeader.bind(res);
         res.setHeader = (name, value) => { if (String(name).toLowerCase() === 'location') throw failure('媒体转发禁止重定向'); return setHeader(name, value); };
         const end = res.end.bind(res);
         res.end = (body, encoding, callback) => {
           if (body && /mpegurl/i.test(String(res.getHeader('Content-Type') || ''))) {
-            body = bridgeManifest(Buffer.isBuffer(body) ? body.toString('utf8') : String(body), origin);
+            body = bridgeManifest(Buffer.isBuffer(body) ? body.toString('utf8') : String(body), origin, task.proxyPath);
             res.setHeader('Content-Length', Buffer.byteLength(body));
           }
           return end(body, encoding, callback);
         };
-        await media.serve(req, res, parsed.searchParams.get('token'));
+        await task.media.serve(req, res, parsed.searchParams.get('token'));
       } catch (error) {
         if (res.destroyed) return;
         if (!res.headersSent) { res.statusCode = error.status || 502; res.removeHeader('Content-Length'); res.setHeader('Content-Type', 'text/plain; charset=utf-8'); res.end('兼容播放媒体转发失败'); }
@@ -125,13 +126,13 @@ export function createTranscoder({ media, spawn = nodeSpawn, env = process.env, 
     task.sockets = new Set(); server.on('connection', socket => { task.sockets.add(socket); socket.once('close', () => task.sockets.delete(socket)); });
     await new Promise((done, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => { server.off('error', reject); done(); }); });
     task.origin = `http://127.0.0.1:${server.address().port}`;
-    return signedPath(task.playback.proxyUrl, task.origin);
+    return signedPath(task.playback.proxyUrl, task.origin, task.proxyPath);
   }
   function argumentsFor(task, acceleration) {
     const scale = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
     return ['-hide_banner', '-loglevel', 'info', '-nostats', '-nostdin', '-threads', '2', '-filter_threads', '2',
       ...(acceleration === 'vaapi' ? ['-hwaccel', 'vaapi', '-hwaccel_device', device, '-hwaccel_output_format', 'vaapi'] : []),
-      '-protocol_whitelist', 'http,tcp,crypto', '-readrate', String(task.speed), '-ss', String(task.position), '-f', task.type === 'hls' ? 'hls' : 'mov',
+      '-protocol_whitelist', 'http,tcp,crypto', '-readrate', String(task.speed), '-ss', String(task.position), '-f', inputFormats[task.type],
       ...(task.type === 'hls' ? ['-allowed_extensions', 'ALL'] : []), '-i', task.input,
       '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn', '-vf', acceleration === 'vaapi' ? "scale_vaapi=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12" : `${scale},format=yuv420p`,
       '-c:v', acceleration === 'vaapi' ? 'h264_vaapi' : 'libx264', ...(acceleration === 'vaapi' ? ['-rc_mode', 'VBR', '-b:v', '2500k'] : ['-preset', 'veryfast', '-crf', '23']),
@@ -155,18 +156,19 @@ export function createTranscoder({ media, spawn = nodeSpawn, env = process.env, 
   }
   return {
     async status() { return { available: enabled && !closed ? await installed() : available === true, enabled: enabled && !closed, acceleration: preference, running: !!current && !current.stopped, ...(lastError ? { error: lastError } : {}) }; },
-    async start({ episode, position = 0, speed = 1, owner, valid: isValid } = {}) {
+    async start({ episode, position = 0, speed = 1, owner, valid: isValid, mediaOverride, proxyPath = '/api/media' } = {}) {
       if (!enabled || closed) throw failure('兼容播放已关闭', 503);
-      if (!media?.playback || !media?.serve) throw failure('兼容播放需要签名媒体转发模块', 503);
-      if (typeof owner !== 'string' || !owner || owner.length > 256 || typeof isValid !== 'function' || !Number.isFinite(position) || position < 0 || position > 604800 || !speeds.has(speed) || !['hls', 'mp4'].includes(episode?.type) || typeof episode.url !== 'string' || episode.url.length > 8192) throw failure('兼容播放参数无效', 400);
+      const selectedMedia = mediaOverride ?? media;
+      if (!selectedMedia?.playback || !selectedMedia?.serve) throw failure('兼容播放需要签名媒体转发模块', 503);
+      if (typeof owner !== 'string' || !owner || owner.length > 256 || typeof isValid !== 'function' || !Number.isFinite(position) || position < 0 || position > 604800 || !speeds.has(speed) || !Object.hasOwn(inputFormats, episode?.type) || typeof episode.url !== 'string' || episode.url.length > 8192 || !/^\/api\/[a-z0-9/_-]{1,120}$/.test(proxyPath)) throw failure('兼容播放参数无效', 400);
       const url = validateUrl(episode.url).href;
       if (current && !current.stopped && current.owner !== owner) throw failure('另一台设备正在使用兼容播放，请稍后再试', 409);
-      const previous = current, task = { id: randomBytes(16).toString('hex'), owner, valid: isValid, position, speed, type: episode.type, duration: null, stopped: false };
+      const previous = current, task = { id: randomBytes(16).toString('hex'), owner, valid: isValid, position, speed, type: episode.type, duration: null, stopped: false, media: selectedMedia, proxyPath };
       current = task;
       try {
         if (previous) await cleanup(previous);
         assertValid(task); if (!await installed()) throw failure(lastError, 503); assertValid(task);
-        task.playback = media.playback({ lines: [{ episodes: [{ url, type: task.type }] }] }, 0, 0);
+        task.playback = selectedMedia.playback({ lines: [{ episodes: [{ url, type: task.type }] }] }, 0, 0);
         task.dir = await mkdtemp(join(tmpRoot, 'vipvideo-transcode-')); assertValid(task);
         task.input = await bridge(task); assertValid(task);
         let acceleration = 'software';

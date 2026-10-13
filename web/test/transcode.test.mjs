@@ -57,6 +57,37 @@ async function fixture(options = {}) {
   } };
 }
 const start = (service, overrides = {}) => service.start({ episode, position: 0, speed: 1, owner: 'device-a', valid: () => true, ...overrides });
+
+test('cloud media override stays inside signed bridge and MKV uses the Matroska demuxer', async () => {
+  const f = await fixture({ run: async ({ input, write }) => {
+    const response = await fetch(input); assert.equal(response.status, 200); assert.equal(await response.text(), 'cloud-video'); await write();
+  } });
+  let upstreamCalls = 0;
+  const cloudMedia = createMedia({ proxyPath: '/api/quark/media/test-lease', request: async () => {
+    upstreamCalls++; return Object.assign(Readable.from([Buffer.from('cloud-video')]), { statusCode: 200, headers: { 'content-type': 'video/x-matroska' } });
+  } });
+  try {
+    await start(f.service, { episode: { type: 'mkv', url: 'https://cloud.quark.cn/file.mkv' }, mediaOverride: cloudMedia, proxyPath: '/api/quark/media/test-lease' });
+    const args = f.calls.find(call => call.args.includes('-i'))?.args;
+    assert.equal(args[args.indexOf('-f') + 1], 'matroska');
+    assert.ok(upstreamCalls > 0);
+    assert.ok(args[args.indexOf('-i') + 1].startsWith('http://127.0.0.1:'));
+    assert.ok(!args.some(arg => arg.includes('cloud.quark.cn')));
+  } finally { await f.close(); }
+});
+
+test('cloud AVI and transport-stream files use fixed demuxers through the signed bridge', async () => {
+  for (const type of ['avi', 'mpegts']) {
+    const f = await fixture({ run: async ({ input, write }) => { assert.equal((await fetch(input)).status, 200); await write(); } });
+    const cloudMedia = createMedia({ proxyPath: '/api/quark/media/test-lease', request: async () => Object.assign(Readable.from([Buffer.from('video')]), { statusCode: 200, headers: { 'content-type': 'application/octet-stream' } }) });
+    try {
+      await start(f.service, { episode: { type, url: 'https://cloud.quark.cn/file.bin' }, mediaOverride: cloudMedia, proxyPath: '/api/quark/media/test-lease' });
+      const args = f.calls.find(call => call.args.includes('-i')).args;
+      assert.equal(args[args.indexOf('-f') + 1], type);
+      assert.ok(args[args.indexOf('-i') + 1].startsWith('http://127.0.0.1:'));
+    } finally { await f.close(); }
+  }
+});
 async function assetServer(service, id) {
   const server = createServer(async (req, res) => {
     try { await service.serve(req, res, id, decodeURIComponent(req.url.slice(1))); }

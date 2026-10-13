@@ -6,13 +6,14 @@ function failure(message, status = 502, cause) {
   return Object.assign(new Error(message, cause ? { cause } : undefined), { status });
 }
 
-export function createMedia({ request = networkRequest, secret = randomBytes(32) } = {}) {
+export function createMedia({ request = networkRequest, secret = randomBytes(32), proxyPath = '/api/media' } = {}) {
+  if (typeof proxyPath !== 'string' || !/^\/api\/[a-z0-9/_-]{1,120}$/i.test(proxyPath)) throw failure('媒体转发路径无效', 400);
   // shortcut: 媒体凭证两小时后需重新打开影片，需要连续长时播放时增加自动续签。
   const lifetime = 2 * 60 * 60 * 1000;
   const sign = value => createHmac('sha256', secret).update(value).digest('base64url');
   function proxyUrl(url, type, expires = Date.now() + lifetime) {
     const payload = Buffer.from(JSON.stringify({ url: validateUrl(url).href, type, expires })).toString('base64url');
-    return `/api/media?token=${payload}.${sign(payload)}`;
+    return `${proxyPath}?token=${payload}.${sign(payload)}`;
   }
   function verify(token) {
     if (typeof token !== 'string' || token.length > 16384) throw failure('媒体凭证无效', 403);
@@ -22,7 +23,7 @@ export function createMedia({ request = networkRequest, secret = randomBytes(32)
     let data;
     try { data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')); } catch (cause) { throw failure('媒体凭证无效', 403, cause); }
     if (!Number.isSafeInteger(data.expires) || data.expires <= Date.now()) throw failure('媒体凭证已过期，请重新打开影片', 403);
-    if (!['hls', 'mp4', 'auto'].includes(data.type)) throw failure('媒体凭证无效', 403);
+    if (!['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts', 'auto'].includes(data.type)) throw failure('媒体凭证无效', 403);
     data.url = validateUrl(data.url).href;
     return data;
   }
@@ -50,7 +51,7 @@ export function createMedia({ request = networkRequest, secret = randomBytes(32)
       if (!episode) throw failure('所选剧集不存在', 400);
       const url = validateUrl(episode.url).href;
       if (episode.type === 'page') return { url, type: 'page' };
-      if (!['hls', 'mp4'].includes(episode.type)) throw failure('不支持的媒体类型', 400);
+      if (!['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'].includes(episode.type)) throw failure('不支持的媒体类型', 400);
       return { url, type: episode.type, proxyUrl: proxyUrl(url, episode.type) };
     },
 

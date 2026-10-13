@@ -44,6 +44,12 @@ try {
   assert(original.streams.some(stream => stream.codec_name === 'mpeg4'));
   assert(original.streams.some(stream => stream.codec_name === 'ac3'));
   const originalDuration = Number(original.format.duration);
+  run(executable, ['-nostdin', '-hide_banner', '-loglevel', 'warning', '-threads', '2', '-i', input,
+    '-map', '0', '-c', 'copy', join(fixtures, 'source.mkv')]);
+  run(executable, ['-nostdin', '-hide_banner', '-loglevel', 'warning', '-threads', '2', '-i', input,
+    '-map', '0', '-c', 'copy', join(fixtures, 'source.avi')]);
+  run(executable, ['-nostdin', '-hide_banner', '-loglevel', 'warning', '-threads', '2', '-filter_threads', '2', '-i', input,
+    '-c:v', 'mpeg2video', '-q:v', '5', '-g', '50', '-threads', '2', '-c:a', 'copy', '-f', 'mpegts', join(fixtures, 'source.ts')]);
   await writeFile(join(fixtures, 'key.bin'), randomBytes(16));
   await writeFile(join(fixtures, 'key.info'), `https://fixtures.example/key.bin?signature=key\n${join(fixtures, 'key.bin')}\n`);
   // MP4 的 MPEG-4 初始化头不能直接复制进独立 TS；MPEG-2 在关键帧重复序列头。
@@ -55,7 +61,7 @@ try {
   await writeFile(join(fixtures, 'master.m3u8'), '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000\nsource.m3u8?signature=playlist&part=1\n');
   const fixtureNames = new Set(await readdir(fixtures));
   // 固定公网样例通过 DI 映射为本地字节；生产网络校验保持启用。
-  const media = createMedia({ request: async (value, options = {}) => {
+  const fixtureRequest = async (value, options = {}) => {
     const url = new URL(value);
     assert.equal(url.origin, 'https://fixtures.example');
     const name = url.pathname.slice(1);
@@ -79,7 +85,9 @@ try {
       headers['content-length'] = String(body.length);
     }
     return Object.assign(Readable.from(options.method === 'HEAD' ? [] : [body]), { statusCode, headers, finalUrl: url.href });
-  } });
+  };
+  const media = createMedia({ request: fixtureRequest });
+  const cloudMedia = createMedia({ request: fixtureRequest, proxyPath: '/api/quark/media/ci-cloud-lease' });
   transcoder = createTranscoder({ media, tmpRoot: jobs, startupTimeout: 60000, probeTimeout: 10000,
     env: { ...process.env, TRANSCODE_ENABLED: 'true', TRANSCODE_ACCEL: 'software', FFMPEG_PATH: executable } });
   const status = await transcoder.status();
@@ -93,9 +101,13 @@ try {
   await new Promise((done, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', done); });
   const origin = `http://127.0.0.1:${server.address().port}`;
   for (const sample of [{ type: 'mp4', path: 'source.mp4?signature=mp4', position: 0, speed: 1 },
-    { type: 'hls', path: 'master.m3u8?signature=master', position: 3, speed: 1.5 }]) {
+    { type: 'hls', path: 'master.m3u8?signature=master', position: 3, speed: 1.5 },
+    { type: 'mkv', path: 'source.mkv?signature=cloud', position: 2, speed: 2 },
+    { type: 'avi', path: 'source.avi?signature=cloud-avi', position: 1, speed: 2 },
+    { type: 'mpegts', path: 'source.ts?signature=cloud-ts', position: 1, speed: 2 }]) {
     const task = await transcoder.start({ episode: { url: `https://fixtures.example/${sample.path}`, type: sample.type },
-      position: sample.position, speed: sample.speed, owner: 'ci-smoke', valid: () => true });
+      position: sample.position, speed: sample.speed, owner: 'ci-smoke', valid: () => true,
+      ...(['mkv', 'avi', 'mpegts'].includes(sample.type) ? { mediaOverride: cloudMedia, proxyPath: '/api/quark/media/ci-cloud-lease' } : {}) });
     assert.equal(task.startPosition, sample.position); assert.equal(task.acceleration, 'software');
     assert.equal((await transcoder.status()).running, true);
     let playlist = '';

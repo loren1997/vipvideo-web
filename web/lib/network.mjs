@@ -55,10 +55,13 @@ export function validateUrl(value) {
 }
 
 export function createRequest({ lookup = dnsLookup, httpRequest = http.request, httpsRequest = https.request } = {}) {
-  return async function safeRequest(value, { headers = {}, timeout = 8000, method = 'GET' } = {}) {
-    if (!['GET', 'HEAD'].includes(method)) throw failure('不支持的请求方法', 400);
+  return async function safeRequest(value, { headers = {}, timeout = 8000, method = 'GET', body, followRedirects = true } = {}) {
+    if (!['GET', 'HEAD', 'POST'].includes(method)) throw failure('不支持的请求方法', 400);
+    if (typeof followRedirects !== 'boolean') throw failure('重定向设置无效', 400);
+    if (body !== undefined && (method !== 'POST' || !(typeof body === 'string' || Buffer.isBuffer(body)) || Buffer.byteLength(body) > 65536)) throw failure('请求正文无效或超过 64 KiB', 400);
     const deadline = Date.now() + timeout;
     let url = validateUrl(value);
+    let requestHeaders = { ...headers };
     try {
       for (let redirects = 0; redirects <= 3; redirects++) {
         const remaining = deadline - Date.now();
@@ -77,7 +80,7 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
         const response = await new Promise((resolve, reject) => {
           const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
           const outgoing = transport(url, {
-            method, agent: false, headers: { 'accept-encoding': 'identity', ...headers },
+            method, agent: false, headers: { 'accept-encoding': 'identity', ...requestHeaders },
             // 固定已验证的地址，避免校验后再次 DNS 解析产生重绑定。
             lookup: (_host, options, callback) => options.all
               ? callback(null, [selected]) : callback(null, selected.address, selected.family),
@@ -85,16 +88,19 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
           const headerTimer = setTimeout(() => outgoing.destroy(failure('影视源请求超时')), Math.max(1, deadline - Date.now()));
           outgoing.once('response', () => clearTimeout(headerTimer));
           outgoing.once('error', error => { clearTimeout(headerTimer); reject(error); });
-          outgoing.end();
+          outgoing.end(body);
         });
         response.finalUrl = url.href;
         response.setTimeout?.(timeout, () => response.destroy(failure('影视源读取超时')));
         if (![301, 302, 303, 307, 308].includes(response.statusCode)) return response;
         const location = response.headers.location;
         response.destroy();
+        if (!followRedirects || method === 'POST') throw failure('此请求不允许重定向');
         if (!location) throw failure('影视源重定向缺少目标链接');
         if (redirects === 3) throw failure('影视源重定向次数过多');
-        url = validateUrl(new URL(location, url).href);
+        const next = validateUrl(new URL(location, url).href);
+        if (next.origin !== url.origin) requestHeaders = Object.fromEntries(Object.entries(requestHeaders).filter(([key]) => !['cookie', 'authorization', 'proxy-authorization'].includes(key.toLowerCase())));
+        url = next;
       }
     } catch (cause) {
       if (cause.status) throw cause;

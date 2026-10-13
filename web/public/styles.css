@@ -189,6 +189,27 @@ a.rating-score:hover { background:#2a4939; }
 .maintenance-state { font-size:11px; border-radius:4px; padding:2px 7px; background:#293141; color:#a8b5c7; white-space:nowrap; }
 .maintenance-state.state-ok { background:#213c30; color:#a9e5c5; }
 .maintenance-state.state-error { background:#492d32; color:#f1afb8; }
+.maintenance-state.state-quarantined { background:#493b25; color:#eac987; }
+.maintenance-detail { grid-column:1/-1; font-size:11px; margin:0; }
+.player-ads { border:1px solid var(--line); border-radius:8px; padding:10px 13px; margin:10px 0 12px; font-size:12px; background:var(--surface); }
+.player-ads summary { cursor:pointer; color:#c4d3e5; }
+.player-ads > p { font-size:11px; margin:10px 0; }
+.player-ads > label { display:flex; align-items:center; gap:7px; margin:10px 0; }
+.ad-range-form { display:flex; flex-wrap:wrap; align-items:flex-end; gap:10px; }
+.ad-range-form label { display:grid; gap:5px; color:var(--muted); font-size:11px; }
+.ad-range-form input { width:140px; min-height:34px; padding:7px 9px; }
+.ad-range-list { margin-top:12px; }
+.ad-range-row { display:flex; align-items:center; gap:12px; margin:5px 0; }
+.quark-resources { padding:16px; background:var(--surface); border:1px solid var(--line); border-radius:10px; margin:16px 0; }
+.quark-resources h3 { font-size:15px; margin:0 0 8px; }
+.quark-resources p, .quark-settings p { font-size:12px; overflow-wrap:anywhere; }
+.quark-choices { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.quark-choices select { max-width:100%; min-width:0; flex:1 1 220px; }
+.quark-settings-fields { display:grid; gap:12px; margin:16px 0; }
+.quark-settings-fields label { display:flex; align-items:center; gap:10px; font-size:12px; }
+.quark-settings-fields input[type=number] { width:90px; }
+.quark-settings-fields input[type=url], .quark-settings-fields input[type=password] { flex:1; min-width:0; }
+@media(max-width:640px) { .quark-settings-fields label:not(.player-option) { display:grid; gap:6px; } .quark-settings-fields input[type=url], .quark-settings-fields input[type=password] { width:100%; } }
 .maintenance-error { grid-column:1/-1; color:var(--danger); font-size:11px; overflow-wrap:anywhere; }
 .line-status { margin-left:7px; font-size:10px; color:var(--muted); }
 .player-preferences { display:flex; flex-wrap:wrap; align-items:center; gap:10px 15px; padding:13px; border:1px solid var(--line); background:var(--surface); border-radius:8px; margin:0 0 12px; font-size:11px; }

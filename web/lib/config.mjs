@@ -63,6 +63,17 @@ export function validatePlayerPreferences(input) {
     if (typeof value !== 'boolean') throw badRequest('播放开关必须是布尔值');
     row[field] = value;
   }
+  row.skipAds = input.skipAds === undefined ? false : input.skipAds;
+  if (typeof row.skipAds !== 'boolean') throw badRequest('广告跳过开关必须是布尔值');
+  const ranges = input.adRanges === undefined ? [] : input.adRanges;
+  if (!Array.isArray(ranges) || ranges.length > 20) throw badRequest('广告时段必须是数组，且不超过 20 个');
+  row.adRanges = ranges.map(range => {
+    if (!range || typeof range !== 'object' || Array.isArray(range)) throw badRequest('广告时段格式不正确');
+    const scope = text(range.scope, '广告版本和剧集标识', 4096);
+    const { start, end } = range;
+    if (typeof start !== 'number' || typeof end !== 'number' || !Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end > 86400 || end <= start || end - start > 600) throw badRequest('广告时段必须为有效秒数，每段不超过 600 秒');
+    return { scope, start, end };
+  });
   row.speed = input.speed === undefined ? 1 : input.speed;
   if (![0.5, 0.75, 1, 1.25, 1.5, 2, 3].includes(row.speed)) throw badRequest('播放速度不受支持');
   return row;

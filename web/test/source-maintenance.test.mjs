@@ -4,7 +4,7 @@ import { Readable } from 'node:stream';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createSourceMaintenance } from '../lib/source-maintenance.mjs';
+import { createSourceMaintenance as createMaintenance } from '../lib/source-maintenance.mjs';
 import { createStore } from '../lib/store.mjs';
 
 const source = (id, extra = {}) => ({ id, name: `${id}源`, api: `https://${id}.example/api.php`, enabled: true, ...extra });
@@ -14,6 +14,10 @@ const response = (body, statusCode = 200) => Object.assign(Readable.from([Buffer
 const feed = (...sources) => ({ api_site: Object.fromEntries(sources.map(item => [item.id, { name: item.name, api: item.api }])) });
 const feedRequest = callback => async (url, options) => url.pathname.endsWith('.json') ? callback(url, options) : response({ code: 1, list: [{ vod_id: 1, vod_name: '可用接口样例' }] });
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(setImmediate); };
+const createSourceMaintenance = options => createMaintenance({
+  catalog: { detail: async () => ({ lines: [{ episodes: [{ url: 'https://media.example/sample.mp4', type: 'mp4' }] }] }) },
+  playability: { check: async () => ({ playable: true }) }, ...options,
+});
 
 function memoryStore(initial) {
   let current = structuredClone(initial);
@@ -23,6 +27,41 @@ function memoryStore(initial) {
     meta: key => meta.get(key), setMeta(key, value) { meta.set(key, value); },
   };
 }
+
+test('quarantines only persistent failures, preserves configuration and recovers automatically', async () => {
+  let clock = 1_000_000, failed = true, requests = 0;
+  const initial = config({ sources: [source('a')] }), store = memoryStore(initial);
+  const service = createSourceMaintenance({ store, now: () => clock, request: async () => {
+    requests++; return failed ? response('unavailable', 503) : response({ list: [{ vod_id: 1, vod_name: '样例' }] });
+  } });
+  await service.probe();
+  clock += 30 * 60_000; await service.probe();
+  assert.equal(service.availableConfig().sources.length, 1);
+  clock += 30 * 60_000; await service.probe();
+  assert.equal(service.status().sources[0].status, 'quarantined');
+  assert.equal(service.availableConfig().sources.length, 0);
+  assert.deepEqual(store.config(), initial);
+  const count = requests; await service.probe({ force: false }); assert.equal(requests, count);
+  failed = false; clock += 30 * 60_000; await service.probe({ force: false });
+  assert.equal(service.status().sources[0].status, 'ok');
+  assert.equal(service.availableConfig().sources.length, 1);
+  await service.stop();
+});
+
+test('new subscription sources must pass actual media validation and large feeds continue in stable windows', async () => {
+  const store = memoryStore(config({ subscriptions: [subscription()] }));
+  const remote = feed(...Array.from({ length: 205 }, (_, i) => source(`s${i}`)));
+  let playable = false;
+  const service = createSourceMaintenance({ store, request: feedRequest(() => response(remote)),
+    playability: { check: async () => ({ playable }) } });
+  await service.update(); assert.equal(store.config().sources.length, 0);
+  playable = true;
+  for (let i = 0; i < 11; i++) await service.update();
+  assert.equal(store.config().sources.length, 200);
+  assert.equal(new Set(store.config().sources.map(row => row.id)).size, 200);
+  assert.ok(store.config().sources.some(row => row.id === 's204'));
+  await service.stop();
+});
 
 test('subscription refresh repairs JSONC and compatible TVBox sites before checking and adding APIs', async () => {
   const store=memoryStore(config({subscriptions:[subscription()]}));
@@ -133,7 +172,7 @@ test('rejects an entire invalid or oversized subscription and leaves all existin
   assert.deepEqual(store.config(), initial);
   remote = { unsupported: [source('valid')] };
   result = await maintenance.update();
-  assert.match(result.subscriptions[0].error, /可识别的影视源 JSON/);
+  assert.match(result.subscriptions[0].error, /兼容的影视源配置/);
   assert.deepEqual(store.config(), initial);
 });
 
@@ -224,7 +263,7 @@ test('shares a two-request limit across simultaneous probes and updates', async 
   const maintenance = createSourceMaintenance({ store, request: async url => {
     active++; maximum = Math.max(maximum, active);
     await new Promise(setImmediate); active--;
-    return response(url.pathname.endsWith('.json') ? feed(source('new')) : { list: [] });
+    return response(url.pathname.endsWith('.json') ? feed(source('new')) : { list: [{ vod_id: 1, vod_name: '播放样例' }] });
   } });
   const probe = maintenance.probe();
   const update = maintenance.update();
@@ -259,7 +298,7 @@ test('persists source status and ownership in SQLite across restart', async t =>
   const initial = config({ sources: [source('existing')], subscriptions: [subscription()] });
   const store = createStore(directory, initial);
   openStore = store;
-  const first = createSourceMaintenance({ store, now: () => 1000, request: async url => response(url.pathname.endsWith('.json') ? feed(source('managed'), source('deleted')) : { list: [] }) });
+  const first = createSourceMaintenance({ store, now: () => 1000, request: async url => response(url.pathname.endsWith('.json') ? feed(source('managed'), source('deleted')) : { list: [{ vod_id: 1, vod_name: '播放样例' }] }) });
   await first.update(); await first.probe(); await first.stop();
   store.setConfig({ ...store.config(), sources: store.config().sources.filter(row => row.id !== 'deleted').map(row => row.id === 'managed' ? { ...row, name: '持久名称' } : row) });
   store.close();
@@ -324,7 +363,7 @@ test('bounded discovery rotates beyond failing candidates and cannot be starved 
   const store = memoryStore(config({ subscriptions: [subscription()] }));
   const service = createSourceMaintenance({ store, request: async url => {
     if (url.pathname.endsWith('.json')) return response(feed(...Array.from({ length: 21 }, (_, i) => source('new' + i))));
-    return url.hostname === 'new20.example' ? response({ list: [] }) : response({}, 503);
+    return url.hostname === 'new20.example' ? response({ list: [{ vod_id: 1, vod_name: '播放样例' }] }) : response({}, 503);
   } });
   await service.update(); assert.equal(store.config().sources.length, 0);
   await service.update(); assert.deepEqual(store.config().sources.map(item => item.id), ['new20']);

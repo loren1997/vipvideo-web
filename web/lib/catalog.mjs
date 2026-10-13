@@ -400,7 +400,17 @@ export function createCatalog({ request = networkRequest } = {}) {
         const item = metadata(video, source);
         if (!item) throw failure('影片不存在或源未返回详情');
         const description = String(video.vod_content || video.vod_blurb || '').replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '').replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').trim();
-        return { ...item, description };
+        const shareLinks = [video.vod_content, video.vod_blurb, video.vod_down_url].filter(Boolean).join(' ').replace(/&amp;/g, '&')
+          .match(/https:\/\/pan\.quark\.cn\/s\/[A-Za-z0-9]{6,64}(?:\?[^\s<>"']*)?/g) || [];
+        const sharesByPath = new Map();
+        for (const value of shareLinks.slice(0, 20)) {
+          const url = new URL(value), password = url.searchParams.get('pwd') || '';
+          url.search = '';
+          if (/^[A-Za-z0-9]{1,16}$/.test(password)) url.searchParams.set('pwd', password);
+          if (!sharesByPath.has(url.pathname) || url.search) sharesByPath.set(url.pathname, url.href);
+        }
+        const quarkShares = [...sharesByPath.values()].slice(0, 10);
+        return { ...item, description, ...(quarkShares.length ? { quarkShares } : {}) };
       });
       if (item.category === 'adult' && config.showAdult !== true) throw failure('三级内容已隐藏，请先在设置中开启显示', 403);
       if (!item.lines.length) { detailCache.delete(key); throw failure('该影片没有可用的 HTTP / HTTPS 播放线路'); }

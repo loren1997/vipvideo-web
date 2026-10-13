@@ -98,7 +98,10 @@ export function repairImport(input) {
       if (entries.length > 200 || entries.some(row => !row || typeof row !== 'object' || Array.isArray(row))) throw invalid('api_site 必须是最多 200 项的对象数组');
       config.api_site = uniqueMap(entries.map(row => { const id = identifier(row); return [id, entry(row, id)]; }));
       warnings.push('已将 api_site 数组转换为按标识索引的对象');
-    } else config.api_site = Object.fromEntries(Object.entries(entries).map(([id, row]) => [id, entry(row, id)]));
+    } else {
+      if (Object.keys(entries).length > 200) throw invalid('api_site 不能超过 200 项');
+      config.api_site = Object.fromEntries(Object.entries(entries).map(([id, row]) => [id, entry(row, id)]));
+    }
   } else if (Object.hasOwn(input, 'sites')) {
     if (!Array.isArray(input.sites) || input.sites.length > 200) throw invalid('sites 必须是最多 200 项的数组');
     const rows = [];
@@ -121,4 +124,34 @@ export function repairImport(input) {
     warnings.push('已补全影视源配置所需的空平台与解析线路字段');
   }
   return { config, warnings: warnings.slice(0, 200) };
+}
+
+// Only background subscriptions use bounded windows; interactive imports retain their 200-row limit.
+export function subscriptionWindow(input, cursor = 0) {
+  if (typeof input === 'string') {
+    if (input.length > 1024 * 1024) throw invalid('订阅内容不能超过 1 MB');
+    const raw = input.trim().replace(/^```(?:jsonc?)?\s*\n?([\s\S]*?)\n?```$/i, '$1');
+    try { input = JSON.parse(raw); }
+    catch { try { input = JSON.parse(jsonWithoutComments(raw)); } catch { throw invalid('订阅内容不是有效 JSON'); } }
+  }
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw invalid('订阅内容必须是 JSON 对象');
+  const field = ['api_site', 'sites', 'sources'].find(key => Object.hasOwn(input, key));
+  if (!field) throw invalid('订阅没有兼容的影视源配置');
+  const value = input[field], object = field === 'api_site' && value && typeof value === 'object' && !Array.isArray(value);
+  if (!object && !Array.isArray(value)) throw invalid('订阅影视源配置格式不正确');
+  const entries = object ? Object.entries(value) : value;
+  if (entries.length > 2000) throw invalid('背景订阅不能超过 2000 项');
+  if (!object) {
+    const ids = new Set();
+    for (const row of entries) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) throw invalid('订阅影视源配置项格式不正确');
+      const id = row.id ?? row.key ?? ('import-' + createHash('sha256').update(String(row.api ?? row.url ?? row.baseUrl)).digest('hex').slice(0, 16));
+      if (ids.has(String(id))) throw invalid('影视源标识重复，未导入以避免覆盖');
+      ids.add(String(id));
+    }
+  }
+  const total = entries.length, start = Number.isSafeInteger(cursor) && cursor >= 0 && total ? cursor % total : 0;
+  const selected = entries.slice(start, start + 200);
+  const { config, warnings } = repairImport({ [field]: object ? Object.fromEntries(selected) : selected });
+  return { config, total, nextCursor: total ? (start + selected.length) % total : 0, warnings };
 }

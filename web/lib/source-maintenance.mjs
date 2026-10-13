@@ -1,6 +1,8 @@
 import { request as networkRequest, readText, validateUrl } from './network.mjs';
 import { importConfig, validateConfig } from './config.mjs';
-import { repairImport } from './import-repair.mjs';
+import { subscriptionWindow } from './import-repair.mjs';
+import { createPlayability } from './playability.mjs';
+import { createCatalog } from './catalog.mjs';
 
 const META_KEY = 'source-maintenance-v1';
 const PROBE_INTERVAL = 30 * 60 * 1000;
@@ -18,7 +20,9 @@ function validAppleCms(body) {
   return (validList || validClass) && (list === undefined || validList) && (classes === undefined || validClass);
 }
 
-export function createSourceMaintenance({ store, catalog, initialSources = [], request = networkRequest, now = Date.now, logger = console }) {
+export function createSourceMaintenance({ store, catalog, initialSources = [], request = networkRequest, now = Date.now, logger = console,
+  playability = createPlayability({ request, now }) }) {
+  catalog ??= createCatalog({ request });
   let saved;
   try { saved = JSON.parse(store.meta(META_KEY) || '{}'); } catch { saved = {}; }
   if (!saved || typeof saved !== 'object' || Array.isArray(saved)) saved = {};
@@ -46,6 +50,7 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
         id: item.id, name: item.name, [key]: item[key],
         status: item.enabled === false ? 'disabled' : current?.status || 'unknown',
         latencyMs: current?.latencyMs ?? null, checkedAt: current?.checkedAt ?? 0, error: current?.error || '',
+        ...(key === 'api' ? { failures: current?.failures || 0, firstFailureAt: current?.firstFailureAt || 0, retryAt: current?.retryAt || 0 } : {}),
         ...(key === 'url' ? { added: current?.added || 0, updated: current?.updated || 0, skipped: current?.skipped || 0 } : {}),
       };
     });
@@ -70,7 +75,7 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
         if (expired) { response.destroy(); throw new Error('请求超时（8 秒）'); }
         if (response.statusCode < 200 || response.statusCode >= 300) { response.destroy(); throw new Error(`请求返回 HTTP ${response.statusCode}`); }
         const raw = await readText(response, maxBytes);
-        return repair ? repairImport(raw).config : JSON.parse(raw);
+        return repair ? raw : JSON.parse(raw);
       })();
       return await Promise.race([result, deadline]);
     } finally {
@@ -81,25 +86,48 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
     }
   }
 
-  async function checkApi(source) {
+  async function checkApi(source, { playback = false } = {}) {
     const start = now();
     let error = '';
     try {
       const url = validateUrl(source.api);
       for (const key of ['ac', 'wd', 'ids', 't', 'pg']) url.searchParams.delete(key);
       url.searchParams.set('ac', 'list');
-      if (!validAppleCms(await jsonRequest(url, 4 * 1024 * 1024))) throw new Error('接口未返回有效的 AppleCMS list / class');
+      const body = await jsonRequest(url, 4 * 1024 * 1024);
+      if (!validAppleCms(body)) throw new Error('接口未返回有效的 AppleCMS list / class');
+      if (playback) {
+        const candidate = body.list?.find(video => String(video.vod_id ?? '').trim());
+        if (stopping || !candidate || !catalog?.detail) throw new Error('接口没有可用于验证播放的影片');
+        const detail = await catalog.detail({ ...store.config(), sources: [source] }, source.id, String(candidate.vod_id));
+        if (stopping) throw new Error('影视源验证已停止');
+        const media = detail.lines.flatMap(line => line.episodes).find(episode => ['hls', 'mp4'].includes(episode.type));
+        if (!media || !(await playability.check(media)).playable) throw new Error('接口已响应，但样例影片未通过播放验证');
+      }
     } catch (cause) { error = errorText(cause); }
-    return { api: source.api, status: error ? 'error' : 'ok', latencyMs: Math.max(0, now() - start), checkedAt: now(), error };
+    return { api: source.api, status: error ? 'error' : 'ok', latencyMs: Math.max(0, now() - start), checkedAt: now(), error,
+      ...(playback ? { playable: !error } : {}) };
   }
 
-  async function runProbe() {
+  function availableConfig(config = store.config()) {
+    return { ...config, sources: config.sources.filter(source => !(state.sources[source.id]?.api === source.api && state.sources[source.id].status === 'quarantined')) };
+  }
+
+  async function runProbe(force) {
     const sources = store.config().sources.filter(source => source.enabled !== false);
     let cursor = 0;
     await Promise.all(Array.from({ length: Math.min(2, sources.length) }, async () => {
       while (cursor < sources.length && !stopping) {
         const source = sources[cursor++];
-        state.sources[source.id] = await checkApi(source);
+        const previous = state.sources[source.id]?.api === source.api ? state.sources[source.id] : null;
+        if (!force && previous?.retryAt > now()) continue;
+        const result = await checkApi(source);
+        if (!store.config().sources.some(item => item.id === source.id && item.api === source.api && item.enabled !== false)) continue;
+        const failures = result.status === 'ok' ? 0 : Math.min(1000, (Number.isSafeInteger(previous?.failures) && previous.failures >= 0 ? previous.failures : 0) + 1);
+        const firstFailureAt = failures ? previous?.failures > 0 && Number.isFinite(previous.firstFailureAt) && previous.firstFailureAt >= 0 && previous.firstFailureAt <= now() ? previous.firstFailureAt : now() : 0;
+        const isolated = failures >= 3 && now() - firstFailureAt >= 2 * PROBE_INTERVAL;
+        state.sources[source.id] = { ...result, failures, firstFailureAt,
+          status: isolated ? 'quarantined' : result.status,
+          retryAt: isolated ? now() + Math.min(6 * 60 * 60_000, PROBE_INTERVAL * 2 ** Math.min(4, failures - 3)) : 0 };
       }
     }));
     if (!stopping) state.lastProbe = now();
@@ -126,26 +154,30 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
       let error = '';
       try {
         const body = await jsonRequest(subscription.url, 1024 * 1024, true);
-        if (!body || typeof body !== 'object' || !Object.hasOwn(body, 'api_site') && !Array.isArray(body.sources)) throw new Error('订阅必须包含可识别的影视源 JSON');
-        const remote = importConfig(validateConfig(emptyConfig()), body).sources;
+        const window = subscriptionWindow(body, previous?.windowCursor || 0);
+        const remote = importConfig(validateConfig(emptyConfig()), window.config).sources;
         const snapshot = store.config();
         const activeSubscription = (snapshot.subscriptions || []).find(item => item.id === subscription.id);
         if (!activeSubscription || activeSubscription.enabled === false || activeSubscription.url !== subscription.url) throw new Error('订阅已变更或停用，本次结果未应用');
         const canonical = api => api.replace(/\/+$/, '');
-        const pendingCandidates = remote.filter(source => {
+        const eligible = source => {
           const current = snapshot.sources.find(item => item.id === source.id);
           if (Object.hasOwn(owned, source.id)) return current && current.enabled !== false && current.api === owned[source.id] && current.api !== source.api;
           return !current && !snapshot.sources.some(item => canonical(item.api) === canonical(source.api));
-        });
-        const cursor = Number(previous?.discoveryCursor) || 0;
-        const candidates = Array.from({ length: Math.min(20, pendingCandidates.length) }, (_, index) => pendingCandidates[(cursor + index) % pendingCandidates.length]);
+        };
+        const candidates = [];
+        let pageOffset = Number.isSafeInteger(previous?.pageOffset) && previous.pageOffset < remote.length ? previous.pageOffset : 0;
+        while (pageOffset < remote.length && candidates.length < 20) {
+          const source = remote[pageOffset++];
+          if (eligible(source)) candidates.push(source);
+        }
         const checked = new Map();
         let next = 0;
         // shortcut: 每次订阅更新最多验证20个新地址，后续更新继续发现，避免大订阅占满NAS。
         await Promise.all(Array.from({ length: Math.min(2, candidates.length) }, async () => {
           while (!stopping && next < candidates.length) {
             const source = candidates[next++];
-            checked.set(source.id, await checkApi(source));
+            checked.set(source.id, await checkApi(source, { playback: true }));
           }
         }));
         const latest = store.config();
@@ -167,12 +199,14 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
           }
         }
         store.setConfig(validateConfig({ ...latest, sources }));
-        previous = { ...previous, discoveryCursor: pendingCandidates.length ? (cursor + candidates.length) % pendingCandidates.length : 0 };
+        previous = { ...previous, discoveryCursor: 0, windowCursor: pageOffset >= remote.length ? window.nextCursor : previous?.windowCursor || 0,
+          pageOffset: pageOffset >= remote.length ? 0 : pageOffset };
       } catch (cause) { error = errorText(cause); }
       state.subscriptions[subscription.id] = {
         url: subscription.url, status: error ? 'error' : 'ok', latencyMs: Math.max(0, now() - start), checkedAt: now(), error,
         owned: error ? previous?.owned || {} : owned, initialized: previous?.initialized === true,
         discoveryCursor: previous?.discoveryCursor || 0,
+        windowCursor: previous?.windowCursor || 0, pageOffset: previous?.pageOffset || 0,
         added: error ? 0 : added, updated: error ? 0 : updated, skipped,
       };
     }
@@ -180,9 +214,9 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
     persist();
   }
 
-  function probe() {
+  function probe({ force = true } = {}) {
     if (stopping) return Promise.resolve(status());
-    if (!probeJob) probeJob = runProbe().finally(() => { probeJob = null; }).then(status);
+    if (!probeJob) probeJob = runProbe(force).finally(() => { probeJob = null; }).then(status);
     return probeJob;
   }
 
@@ -199,7 +233,7 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
     const last = probeMode ? state.lastProbe : state.lastUpdate;
     const delay = last ? Math.max(0, Math.min(interval, last + interval - now())) : 0;
     const timer = setTimeout(async () => {
-      try { await (probeMode ? probe() : update()); }
+      try { await (probeMode ? probe({ force: false }) : update()); }
       catch (error) { logger.error?.(`影视源${probeMode ? '探测' : '订阅更新'}失败：${errorText(error)}`); }
       finally { schedule(kind); }
     }, delay);
@@ -220,5 +254,5 @@ export function createSourceMaintenance({ store, catalog, initialSources = [], r
     await Promise.allSettled([probeJob, updateJob].filter(Boolean));
   }
 
-  return { status, probe, update, verify: checkApi, start, stop };
+  return { status, probe, update, verify: checkApi, availableConfig, start, stop };
 }

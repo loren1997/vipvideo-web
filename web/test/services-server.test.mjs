@@ -15,7 +15,7 @@ const ratingResult = { douban: { score: 8, url: 'https://movie.douban.com/subjec
 const catalog = { async detail() { return movie; }, async search() { return { groups: [], failedSources: [] }; } };
 const maintenance = { status() { return { sources: [] }; }, async probe() { return { sources: [] }; }, async update() { return { sources: [] }; } };
 const live = { async list() { return { channels }; }, status() { return []; } };
-const preferences = { key: movie.key, introSeconds: 0, outroSeconds: 0, autoNext: true, danmakuEnabled: true, speed: 1 };
+const preferences = { key: movie.key, introSeconds: 0, outroSeconds: 0, autoNext: true, danmakuEnabled: true, skipAds: false, adRanges: [], speed: 1 };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 
 async function running(t, options = {}) {
@@ -335,7 +335,7 @@ test('player preferences persist across application restart without invalidating
   const response = await instance.call('/api/player/preferences?key='+encodeURIComponent(movie.key), undefined, cookie);
   assert.equal(response.status, 200);
   const body = await response.json();
-  for(const [key,value] of Object.entries(saved))assert.equal(body[key],value);
+  for(const [key,value] of Object.entries(saved))assert.deepEqual(body[key],value);
 });
 
 test('player preference validation rejects malformed values without replacing an existing save', async t => {
@@ -349,7 +349,7 @@ test('player preference validation rejects malformed values without replacing an
   assert.equal((await instance.call('/api/player/preferences', null, cookie, 'PUT')).status, 400);
   assert.equal((await instance.call('/api/player/preferences', undefined, cookie)).status, 400);
   const body = await (await instance.call('/api/player/preferences?key='+encodeURIComponent(movie.key), undefined, cookie)).json();
-  for(const [key,value] of Object.entries(saved))assert.equal(body[key],value);
+  for(const [key,value] of Object.entries(saved))assert.deepEqual(body[key],value);
 });
 
 test('danmaku endpoints use the agreed selection, comment and binding service contracts', async t => {

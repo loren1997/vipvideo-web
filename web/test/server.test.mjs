@@ -9,12 +9,71 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../server.mjs';
 import { createStore } from '../lib/store.mjs';
+import { createQuarkMedia } from '../lib/quark-media.mjs';
+import { Readable } from 'node:stream';
 
 const empty = { showAdult: false, sources: [], platforms: [], parsers: [], subscriptions: [], liveSources: [] };
 const detail = { key: 'film', source: 'demo', id: '1', title: '测试影片', year: '2025', type: 'movie', poster: '', description: '简介',
   lines: [{ name: '线路', episodes: [{ name: '正片', url: 'https://media.example/video.m3u8?token=abc', type: 'hls' }] }] };
 const catalog = { async search() { return { groups: [{ ...detail, items: [{ source: 'demo', id: '1' }] }], failedSources: [] }; },
   async detail() { return detail; } };
+
+test('ad inspection resolves configured episodes and preserves ranges for older clients', async t => {
+  const source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
+  const calls = [], { call, login } = await running(t, { initialConfig: { ...empty, sources: [source] },
+    adMarkers: { inspect: async episode => { calls.push(episode); return { supported: true, ranges: [{ start: 20, end: 30, kind: 'cue' }] }; } } });
+  assert.equal((await call('/api/ads?source=demo&id=1')).status, 401);
+  const cookie = await login();
+  const ad = await call('/api/ads?source=demo&id=1&line=0&episode=0&url=http://127.0.0.1/private', undefined, cookie);
+  assert.equal(ad.status, 200); assert.equal(calls[0].url, detail.lines[0].episodes[0].url);
+  assert.equal((await call('/api/ads?source=missing&id=1', undefined, cookie)).status, 400);
+  assert.equal((await call('/api/ads?source=demo&id=1&episode=-1', undefined, cookie)).status, 400);
+  const range = { scope: 'specific-version', start: 20, end: 30 };
+  assert.equal((await call('/api/player/preferences', { key: 'film', skipAds: true, adRanges: [range] }, cookie, 'PUT')).status, 200);
+  const legacy = await call('/api/player/preferences', { key: 'film', speed: 2 }, cookie, 'PUT');
+  assert.equal((await legacy.json()).skipAds, true);
+  assert.deepEqual((await (await call('/api/player/preferences?key=film', undefined, cookie)).json()).adRanges, [range]);
+  assert.equal((await call('/api/player/preferences', { key: 'film', skipAds: null }, cookie, 'PUT')).status, 400);
+});
+
+test('cloud routes protect account data, resolve trusted selections and proxy only server-created assets', async t => {
+  const calls = [], source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
+  const settings = () => ({ configured: true, enabled: true, account: { connected: true, label: '已连接账号' } });
+  const quark = { settings, configure: async input => { calls.push(['configure', input]); return settings(); },
+    resources: async (value, options) => { calls.push(['resources', value, options]); return { resources: [{ id: 'share', name: '影片' }] }; },
+    files: async () => ({ files: [] }), prepare: async (value, options) => { calls.push(['prepare', options]); return { assetId: 'asset', status: 'ready' }; },
+    playback: async () => ({ episode: { type: 'mp4', url: 'https://video.quark.cn/file.mp4' }, headers: { cookie: 'server-only-secret' },
+      allowCookieOrigins: ['https://video.quark.cn'], metadata: { name: '影片', category: 'movie', version: 'quality-1' } }),
+    progress: async (_id, input) => ({ saved: true, ended: input.ended }), cleanup: async () => ({ deleted: 0 }), clearAccount: async () => settings() };
+  const cloud = createQuarkMedia({ quark, request: async () => Object.assign(Readable.from([Buffer.from('video')]), { statusCode: 200, headers: { 'content-type': 'video/mp4' } }) });
+  const { call, login } = await running(t, { initialConfig: { ...empty, sources: [source] }, quark, quarkMedia: cloud });
+  for (const path of ['/api/quark/settings', '/api/quark/resources?source=demo&id=1', '/api/quark/media/00000000000000000000000000000000?token=x']) assert.equal((await call(path)).status, 401);
+  const cookie = await login();
+  assert.equal((await call('/api/quark/settings', { cookie: 'server-only-secret', enabled: true }, cookie, 'PUT')).status, 200);
+  assert.ok(!(await (await call('/api/config', undefined, cookie)).text()).includes('server-only-secret'));
+  assert.equal((await call('/api/quark/resources?source=demo&id=1&episode=0', undefined, cookie)).status, 200);
+  assert.equal(calls.find(row => row[0] === 'resources')[1].title, detail.title);
+  assert.equal((await call('/api/quark/resources?source=demo&id=1&episode=99', undefined, cookie)).status, 400);
+  assert.equal((await call('/api/quark/prepare', { source: 'demo', id: '1', auto: true }, cookie)).status, 200);
+  assert.equal((await call('/api/quark/prepare', { source: 'demo', id: '1', auto: 'yes' }, cookie)).status, 400);
+  const playback = await (await call('/api/quark/playback', { assetId: 'asset' }, cookie)).json();
+  assert.ok(!JSON.stringify(playback).includes('server-only-secret')); assert.ok(!JSON.stringify(playback).includes('video.quark.cn'));
+  assert.equal((await call(playback.url, undefined, cookie)).status, 200);
+  assert.equal((await call('/api/quark/account', {}, cookie, 'DELETE')).status, 200);
+  assert.equal((await call(playback.url, undefined, cookie)).status, 403);
+});
+
+test('logout during delayed film lookup prevents a subsequent cloud transfer', async t => {
+  let release, entered, transfers = 0;
+  const pending = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { entered = resolve; });
+  const source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
+  const { call, login } = await running(t, { initialConfig: { ...empty, sources: [source] },
+    catalog: { detail: async () => { entered(); await pending; return detail; } },
+    quark: { prepare: async () => { transfers++; return { status: 'ready' }; } } });
+  const cookie = await login(), response = call('/api/quark/prepare', { source: 'demo', id: '1', auto: true }, cookie);
+  await started; assert.equal((await call('/api/auth/logout', {}, cookie)).status, 200); release();
+  assert.equal((await response).status, 401); assert.equal(transfers, 0);
+});
 
 test('static gzip and conditional cache preserve bytes, HEAD, representation tags and file updates', async t => {
   const { base, call } = await running(t);
