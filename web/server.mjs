@@ -168,6 +168,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
             const result = await liveService.list(snapshot);
             const channel = result.channels.find(item => item.id === text(body.liveId, '频道标识', 200));
             selected = channel?.streams[line];
+            if (selected?.playbackUrl) selected = { ...selected, url: selected.playbackUrl };
             unchanged = () => JSON.stringify(snapshot.liveSources) === JSON.stringify(store.config().liveSources);
             if (position !== 0 || speed !== 1) throw badRequest('直播兼容播放不支持跳转或倍速');
           } else {
@@ -225,7 +226,8 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           const channel = result.channels.find(item => item.id === url.searchParams.get('id'));
           const line = Number(url.searchParams.get('line') ?? 0);
           if (!channel || !Number.isSafeInteger(line) || line < 0 || !channel.streams[line]) throw badRequest('请选择有效的频道和线路');
-          return json(res, 200, media.playback({ lines: [{ episodes: [channel.streams[line]] }] }, 0, 0));
+          const stream = channel.streams[line];
+          return json(res, 200, media.playback({ lines: [{ episodes: [{ ...stream, url: stream.playbackUrl || stream.url }] }] }, 0, 0));
         }
         if (path === '/api/live/report' && method === 'POST') {
           const body = await readBody(req);
@@ -265,6 +267,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
             category,
             page: url.searchParams.get('page') ?? '1',
             source: url.searchParams.get('source') ?? undefined,
+            ...Object.fromEntries(['genre', 'year', 'sort'].filter(key => url.searchParams.has(key)).map(key => [key, url.searchParams.get(key)])),
             ...(url.searchParams.get('progressive') === '1' ? { progressive: true } : {}),
           });
           ensureVisible(category);

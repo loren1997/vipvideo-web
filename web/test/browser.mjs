@@ -49,7 +49,19 @@ adult.category = 'adult'; adult.items.forEach(item => { item.category = 'adult';
 const categoryBoundary = fixture('分类边界样例', 'movie', 'category-normal', '剧情片', '样例');
 const categoryAdult = { ...categoryBoundary.items[0], source: 'third', id: 'category-adult', category: 'adult', typeName: '限制级' };
 const mixedCategory = { ...categoryBoundary, category: 'adult', typeName: '限制级', items: [...categoryBoundary.items, categoryAdult] };
-const groups = [{ ...summary, items }, movie, moviePage2, anime, variety, broken, badDetail, doomed, slow, hlsPriority, controlsFilm, compatibilityFilm, progressiveFast, progressiveSlow, progressiveAnime, verifiedFilm, adult, mixedCategory];
+function facetFixture(title, id, year, genre, releaseDate = '') {
+  const base = fixture(title, 'movie', id, `${genre}片`);
+  const fields = { year, key: JSON.stringify([title, year, 'movie']), genres: [genre], releaseDate };
+  return { ...base, ...fields, items: base.items.map(item => ({ ...item, ...fields })) };
+}
+const facetEarly = facetFixture('喜剧春日样例', 'facet-early', '2025', '喜剧', '2025-02-04');
+const facetNew = facetFixture('喜剧新片样例', 'facet-new', '2025', '喜剧', '2025-12-02');
+const facetUnknown = facetFixture('喜剧日期未知样例', 'facet-unknown', '2026', '喜剧');
+const facetOld = facetFixture('惊悚旧片样例', 'facet-old', '2024', '惊悚', '2024-11-13');
+const facetHorror = facetFixture('恐怖旧片样例', 'facet-horror', '2023', '恐怖');
+const facetClassic = facetFixture('喜剧老片样例', 'facet-classic', '1960', '喜剧', '1960-01-01');
+const facetFilms = [facetEarly, facetNew, facetUnknown, facetOld, facetHorror, facetClassic];
+const groups = [{ ...summary, items }, movie, moviePage2, anime, variety, broken, badDetail, doomed, slow, hlsPriority, controlsFilm, compatibilityFilm, progressiveFast, progressiveSlow, progressiveAnime, verifiedFilm, adult, mixedCategory, ...facetFilms];
 let delayAdultDetail = false;
 const catalogRequests = [];
 const maintenance = { probeCount: 0, updateCount: 0, discoverCount: 0, statusReads: 0, checkedAt: 0, updatedAt: 0 };
@@ -61,6 +73,10 @@ const transcodeStarts = [], transcodeStops = [];
 let transcodeMode = 'disabled', transcodeDuration = 1200, transcodeAcceleration = 'software', holdTranscode = false, releaseTranscode;
 let holdCandidateSearch = false, releaseCandidateSearch;
 let holdState = false, releaseStates = [], progressiveBrowse = null, progressiveSearch = null, liveProgress = null;
+let facetScenario = false, facetProgress = null;
+let metadataProgress = null;
+const fixtureGenres = ['喜剧', '惊悚', '恐怖', '动作', '爱情', '科幻', '悬疑', '犯罪', '战争', '剧情', '动画', '冒险', '奇幻', '家庭', '历史', '纪录', '武侠', '古装', '音乐', '运动', '青春'];
+const fixtureFacets = { genres: fixtureGenres, years: Array.from({ length: new Date().getFullYear() - 1899 }, (_value, index) => String(new Date().getFullYear() - index)) };
 const apiReads = [], vendorReads = [];
 let nextContextId = 0;
 let holdVendor = false, releaseVendor;
@@ -93,12 +109,20 @@ const catalog = {
   async search(config, query) {
     return { groups: config.sources.length ? groups.filter(group => group.title.includes(query) && (config.showAdult === true || group.category !== 'adult')) : [], failedSources: [] };
   },
-  async browse(config, { category, page, source }) {
-    catalogRequests.push({ kind: 'browse', category, page: Number(page), source });
+  async browse(config, { category, page, source, genre = '', year = '', sort = 'updated' }) {
+    catalogRequests.push({ kind: 'browse', category, page: Number(page), source, genre, year, sort });
     if (source === 'fourth') throw Object.assign(new Error('固定分类接口故障'), { status: 502 });
     if (category === 'adult' && config.showAdult !== true) throw Object.assign(new Error('三级内容已隐藏，请先在设置中开启显示。'), { status: 403 });
+    if (facetScenario) {
+      assert.ok(!genre || fixtureGenres.includes(genre), 'fixture严格接收规范genre标签');
+      assert.ok(!year || /^\d{4}$/.test(year) && Number(year) >= 1900 && Number(year) <= new Date().getFullYear() + 3);
+      assert.ok(['updated', 'release', 'year'].includes(sort));
+      const selected = facetFilms.filter(group => (!genre || group.genres.includes(genre)) && (!year || group.year === year));
+      const list = Number(page) === 1 ? selected.filter(group => group !== facetNew) : selected.filter(group => group === facetNew);
+      return { category, page: Number(page), groups: list.map(group => ({ ...group, category, items: group.items.filter(item => !source || item.source === source).map(item => ({ ...item, category })) })), failedSources: [], hasMore: Number(page) === 1 && selected.includes(facetNew), filters: { genre, year, sort }, facets: fixtureFacets, sortScope: 'loaded' };
+    }
     const list = category === 'adult' ? [adult] : category === 'movie' ? Number(page) === 1 ? [movie, badDetail, ...(config.showAdult === true ? [categoryBoundary] : [])] : [moviePage2, movie] : category === 'anime' ? [anime] : category === 'variety' ? [variety] : [{ ...summary, items }, broken, doomed, slow, controlsFilm, verifiedFilm];
-    return { category, page: Number(page), groups: list.map(group => ({ ...group, items: group.items.filter(item => (!source || item.source === source) && config.sources.some(row => row.id === item.source)) })).filter(group => group.items.length), failedSources: category === 'anime' ? [{ source: 'third', name: '第三源', error: '固定测试超时' }] : [], hasMore: category === 'movie' && Number(page) === 1 };
+    return { category, page: Number(page), groups: list.map(group => ({ ...group, items: group.items.filter(item => (!source || item.source === source) && config.sources.some(row => row.id === item.source)) })).filter(group => group.items.length), failedSources: category === 'anime' ? [{ source: 'third', name: '第三源', error: '固定测试超时' }] : [], hasMore: category === 'movie' && Number(page) === 1, filters: { genre, year, sort }, facets: fixtureFacets, sortScope: 'loaded' };
   },
   async detail(config, source, id) {
     catalogRequests.push({ kind: 'detail', source, id });
@@ -150,6 +174,18 @@ try {
       if (parsed.origin === base && ['/api/config', '/api/state', '/api/browse', '/api/search', '/api/live', '/api/live/probe'].includes(parsed.pathname)) apiReads.push({ contextId, path: parsed.pathname, url, method: route.request().method() });
       if (parsed.origin === base && parsed.pathname === '/vendor/hls.min.js') { vendorReads.push({ contextId, url }); if (holdVendor) await new Promise(ok => { releaseVendor = ok; }); }
       if (parsed.origin === base && parsed.pathname === '/api/state' && holdState) await new Promise(ok => releaseStates.push(ok));
+      if (parsed.origin === base && parsed.pathname === '/api/browse' && metadataProgress && parsed.searchParams.get('category') === 'movie' && parsed.searchParams.get('sort') === 'release' && !parsed.searchParams.has('genre')) {
+        metadataProgress.reads++;
+        const initial = facetFixture('聚合补全样例', 'metadata-enriched', '2025', '喜剧');
+        initial.items = [initial.items[0]];
+        const enriched = metadataProgress.stage === 0 ? initial : metadataProgress.stage === 3 ? { ...initial, releaseDate: '2025-11-05', genres: ['动作'], items: [{ ...initial.items[0], source: 'fourth', releaseDate: '2025-11-05', genres: ['动作'] }] } : { ...initial, releaseDate: metadataProgress.stage === 1 ? '2025-12-02' : '2025-08-03', genres: metadataProgress.stage === 1 ? ['喜剧', '惊悚'] : ['悬疑'], items: [initial.items[0], { ...initial.items[0], source: 'second', releaseDate: '2025-12-02', genres: ['惊悚'] }, ...(metadataProgress.stage === 2 ? [{ ...initial.items[0], source: 'third', releaseDate: '2025-08-03', genres: ['悬疑'] }] : [])] };
+        const reference = facetFixture('日期排序参照样例', 'metadata-reference', '2025', '剧情', '2025-06-01');
+        return route.fulfill({ json: { category: 'movie', page: Number(parsed.searchParams.get('page')), groups: [reference, enriched], failedSources: [], hasMore: metadataProgress.stage === 2, complete: metadataProgress.stage >= 2, pendingSources: metadataProgress.stage >= 2 ? [] : [{ source: 'second', name: '第二源' }], filters: { genre: '', year: '', sort: 'release' }, facets: fixtureFacets, sortScope: 'loaded' } });
+      }
+      if (parsed.origin === base && parsed.pathname === '/api/browse' && facetProgress && parsed.searchParams.get('category') === 'movie' && parsed.searchParams.get('genre') === '喜剧' && parsed.searchParams.get('sort') === 'release') {
+        facetProgress.reads++;
+        return route.fulfill({ json: { category: 'movie', page: 1, groups: [facetEarly, facetUnknown, ...(facetProgress.complete ? [facetNew, facetEarly] : [])], failedSources: [], hasMore: false, complete: facetProgress.complete, pendingSources: facetProgress.complete ? [] : [{ source: 'second', name: '第二源' }], filters: { genre: '喜剧', year: '', sort: 'release' }, facets: fixtureFacets, sortScope: 'loaded' } });
+      }
       if (parsed.origin === base && parsed.pathname === '/api/browse' && progressiveBrowse && parsed.searchParams.get('category') === 'anime' && !parsed.searchParams.has('source')) {
         progressiveBrowse.reads++;
         return route.fulfill({ json: { category: 'anime', page: 1, groups: [{ ...anime, items: anime.items.filter(item => progressiveBrowse.complete || item.source === 'first') }, ...(progressiveBrowse.complete ? [progressiveAnime] : [])], failedSources: [], hasMore: false, complete: progressiveBrowse.complete, pendingSources: progressiveBrowse.complete ? [] : [{ source: 'second', name: '第二源' }] } });
@@ -257,7 +293,7 @@ try {
         liveRequests.push(url);
         const channel = channels.find(item => item.id === parsed.searchParams.get('id')); const stream = channel?.streams[Number(parsed.searchParams.get('line'))];
         if (channel?.id === 'test-tv-two') await new Promise(ok => setTimeout(ok, 350));
-        return route.fulfill({ json: { ...stream, proxyUrl: base + '/api/media?token=live-fixture' } });
+        return route.fulfill({ json: { ...stream, url: stream.playbackUrl || stream.url, proxyUrl: base + '/api/media?token=live-fixture' } });
       }
       if (parsed.origin === base && parsed.pathname === '/api/live/report') { liveReports.push(route.request().postDataJSON()); return route.fulfill({ json: { ok: true } }); }
       if (url.startsWith(base + '/api/media?')) return route.fulfill({ status: 404, body: 'fixture failed proxy' });
@@ -280,6 +316,73 @@ try {
     await page.locator('#app-view').waitFor({ state: 'visible' });
     return { value, page, contextId };
   }
+  async function verifyBitstreamInitialLevel() {
+    const channel = { id: 'initial-level-satellite', name: '码流起始层样例', category: '卫视', group: '起始层样例', preferredLine: 0, streams: [{ name: '已验证H264动态主清单', status: 'ok', type: 'hls', url: 'https://fixtures.example/initial-level-master.m3u8?session=fixture', quality: { width: 1920, height: 1080, source: 'bitstream' } }] };
+    channels.push(channel); let isolated;
+    try {
+      isolated = await context({ width: 1440, height: 1000 }, true, false, '#live?category=%E5%8D%AB%E8%A7%86'); const p = isolated.page;
+      await p.evaluate(() => {
+        window.__initialHls = []; window.__initialLevels = [];
+        class InitialLevelFixtureHls {
+          static isSupported() { return true; }
+          static Events = { ERROR: 'hlsError', MANIFEST_PARSED: 'hlsManifestParsed' };
+          constructor(options) { this.options = options; this.levels = window.__initialLevels; this.handlers = new Map(); this.currentLevel = -1; this.autoLevelEnabled = true; window.__initialHls.push(this); }
+          loadSource(url) { this.url = url; }
+          attachMedia(video) { this.video = video; if (this.options.autoStartLoad !== false) this.startMedia(); setTimeout(() => { if (!this.destroyed) this.handlers.get('hlsManifestParsed')?.('hlsManifestParsed', { levels: this.levels }); }, 0); }
+          startMedia() { this.video.src = this.url.replace('.m3u8', '.mp4'); }
+          startLoad() { this.startLoads = (this.startLoads || 0) + 1; this.startMedia(); }
+          on(event, handler) { this.handlers.set(event, handler); }
+          destroy() { this.destroyed = true; }
+        }
+        window.Hls = InitialLevelFixtureHls;
+      });
+      const card = p.getByRole('button', { name: '播放频道 码流起始层样例', exact: true }); await card.waitFor();
+      const low = { width: 320, height: 180, videoCodec: 'avc1.42E01E' }, high = { width: 1920, height: 1080, videoCodec: 'avc1.640028' };
+      const cases = [
+        { name: '唯一AVC高清层', levels: [low, high], expected: 1 },
+        { name: 'attrs CODECS明确AVC', levels: [low, { width: 1920, height: 1080, attrs: { CODECS: 'avc1.640028, mp4a.40.2' } }], expected: 1 },
+        { name: '同尺寸多个AVC候选不猜', levels: [low, high, { ...high, videoCodec: 'avc1.4d4028' }], expected: undefined },
+        { name: 'HEVC-only不猜', levels: [low, { ...high, videoCodec: 'hvc1.1.6.L123.B0' }], expected: undefined },
+        { name: '未声明视频codec不猜', levels: [low, { width: 1920, height: 1080 }], expected: undefined },
+        { name: '宽高不精确匹配不猜', levels: [low, { ...high, height: 1088 }], expected: undefined },
+      ];
+      for (const [index, sample] of cases.entries()) {
+        await p.evaluate(levels => { window.__initialLevels = levels; }, sample.levels); await card.click();
+        await until(() => p.evaluate(count => window.__initialHls.length === count, index + 1), sample.name);
+        await until(() => p.locator('video').evaluate(video => video.readyState >= 2).catch(() => false), `${sample.name}媒体事件`);
+        const selection = await p.evaluate(() => { const instance = window.__initialHls.at(-1); return { startLevel: instance.startLevel, currentLevel: instance.currentLevel, auto: instance.autoLevelEnabled, starts: instance.startLoads }; });
+        assert.equal(selection.startLevel, sample.expected, sample.name); assert.equal(selection.currentLevel, -1, '不设置manual currentLevel'); assert.equal(selection.auto, true, '保持auto ABR'); assert.equal(selection.starts, 1);
+      }
+      channel.streams[0].quality.source = 'manifest';
+      await p.locator('nav a[href="#home"]').click(); await p.getByRole('button', { name: '电视直播', exact: true }).click(); await card.locator('.channel-badge').filter({ hasText: '清单1080p' }).waitFor();
+      await p.evaluate(() => { window.__initialLevels = [{ width: 320, height: 180 }, { width: 1920, height: 1080 }]; }); await card.click();
+      await until(() => p.locator('video').evaluate(video => video.readyState >= 2).catch(() => false), '原manifest起始层路径');
+      assert.equal(await p.evaluate(() => window.__initialHls.at(-1).startLevel), 1); assert.equal(await p.evaluate(() => window.__initialHls.at(-1).currentLevel), -1);
+      console.log('PASS bitstream主清单唯一兼容AVC精确层启动1080、CODECS回退、歧义/HEVC/未知/不匹配不猜、保留auto ABR和原manifest路径（固定契约）');
+    } finally { await isolated?.value.close(); channels.splice(channels.indexOf(channel), 1); }
+  }
+
+  async function verifyProgressiveMetadata() {
+    metadataProgress = { reads: 0, stage: 0 }; let isolated;
+    try {
+      isolated = await context({ width: 1440, height: 1000 }, true, false, '#home?category=movie&sort=release'); const p = isolated.page; await p.clock.install();
+      const titles = () => p.locator('#browse-results .card-title').allTextContents();
+      const card = p.locator('#browse-results .media-card').filter({ hasText: '聚合补全样例' });
+      await card.waitFor(); assert.deepEqual(await titles(), ['日期排序参照样例', '聚合补全样例']); assert.equal(await card.locator('.card-date').textContent(), '上映日期未知');
+      metadataProgress.stage = 1; await p.clock.fastForward(1000);
+      await until(async () => (await titles())[0] === '聚合补全样例', '后到同片日期补全后向前重排');
+      assert.equal(await card.locator('.card-date').textContent(), '2025-12-02', '首源空日期不能覆盖聚合上映日期'); assert.equal(await card.locator('.card-meta').getAttribute('title'), '喜剧 · 惊悚');
+      metadataProgress.stage = 2; await p.clock.fastForward(1000);
+      await until(() => card.locator('.card-date').textContent().then(text => text === '2025-08-03'), '同片多个日期取最早有效首映');
+      assert.equal(await card.locator('.card-meta').getAttribute('title'), '喜剧 · 惊悚 · 悬疑'); assert.match(await card.locator('.card-meta').textContent(), /3 个来源/);
+      await until(() => p.getByRole('button', { name: '加载更多', exact: true }).isEnabled(), '渐进完成后可加载下一页');
+      metadataProgress.stage = 3; await p.getByRole('button', { name: '加载更多', exact: true }).click();
+      await until(() => card.locator('.card-meta').textContent().then(text => text.includes('4 个来源')), '下一页增加独立来源不替换原items');
+      assert.equal(await card.locator('.card-date').textContent(), '2025-08-03', '较晚上映日期不覆盖既有最早日期'); assert.equal(await card.locator('.card-meta').getAttribute('title'), '喜剧 · 惊悚 · 悬疑 · 动作'); assert.deepEqual(await titles(), ['聚合补全样例', '日期排序参照样例']);
+      console.log('PASS 同key渐进补全日期/合并类型即重排、首源未知不覆盖聚合信息、多源首映取最早有效日期及分页保留来源顺序');
+    } finally { metadataProgress = null; await isolated?.value.close(); }
+  }
+
   const { page } = await context({ width: 1440, height: 1000 });
   await page.locator('.notice').filter({ hasText: '还没有影视源' }).waitFor();
   assert.equal(vendorReads.length, 0, '首页不预加载HLS组件');
@@ -1023,6 +1126,57 @@ try {
   progressiveBrowse = null; progressiveSearch = null;
   console.log('PASS 分类/搜索先显示快源、pending提示、后续结果去重合并、慢源完成前可播放、离页停止渐进请求');
 
+  facetScenario = true;
+  const facetsContext = await context({ width: 1440, height: 1000 }, true, false, '#home?category=movie&genre=%E5%96%9C%E5%89%A7'); const fp = facetsContext.page;
+  await fp.getByRole('button', { name: '播放 喜剧春日样例', exact: true }).waitFor();
+  assert.equal(await fp.getByLabel('影片类型', { exact: true }).inputValue(), '喜剧');
+  assert.ok(await fp.getByLabel('上映年份', { exact: true }).locator('option[value="1960"]').count(), '可以主动选择早期影片年份');
+  await fp.getByLabel('影片排序', { exact: true }).selectOption('release');
+  await fp.locator('.filter-note').waitFor();
+  const facetTitles = () => fp.locator('#browse-results .card-title').allTextContents();
+  await until(async () => (await facetTitles()).join('|') === '喜剧春日样例|喜剧老片样例|喜剧日期未知样例', '首批按真实上映日期排序，未知日期末尾');
+  await fp.getByRole('button', { name: '加载更多', exact: true }).click();
+  await until(async () => (await facetTitles()).join('|') === '喜剧新片样例|喜剧春日样例|喜剧老片样例|喜剧日期未知样例', '第二页合并后重新按日期排序');
+  await fp.getByLabel('上映年份', { exact: true }).selectOption('2025');
+  await until(async () => (await facetTitles()).join('|') === '喜剧春日样例', '更改年份重置分页');
+  assert.equal(new URLSearchParams(new URL(fp.url()).hash.split('?')[1]).get('year'), '2025');
+  for (const category of ['电视剧', '动漫']) {
+    await fp.getByRole('button', { name: category, exact: true }).click();
+    await fp.getByRole('button', { name: '播放 喜剧春日样例', exact: true }).waitFor();
+    assert.equal(await fp.getByLabel('影片类型', { exact: true }).inputValue(), '喜剧'); assert.equal(await fp.getByLabel('上映年份', { exact: true }).inputValue(), '2025'); assert.equal(await fp.getByLabel('影片排序', { exact: true }).inputValue(), 'release');
+  }
+  await fp.getByLabel('浏览影视源', { exact: true }).selectOption('second');
+  await until(() => fp.locator('#browse-results .card-meta').first().textContent().then(text => text.includes('1 个来源')), '换影视源保留筛选且缩至指定来源');
+  assert.equal(catalogRequests.at(-1).page, 1); assert.equal(catalogRequests.at(-1).genre, '喜剧'); assert.equal(catalogRequests.at(-1).year, '2025'); assert.equal(catalogRequests.at(-1).sort, 'release');
+  await fp.getByLabel('上映年份', { exact: true }).selectOption(''); await fp.getByLabel('影片排序', { exact: true }).selectOption('year');
+  await until(async () => (await facetTitles()).join('|') === '喜剧日期未知样例|喜剧春日样例|喜剧老片样例', '按年份降序且不依赖完整上映日期');
+  for (const [genre, title] of [['惊悚', '惊悚旧片样例'], ['恐怖', '恐怖旧片样例']]) {
+    await fp.getByLabel('影片类型', { exact: true }).selectOption(genre);
+    await until(async () => (await facetTitles()).join('|') === title, `${genre}类型筛选`);
+    assert.equal(await fp.getByRole('button', { name: '加载更多', exact: true }).isVisible(), false);
+  }
+  await fp.getByLabel('影片类型', { exact: true }).selectOption('喜剧'); await fp.getByLabel('上映年份', { exact: true }).selectOption('1960');
+  await fp.getByRole('button', { name: '电影', exact: true }).click(); await fp.getByRole('button', { name: '播放 喜剧老片样例', exact: true }).waitFor();
+  await fp.screenshot({ path: join(output, 'desktop-catalog-filters.png'), fullPage: true });
+  await fp.setViewportSize({ width: 390, height: 844 }); assert.ok(await fp.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '手机筛选布局无横向溢出'); await fp.screenshot({ path: join(output, 'mobile-catalog-filters.png'), fullPage: true });
+  await fp.getByRole('button', { name: '播放 喜剧老片样例', exact: true }).click();
+  await until(() => fp.locator('video').evaluate(video => video.readyState >= 2 && video.currentSrc.includes('facet-classic-second')).catch(() => false), '筛选卡片沿用单击自动播放');
+  await fp.locator('video').evaluate(video => video.pause()); await until(() => app.store.list('history').some(row => row.key === facetClassic.key && row.year === '1960'), '筛选不改变影片key和续播记录');
+  await facetsContext.value.close();
+  console.log('PASS 类型喜剧/惊悚/恐怖与早期年份筛选、网址/分类/来源保留条件、分页重排与未知日期末尾、手机桌面和卡片自动播放');
+
+  facetProgress = { reads: 0, complete: false };
+  const progressiveFacets = await context({ width: 1440, height: 1000 }, true, false, '#home?category=movie&genre=%E5%96%9C%E5%89%A7&sort=release'); const pfp = progressiveFacets.page;
+  await pfp.clock.install(); await pfp.getByRole('button', { name: '播放 喜剧春日样例', exact: true }).waitFor(); await pfp.locator('.resource-progress').waitFor();
+  await pfp.getByLabel('影片类型', { exact: true }).evaluate(input => { window.__genreOptions = [...input.options]; });
+  facetProgress.complete = true; await pfp.clock.fastForward(1000); await pfp.getByRole('button', { name: '播放 喜剧新片样例', exact: true }).waitFor();
+  assert.deepEqual(await pfp.locator('#browse-results .card-title').allTextContents(), ['喜剧新片样例', '喜剧春日样例', '喜剧日期未知样例'], '渐进后到的新片插入最前，重复组去重');
+  assert.equal(await pfp.getByLabel('影片类型', { exact: true }).evaluate(input => [...input.options].every((option, index) => option === window.__genreOptions[index])), true, '相同facets不重建正在使用的下拉选项');
+  await pfp.locator('.media-card').filter({ hasText: '喜剧日期未知样例' }).getByText('上映日期未知', { exact: true }).waitFor();
+  assert.equal(await pfp.locator('.resource-progress').count(), 0);
+  await progressiveFacets.value.close(); facetProgress = null; facetScenario = false;
+  console.log('PASS 渐进类型结果按已加载真实日期重新排序、重复影片去重、未知日期如实显示和稳定筛选DOM');
+
   liveProgress = { reads: 0, probing: true };
   await page.locator('nav a[href="#home"]').click(); const liveProbeBeforeCards = apiReads.filter(item => item.contextId === 1 && item.path === '/api/live/probe').length;
   await page.getByRole('button', { name: '电视直播', exact: true }).click();
@@ -1093,6 +1247,66 @@ try {
   channels.splice(channels.indexOf(lateChannel), 1);
   liveProgress = null;
   console.log('PASS 直播海报/批间gap晚来频道、仅ok选项、保持既有卡片与原流URL/编号、后台失败同步、1秒/3秒/30秒巡检、播放政策与离页取消');
+
+  // 质量字段由后端清单/SPS测试证实；此处用WAV适配器只验证UI和原线路索引，不声称真实HD解码。
+  const qualityChannel = { id: 'quality-satellite', name: '卫视清晰度样例', category: '卫视', group: '上游原始分组', preferredLine: 3, streams: [
+    { name: '名字HD但未核实', type: 'mp4', status: 'ok', url: 'https://fixtures.example/quality-nameHD.mp4' },
+    { name: '已失败的高清线', type: 'hls', status: 'error', url: 'https://fixtures.example/quality-error.m3u8', quality: { width: 1920, height: 1080, source: 'manifest' } },
+    { name: '清单验证线路', type: 'hls', status: 'ok', url: 'https://fixtures.example/quality-master720.m3u8', playbackUrl: 'https://fixtures.example/quality-selected720.m3u8?token=720', quality: { width: 1280, height: 720, bandwidth: 2000000, source: 'manifest' } },
+    { name: '码流验证线路', type: 'hls', status: 'ok', url: 'https://fixtures.example/quality-master1080.m3u8', playbackUrl: 'https://fixtures.example/quality-selected1080.m3u8?token=1080', quality: { width: 1920, height: 1080, source: 'bitstream' } },
+    { name: '未知超高清线', type: 'hls', status: 'unknown', url: 'https://fixtures.example/quality-unknown.m3u8', quality: { width: 3840, height: 2160, source: 'manifest' } },
+  ] };
+  const qualityLocal = { id: 'quality-local', name: '地方HD名称样例', category: '地方', group: '上游原始分组', streams: [{ name: '可用未知分辨率', type: 'mp4', status: 'ok', url: 'https://fixtures.example/quality-local.mp4' }] };
+  const qualityCctv = { id: 'quality-cctv', name: 'CCTV5栏目样例', category: '体育', group: '体育', streams: [{ name: '央视可用线', type: 'mp4', status: 'ok', url: 'https://fixtures.example/quality-cctv.mp4' }] };
+  channels.push(qualityChannel, qualityLocal, qualityCctv);
+  const qualityContext = await context({ width: 1440, height: 1000 }, true, false, '#live?category=%E5%8D%AB%E8%A7%86'); const qp = qualityContext.page;
+  await qp.evaluate(() => {
+    window.__qualityHls = [];
+    class QualityFixtureHls {
+      static isSupported() { return true; }
+      static Events = { ERROR: 'hlsError', MANIFEST_PARSED: 'hlsManifestParsed' };
+      constructor(options) { this.options = options; this.handlers = new Map(); this.levels = [{ width: 640, height: 360 }, { width: 1280, height: 720 }, { width: 1920, height: 1080 }]; window.__qualityHls.push(this); }
+      loadSource(url) { this.url = url; }
+      attachMedia(video) {
+        this.video = video;
+        if (this.options.autoStartLoad !== false) this.startMedia();
+        setTimeout(() => { if (!this.destroyed) this.handlers.get('hlsManifestParsed')?.('hlsManifestParsed', { levels: this.levels }); }, 0);
+      }
+      startMedia() { this.video.src = this.url.replace('.m3u8', '.mp4'); }
+      startLoad() { this.startLoads = (this.startLoads || 0) + 1; this.startMedia(); }
+      on(event, handler) { this.handlers.set(event, handler); }
+      destroy() { this.destroyed = true; }
+    }
+    window.Hls = QualityFixtureHls;
+  });
+  const qualityCard = qp.getByRole('button', { name: '播放频道 卫视清晰度样例', exact: true }); await qualityCard.waitFor();
+  assert.equal(await qualityCard.locator('.channel-badge').textContent(), '码流1080p');
+  assert.equal(await qp.getByRole('button', { name: '播放频道 地方HD名称样例', exact: true }).count(), 0, '卫视入口使用规范category，非原group或HD名称');
+  await qualityCard.locator('.channel-cover').click();
+  await until(() => qp.locator('video').evaluate(video => video.readyState >= 2 && video.currentSrc.includes('quality-selected1080')).catch(() => false), '频道自动选择preferredLine的真实派生播放URL');
+  assert.equal(new URL(liveRequests.filter(url => url.includes('/api/live/playback') && url.includes('quality-satellite')).at(-1)).searchParams.get('line'), '3', '保留最高质量线路原始编号');
+  assert.equal(await qp.locator('#live-lines button[data-line="1"]').count(), 0); assert.equal(await qp.locator('#live-lines button[data-line="4"]').count(), 0, 'failed/unknown即使分辨率更高仍隐藏');
+  assert.equal(await qp.locator('#live-lines button[data-line="0"] .line-status').textContent(), '可用', '名称HD不生成分辨率标记');
+  assert.equal(await qp.evaluate(() => window.__qualityHls[0].startLevel), undefined, '码流质量在没有明确AVC证据时不猜master层');
+  const qualityReportsStart = liveReports.length;
+  await qp.locator('video').evaluate(video => { Object.defineProperty(video, 'error', { value: { code: 4, message: '固定解码故障' }, configurable: true }); video.dispatchEvent(new Event('error')); delete video.error; });
+  await until(() => qp.locator('video').evaluate(video => video.readyState >= 2 && video.currentSrc.includes('quality-selected720')).catch(() => false), '高清故障及代理失败后选择下一条已知最高质量');
+  assert.equal(new URL(liveRequests.filter(url => url.includes('/api/live/playback') && url.includes('quality-satellite')).at(-1)).searchParams.get('line'), '2');
+  await until(() => liveReports.slice(qualityReportsStart).some(report => report.id === qualityChannel.id && report.line === 3 && report.status === 'error'), '原master按raw编号上报失败');
+  assert.equal(await qualityCard.locator('.channel-badge').textContent(), '清单720p');
+  assert.equal(await qp.evaluate(() => window.__qualityHls.at(-1).options.autoStartLoad), false); assert.equal(await qp.evaluate(() => window.__qualityHls.at(-1).startLevel), 1, '匹配已验证720p起始层，不强制1080p且保留ABR');
+  assert.equal(await qp.evaluate(() => window.__qualityHls.at(-1).startLoads), 1);
+  await qp.locator('video').evaluate(video => video.pause());
+  await qp.screenshot({ path: join(output, 'desktop-live-quality.png'), fullPage: true });
+  await qp.setViewportSize({ width: 390, height: 844 }); assert.ok(await qp.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1); await qp.screenshot({ path: join(output, 'mobile-live-quality.png'), fullPage: true });
+  await qp.getByRole('button', { name: '地方', exact: true }).click(); await qp.getByRole('button', { name: '播放频道 地方HD名称样例', exact: true }).waitFor(); assert.equal(await qp.locator('.channel-badge').textContent(), '可播放');
+  assert.equal(await qp.locator('video').evaluate(video => video.currentSrc.includes('quality-selected720')), true, '频道分类不会中断正在播放的原流');
+  await qp.getByRole('button', { name: '央视', exact: true }).click(); await qp.getByRole('button', { name: '播放频道 CCTV5栏目样例', exact: true }).waitFor();
+  assert.equal(await qp.getByRole('button', { name: '播放频道 卫视清晰度样例', exact: true }).count(), 0);
+  await qualityContext.value.close(); channels.splice(channels.indexOf(qualityChannel), 3);
+  console.log('PASS 卫视/地方/央视入口、manifest/bitstream可信质量标记、HD名称不冒充质量、最高质量raw选线和故障720p备用、派生URL及Hls起始层、手机桌面');
+  await verifyBitstreamInitialLevel();
+  await verifyProgressiveMetadata();
 
   await page.locator('nav a[href="#settings"]').click();
   const parsers = page.locator('.settings-section').filter({ has: page.getByRole('heading', { name: '解析线路', exact: true }) });

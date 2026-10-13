@@ -98,6 +98,23 @@ test('browse passes category, page and selected source to the configured catalog
   assert.equal(response.status, 200);
   assert.equal((await response.json()).page, 2);
   assert.deepEqual(received, { config: empty, options: { category: 'anime', page: '2', source: 'demo' } });
+  assert.equal((await call('/api/browse?category=tv&genre=%E5%96%9C%E5%89%A7&year=2024&sort=release', undefined, cookie)).status, 200);
+  assert.deepEqual(received.options, { category: 'tv', page: '1', source: undefined, genre: '喜剧', year: '2024', sort: 'release' });
+});
+
+test('live playback and compatible playback use the verified quality variant while reports keep the original line', async t => {
+  const stream = { url: 'https://media.example/master.m3u8?token=origin', playbackUrl: 'https://media.example/1080.m3u8?token=high', type: 'hls', status: 'ok' };
+  let reported, transcoded;
+  const live = { async list() { return { channels: [{ id: 'hd', streams: [stream] }] }; }, start() {}, async stop() {}, report(url) { reported = url; } };
+  const transcoder = { async start(options) { transcoded = options.episode; return { id: 'test' }; }, async stop() {} };
+  const { call, login } = await running(t, { live, transcoder });
+  const cookie = await login();
+  const result = await (await call('/api/live/playback?id=hd&line=0', undefined, cookie)).json();
+  assert.equal(result.url, stream.playbackUrl);
+  assert.equal((await call('/api/transcode/start', { liveId: 'hd', line: 0 }, cookie)).status, 200);
+  assert.equal(transcoded.url, stream.playbackUrl);
+  assert.equal((await call('/api/live/report', { id: 'hd', line: 0, status: 'ok' }, cookie)).status, 200);
+  assert.equal(reported, stream.url);
 });
 
 test('builtin source presets can be merged without deleting customized sources', async (t) => {

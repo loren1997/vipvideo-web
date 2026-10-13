@@ -12,9 +12,47 @@ const ROOT_NAMES = {
   adult: /^(?:三级|三級|限制级|限制級|成人|伦理|倫理|情色|福利|R18|18禁)(?:内容|频道)?$/i,
 };
 
+const GENRES = {
+  喜剧: /喜剧|喜劇|搞笑|\bcomedy\b/i,
+  惊悚: /惊悚|驚悚|\bthriller\b/i,
+  恐怖: /恐怖|\bhorror\b/i,
+  动作: /动作|動作|武打|战斗|戰鬥|热血|熱血|\baction\b/i,
+  爱情: /爱情|愛情|恋爱|戀愛|\bromance\b/i,
+  科幻: /科幻|\bsci[ -]?fi\b|science fiction/i,
+  悬疑: /悬疑|懸疑|推理|\bmystery\b/i,
+  犯罪: /犯罪|\bcrime\b/i,
+  战争: /战争|戰爭|\bwar\b/i,
+  剧情: /剧情|劇情|\bdrama\b/i,
+  动画: /动画|動畫|\banimation\b/i,
+  冒险: /冒险|冒險|\badventure\b/i,
+  奇幻: /奇幻|玄幻|魔幻|魔法|\bfantasy\b/i,
+  家庭: /家庭|\bfamily\b/i,
+  历史: /历史|歷史|\bhistory\b|\bhistorical\b/i,
+  纪录: /纪录|記錄|记录|紀錄|\bdocumentary\b/i,
+  武侠: /武侠|武俠|\bwuxia\b/i,
+  古装: /古装|古裝|\bcostume\b/i,
+  音乐: /音乐|音樂|歌舞|\bmusical?\b/i,
+  运动: /运动|運動|体育|體育|\bsports?\b/i,
+  青春: /青春|校园|校園|\byouth\b/i,
+};
+
+function genres(video) {
+  const value = [video?.vod_class, video?.type_name, video?.vod_type_name].map(value => String(value || '').slice(0, 2000)).join(' ').normalize('NFKC');
+  return Object.entries(GENRES).filter(([, pattern]) => pattern.test(value)).map(([name]) => name);
+}
+
+function releaseDate(value) {
+  const dates = [...String(value || '').slice(0, 2000).matchAll(/\b((?:19|20)\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b/g)].map(([, year, month, day]) => {
+    const date = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+    const parsed = new Date(`${date}T00:00:00Z`);
+    return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date ? date : '';
+  }).filter(Boolean);
+  return dates.sort()[0] || '';
+}
+
 function adultCategory(value) {
   const text = String(value || '').normalize('NFKC').replace(/\s+/g, '');
-  return /伦理|倫理|情色|福利|成人|三级|三級|限制级|限制級|18禁|(?:^|[^a-z0-9])r-?18(?:\+|$|[^a-z0-9])/i.test(text);
+  return /伦理|倫理|情色|福利|成人|三级|三級|限制级|限制級|里番|裏番|hentai|18禁|(?:^|[^a-z0-9])r-?18(?:\+|$|[^a-z0-9])/i.test(text);
 }
 
 function adultVideo(video) {
@@ -32,6 +70,7 @@ function inferCategory(value, includeAdult = true) {
 }
 
 function classifyTypes(entries) {
+  if (entries.length > 256) throw failure('影视源分类数量超过安全上限（256），请使用更精简的接口');
   const byId = new Map();
   for (const entry of entries) {
     const id = String(entry?.type_id ?? '');
@@ -70,8 +109,7 @@ function selectTypes(types, category) {
     // 部分源不提供 type_pid，此时只使用名称明确属于同类的叶子分类。
     if (descendants.length) leaves = descendants;
   }
-  // shortcut: 父类不聚合时只浏览前 3 个子类；需要全覆盖时再扩展分类分页。
-  return { root, leaves: leaves.slice(0, 3), matching };
+  return { root, leaves, matching };
 }
 
 function parseLines(video) {
@@ -109,7 +147,9 @@ function metadata(video, source, categoryHint) {
   if (/^[1-9]\d{0,11}$/.test(String(video.vod_douban_id ?? ''))) douban.id = String(video.vod_douban_id);
   const score = Number(video.vod_douban_score);
   if (String(video.vod_douban_score ?? '').trim() && Number.isFinite(score) && score > 0 && score <= 10) douban.score = score;
-  return { key: JSON.stringify([normalizedTitle, year, type]), source: source.id, id: String(video.vod_id), title, year, type, poster, typeName, remarks, ...(category ? { category } : {}), ...(Object.keys(douban).length ? { douban } : {}), lines };
+  return { key: JSON.stringify([normalizedTitle, year, type]), source: source.id, id: String(video.vod_id), title, year, type, poster, typeName, remarks,
+    genres: genres(video), releaseDate: releaseDate(video.vod_pubdate),
+    ...(category ? { category } : {}), ...(Object.keys(douban).length ? { douban } : {}), lines };
 }
 
 function aggregate(results, category) {
@@ -126,6 +166,8 @@ function aggregate(results, category) {
       if (item.category === 'adult') group.category = 'adult';
       if (!group.items.some(existing => existing.source === item.source && existing.id === item.id)) group.items.push({ ...fields, source, id });
       for (const field of ['poster', 'typeName', 'remarks']) if (!group[field] && item[field]) group[field] = item[field];
+      if (item.releaseDate && (!group.releaseDate || item.releaseDate < group.releaseDate)) group.releaseDate = item.releaseDate;
+      group.genres = [...new Set([...group.genres, ...item.genres])];
       if (!group.douban?.score && item.douban?.score) group.douban = item.douban;
     }
   }
@@ -212,7 +254,7 @@ export function createCatalog({ request = networkRequest } = {}) {
   }
   async function query(source, parameters, priority = false) {
     const url = validateUrl(source.api);
-    for (const key of ['wd', 'ids', 't', 'pg', 'ac']) url.searchParams.delete(key);
+    for (const key of ['wd', 'ids', 't', 'pg', 'ac', 'year', 'class', 'sort_direction']) url.searchParams.delete(key);
     url.searchParams.set('ac', 'videolist');
     for (const [key, value] of Object.entries(parameters)) url.searchParams.set(key, value);
     return limited(async () => {
@@ -265,37 +307,45 @@ export function createCatalog({ request = networkRequest } = {}) {
     const types = Array.isArray(body.class) ? classifyTypes(body.class) : list.some(video => video?.type_id != null) ? await sourceTypes(source, priority) : undefined;
     return types ? list.map(video => types.categories.get(String(video?.type_id)) === 'adult' ? { ...video, _catalogAdult: true } : video) : list;
   }
-  async function sourceBrowse(source, category, page) {
+  async function sourceBrowse(source, category, page, { genre, year }) {
     const types = await sourceTypes(source);
     const readPage = async type => {
-      const body = await query(source, { pg: page, ...(type ? { t: type.id } : {}) });
+      const body = await query(source, { pg: page, ...(type ? { t: type.id } : {}), ...(year ? { year } : {}) });
       const list = videos(body);
       let recognized = false;
       const filtered = list.filter(video => {
         const kind = adultVideo(video) || types.categories.get(String(video?.type_id)) === 'adult' ? 'adult' : types.categories.get(String(video?.type_id)) || inferCategory(video?.type_name || video?.vod_type_name);
         if (kind) recognized = true;
         return kind === category;
-      }).map(video => video.type_name || video.vod_type_name ? video : { ...video, type_name: types.byId.get(String(video.type_id))?.name || '' });
+      }).map(video => {
+        const typeName = types.byId.get(String(video.type_id))?.name || '';
+        return { ...video, type_name: video.type_name || video.vod_type_name || typeName,
+          vod_class: [video.vod_class, typeName].filter(Boolean).join(',') };
+      });
       if (list.length && !recognized) throw failure('影视源未提供可识别的影片分类');
-      return { videos: filtered, hasMore: hasMore(body, page) };
+      return { videos: filtered.filter(video => (!year || String(video.vod_year || '').trim() === year) && (!genre || genres(video).includes(genre))),
+        categoryCount: filtered.length, hasMore: hasMore(body, page) };
     };
     const { root, leaves, matching } = selectTypes(types, category);
-    if (root) {
+    // 子分类 ID 由每个源自己提供，不能把喜剧等类别固定成某个数字。
+    const genreTypes = genre ? matching.filter(type => GENRES[genre].test(type.name)) : [];
+    if (!genreTypes.length && root) {
       const result = await readPage(root);
-      if (result.videos.length || !leaves.length) return result;
+      if (result.categoryCount || !leaves.length) return result;
     }
-    if (!leaves.length) {
+    if (!genreTypes.length && !leaves.length) {
       if (!matching.length && types.categories.size && category !== 'adult') return { videos: [], hasMore: false };
       return readPage();
     }
     const result = { videos: [], hasMore: false };
     const errors = [];
-    for (const leaf of leaves) {
-      try {
-        const pageResult = await readPage(leaf);
-        result.videos.push(...pageResult.videos);
-        result.hasMore ||= pageResult.hasMore;
-      } catch (error) { errors.push(error.message); }
+    const pages = await Promise.all((genreTypes.length ? genreTypes : leaves).map(async leaf => {
+      try { return await readPage(leaf); } catch (error) { return { error }; }
+    }));
+    for (const pageResult of pages) {
+      if (pageResult.error) { errors.push(pageResult.error.message); continue; }
+      result.videos.push(...pageResult.videos);
+      result.hasMore ||= pageResult.hasMore;
     }
     if (errors.length) result.error = failure(errors.join('；'));
     return result;
@@ -312,16 +362,31 @@ export function createCatalog({ request = networkRequest } = {}) {
         results => aggregate(results), progressive);
     },
 
-    async browse(config, { category = 'movie', page = 1, source: sourceId, progressive = false } = {}) {
+    async browse(config, { category = 'movie', page = 1, source: sourceId, progressive = false, genre = '', year = '', sort = 'updated' } = {}) {
       if (typeof category !== 'string' || !Object.hasOwn(ROOT_NAMES, category)) throw failure('分类必须为 movie、tv、anime、variety 或 adult', 400);
       if (category === 'adult' && config.showAdult !== true) throw failure('三级内容已隐藏，请先在设置中开启显示', 403);
       if (!((typeof page === 'number' && Number.isInteger(page)) || (typeof page === 'string' && /^[1-9]\d{0,2}$/.test(page))) || Number(page) < 1 || Number(page) > 100) throw failure('页码必须为 1 到 100 的整数', 400);
       page = Number(page);
+      if (typeof genre !== 'string' || genre && !Object.hasOwn(GENRES, genre)) throw failure('影片类型无效，请选择提供的类型', 400);
+      const currentYear = new Date().getFullYear();
+      if (typeof year !== 'string' || year && (!/^\d{4}$/.test(year) || Number(year) < 1900 || Number(year) > currentYear + 3)) throw failure('上映年份必须为 1900 至当前年份加 3 的四位年份', 400);
+      if (!['updated', 'release', 'year'].includes(sort)) throw failure('排序方式无效', 400);
       const sources = config.sources.filter(source => source.enabled !== false && (sourceId === undefined || source.id === sourceId));
       if (sourceId !== undefined && !sources.length) throw failure('影视源不存在或已停用', 400);
-      const key = JSON.stringify([signature(config), category, page, sourceId]);
-      return batch(browseCache, key, 180000, sources, source => sourceBrowse(source, category, page),
-        results => ({ category, page, ...aggregate(results, category), hasMore: results.some(result => result.hasMore === true) }), progressive);
+      const filters = { genre, year, sort };
+      const key = JSON.stringify([signature(config), category, page, sourceId, filters]);
+      return batch(browseCache, key, 180000, sources, source => sourceBrowse(source, category, page, filters), results => {
+        const result = aggregate(results, category);
+        // 采集 API 按资源更新时间分页；上映顺序只适用于已加载的影片。
+        if (sort !== 'updated') result.groups.sort((a, b) => {
+          const value = item => sort === 'release' ? item.releaseDate : /^\d{4}$/.test(item.year) ? item.year : '';
+          return value(b).localeCompare(value(a)) || a.title.localeCompare(b.title, 'zh-CN');
+        });
+        const years = new Set(Array.from({ length: Math.max(1, currentYear - 1899) }, (_, index) => String(currentYear - index)));
+        for (const item of result.groups) if (/^\d{4}$/.test(item.year) && Number(item.year) >= 1900 && Number(item.year) <= currentYear + 3) years.add(item.year);
+        return { category, page, ...result, filters, facets: { genres: Object.keys(GENRES), years: [...years].sort((a, b) => Number(b) - Number(a)) },
+          sortScope: 'loaded', hasMore: results.some(result => result.hasMore === true) };
+      }, progressive);
     },
 
     async detail(config, sourceId, id) {

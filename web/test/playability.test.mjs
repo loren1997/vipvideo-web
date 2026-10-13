@@ -58,7 +58,7 @@ test('HLS follows redirected master, keeps child/map/segment queries and verifie
   } });
   assert.equal((await service.check(episode('https://cdn.example/start.m3u8?token=root'))).playable, true);
   assert.deepEqual(calls.map(call => call.url), ['https://cdn.example/start.m3u8?token=root', 'https://cdn.example/final/child/list.m3u8?token=child%2Fvalue', 'https://cdn.example/final/child/init.mp4?token=map', 'https://cdn.example/final/segment.ts?token=segment']);
-  assert.deepEqual(calls.slice(2).map(call => call.options.headers.range), ['bytes=0-1023', 'bytes=0-1023']);
+  assert.deepEqual(calls.slice(2).map(call => call.options.headers.range), ['bytes=0-16383', 'bytes=0-16383']);
 });
 
 test('AES-128 verifies exact key, encrypted initialization and decrypted transport stream', async () => {
@@ -206,4 +206,89 @@ test('actual decoder reports override cached and in-flight successes, then can r
   assert.equal(calls, 1);
   assert.equal(service.report(video, true).playable, true);
   assert.equal((await service.check(video)).playable, true);
+});
+
+const hdMaster = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=640x360,CODECS="avc1.42e01e"\nsd.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,CODECS="avc1.640028"\nhd.m3u8\n';
+
+test('master validates the highest reasonable compatible rendition instead of the first low-quality URI', async () => {
+  const calls = [];
+  const service = createPlayability({ request: async url => {
+    calls.push(url); if (url.includes('video.m3u8')) return response(hdMaster);
+    if (url.endsWith('/hd.m3u8')) return response(manifest('hd.ts'));
+    if (url.endsWith('/hd.ts')) return response(ts, 206, { 'content-type': 'video/mp2t' });
+    throw new Error('不应访问低清分支');
+  } });
+  const result = await service.check(episode());
+  assert.equal(result.playable, true); assert.deepEqual(result.quality, { width: 1920, height: 1080, bandwidth: 3000000, source: 'manifest' }); assert.equal(result.playbackUrl, 'https://cdn.example/hd.m3u8');
+  assert.equal(calls.length, 3);
+});
+
+test('a failed highest rendition falls back to verified lower quality without using private rendition URLs', async () => {
+  const called = [];
+  const body = hdMaster.replace('sd.m3u8', 'low.m3u8').replace('640x360', '1280x720').replace('hd.m3u8', 'http://127.0.0.1/private.m3u8');
+  const service = createPlayability({ request: async url => {
+    called.push(url); if (url.includes('video.m3u8')) return response(body);
+    if (url.endsWith('/low.m3u8')) return response(manifest('low.ts'));
+    return response(ts, 206, { 'content-type': 'video/mp2t' });
+  } });
+  const result = await service.check(episode()); assert.equal(result.playable, true); assert.equal(result.quality.height, 720); assert.ok(called.every(url => !url.includes('127.0.0.1')));
+});
+
+test('independent audio and newly issued child queries retain the master entry instead of freezing video-only or temporary URLs', async () => {
+  for (const independent of [false, true]) {
+    const master = independent ? '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",URI="audio.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,AUDIO="aud"\nchild.m3u8\n' : '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720\nchild.m3u8?opaque=temporary\n';
+    const service = createPlayability({ request: async url => url.includes('video.m3u8') ? response(master) : url.includes('child.m3u8') ? response(manifest('part.ts')) : response(ts, 206, { 'content-type': 'video/mp2t' }) });
+    const result = await service.check(episode()); assert.equal(result.playable, true); assert.equal(result.playbackUrl, episode().url); assert.equal(result.quality.height, 720);
+  }
+});
+
+test('stalled high-quality headers or body cannot consume the full deadline and block a ready lower rendition', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const flush = () => new Promise(done => setImmediate(done));
+  for (const stalled of ['headers', 'body']) {
+    let release;
+    const hanging = new Readable({ read() {} }); Object.assign(hanging, { statusCode: 200, headers: {} });
+    const service = createPlayability({ request: async url => {
+      if (url.includes('video.m3u8')) return response(hdMaster.replace('640x360', '1280x720'));
+      if (url.endsWith('/hd.m3u8')) return stalled === 'body' ? hanging : new Promise(done => { release = () => done(hanging); });
+      if (url.endsWith('/sd.m3u8')) return response(manifest('low.ts'));
+      return response(ts, 206, { 'content-type': 'video/mp2t' });
+    } });
+    const pending = service.check(episode()); await flush(); t.mock.timers.tick(4000); await flush();
+    const result = await pending; assert.equal(result.playable, true); assert.equal(result.quality.height, 720);
+    release?.(); await flush(); assert.equal(hanging.destroyed, true);
+  }
+});
+
+function transportWithSps(nal) {
+  const body = Buffer.alloc(188 * 4, 0xff);
+  for (let offset = 0; offset < body.length; offset += 188) { body[offset] = 0x47; body[offset + 1] = 0; body[offset + 2] = 0x20; body[offset + 3] = 0x10; }
+  body[189] = 0x41; body[190] = 0; body[191] = 0x10;
+  Buffer.concat([Buffer.from('000001e0000080000000000001', 'hex'), nal, Buffer.from('000000016801', 'hex')]).copy(body, 192);
+  return body;
+}
+
+test('a real H264 SPS yields actual 1080p dimensions without depending on the channel name or manifest labels', async () => {
+  // 36-byte codec metadata from the bounded public Anhui sample; no video frames are embedded.
+  const sps = Buffer.from('67640029acd100780227e59a2000000300200000065d5800ea60030d5259803c60c44800', 'hex');
+  const service = createPlayability({ request: async url => url.includes('.m3u8') ? response(manifest('part.ts').replace('#EXT-X-ENDLIST\n', '')) : response(transportWithSps(sps), 206, { 'content-type': 'video/mp2t' }) });
+  const result = await service.check(episode()); assert.equal(result.playable, true); assert.equal(result.live, true); assert.deepEqual(result.quality, { width: 1920, height: 1080, source: 'bitstream' });
+});
+
+test('truncated and oversized-exponent SPS omit unknown dimensions without looping or reading outside the bounded sample', async () => {
+  for (const nal of [Buffer.from('67640029ac', 'hex'), Buffer.concat([Buffer.from('6742001f', 'hex'), Buffer.alloc(64)]), Buffer.from('67ffffffffffff', 'hex')]) {
+    const service = createPlayability({ request: async url => url.includes('.m3u8') ? response(manifest('part.ts')) : response(transportWithSps(nal), 206, { 'content-type': 'video/mp2t' }) });
+    const result = await service.check(episode()); assert.equal(result.playable, true); assert.equal(result.quality, undefined);
+  }
+});
+
+test('explicit audio-only renditions cannot outrank real HEVC or unknown-codec video and an audio-only master is rejected', async () => {
+  for (const codecs of ['CODECS="hvc1.1.6.L120"', '']) {
+    const calls = [], master = `#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS="mp4a.40.2"\naudio.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080${codecs ? ',' + codecs : ''}\nvideo.m3u8\n`;
+    const service = createPlayability({ request: async url => { calls.push(url); return url.endsWith('/master.m3u8') ? response(master) : url.endsWith('/video.m3u8') ? response(manifest('video.ts')) : response(ts, 206, { 'content-type': 'video/mp2t' }); } });
+    const result = await service.check(episode('https://cdn.example/master.m3u8'));
+    assert.equal(result.playable, true); assert.equal(result.quality.height, 1080); assert.ok(result.playbackUrl.endsWith('/video.m3u8')); assert.equal(calls.some(url => url.includes('audio.m3u8')), false);
+  }
+  const service = createPlayability({ request: async () => response('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS="mp4a.40.2,ec-3"\naudio.m3u8\n') });
+  const result = await service.check(episode()); assert.equal(result.playable, false); assert.match(result.error, /视频分支/);
 });

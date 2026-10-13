@@ -76,6 +76,13 @@ main { min-height:calc(100vh - 220px); }
 .category-tabs { display:flex; flex-wrap:wrap; gap:8px; }
 .category-tabs .button { padding:8px 20px; }
 .browse-controls select { padding:8px 12px; font-size:12px; max-width:220px; }
+.browse-filters { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:-4px 0 18px; }
+.browse-filter { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:12px; }
+.browse-filter > span { flex-shrink:0; }
+.browse-filter select { width:100%; min-width:0; padding:8px 10px; font-size:12px; }
+.filter-note { font-size:12px; margin:-6px 0 16px; }
+.card-date { margin:4px 0 0; color:var(--muted); font-size:10px; }
+@media(max-width:640px) { .browse-filters { gap:10px; grid-template-columns:repeat(2,minmax(0,1fr)); } .browse-filter { display:block; } .browse-filter > span { display:block; margin-bottom:5px; } .browse-filter:last-child { grid-column:1/-1; } }
 .load-more { margin:23px auto 0; display:flex; min-width:150px; }
 @media(max-width:640px) { .browse-controls { gap:12px; } .category-tabs { flex:1; width:100%; } .category-tabs .button { flex:1 0 28%; padding:8px 10px; } .browse-controls select { max-width:none; width:100%; } }
 .card-delete { border:1px solid #ffffff33; background:#111927cc; color:#fff; border-radius:50%; width:28px; height:28px; position:absolute; top:8px; right:8px; font-size:18px; z-index:2; }
@@ -165,6 +172,8 @@ a.rating-score:hover { background:#2a4939; }
 .channel-fallback { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; padding:12px; text-align:center; font-size:13px; font-weight:600; }
 .channel-fallback small { font-size:9px; letter-spacing:3px; color:var(--accent); }
 .channel-badge { position:absolute; right:5px; bottom:5px; padding:1px 4px; border-radius:4px; background:#10252bdd; color:var(--accent); font-size:9px; }
+.live-category-tabs { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:12px; }
+.live-category-tabs .button { flex:1 0 20%; padding:6px 4px; font-size:11px; }
 .channel-caption { display:flex; flex-direction:column; padding:8px; gap:2px; }
 .channel-caption strong { font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .channel-caption small { color:var(--muted); font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }

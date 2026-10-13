@@ -253,7 +253,9 @@ function card(item, options = {}) {
     const progress = node('progress'); progress.max = item.duration; progress.value = item.position || 0;
     progress.setAttribute('aria-label', '观看进度'); cover.append(progress);
   }
-  element.append(cover, node('h3', item.title, 'card-title'), node('p', options.resume ? sourceName(item.source) : `${item.year || '年份未知'} · ${item.typeName || typeLabel(item.type)} · ${item.items?.length || 1} 个来源`, 'card-meta'));
+  const metadata = node('p', options.resume ? sourceName(item.source) : `${item.year || '年份未知'} · ${item.typeName || typeLabel(item.type)} · ${item.items?.length || 1} 个来源`, 'card-meta'); metadata.title = (item.genres || []).join(' · ');
+  element.append(cover, node('h3', item.title, 'card-title'), metadata);
+  if (options.releaseDates) element.append(node('p', browseReleaseDate(item) || '上映日期未知', 'card-date'));
   if (options.remove) {
     const remove = button('×', options.remove, 'card-delete'); remove.setAttribute('aria-label', `移除 ${item.title}`); element.append(remove);
   }
@@ -300,7 +302,7 @@ function presetButton() {
 function groupCards(groups) {
   return groups.map(group => {
     const items = sourceCandidates(group, group.items || []);
-    return items.length ? { ...group, ...items[0], key: group.key, items } : null;
+    return items.length ? { ...group, ...items[0], key: group.key, items, releaseDate: browseReleaseDate(group), genres: group.genres || items[0].genres || [] } : null;
   }).filter(Boolean);
 }
 
@@ -308,8 +310,12 @@ function mergeGroups(previous, incoming) {
   const groups = new Map(previous.map(group => [group.key, { ...group, items: [...group.items] }]));
   for (const group of incoming) {
     const existing = groups.get(group.key);
-    if (!existing) groups.set(group.key, { ...group, items: [...group.items] });
-    else for (const item of group.items) if (!existing.items.some(other => other.source === item.source && String(other.id) === String(item.id))) existing.items.push(item);
+    if (!existing) groups.set(group.key, { ...group, items: [...group.items], releaseDate: browseReleaseDate(group), genres: [...(group.genres || [])] });
+    else {
+      existing.releaseDate = [browseReleaseDate(existing), browseReleaseDate(group)].filter(Boolean).sort()[0] || '';
+      existing.genres = [...new Set([...(existing.genres || []), ...(group.genres || [])])];
+      for (const item of group.items) if (!existing.items.some(other => other.source === item.source && String(other.id) === String(item.id))) existing.items.push(item);
+    }
   }
   return [...groups.values()];
 }
@@ -322,23 +328,47 @@ function failuresList(sources, label = '影视源') {
   return failures;
 }
 
-function categoryTabs(category, selectedSource = '') {
+const browseGenres = ['喜剧', '惊悚', '恐怖', '动作', '爱情', '科幻', '悬疑', '犯罪', '战争', '剧情', '动画', '冒险', '奇幻', '家庭', '历史', '纪录', '武侠', '古装', '音乐', '运动', '青春'];
+
+function browseParams(category, source = '', filters = {}) {
+  return { category, ...(source ? { source } : {}), ...(filters.genre ? { genre: filters.genre } : {}), ...(filters.year ? { year: filters.year } : {}), ...(filters.sort && filters.sort !== 'updated' ? { sort: filters.sort } : {}) };
+}
+
+function browseReleaseDate(item) {
+  return [item.releaseDate, ...(item.items || []).map(value => value.releaseDate)].filter(value => {
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const date = new Date(value); return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+  }).sort()[0] || '';
+}
+
+function sortBrowseGroups(groups, sort) {
+  if (sort === 'updated') return groups;
+  const value = group => {
+    if (sort === 'year') return /^\d{4}$/.test(group.year) ? Number(group.year) : 0;
+    const date = browseReleaseDate(group);
+    return date ? Number(date.replaceAll('-', '')) : 0;
+  };
+  return [...groups].sort((first, second) => value(second) - value(first));
+}
+
+function categoryTabs(category, selectedSource = '', filters = {}) {
   const tabs = node('div', undefined, 'category-tabs'); tabs.setAttribute('aria-label', '影视分类');
   const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺·栏目', live: '电视直播', ...(config.showAdult === true ? { adult: '三级' } : {}) };
   for (const [id, name] of Object.entries(categories)) {
-    const tab = button(name, () => id === 'live' ? goto('live') : goto('home', { category: id, ...(selectedSource ? { source: selectedSource } : {}) }), `button${id === category ? ' selected' : ''}`);
+    const tab = button(name, () => id === 'live' ? goto('live') : goto('home', browseParams(id, selectedSource, filters)), `button${id === category ? ' selected' : ''}`);
     tab.setAttribute('aria-pressed', String(id === category)); tabs.append(tab);
   }
   return tabs;
 }
 
-async function renderHome(category = 'movie', selectedSource = '', stamp = routeVersion, statePromise = null) {
+async function renderHome(category = 'movie', selectedSource = '', stamp = routeVersion, statePromise = null, filters = {}) {
+  filters = { genre: filters.genre || '', year: filters.year || '', sort: ['release', 'year'].includes(filters.sort) ? filters.sort : 'updated' };
   const page = document.createDocumentFragment();
   const catalog = section('发现好故事', '选一部，直接开始看');
   const controls = node('div', undefined, 'browse-controls');
   const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺·栏目', ...(config.showAdult === true ? { adult: '三级' } : {}) };
   if (!categories[category]) category = 'movie';
-  const tabs = categoryTabs(category, selectedSource);
+  const tabs = categoryTabs(category, selectedSource, filters);
   const select = node('select'); select.setAttribute('aria-label', '浏览影视源');
   const all = node('option', '全部影视源'); all.value = ''; select.append(all);
   function updateSourceChoices() {
@@ -349,8 +379,31 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
     select.value = [...select.options].some(option => option.value === selectedSource) ? selectedSource : '';
   }
   updateSourceChoices();
-  select.addEventListener('change', () => goto('home', { category, ...(select.value ? { source: select.value } : {}) }));
+  select.addEventListener('change', () => goto('home', browseParams(category, select.value, filters)));
   controls.append(tabs, select); catalog.append(controls);
+  const filterRow = node('div', undefined, 'browse-filters');
+  function filterSelect(label, ariaLabel) {
+    const field = node('label', undefined, 'browse-filter'); field.append(node('span', label));
+    const input = node('select'); input.setAttribute('aria-label', ariaLabel); field.append(input); filterRow.append(field); return input;
+  }
+  const genreSelect = filterSelect('类型', '影片类型'), yearSelect = filterSelect('上映年份', '上映年份'), sortSelect = filterSelect('排列', '影片排序');
+  function choices(input, values, placeholder, selected) {
+    const list = ['', ...values.filter(value => value !== '')]; if (selected && !list.includes(selected)) list.push(selected);
+    if (input.options.length !== list.length || [...input.options].some((option, index) => option.value !== list[index])) {
+      input.replaceChildren(); for (const value of list) { const option = node('option', value || placeholder); option.value = value; input.append(option); }
+    }
+    input.value = selected;
+  }
+  function updateFacets(facets = {}) {
+    choices(genreSelect, Array.isArray(facets.genres) ? facets.genres.filter(value => typeof value === 'string') : browseGenres, '全部类型', filters.genre);
+    choices(yearSelect, Array.isArray(facets.years) ? facets.years.map(String) : Array.from({ length: new Date().getFullYear() - 1899 }, (_value, index) => String(new Date().getFullYear() - index)), '全部年份', filters.year);
+  }
+  updateFacets();
+  for (const [value, label] of [['updated', '默认顺序'], ['release', '上映时间（已加载）'], ['year', '年份（已加载）']]) { const option = node('option', label); option.value = value; sortSelect.append(option); }
+  sortSelect.value = filters.sort;
+  for (const [input, field] of [[genreSelect, 'genre'], [yearSelect, 'year'], [sortSelect, 'sort']]) input.addEventListener('change', () => goto('home', browseParams(category, selectedSource, { ...filters, [field]: input.value })));
+  catalog.append(filterRow);
+  const sortNote = node('p', filters.sort === 'year' ? '排序仅针对已加载影片，按上映年份从新到旧排列。' : '排序仅针对已加载影片；没有完整上映日期的影片排在末尾。', 'filter-note muted'); sortNote.hidden = filters.sort === 'updated'; catalog.append(sortNote);
   const listing = node('div'); listing.id = 'browse-results'; catalog.append(listing);
   const more = button('加载更多', () => void loadPage(), 'button subtle'); more.hidden = true; more.classList.add('load-more'); catalog.append(more);
   page.append(catalog);
@@ -391,14 +444,14 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
     if (nextPage === 1 && !groups.length) listing.replaceChildren(node('div', `正在加载${categories[category]}…`, 'loading'));
     else more.textContent = '正在加载…';
     try {
-      const path = `/api/browse?${new URLSearchParams({ category, page: nextPage, progressive: '1', ...(selectedSource ? { source: selectedSource } : {}) })}`;
+      const path = `/api/browse?${new URLSearchParams({ ...browseParams(category, selectedSource, filters), page: nextPage, progressive: '1' })}`;
       const draw = result => {
-      updateSourceChoices();
+      updateSourceChoices(); updateFacets(result.facets);
       const incoming = (result.groups || []).filter(group => category === 'adult' ? group.category === 'adult' : group.category !== 'adult').map(group => ({ ...group, items: group.items.filter(item => category === 'adult' ? item.category === 'adult' : item.category !== 'adult') }));
-      groups = mergeGroups(groups, incoming.filter(group => group.items.length)); browseGroups = mergeGroups(browseGroups, groups);
+      groups = sortBrowseGroups(mergeGroups(groups, incoming.filter(group => group.items.length)), filters.sort); browseGroups = mergeGroups(browseGroups, groups);
       listing.replaceChildren(); const failures = failuresList(result.failedSources); if (failures) listing.append(failures);
       if (result.complete === false) listing.append(node('p', pendingSources(result), 'resource-progress muted'));
-      listing.append(groups.length ? grid(groupCards(groups), { priorityCount: 6 }) : result.complete === false ? node('p', '正在等待影视源返回影片…', 'muted') : empty('这个分类暂时没有影片', '试试切换影视源或稍后重新加载。', button('重新加载', () => void loadPage(true))));
+      listing.append(groups.length ? grid(groupCards(groups), { priorityCount: 6, releaseDates: filters.sort === 'release' }) : result.complete === false ? node('p', '正在等待影视源返回影片…', 'muted') : empty('这个分类暂时没有影片', '试试切换影视源或稍后重新加载。', button('重新加载', () => void loadPage(true))));
       more.hidden = !result.hasMore; more.textContent = '加载更多';
       };
       const cached = resourceSnapshot(path); if (cached && !force) draw(cached);
@@ -406,7 +459,7 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
       if (!valid() || !result) return;
       nextPage++;
     } catch (error) {
-      if (stamp !== routeVersion) return;
+      if (!valid()) return;
       if (error.adultHidden) { leaveAdultScreen(); return; }
       if (selectedSource) { sourceSuccess.delete(selectedSource); updateSourceChoices(); }
       if (nextPage === 1 && !groups.length) listing.replaceChildren(empty('分类内容暂时不可用', error.message, button('重新加载', () => void loadPage(true))));
@@ -909,15 +962,27 @@ async function renderLive(params, stamp) {
   host.append(empty('选择一个频道', '支持在播放时手动切换频道线路。'));
   const lines = node('div', undefined, 'source-row'); lines.id = 'live-lines'; watch.append(host, lines);
   const panel = node('aside', undefined, 'episode-panel channel-panel'); panel.append(node('h3', '频道'));
+  const categoryChoices = ['', '卫视', '央视', '地方', '体育', '少儿', '新闻·教育', '其他'];
+  let liveCategory = categoryChoices.includes(params.get('category')) ? params.get('category') : '';
+  const categories = node('div', undefined, 'live-category-tabs'); categories.setAttribute('aria-label', '直播频道分类');
+  for (const category of categoryChoices) {
+    const tab = button(category || '全部', () => {
+      liveCategory = category; group.value = ''; updateCategories(); drawChannels();
+      const query = new URLSearchParams(location.hash.split('?')[1] || ''); if (category) query.set('category', category); else query.delete('category');
+      history.replaceState(null, '', `#live${query.size ? `?${query}` : ''}`);
+    }, 'button small'); tab.dataset.category = category; categories.append(tab);
+  }
+  function updateCategories() { for (const tab of categories.children) { const selected = tab.dataset.category === liveCategory; tab.classList.toggle('selected', selected); tab.setAttribute('aria-pressed', String(selected)); } }
+  updateCategories();
   const group = node('select'); group.setAttribute('aria-label', '频道分组');
-  const list = node('div', undefined, 'channel-list'); list.setAttribute('aria-label', '可播放直播频道'); panel.append(group, list); layout.append(watch, panel); page.append(layout); content.replaceChildren(page);
+  const list = node('div', undefined, 'channel-list'); list.setAttribute('aria-label', '可播放直播频道'); panel.append(categories, group, list); layout.append(watch, panel); page.append(layout); content.replaceChildren(page);
   let channels = [], loadingVersion = 0;
   let renderedCards = '', restoredChannel = false;
   const sourcesAtEntry = JSON.stringify(config.liveSources);
   const valid = request => stamp === routeVersion && location.hash.startsWith('#live') && request === loadingVersion && sourcesAtEntry === JSON.stringify(config.liveSources);
   function drawChannels() {
-    const visible = channels.filter(item => item.streams.some(stream => stream.status === 'ok') && (!group.value || item.group === group.value));
-    const signature = JSON.stringify(visible.map(item => [item.id, item.name, item.group, item.logo]));
+    const visible = channels.filter(item => item.streams.some(stream => stream.status === 'ok') && (!group.value || item.group === group.value) && (!liveCategory || item.category === liveCategory || liveCategory === '央视' && /^CCTV\s*\d/i.test(item.name)));
+    const signature = JSON.stringify(visible.map(item => [item.id, item.name, item.group, item.logo, liveQualityLabel(item.streams[preferredLiveLine(item)])]));
     if (signature === renderedCards && list.childElementCount) return;
     renderedCards = signature;
     const focused = document.activeElement?.closest('.channel-card')?.dataset.channel;
@@ -941,11 +1006,12 @@ async function renderLive(params, stamp) {
       const caption = node('span', undefined, 'channel-caption'); caption.append(node('strong', channel.name), node('small', channel.group || '电视直播')); item.append(cover, caption);
       item.setAttribute('aria-label', `播放频道 ${channel.name}`);
       }
+      const badge = $('.channel-badge', item); badge.textContent = liveQualityLabel(channel.streams[preferredLiveLine(channel)]) || '可播放'; badge.title = liveQualityDescription(channel.streams[preferredLiveLine(channel)]);
       item.classList.toggle('selected', Boolean(selectedChannel)); item.setAttribute('aria-pressed', String(Boolean(selectedChannel))); ordered.push(item);
     }
     ordered.forEach((item, index) => { if (list.children[index] !== item) list.insertBefore(item, list.children[index] || null); });
     const retained = new Set(ordered); for (const item of [...list.children]) if (!retained.has(item)) item.remove();
-    if (!list.childElementCount) list.append(node('p', '没有可用频道。', 'muted'));
+    if (!list.childElementCount) list.append(node('p', liveCategory ? `“${liveCategory}”暂无已验证可播放频道，后台会继续探测。` : '没有可用频道。', 'muted'));
     list.scrollTop = scrollTop;
     if (focused) [...list.querySelectorAll('.channel-card')].find(item => item.dataset.channel === focused)?.focus({ preventScroll: true });
   }
@@ -960,10 +1026,14 @@ async function renderLive(params, stamp) {
         active.staleLiveLines ||= new Set();
         active.channel.streams.forEach((stream, index) => {
           const same = updated.streams[index]?.url === stream.url;
-          if (same) { stream.status = updated.streams[index].status; active.staleLiveLines.delete(index); }
+          if (same) {
+            stream.status = updated.streams[index].status; stream.quality = updated.streams[index].quality; stream.playbackUrl = updated.streams[index].playbackUrl; active.staleLiveLines.delete(index);
+            const status = $(`#live-lines button[data-line="${index}"] .line-status`); if (status) { status.textContent = liveQualityLabel(stream) || '可用'; status.title = liveQualityDescription(stream); }
+          }
           else active.staleLiveLines.add(index);
           if (!same || stream.status !== 'ok') $(`#live-lines button[data-line="${index}"]`)?.remove();
         });
+        active.channel.preferredLine = updated.preferredLine;
       }
       const failures = failuresList(result.failedSources, '直播源');
       if (failures) { failures.open = result.failedSources.some(source => source.stale); feedback.append(failures); }
@@ -1002,14 +1072,49 @@ async function renderLive(params, stamp) {
   void loadChannels();
 }
 
+function liveQuality(stream) {
+  const quality = stream?.quality;
+  return stream?.status === 'ok' && ['manifest', 'bitstream'].includes(quality?.source) && Number.isInteger(quality.width) && Number.isInteger(quality.height) && quality.width > 0 && quality.height > 0 && quality.width <= 16384 && quality.height <= 16384 ? quality : null;
+}
+
+function liveQualityLabel(stream) {
+  const quality = liveQuality(stream); return quality ? `${quality.source === 'manifest' ? '清单' : '码流'}${quality.height}p` : '';
+}
+
+function liveQualityDescription(stream) {
+  const quality = liveQuality(stream); return quality ? `${quality.width} × ${quality.height}，${quality.source === 'manifest' ? '来自已验证播放清单' : '来自已验证视频码流'}。` : '线路已通过可用性检查，分辨率尚未核实。';
+}
+
+function hlsInitialLevel(levels, quality) {
+  const matches = levels.map((level, index) => ({ level, index })).filter(({ level }) => level.width === quality.width && level.height === quality.height);
+  if (quality.source === 'manifest') return matches[0]?.index ?? -1;
+  const mediaSource = window.MediaSource || window.ManagedMediaSource;
+  const compatible = matches.filter(({ level }) => {
+    const declared = String(level.videoCodec || '').trim();
+    const codecs = declared ? [declared] : String(level.attrs?.CODECS || '').split(',').map(codec => codec.trim());
+    const avc = codecs.filter(codec => /^avc[13]\.[0-9a-f]{6}$/i.test(codec));
+    return avc.length === 1 && mediaSource?.isTypeSupported?.(`video/mp4; codecs="${avc[0]}"`) === true;
+  });
+  return compatible.length === 1 ? compatible[0].index : -1;
+}
+
 function preferredLiveLine(channel, tried = new Set()) {
-  return channel.streams.findIndex((stream, index) => stream.status === 'ok' && !tried.has(index));
+  const allowed = index => Number.isInteger(index) && channel.streams[index]?.status === 'ok' && !tried.has(index);
+  if (allowed(channel.preferredLine)) return channel.preferredLine;
+  const choices = channel.streams.map((stream, index) => ({ index, quality: liveQuality(stream) })).filter(value => allowed(value.index));
+  choices.sort((first, second) => (second.quality?.width * second.quality?.height || 0) - (first.quality?.width * first.quality?.height || 0) || (second.quality?.bandwidth || 0) - (first.quality?.bandwidth || 0));
+  return choices[0]?.index ?? -1;
 }
 
 function reportLive(current, status) {
   if (player !== current || current.transcoded || current.staleLiveLines?.has(current.line) || current.liveReported === status) return;
   current.liveReported = status;
   current.channel.streams[current.line].status = status;
+  document.querySelectorAll('.channel-button').forEach(item => {
+    if (item.dataset.channel !== current.channel.id) return;
+    const stream = current.channel.streams[preferredLiveLine(current.channel, current.staleLiveLines || new Set())], badge = $('.channel-badge', item);
+    if (badge) { badge.textContent = liveQualityLabel(stream) || '可播放'; badge.title = liveQualityDescription(stream); }
+  });
   if (status === 'error') {
     $(`#live-lines button[data-line="${current.line}"]`)?.remove();
     if (!current.channel.streams.some(stream => stream.status === 'ok')) document.querySelectorAll('.channel-button').forEach(item => { if (item.dataset.channel === current.channel.id) item.remove(); });
@@ -1030,11 +1135,12 @@ async function startLiveChannel(channel, line, stamp, flow = { tried: new Set() 
     if (stream.status !== 'ok') return;
     const name = stream.name || `线路 ${index + 1}`;
     const item = button(name, () => void startLiveChannel(channel, index, stamp), `button${index === line ? ' selected' : ''}`);
-    item.setAttribute('aria-label', name); item.dataset.line = index; item.append(node('span', '可用', 'line-status'));
+    item.setAttribute('aria-label', name); item.dataset.line = index; const status = node('span', liveQualityLabel(stream) || '可用', 'line-status'); status.title = liveQualityDescription(stream); item.append(status);
     item.disabled = index === line; item.setAttribute('aria-pressed', String(index === line)); choices.append(item);
   });
   document.querySelectorAll('.channel-button').forEach(item => { const selectedChannel = item.dataset.channel === channel.id; item.setAttribute('aria-pressed', String(selectedChannel)); item.classList.toggle('selected', selectedChannel); });
-  history.replaceState(null, '', `#live?${new URLSearchParams({ id: channel.id, line })}`);
+  const query = new URLSearchParams(location.hash.split('?')[1] || ''); query.set('id', channel.id); query.set('line', line);
+  history.replaceState(null, '', `#live?${query}`);
   try {
     const playback = await api(`/api/live/playback?${new URLSearchParams({ id: channel.id, line })}`);
     if (stamp !== routeVersion || request !== playVersion || player !== current) return;
@@ -1448,9 +1554,20 @@ async function loadMedia(current, message = '正在连接播放地址…') {
   }
   current.loadTimer = setTimeout(() => { if (player === current && generation === current.mediaVersion && video.readyState < 2) playbackError(current); }, 15000);
   if (current.type === 'hls' && window.Hls?.isSupported()) {
-    hls = new window.Hls(current.transcoded ? { startPosition: 0 } : {}); hls.loadSource(url); hls.attachMedia(video);
+    const quality = current.live && !current.transcoded ? liveQuality(current.channel.streams[current.line]) : null;
+    const selectLevel = Boolean(quality);
+    hls = new window.Hls(current.transcoded ? { startPosition: 0 } : selectLevel ? { autoStartLoad: false } : {}); const instance = hls; hls.loadSource(url); hls.attachMedia(video);
     hls.on(window.Hls.Events.ERROR, (_event, data) => { if (player === current && generation === current.mediaVersion && data.fatal) playbackError(current); });
-    hls.on(window.Hls.Events.MANIFEST_PARSED, () => { if (player === current && generation === current.mediaVersion) attemptPlay(current, generation); });
+    hls.on(window.Hls.Events.MANIFEST_PARSED, (_event, data) => {
+      if (player !== current || generation !== current.mediaVersion) return;
+      if (selectLevel) {
+        const levels = data?.levels || instance.levels || [];
+        const index = hlsInitialLevel(levels, quality);
+        if (index >= 0) instance.startLevel = index;
+        instance.startLoad?.(-1);
+      }
+      attemptPlay(current, generation);
+    });
   } else if (current.type === 'hls' && !video.canPlayType('application/vnd.apple.mpegurl')) {
     clearTimeout(current.loadTimer); playbackError(current);
   } else { video.src = url; attemptPlay(current, generation); }
@@ -1650,7 +1767,7 @@ async function renderRoute() {
     if (stamp !== routeVersion) return;
     if (selectedView !== 'home') { const latestState = await statePromise; if (stamp !== routeVersion) return; if (latestState) library = latestState; }
     if (selectedView === 'home' && params.get('category') === 'adult' && !config.showAdult) { leaveAdultScreen(); return; }
-    if (selectedView === 'home') await renderHome(params.get('category') || 'movie', params.get('source') || '', stamp, statePromise);
+    if (selectedView === 'home') await renderHome(params.get('category') || 'movie', params.get('source') || '', stamp, statePromise, { genre: params.get('genre'), year: params.get('year'), sort: params.get('sort') });
     else if (selectedView === 'favorites' || selectedView === 'history') renderLibrary(selectedView);
     else if (selectedView === 'settings') renderSettings();
     else if (selectedView === 'search') await renderSearch(params.get('q') || '', stamp);

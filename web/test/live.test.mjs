@@ -264,6 +264,7 @@ test('live probing delegates HLS and MP4 checks without removing or reordering f
       report(episode, playable) { reports.push([episode, playable]); } } });
   const config = { liveSources: [source] };
   await live.probe(config);
+  await live.probe(config);
   const result = await live.list(config);
   assert.equal(result.channels.length, 1);
   assert.deepEqual(result.channels[0].streams.map(row => [row.url,row.status]), [['https://tv.example/dead.m3u8','error'],['https://tv.example/good.mp4?token=keep','ok']]);
@@ -457,5 +458,56 @@ test('long public stream URLs cannot exceed the persistent playlist byte budget'
     await live.list(config, { refresh: true });
     const saved = state.metadata.get('live-playlists-v1'), rows = Object.values(JSON.parse(saved)).reduce((count, record) => count + record.channels.length, 0);
     assert.ok(Buffer.byteLength(saved) <= 24 * 1024 * 1024); assert.ok(rows > 3000 && rows < 4800);
+  } finally { await live.stop(); }
+});
+
+test('the first batch fairly covers satellite and local channels behind a long CCTV prefix', async () => {
+  const rows = Array.from({ length: 100 }, (_, index) => `#EXTINF:-1 group-title="央视",央视样例${index}\nhttps://tv.example/cctv-${index}.m3u8`).concat(['#EXTINF:-1 group-title="卫视",湖南卫视\nhttps://tv.example/satellite.m3u8', '#EXTINF:-1 group-title="地方",普通地方新闻\nhttps://tv.example/local.m3u8']);
+  const checked = [], live = createLive({ request: async () => response('#EXTM3U\n' + rows.join('\n')), playability: { async check({ url }) { checked.push(url); return { playable: true, live: true, checkedAt: Date.now() }; } } });
+  try {
+    await live.probe({ liveSources: [source] }); assert.equal(checked.length, 20); assert.ok(checked.includes('https://tv.example/satellite.m3u8')); assert.ok(checked.includes('https://tv.example/local.m3u8'));
+    const list = await live.list({ liveSources: [source] }); assert.equal(list.channels.find(channel => channel.name === '湖南卫视').category, '卫视');
+  } finally { await live.stop(); }
+});
+
+test('a failed satellite primary receives a timely HD backup without waiting behind hundreds of other channels', async () => {
+  const second = { ...source, id: 'backup', url: 'https://tv.example/backup.m3u' }, checked = [];
+  const live = createLive({ now: () => 1000, request: async target => response('#EXTM3U\n#EXTINF:-1 tvg-id="HunanTV.cn" group-title="卫视",湖南卫视\n' + (target === source.url ? 'https://tv.example/dead.m3u8\n' + Array.from({ length: 500 }, (_, index) => `#EXTINF:-1 group-title="央视",央视样例${index}\nhttps://tv.example/cctv-${index}.m3u8`).join('\n') : 'https://tv.example/hd.m3u8')), playability: { async check({ url }) { checked.push(url); return { playable: !url.includes('dead'), live: true, checkedAt: 1000, quality: { width: 1920, height: 1080, source: 'bitstream' }, playbackUrl: url }; } } });
+  const config = { liveSources: [source, second] };
+  try {
+    await live.probe(config); assert.equal(checked.length, 20); await live.probe(config); assert.equal(checked[20], 'https://tv.example/hd.m3u8');
+    const channel = (await live.list(config)).channels.find(item => item.name === '湖南卫视'); assert.equal(channel.preferredLine, 1); assert.equal(channel.streams[0].url, 'https://tv.example/dead.m3u8'); assert.equal(channel.streams[1].quality.height, 1080);
+  } finally { await live.stop(); }
+});
+
+test('quality selects the best verified original line, ignores fabricated metadata, and refuses ended VOD playlists as live', async () => {
+  const config = { liveSources: [source] }, state = cacheStore(config), urls = ['low', 'high', 'bad-metadata', 'ended'].map(name => `https://tv.example/${name}.m3u8`);
+  const live = createLive({ store: state.store, now: () => 1000, request: async () => response('#EXTM3U\n' + urls.map(url => `#EXTINF:-1 tvg-id="QualityTV.cn",质量样例\n${url}`).join('\n')), playability: { async check({ url }) {
+    if (url.includes('bad-metadata')) return { playable: true, live: true, checkedAt: 1000, quality: { width: '1920', height: 1080, source: 'name' }, playbackUrl: 'http://127.0.0.1/private.m3u8' };
+    return { playable: true, live: !url.includes('ended'), checkedAt: 1000, quality: { width: url.includes('high') ? 1920 : 1280, height: url.includes('high') ? 1080 : 720, source: 'manifest' }, playbackUrl: url.replace('tv.example', 'cdn.example') };
+  }, report() {} } });
+  try {
+    for (let index = 0; index < 4; index++) await live.probe(config);
+    const channel = (await live.list(config)).channels[0]; assert.deepEqual(channel.streams.map(stream => stream.url), urls); assert.equal(channel.preferredLine, 1); assert.equal(channel.streams[1].playbackUrl, 'https://cdn.example/high.m3u8'); assert.equal(channel.streams[2].quality, undefined); assert.equal(channel.streams[2].playbackUrl, undefined); assert.equal(channel.streams[3].status, 'error');
+    live.report(urls[1], 'error'); assert.equal((await live.list(config)).channels[0].preferredLine, 0);
+    await live.stop();
+    const saved = JSON.parse(state.metadata.get('live-health')); saved.streams[urls[0]].quality = { width: 999999, height: 1080, source: 'bitstream' }; saved.streams[urls[0]].playbackUrl = 'http://10.0.0.1/private.m3u8'; state.metadata.set('live-health', JSON.stringify(saved));
+    const reopened = createLive({ store: state.store, now: () => 1000, request: async () => response('offline', 503) });
+    try { const restored = await reopened.list(config); assert.equal(restored.channels[0].streams[0].quality, undefined); assert.equal(restored.channels[0].streams[0].playbackUrl, undefined); }
+    finally { await reopened.stop(); }
+  } finally { await live.stop(); }
+});
+
+test('packaged seed upgrades an old builtin SQLite playlist and preserves old and new backup indices when GitHub is offline', async () => {
+  const builtin = { id: 'live-presets', name: '内置', url: 'https://raw.githubusercontent.com/loren1997/vipvideo-web/main/web/live-presets.m3u', enabled: true };
+  const config = { liveSources: [builtin] }, state = cacheStore(config), oldUrl = 'https://tv.example/old-hebei.m3u8';
+  state.metadata.set('live-playlists-v1', JSON.stringify({ 'live-presets': { url: builtin.url, checkedAt: 1000, channels: parsePlaylist(`#EXTM3U\n#EXTINF:-1 tvg-id="HebeiTV.cn" group-title="卫视",河北卫视\n${oldUrl}`, builtin) } }));
+  const live = createLive({ store: state.store, now: () => 2000, request: async () => response('GitHub offline', 503), playability: { async check({ url }) { return { playable: true, live: true, checkedAt: 2000, quality: { width: url === oldUrl ? 640 : 1920, height: url === oldUrl ? 360 : 1080, source: 'bitstream' }, playbackUrl: url }; } } });
+  try {
+    const cached = await live.list(config), heb = cached.channels.find(channel => channel.name === '河北卫视');
+    assert.ok(cached.channels.some(channel => channel.name === '安徽卫视')); assert.ok(cached.channels.some(channel => channel.name === '浙江卫视')); assert.equal(heb.streams[0].url, oldUrl); assert.ok(heb.streams.some(stream => stream.url === 'http://204.12.221.218:8181/3m1080p/hews.m3u8'));
+    await live.list(config, { refresh: true }); await live.probe(config); await live.probe(config);
+    const upgraded = (await live.list(config)).channels.find(channel => channel.name === '河北卫视'); assert.equal(upgraded.streams[0].url, oldUrl); assert.ok(upgraded.preferredLine > 0); assert.equal(upgraded.streams[upgraded.preferredLine].quality.height, 1080);
+    state.setConfig({ liveSources: [{ ...builtin, url: 'https://tv.example/user-edited.m3u' }] }); assert.equal((await live.list(state.store.config(), { refresh: true })).channels.length, 0);
   } finally { await live.stop(); }
 });

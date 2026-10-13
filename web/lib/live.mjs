@@ -15,6 +15,34 @@ const PROBE_INTERVAL = 5000;
 const BUILTIN_URL = 'https://raw.githubusercontent.com/loren1997/vipvideo-web/main/web/live-presets.m3u';
 const adultChannel = /成人|情色|伦理|三级|限制级|\badult\b|\bxxx\b/i;
 
+function channelCategory(channel) {
+  const name = channel.name || '', group = channel.group || '';
+  if (/卫视|satellite/i.test(name + ' ' + group)) return '卫视';
+  if (/CCTV[\s-]*14(?:\D|$)|少儿|卡通|kids|children/i.test(name + ' ' + group)) return '少儿';
+  if (/CCTV[\s-]*5(?:\D|$)|体育|sports?/i.test(name + ' ' + group)) return '体育';
+  if (/地方/.test(group) && !/^CCTV|^CGTN|^CETV/i.test(name)) return '地方';
+  if (/CGTN|CETV|CCTV[\s-]*13(?:\D|$)|新闻|教育|news|education/i.test(name + ' ' + group)) return '新闻·教育';
+  if (/^CCTV|央视|央视频道/i.test(name + ' ' + group)) return '央视';
+  return /地方|local|省|市|县/i.test(group) ? '地方' : '其他';
+}
+
+function trustedEvidence(record) {
+  const output = {}, value = record?.quality;
+  if (value && ['manifest', 'bitstream'].includes(value.source) && Number.isSafeInteger(value.width) && value.width >= 32 && value.width <= 8192 && Number.isSafeInteger(value.height) && value.height >= 32 && value.height <= 4320) {
+    output.quality = { width: value.width, height: value.height, source: value.source, ...(Number.isSafeInteger(value.bandwidth) && value.bandwidth > 0 && value.bandwidth <= 200_000_000 ? { bandwidth: value.bandwidth } : {}) };
+  }
+  if (typeof record?.playbackUrl === 'string' && record.playbackUrl.length <= 8192) try { output.playbackUrl = validateUrl(record.playbackUrl).href; } catch { /* 存储中的派生地址不能绕过公网限制。 */ }
+  return output;
+}
+
+function fairChannels(channels) {
+  const buckets = new Map(['卫视', '地方', '新闻·教育', '体育', '少儿', '央视', '其他'].map(category => [category, []]));
+  for (const channel of channels) buckets.get(channelCategory(channel)).push(channel);
+  const ordered = [], groups = [...buckets.values()];
+  for (let row = 0; row < Math.max(0, ...groups.map(group => group.length)); row++) for (const group of groups) if (group[row]) ordered.push(group[row]);
+  return ordered;
+}
+
 function safeCachedChannels(rows, source) {
   if (!Array.isArray(rows)) return [];
   const channels = [];
@@ -78,7 +106,23 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
   const playlists = new Map();
   const localSeeds = new Map(); let seedText;
   let latestSources = new Map(), playlistsChanged = false;
-  try { if (store?.meta('live-health')) health = { ...health, ...JSON.parse(store.meta('live-health')) }; } catch (error) { logger.error('直播探测记录无法读取', error); }
+  try {
+    const text = store?.meta('live-health');
+    if (text) {
+      if (typeof text !== 'string' || Buffer.byteLength(text) > 64 * 1024 * 1024) throw failure('直播探测记录过大');
+      const saved = JSON.parse(text); health = { ...health, ...saved };
+      health.cursor = Number.isSafeInteger(saved.cursor) && saved.cursor >= 0 ? saved.cursor : 0;
+      health.lastProbe = Number.isFinite(saved.lastProbe) && saved.lastProbe >= 0 && saved.lastProbe <= now() ? saved.lastProbe : 0;
+      health.streams = Object.fromEntries(Object.entries(saved.streams || {}).slice(0, HEALTH_LIMIT).flatMap(([url, record]) => {
+        try {
+          if (url.length > 8192 || !['ok', 'error'].includes(record?.status) || !Number.isFinite(record.checkedAt) || record.checkedAt < 0 || record.checkedAt > now()) return [];
+          validateUrl(url);
+          return [[url, { status: record.status, checkedAt: record.checkedAt, ...(record.error ? { error: String(record.error).slice(0, 300) } : {}), ...trustedEvidence(record) }]];
+        } catch { return []; }
+      }));
+      if (!health.sources || typeof health.sources !== 'object' || Array.isArray(health.sources)) health.sources = {};
+    }
+  } catch (error) { logger.error('直播探测记录无法读取', error); }
   try {
     const saved = store?.meta(PLAYLISTS_KEY);
     if (saved) {
@@ -148,9 +192,16 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
   }
   const view = result => {
     const copy = structuredClone(result);
-    for (const channel of copy.channels) for (const stream of channel.streams) {
-      const record = health.streams[stream.url];
-      stream.status = record && record.checkedAt <= now() && now() - record.checkedAt < HEALTH_AGE ? record.status : 'unknown';
+    for (const channel of copy.channels) {
+      channel.category = channelCategory(channel);
+      for (const stream of channel.streams) {
+        const record = health.streams[stream.url];
+        stream.status = record && record.checkedAt <= now() && now() - record.checkedAt < HEALTH_AGE ? record.status : 'unknown';
+        if (stream.status === 'ok') Object.assign(stream, trustedEvidence(record));
+      }
+      const candidates = channel.streams.map((stream, line) => ({ stream, line })).filter(({ stream }) => stream.status === 'ok');
+      candidates.sort((a, b) => (b.stream.quality?.height || 0) - (a.stream.quality?.height || 0) || (b.stream.quality?.width || 0) - (a.stream.quality?.width || 0) || (b.stream.quality?.bandwidth || 0) - (a.stream.quality?.bandwidth || 0));
+      if (candidates.length) channel.preferredLine = candidates[0].line;
     }
     const urls = [...new Set(copy.channels.flatMap(channel => channel.streams.map(stream => stream.url)))];
     Object.assign(copy, { probing: !!probeJob || !!cache?.promise, checkedStreams: urls.filter(url => health.streams[url]?.checkedAt <= now() && now() - health.streams[url].checkedAt < HEALTH_AGE).length, totalStreams: urls.length, lastProbe: health.lastProbe });
@@ -202,7 +253,7 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
     async list(config, { refresh = false } = {}) {
       const sources = (config.liveSources || []).filter(source => source.enabled !== false);
       prunePlaylists(sources);
-      for (const source of sources) if (source.id === 'live-presets' && source.url === BUILTIN_URL && !playlists.has(source.id) && !localSeeds.has(source.id)) {
+      for (const source of sources) if (source.id === 'live-presets' && source.url === BUILTIN_URL && !localSeeds.has(source.id)) {
         try {
           seedText ??= readFile(new URL('../live-presets.m3u', import.meta.url), 'utf8');
           const channels = parsePlaylist(await seedText, source);
@@ -218,11 +269,11 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
       if (cache?.signature === signature && cache.promise) return view(await cache.promise);
       const previousResult = cache?.signature === signature ? cache.result : undefined;
       const saved = merge(sources.map(source => {
-        const record = playlists.get(source.id) || localSeeds.get(source.id), state = health.sources[source.id];
+        const seed = localSeeds.get(source.id), record = playlists.get(source.id) || seed, state = health.sources[source.id];
         if (record?.url !== source.url) return { channels: [] };
         const stale = state?.url === source.url && state.status === 'error';
         const fallback = stale ? { stale: true, cachedAt: record.checkedAt } : {};
-        return { channels: safeCachedChannels(record.channels, source).map(channel => ({ ...channel, streams: channel.streams.map(stream => ({ ...stream, ...fallback })) })), ...(stale ? { error: { source: source.id, name: source.name, error: state.error, ...fallback } } : {}) };
+        return { channels: merge([{ channels: safeCachedChannels(record.channels, source) }, { channels: safeCachedChannels(seed?.channels || [], source) }]).channels.map(channel => ({ ...channel, streams: channel.streams.map(stream => ({ ...stream, ...fallback })) })), ...(stale ? { error: { source: source.id, name: source.name, error: state.error, ...fallback } } : {}) };
       }));
       const entry = { signature, expires: now() + 10 * 60_000 };
       if (previousResult || saved.channels.length) entry.result = previousResult || saved;
@@ -236,13 +287,13 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
             const began = now();
             try {
               if (!currentSource(source)) continue;
-              const channels = await load(source);
+              const channels = merge([{ channels: await load(source) }, { channels: localSeeds.get(source.id)?.channels || [] }]).channels;
               if (!currentSource(source)) continue;
               if (!channels.length) throw failure('直播列表没有可播放的公网 HTTP 频道');
               results[index] = { channels };
               health.sources[source.id] = { url: source.url, status: 'ok', checkedAt: now(), latencyMs: Math.max(0, now() - began), error: '' };
               if (currentSource(source)) {
-                const saved = safeCachedChannels(channels, source);
+                const saved = safeCachedChannels(channels.flatMap(channel => channel.streams.map(stream => ({ ...channel, streams: [stream] }))), source);
                 if (saved.length) { playlists.set(source.id, { url: source.url, checkedAt: now(), channels: saved }); playlistsChanged = true; }
               }
             }
@@ -252,7 +303,7 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
               const stale = currentSource(source) && saved?.url === source.url && saved.checkedAt <= now() && now() - saved.checkedAt <= PLAYLIST_AGE;
               const message = error.message + (stale ? saved.local ? '；使用内置频道列表' : '；使用最近可用列表' : '');
               const fallback = stale ? { stale: true, cachedAt: saved.checkedAt } : {};
-              results[index] = { channels: stale ? safeCachedChannels(saved.channels, source).map(channel => ({ ...channel,
+              results[index] = { channels: stale ? merge([{ channels: safeCachedChannels(saved.channels, source) }, { channels: safeCachedChannels(localSeeds.get(source.id)?.channels || [], source) }]).channels.map(channel => ({ ...channel,
                 streams: channel.streams.map(stream => ({ ...stream, ...fallback })) })) : [],
                 error: { source: source.id, name: source.name, error: message, ...fallback } };
               health.sources[source.id] = { url: source.url, status: 'error', checkedAt: now(), latencyMs: Math.max(0, now() - began), error: message, ...fallback };
@@ -273,16 +324,25 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
       probeJob = (async () => {
         const visible = await service.list(config), signature = JSON.stringify((config.liveSources || []).filter(source => source.enabled !== false));
         const result = cache?.signature === signature && cache.result ? cache.result : visible;
-        const ordered = [];
-        for (let line = 0; line < Math.max(0, ...result.channels.map(channel => channel.streams.length)); line++) for (const channel of result.channels) if (channel.streams[line]) ordered.push(channel.streams[line].url);
-        const urls = [...new Set(ordered)];
+        const channels = fairChannels(result.channels), urls = [...new Set(channels.flatMap(channel => channel.streams.map(stream => stream.url)))];
         const unchanged = () => !stopping && (!store?.config || signature === JSON.stringify((store.config().liveSources || []).filter(source => source.enabled !== false)));
-        const sample = [];
-        let walked = 0;
-        while (walked < urls.length && sample.length < 20) {
-          const url = urls[(health.cursor + walked++) % urls.length], record = health.streams[url];
-          if (!record || record.checkedAt > now() || now() - record.checkedAt >= (record.status === 'ok' ? 30 * 60_000 : 10 * 60_000)) sample.push(url);
+        const sample = [], selected = new Set(), pools = { normal: [], rescue: [], upgrade: [] };
+        for (let walked = 0; walked < channels.length; walked++) {
+          const index = (health.cursor + walked) % channels.length, channel = channels[index];
+          const fresh = stream => { const record = health.streams[stream.url]; return record && record.checkedAt <= now() && now() - record.checkedAt < HEALTH_AGE; };
+          const healthy = channel.streams.some(stream => fresh(stream) && health.streams[stream.url].status === 'ok');
+          const unknown = channel.streams.find(stream => !health.streams[stream.url]) || channel.streams.find(stream => !fresh(stream));
+          const due = channel.streams.find(stream => { const record = health.streams[stream.url]; return !record || record.checkedAt > now() || now() - record.checkedAt >= (record.status === 'ok' ? 30 * 60_000 : 10 * 60_000); });
+          const candidate = unknown || due;
+          if (!candidate) continue;
+          const attempted = channel.streams.some(stream => !!health.streams[stream.url]);
+          const pool = !healthy && unknown && attempted ? 'rescue' : healthy && unknown ? 'upgrade' : 'normal';
+          pools[pool].push({ url: candidate.url, index });
         }
+        let nextCursor = health.cursor;
+        const take = (pool, quota) => { while (pools[pool].length && quota-- > 0 && sample.length < 20) { const candidate = pools[pool].shift(); if (selected.has(candidate.url)) { quota++; continue; } selected.add(candidate.url); sample.push(candidate.url); if (pool === 'normal' || !pools.normal.length) nextCursor = candidate.index + 1; } };
+        take('rescue', 6); take('normal', 12); take('upgrade', 4);
+        take('normal', 20); take('rescue', 20); take('upgrade', 20);
         if (!sample.length) return service.status(config);
         let next = 0;
         await Promise.all(Array.from({ length: Math.min(2, sample.length) }, async () => {
@@ -293,14 +353,15 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
               if (!unchanged() || health.streams[url] !== before) continue;
               const result = await playability.check({ url, type: /\.mp4$/i.test(new URL(url).pathname) ? 'mp4' : 'hls' });
               if (!unchanged() || health.streams[url] !== before) continue;
-              health.streams[url] = { status: result.playable ? 'ok' : 'error', checkedAt: result.checkedAt ?? now(), latencyMs: Math.max(0, now() - began),
-                ...(result.playable ? {} : { error: result.error || '线路暂不可播放' }) };
+              const playable = result.playable && result.live !== false;
+              health.streams[url] = { status: playable ? 'ok' : 'error', checkedAt: result.checkedAt ?? now(), latencyMs: Math.max(0, now() - began),
+                ...(playable ? trustedEvidence(result) : { error: result.live === false ? '这是结束的点播清单，不能作为实时频道' : result.error || '线路暂不可播放' }) };
             } catch (error) { if (unchanged() && health.streams[url] === before) health.streams[url] = { status: 'error', checkedAt: now(), error: error.message }; }
             finally { releaseSlot(); }
           }
         }));
         if (!unchanged()) return service.status(store?.config?.() || config);
-        health.cursor = urls.length ? (health.cursor + walked) % urls.length : 0;
+        health.cursor = channels.length ? nextCursor % channels.length : 0;
         health.lastProbe = now();
         const currentUrls = new Set(urls);
         health.streams = Object.fromEntries(Object.entries(health.streams).filter(([url]) => currentUrls.has(url)).sort((a, b) => b[1].checkedAt - a[1].checkedAt).slice(0, HEALTH_LIMIT));
@@ -312,7 +373,7 @@ export function createLive({ store, request = networkRequest, now = Date.now, lo
     },
     report(url, status) {
       playability.report?.({ url, type: /\.mp4$/i.test(new URL(url).pathname) ? 'mp4' : 'hls' }, status === 'ok');
-      health.streams[url] = { status, checkedAt: now() };
+      health.streams[url] = { status, checkedAt: now(), ...(status === 'ok' ? trustedEvidence(health.streams[url]) : {}) };
       health.streams = Object.fromEntries(Object.entries(health.streams).sort((a, b) => b[1].checkedAt - a[1].checkedAt).slice(0, HEALTH_LIMIT));
       persist();
     },

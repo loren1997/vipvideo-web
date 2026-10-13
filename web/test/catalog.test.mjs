@@ -7,6 +7,99 @@ const config = { sources: [{ id: 'a', name: '甲源', api: 'https://a.example/ap
 function response(list, extra = {}) { return Object.assign(Readable.from([Buffer.from(JSON.stringify({ list, ...extra }))]), { statusCode: 200, headers: {} }); }
 function video(id, title = '影片', year = '2026', extra = {}) { return { vod_id: id, vod_name: title, vod_year: year, vod_play_from: '直链', vod_play_url: '正片$https://cdn.example/v.mp4?token=a%2Fb&dollar=$keep', ...extra }; }
 
+test('genre uses each source category ID and enforces year even when the source ignores its filter', async () => {
+  const calls = [];
+  const single = { sources: [{ ...config.sources[0], api: 'https://a.example/api?token=keep&year=1990&class=stale&sort_direction=asc' }] };
+  const catalog = createCatalog({ request: async url => {
+    calls.push(new URL(url));
+    if (url.searchParams.get('ac') === 'list') return response([], { class: [
+      { type_id: 1, type_name: '电影' }, { type_id: 77, type_name: '喜剧片', type_pid: 1 }, { type_id: 78, type_name: '恐怖片', type_pid: 1 },
+    ] });
+    return response([video(1, '符合筛选', '2024', { type_id: 77, type_name: '电影' }),
+      video(2, '年份错误', '2023', { type_id: 77, type_name: '喜剧片' }),
+      video(3, '类型错误', '2024', { type_id: 78, type_name: '恐怖片' }),
+      video(4, '受限内容', '2024', { type_id: 77, type_name: '喜剧片', vod_class: '三级' })], { pagecount: 2 });
+  } });
+  const options = { genre: '喜剧', year: '2024' };
+  const result = await catalog.browse(single, options);
+  assert.deepEqual(result.groups.map(group => group.title), ['符合筛选']);
+  assert.deepEqual(result.groups[0].genres, ['喜剧']); assert.equal(result.hasMore, true);
+  assert.equal(calls[1].searchParams.get('t'), '77'); assert.equal(calls[1].searchParams.get('year'), '2024');
+  assert.equal(calls[1].searchParams.get('token'), 'keep'); assert.equal(calls[1].searchParams.has('class'), false);
+  assert.equal(calls[1].searchParams.has('sort_direction'), false); assert.equal(calls[0].searchParams.has('year'), false);
+  assert.deepEqual(result.filters, { genre: '喜剧', year: '2024', sort: 'updated' });
+  result.facets.genres.length = 0;
+  assert((await catalog.browse(single, options)).facets.genres.includes('恐怖')); assert.equal(calls.length, 2);
+  await catalog.browse(single, { ...options, year: '2023' }); assert.equal(calls.length, 3);
+});
+
+for (const [category, root, typeName] of [['tv', '连续剧', '国产剧'], ['anime', '动漫', '日韩动漫']]) test(`${category} genres come from tags without searching the title or leaking adult items`, async () => {
+  const catalog = createCatalog({ request: async url => url.searchParams.get('ac') === 'list' ? response([], { class: [{ type_id: 1, type_name: root }] }) : response([
+    video(1, '正片', '2025', { type_id: 1, type_name: typeName, vod_class: '剧情,惊悚,恐怖' }),
+    video(2, '恐怖惊悚只在标题', '2025', { type_id: 1, type_name: typeName, vod_class: '爱情' }),
+    video(3, '受限正片', '2025', { type_id: 1, type_name: typeName, vod_class: '恐怖,限制级' }),
+  ], { pagecount: 1 }) });
+  for (const genre of ['恐怖', '惊悚']) {
+    const result = await catalog.browse({ sources: [config.sources[0]] }, { category, genre });
+    assert.deepEqual(result.groups.map(group => group.title), ['正片']);
+    assert(result.groups[0].genres.includes(genre)); assert.equal(result.groups[0].category, category);
+  }
+});
+
+test('release ordering uses validated premiere dates and never confuses resource updates with release dates', async () => {
+  const catalog = createCatalog({ request: async url => url.searchParams.get('ac') === 'list' ? response([], { class: [{ type_id: 1, type_name: '电影' }] }) : response([
+    video(1, '未知上映日期', '2026', { type_id: 1, vod_time: '2026-10-13 00:00:00', vod_pubdate: '2025-02-30' }),
+    video(2, '较早', '2024', { type_id: 1, vod_pubdate: '2024-05-01(中国)/2024-04-03(海外)' }),
+    video(3, '较新', '2025', { type_id: 1, vod_pubdate: '2025/6/7', vod_class: '喜剧,冒险' }),
+    video(4, '老片', '1970', { type_id: 1, vod_pubdate: '1970-01-02' }),
+  ], { pagecount: 3 }) });
+  const state = { sources: [config.sources[0]] };
+  const result = await catalog.browse(state, { sort: 'release' });
+  assert.deepEqual(result.groups.map(group => group.title), ['较新', '较早', '老片', '未知上映日期']);
+  assert.equal(result.groups[0].releaseDate, '2025-06-07'); assert.equal(result.groups[1].releaseDate, '2024-04-03');
+  assert.equal(result.groups[3].releaseDate, ''); assert.equal(result.sortScope, 'loaded'); assert.equal(result.hasMore, true);
+  assert(result.facets.years.includes('1970')); assert(result.facets.genres.includes('惊悚'));
+  assert.deepEqual((await catalog.browse(state, { sort: 'year' })).groups.map(group => group.year), ['2026', '2025', '2024', '1970']);
+});
+
+test('validates browse filters before making an upstream request', async () => {
+  let calls = 0;
+  const catalog = createCatalog({ request: async () => { calls++; return response([]); } });
+  for (const genre of ['任意', null, {}, ['喜剧']]) await assert.rejects(catalog.browse(config, { genre }), { status: 400 });
+  for (const year of ['1899', '2024,2025', '2024<script>', '9999', 2024, null, []]) await assert.rejects(catalog.browse(config, { year }), { status: 400 });
+  for (const sort of ['title', '', null, {}, ['release']]) await assert.rejects(catalog.browse(config, { sort }), { status: 400 });
+  assert.equal(calls, 0);
+});
+
+test('grouped films retain genre labels from all sources and use the earliest reported premiere', async () => {
+  const catalog = createCatalog({ request: async url => response([video(1, '同一影片', '2024', {
+    type_name: '电影', vod_class: url.hostname === 'a.example' ? '喜剧' : '冒险',
+    vod_pubdate: url.hostname === 'a.example' ? '2024-06-01' : '2024-03-02',
+  })]) });
+  const result = await catalog.search(config, '同一影片');
+  assert.equal(result.groups.length, 1); assert.equal(result.groups[0].releaseDate, '2024-03-02');
+  assert.deepEqual(result.groups[0].genres, ['喜剧', '冒险']);
+  assert.equal(result.groups[0].items[0].releaseDate, '2024-06-01');
+});
+
+test('an explicitly restricted animation subtype stays out of normal animation genre results', async () => {
+  const catalog = createCatalog({ request: async url => url.searchParams.get('ac') === 'list' ? response([], { class: [
+    { type_id: 1, type_name: '动漫' }, { type_id: 2, type_name: '日本动漫', type_pid: 1 }, { type_id: 3, type_name: '里番动漫', type_pid: 1 },
+  ] }) : response([video(1, '正常动漫', '2024', { type_id: 2, vod_class: '喜剧' }),
+    video(2, '受限动漫', '2024', { type_id: 3, type_name: '动漫', vod_class: '喜剧' })], { pagecount: 1 }) });
+  const result = await catalog.browse({ sources: [config.sources[0]] }, { category: 'anime', genre: '喜剧' });
+  assert.deepEqual(result.groups.map(group => group.title), ['正常动漫']);
+  const search = await catalog.search({ sources: [config.sources[0]] }, '动漫');
+  assert.deepEqual(search.groups.map(group => group.title), ['正常动漫']);
+});
+
+test('oversized source taxonomy fails closed instead of scheduling unbounded child requests', async () => {
+  let calls = 0;
+  const catalog = createCatalog({ request: async () => { calls++; return response([], { class: Array.from({ length: 257 }, (_, index) => ({ type_id: index + 1, type_name: '喜剧片' })) }); } });
+  const result = await catalog.browse({ sources: [config.sources[0]] }, { genre: '喜剧' });
+  assert.deepEqual(result.groups, []); assert.match(result.failedSources[0].error, /安全上限/); assert.equal(calls, 1);
+});
+
 test('progressive browse displays a ready source while a slow source continues, sharing the same work', async () => {
   let release, calls = 0;
   const slow = new Promise(resolve => { release = resolve; });
@@ -245,7 +338,7 @@ test('browses real parent categories, keeps business parameters, and excludes mi
   }
 });
 
-for (const withParents of [true, false]) test(`falls back from empty parent to at most three matching leaves (${withParents ? 'with' : 'without'} type_pid)`, async () => {
+for (const withParents of [true, false]) test(`falls back from empty parent to every matching leaf (${withParents ? 'with' : 'without'} type_pid)`, async () => {
   const calls = [];
   const catalog = createCatalog({ request: async url => {
     if (url.searchParams.get('ac') === 'list') return response([], { class: withParents ? classes : classes.map(({ type_pid, ...type }) => type) });
@@ -254,8 +347,8 @@ for (const withParents of [true, false]) test(`falls back from empty parent to a
     return response(type === '1' ? [] : [video(type, `分类 ${type}`, '2026', { type_id: type, type_name: classes.find(item => String(item.type_id) === type).type_name })], { pagecount: type === '6' ? 3 : 1 });
   } });
   const result = await catalog.browse({ sources: [config.sources[0]] });
-  assert.deepEqual(calls, ['1', '6', '7', '8']);
-  assert.equal(result.groups.length, 3);
+  assert.deepEqual(calls, ['1', '6', '7', '8', '9']);
+  assert.equal(result.groups.length, 4);
   assert.equal(result.hasMore, true);
   assert.deepEqual(result.failedSources, []);
 });
@@ -312,7 +405,9 @@ test('validates browse category, strict page strings, and disabled or missing so
   for (const source of ['', 'missing', null]) await assert.rejects(catalog.browse(config, { source }), { status: 400 });
   await assert.rejects(catalog.browse({ sources: [{ ...config.sources[0], enabled: false }] }, { source: 'a' }), { status: 400 });
   assert.equal(calls, 0);
-  assert.deepEqual(await catalog.browse({ sources: [] }), { category: 'movie', page: 1, groups: [], failedSources: [], hasMore: false });
+  const empty = await catalog.browse({ sources: [] });
+  assert.deepEqual(empty.groups, []); assert.deepEqual(empty.failedSources, []); assert.equal(empty.hasMore, false);
+  assert.deepEqual(empty.filters, { genre: '', year: '', sort: 'updated' }); assert.equal(empty.sortScope, 'loaded');
 });
 
 test('caches classifications and pages without leaking mutable results, then refreshes expiry and config changes', async t => {
