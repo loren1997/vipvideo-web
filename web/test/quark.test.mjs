@@ -153,6 +153,174 @@ test('an incomplete root directory listing reports its bound and cannot authoriz
   assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
 });
 
+test('a rotated fallback Cookie identity reconnects only the registered root folder and reuses its saved video', async t => {
+  for (const mode of ['ready', 'ready-with-empty-registration', 'ready-with-numeric-root', 'pending']) await t.test(mode, async t => {
+    const { service, options, state, metadata, connect, save } = await fixture(t);
+    state.beforeRequest = call => call.path === '/config' ? reply({}) : undefined;
+    await connect(); state.pending = mode === 'pending';
+    assert.equal((await save()).status, state.pending ? 'pending' : 'ready');
+    const before = JSON.parse(metadata.get('quark-registry-v1')), oldAccount = Object.keys(before.folders)[0], oldAsset = before.assets[0];
+    await connect({ cookie: COOKIE.replace('synthetic-account-A-secret', 'synthetic-account-A-rotated') });
+    const config = JSON.parse(metadata.get('quark-settings-v1')), account = config.account.id; assert.notEqual(account, oldAccount);
+    if (mode === 'ready-with-empty-registration') {
+      before.folders[account] = { name: 'VipVideo-' + config.installId, createdAt: state.clock };
+      metadata.set('quark-registry-v1', JSON.stringify(before));
+    }
+    await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+    if (mode === 'ready-with-numeric-root') state.folders.get('A').pdir_fid = 0;
+    const selectRestored = async instance => {
+      const shareId = (await instance.resources(detail)).resources[0].id;
+      const fileId = (await instance.files(detail, { shareId, line: 0, episode: 0 })).files[0].id;
+      return instance.prepare(detail, { shareId, fileId, line: 0, episode: 0 });
+    };
+    const result = await selectRestored(restored);
+    assert.equal(result.status, state.pending ? 'pending' : 'ready'); assert.equal(result.assetId, oldAsset.id); assert.equal(result.reused, true);
+    const after = JSON.parse(metadata.get('quark-registry-v1'));
+    assert.equal(after.folders[oldAccount], undefined); assert.equal(after.folders[account].fid, before.folders[oldAccount].fid);
+    assert.equal(after.assets.length, 1); assert.equal(after.assets[0].account, account);
+    for (const field of ['id', 'parent', 'source', 'name', 'day', 'size', 'createdAt', 'status']) assert.deepEqual(after.assets[0][field], oldAsset[field]);
+    assert.equal(state.saved, 1); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+    assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+    await restored.stop(); const restarted = createQuark(options); t.after(() => restarted.stop());
+    assert.equal((await selectRestored(restarted)).assetId, oldAsset.id); assert.equal(state.saved, 1);
+  });
+});
+
+test('reconnecting a Cookie identity preserves daily count and byte quotas while still reusing an existing video', async t => {
+  for (const limit of ['count', 'bytes']) await t.test(limit, async t => {
+    const { service, options, state, metadata, connect, save } = await fixture(t);
+    state.beforeRequest = call => call.path === '/config' ? reply({}) : undefined; await connect(); await save();
+    const before = JSON.parse(metadata.get('quark-registry-v1')), original = before.assets[0];
+    for (let index = 1; index < (limit === 'count' ? 100 : 28); index++) before.assets.push({ ...original, id: index.toString(16).padStart(32, '0'), source: index.toString(16).padStart(64, '0'), fid: 'other-managed-' + index, size: limit === 'bytes' ? 100 * GIB : original.size });
+    await connect({ cookie: COOKIE.replace('synthetic-account-A-secret', 'synthetic-account-A-quota-rotated') });
+    metadata.set('quark-registry-v1', JSON.stringify(before)); await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+    const prepare = async film => {
+      const shareId = (await restored.resources(film)).resources[0].id, fileId = (await restored.files(film, { shareId, line: 0, episode: 0 })).files[0].id;
+      return restored.prepare(film, { shareId, fileId, line: 0, episode: 0 });
+    };
+    const reused = await prepare(detail); assert.equal(reused.status, 'ready'); assert.equal(reused.assetId, original.id); assert.equal(reused.reused, true);
+    state.source = [sourceVideo('next-video', '影片.2026.mp4', limit === 'bytes' ? 100 * GIB : original.size)];
+    const denied = await prepare({ ...detail, id: 'quota-next' }); assert.equal(denied.status, 'error'); assert.match(denied.reason, /每日转存数量或容量上限/);
+    const after = JSON.parse(metadata.get('quark-registry-v1')); assert.equal(after.assets.length, before.assets.length);
+    for (let index = 0; index < before.assets.length; index++) for (const field of ['day', 'size', 'createdAt', 'parent', 'source']) assert.deepEqual(after.assets[index][field], before.assets[index][field]);
+    assert.equal(state.saved, 1); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+    assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+  });
+});
+
+test('a full registry reconnects a rotated identity to reuse an existing video while refusing new saves', async t => {
+  const { service, options, state, metadata, connect, save } = await fixture(t);
+  state.beforeRequest = call => call.path === '/config' ? reply({}) : undefined; await connect(); await save();
+  const before = JSON.parse(metadata.get('quark-registry-v1')), original = before.assets[0];
+  for (let index = 1; index < 1000; index++) before.assets.push({ ...original, id: index.toString(16).padStart(32, '0'), source: index.toString(16).padStart(64, '0'), fid: 'historical-' + index, day: '2025-12-01' });
+  await connect({ cookie: COOKIE.replace('synthetic-account-A-secret', 'synthetic-account-A-full-rotated') });
+  metadata.set('quark-registry-v1', JSON.stringify(before)); await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+  const prepare = async film => {
+    const shareId = (await restored.resources(film)).resources[0].id, fileId = (await restored.files(film, { shareId, line: 0, episode: 0 })).files[0].id;
+    return restored.prepare(film, { shareId, fileId, line: 0, episode: 0 });
+  };
+  const reused = await prepare(detail); assert.equal(reused.status, 'ready'); assert.equal(reused.assetId, original.id); assert.equal(reused.reused, true);
+  state.source = [sourceVideo('next-video')];
+  assert.match((await prepare({ ...detail, id: 'full-registry-next' })).reason, /每日转存数量或容量上限/);
+  assert.equal(JSON.parse(metadata.get('quark-registry-v1')).assets.length, 1000);
+  assert.equal(state.saved, 1); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+  assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+});
+
+test('reconnecting a Cookie identity refuses every incomplete or conflicting folder proof without cloud mutations', async t => {
+  for (const mode of ['different-fid', 'no-old-fid', 'old-mkdir-pending', 'current-mkdir-pending', 'multiple-old-fids', 'multiple-old-accounts', 'missing-parent', 'non-root-parent', 'non-directory', 'duplicate-row', 'incomplete-root', 'invalid-total', 'conflicting-current-asset']) await t.test(mode, async t => {
+    const { service, options, state, metadata, connect, save } = await fixture(t);
+    state.beforeRequest = call => call.path === '/config' ? reply({}) : undefined; await connect(); await save();
+    const before = JSON.parse(metadata.get('quark-registry-v1')), oldAccount = Object.keys(before.folders)[0], entry = before.folders[oldAccount];
+    await connect({ cookie: COOKIE.replace('synthetic-account-A-secret', 'synthetic-account-A-denied-rotated') });
+    const account = JSON.parse(metadata.get('quark-settings-v1')).account.id;
+    if (mode === 'no-old-fid') delete entry.fid;
+    if (mode === 'old-mkdir-pending') entry.mkdirStarted = true;
+    if (mode === 'current-mkdir-pending') before.folders[account] = { name: entry.name, createdAt: state.clock, mkdirStarted: true };
+    if (mode.startsWith('multiple-old')) before.folders['f'.repeat(64)] = { ...entry, ...(mode === 'multiple-old-fids' ? { fid: 'different-registered-fid' } : {}) };
+    if (mode === 'conflicting-current-asset') before.assets.push({ ...before.assets[0], id: 'e'.repeat(32), account, parent: 'different-parent', source: 'e'.repeat(64) });
+    metadata.set('quark-registry-v1', JSON.stringify(before)); await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+    const row = { ...state.folders.get('A') };
+    if (mode === 'different-fid') row.fid = 'unregistered-same-name';
+    if (mode === 'missing-parent') delete row.pdir_fid;
+    if (mode === 'non-root-parent') row.pdir_fid = 'not-root';
+    if (mode === 'non-directory') row.file = true;
+    state.beforeRequest = call => {
+      if (call.path === '/config') return reply({});
+      if (call.path !== '/file/sort' || new URL(call.value).searchParams.get('pdir_fid') !== '0') return;
+      if (['incomplete-root', 'invalid-total'].includes(mode)) {
+        const page = Number(new URL(call.value).searchParams.get('_page'));
+        const list = Array.from({ length: 100 }, (_, index) => page === 1 && index === 0 ? row : { fid: `private-${page}-${index}`, file_name: 'private-directory', file: false, pdir_fid: '0' });
+        return Object.assign(Readable.from([JSON.stringify({ code: 0, status: 200, data: { list }, metadata: { _total: mode === 'invalid-total' ? 0 : 601 } })]), { statusCode: 200, headers: {} });
+      }
+      return reply({ list: mode === 'duplicate-row' ? [row, row] : [row] });
+    };
+    const shareId = (await restored.resources(detail)).resources[0].id, fileId = (await restored.files(detail, { shareId, line: 0, episode: 0 })).files[0].id;
+    const snapshot = metadata.get('quark-registry-v1');
+    const result = await restored.prepare(detail, { shareId, fileId, line: 0, episode: 0 });
+    assert.equal(result.status, 'error'); assert.equal(metadata.get('quark-registry-v1'), snapshot);
+    assert.equal(state.saved, 1); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+    assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+  });
+});
+
+test('revoking viewing authorization during folder identity proof cannot rebind the registry', async t => {
+  const { service, options, state, metadata, connect, save } = await fixture(t);
+  state.beforeRequest = call => call.path === '/config' ? reply({}) : undefined; await connect(); await save();
+  await connect({ cookie: COOKIE.replace('synthetic-account-A-secret', 'synthetic-account-A-cancelled-rotated') });
+  await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+  const shareId = (await restored.resources(detail)).resources[0].id, fileId = (await restored.files(detail, { shareId, line: 0, episode: 0 })).files[0].id;
+  const snapshot = metadata.get('quark-registry-v1'); let valid = true;
+  state.beforeRequest = call => { if (call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') === '0') valid = false; };
+  const result = await restored.prepare(detail, { shareId, fileId, line: 0, episode: 0, valid: () => valid });
+  assert.equal(result.status, 'error'); assert.match(result.reason, /授权已失效/); assert.equal(metadata.get('quark-registry-v1'), snapshot);
+  assert.equal(state.saved, 1); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+  assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+});
+
+test('folder identity reconnection preserves cleanup intent guards and never triggers deletion itself', async t => {
+  for (const mode of ['valid', 'wrong-account', 'wrong-parent', 'wrong-fid']) await t.test(mode, async t => {
+    const { service, options, state, metadata, connect, save } = await fixture(t);
+    state.beforeRequest = call => call.path === '/config' ? reply({}) : undefined; await connect({ maxDailyTransfers: 1 }); await save();
+    const before = JSON.parse(metadata.get('quark-registry-v1')), oldAccount = Object.keys(before.folders)[0], asset = before.assets[0];
+    asset.status = 'purging'; asset.watchedAt = state.clock - 2 * DAY; asset.lastActivity = asset.watchedAt;
+    asset.deleteIntent = { account: mode === 'wrong-account' ? 'f'.repeat(64) : oldAccount, parent: mode === 'wrong-parent' ? 'not-owned-parent' : asset.parent, fid: mode === 'wrong-fid' ? 'not-owned-file' : asset.fid, at: state.clock - DAY, record_id: 'kept-record' };
+    const intent = { ...asset.deleteIntent };
+    await connect({ cookie: COOKIE.replace('synthetic-account-A-secret', 'synthetic-account-A-intent-rotated') });
+    const account = JSON.parse(metadata.get('quark-settings-v1')).account.id;
+    metadata.set('quark-registry-v1', JSON.stringify(before)); await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+    state.source = [sourceVideo('new-video')];
+    const shareId = (await restored.resources(detail)).resources[0].id, fileId = (await restored.files(detail, { shareId, line: 0, episode: 0 })).files[0].id;
+    assert.match((await restored.prepare(detail, { shareId, fileId, line: 0, episode: 0 })).reason, /每日转存数量或容量上限/);
+    const migrated = JSON.parse(metadata.get('quark-registry-v1')).assets[0];
+    assert.equal(migrated.account, account); assert.equal(migrated.status, 'purging');
+    assert.deepEqual(migrated.deleteIntent, { ...intent, ...(mode === 'valid' ? { account } : {}) });
+    assert.equal(state.saved, 1); assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+    if (mode !== 'valid') {
+      await restored.configure({ cleanupEnabled: true, retentionDays: 1 });
+      assert.equal((await restored.cleanup()).deleted, 0); assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+    }
+  });
+});
+
+test('cleanup can reconnect a rotated identity but still refuses a changed managed file and leaves untracked files untouched', async t => {
+  const { service, options, state, metadata, connect, save } = await fixture(t);
+  state.beforeRequest = call => call.path === '/config' ? reply({}) : undefined;
+  await connect({ cleanupEnabled: true, retentionDays: 1 }); await save();
+  const before = JSON.parse(metadata.get('quark-registry-v1'));
+  before.assets[0].watchedAt = state.clock - 2 * DAY; before.assets[0].lastActivity = before.assets[0].watchedAt;
+  await connect({ cookie: COOKIE.replace('synthetic-account-A-secret', 'synthetic-account-A-cleanup-rotated') });
+  const account = JSON.parse(metadata.get('quark-settings-v1')).account.id;
+  metadata.set('quark-registry-v1', JSON.stringify(before)); await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+  state.files[0].file_name = 'user-renamed-managed-video.mp4';
+  state.files.push({ ...state.files[0], fid: 'untracked-user-video', file_name: 'untracked-user-video.mp4' });
+  const result = await restored.cleanup(); assert.equal(result.deleted, 0); assert.equal(result.errors, 1);
+  const after = JSON.parse(metadata.get('quark-registry-v1'));
+  assert.equal(after.assets.length, 1); assert.equal(after.assets[0].account, account); assert.equal(after.assets[0].status, 'ready');
+  assert.equal(after.assets[0].deleteIntent, undefined); assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+  assert.equal(state.saved, 1); assert.equal(state.calls.filter(call => call.path === '/file' && call.options.method === 'POST').length, 1);
+});
+
 test('revoking the viewing authorization during directory indexing cancels all later reads and transfers', async t => {
   const { service, state, connect, select } = await fixture(t); await connect(); const selected = await select();
   let valid = true, confirmations = 0;

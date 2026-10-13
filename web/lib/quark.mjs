@@ -351,24 +351,38 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       const result = await auth(context, '/file/sort', { query: { pdir_fid: parent, _page: String(page), _size: '100', _fetch_total: '1', fetch_all_file: '1', _sort: 'file_type:asc,updated_at:desc' } }); current(context);
       if (!Array.isArray(result.data?.list) || result.data.list.length > 100) throw failure('无法可靠核验夸克文件目录');
       output.push(...result.data.list);
-      if (result.data.list.length < 100 || Number(result.metadata?._total) <= page * 100) { complete = true; break; }
+      const total = Number(result.metadata?._total);
+      if (result.data.list.length < 100 || Number.isSafeInteger(total) && total >= output.length && total <= page * 100) { complete = true; break; }
     }
     return { list: output, complete };
   }
   async function ownedFolder(context, create = false) {
     current(context);
     let folder = registry.folders[context.account];
-    if (!folder) { if (!create) throw failure('未找到本应用登记的夸克目录', 409); folder = { name: 'VipVideo-' + config.installId, createdAt: now() }; registry.folders[context.account] = folder; persist(); }
-    const root = await ownList(context, '0');
+    if (!folder) folder = { name: 'VipVideo-' + config.installId, createdAt: now() };
+    const root = await ownList(context, '0'); current(context);
     const matches = root.list.filter(row => directory(row) && row.file_name === folder.name && (!folder.fid || row.fid === folder.fid) && (!row.pdir_fid || row.pdir_fid === '0'));
-    if (matches.length === 1 && validFid(matches[0].fid) && (folder.fid || folder.mkdirStarted)) { folder.fid = matches[0].fid; delete folder.mkdirStarted; persist(); return folder; }
-    if (!create || folder.fid && !folder.mkdirStarted || !root.complete || matches.length) {
+    if (matches.length === 1 && validFid(matches[0].fid) && (folder.fid || folder.mkdirStarted && !Object.entries(registry.folders).some(([account, entry]) => account !== context.account && entry.fid === matches[0].fid))) { folder.fid = matches[0].fid; delete folder.mkdirStarted; persist(); return folder; }
+    if (!folder.fid && !folder.mkdirStarted && root.complete && matches.length === 1 && (matches[0].pdir_fid === '0' || matches[0].pdir_fid === 0) && !registry.assets.some(asset => asset.account === context.account)) {
+      const previous = Object.entries(registry.folders).filter(([account, entry]) => account !== context.account && entry.name === folder.name && validFid(entry.fid) && !entry.mkdirStarted);
+      if (previous.length === 1 && previous[0][1].fid === matches[0].fid) {
+        current(context);
+        const [account, entry] = previous[0]; folder = { ...entry };
+        for (const asset of registry.assets) if (asset.account === account && asset.parent === folder.fid) {
+          asset.account = context.account;
+          if (asset.deleteIntent?.account === account && asset.deleteIntent.parent === folder.fid && asset.deleteIntent.fid === asset.fid) asset.deleteIntent.account = context.account;
+        }
+        delete registry.folders[account]; registry.folders[context.account] = folder; persist(); return folder;
+      }
+    }
+    if (!create || folder.fid && !folder.mkdirStarted || !root.complete || root.list.some(row => row.file_name === folder.name)) {
       const reason = !root.complete ? '根目录列表超过核验范围，已停止操作'
         : matches.length > 1 ? '目录记录冲突，已停止操作'
           : folder.fid ? '已登记目录未找到或已改名、移动，请在夸克恢复原目录后重试'
             : matches.length ? '存在同名但未登记的目录，已停止操作' : '目录登记不完整，已停止操作';
       throw failure('无法确认本应用专用夸克目录：' + reason, 409);
     }
+    if (!registry.folders[context.account]) { registry.folders[context.account] = folder; persist(); }
     if (!folder.mkdirStarted) {
       const created = await auth(context, '/file', { method: 'POST', body: { pdir_fid: '0', file_name: folder.name, dir_path: '', dir_init_lock: false }, beforeSend: () => { current(context); folder.mkdirStarted = true; persist(); } }); current(context);
       if (created.data?.fid !== undefined) { if (!validFid(created.data.fid)) throw failure('无法核验夸克创建目录的响应', 409); folder.fid = created.data.fid; persist(); }
@@ -418,6 +432,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         current(context);
         if (!validFid(file.fid) || typeof file.token !== 'string' || !file.token || file.token.length > 4096 || !Number.isSafeInteger(file.size) || file.size <= 0 || file.size > 100 * GIB) throw failure('视频大小或分享凭证无法核验，已停止转存', 400);
         const resource = shares.get(file.share); if (!resource || resource.detail !== info.key || resource.expires <= now()) throw failure('分享资源已过期，请重新搜索', 404);
+        if (registry.assets.length >= 1000 && !registry.folders[context.account]?.fid) await ownedFolder(context);
         const source = hash(resource.pwdId + ':' + file.fid), existing = registry.assets.find(asset => asset.account === context.account && asset.source === source && asset.status !== 'deleted');
         if (existing) { if (detail.category === 'adult' || !existing.category) { existing.category = name(detail.category).slice(0, 32); persist(); } if (existing.status === 'ready') { await ownedFile(context, existing); return publicAsset(existing, true); } return resume(context, existing); }
         const day = new Date(now()).toISOString().slice(0, 10), retained = registry.assets.filter(asset => asset.status !== 'deleted' || asset.day === day);
@@ -425,6 +440,10 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         const today = registry.assets.filter(asset => asset.account === context.account && asset.day === day && asset.status !== 'queued');
         if (today.length >= config.maxDailyTransfers || today.reduce((sum, asset) => sum + asset.size, 0) + file.size > config.maxDailyBytes || registry.assets.length >= 1000) throw failure('已达到本应用每日转存数量或容量上限', 429);
         const folder = await ownedFolder(context, true); current(context);
+        const reconnected = registry.assets.find(asset => asset.account === context.account && asset.source === source && asset.status !== 'deleted');
+        if (reconnected) { if (detail.category === 'adult' || !reconnected.category) { reconnected.category = name(detail.category).slice(0, 32); persist(); } if (reconnected.status === 'ready') { await ownedFile(context, reconnected); return publicAsset(reconnected, true); } return resume(context, reconnected); }
+        const reconnectedToday = registry.assets.filter(asset => asset.account === context.account && asset.day === day && asset.status !== 'queued');
+        if (reconnectedToday.length >= config.maxDailyTransfers || reconnectedToday.reduce((sum, asset) => sum + asset.size, 0) + file.size > config.maxDailyBytes || registry.assets.length >= 1000) throw failure('已达到本应用每日转存数量或容量上限', 429);
         const asset = { id: id(), account: context.account, managed: true, source, parent: folder.fid, name: file.name, size: file.size, category: name(detail.category).slice(0, 32), day, createdAt: now(), lastActivity: now(), status: 'queued' };
         queuedAsset = asset;
         registry.assets.push(asset); persist();
