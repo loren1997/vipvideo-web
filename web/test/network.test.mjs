@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { gzipSync } from 'node:zlib';
+import http from 'node:http';
 import { createRequest, isPublicAddress, readText, validateUrl } from '../lib/network.mjs';
 
 function response(body = '', statusCode = 200, headers = {}) {
@@ -71,9 +72,49 @@ test('pins the validated DNS address and validates every redirect', async () => 
   const result = await safeRequest('https://source.example/api');
   assert.deepEqual(lookupCalls, ['source.example', 'cdn.example']);
   assert.deepEqual(calls[0].addresses, [{ address: '8.8.8.8', family: 4 }]);
-  assert.equal(calls[0].options.agent, false);
+  assert.equal(calls[0].options.agent.keepAlive, true);
   assert.equal(result.finalUrl, 'https://cdn.example/list?key=1');
   assert.equal(await readText(result), 'ok');
+});
+
+test('reuses bounded media connections only for the same validated address while rechecking DNS', async t => {
+  let connections = 0, lookups = 0, requests = 0;
+  const server = http.createServer((_req, res) => { requests++; res.end('part'); });
+  server.on('connection', () => connections++);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const agents = new Set(), addresses = ['8.8.8.8', '8.8.8.8', '1.1.1.1', '10.0.0.1'];
+  const request = createRequest({ lookup: async () => [{ address: addresses[lookups++], family: 4 }],
+    httpRequest: (url, options, callback) => {
+      agents.add(options.agent);
+      return http.request({ ...options, hostname: '127.0.0.1', port: server.address().port, path: url.pathname }, callback);
+    } });
+  t.after(async () => { for (const agent of agents) agent?.destroy?.(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  for (let index = 0; index < 3; index++) assert.equal(await readText(await request('http://cdn.example/part.ts')), 'part');
+  await assert.rejects(request('http://cdn.example/part.ts'), { status: 403 });
+  assert.equal(lookups, 4, 'Every media request still validates current DNS records');
+  assert.equal(requests, 3, 'A later private DNS answer must not reuse an existing public socket');
+  assert.equal(connections, 2, 'The first two segments reuse a connection; a different validated IP uses a new one');
+  assert.equal(agents.size, 1);
+  const [agent] = agents;
+  assert.equal(agent.keepAlive, true);
+  assert.ok(agent.maxSockets <= 8 && agent.maxTotalSockets <= 32 && agent.maxFreeSockets <= 2);
+});
+
+test('aborting while waiting for response headers releases the outgoing media connection', async t => {
+  let received, closed;
+  const entered = new Promise(resolve => { received = resolve; }), disconnected = new Promise(resolve => { closed = resolve; });
+  const server = http.createServer(req => { req.on('close', closed); received(); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const agents = new Set();
+  const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpRequest: (url, options, callback) => {
+    agents.add(options.agent);
+    return http.request({ ...options, hostname: '127.0.0.1', port: server.address().port, path: url.pathname }, callback);
+  } });
+  t.after(async () => { for (const agent of agents) agent?.destroy?.(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  const controller = new AbortController(), pending = request('http://cdn.example/slow.ts', { signal: controller.signal, timeout: 200 });
+  await entered; controller.abort();
+  await assert.rejects(pending, error => error.cause?.code === 'ABORT_ERR');
+  await disconnected;
 });
 
 test('mixed public/private DNS and redirects to private IP cannot reach transport', async () => {

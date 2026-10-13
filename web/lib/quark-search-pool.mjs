@@ -1,7 +1,7 @@
 import { Readable } from 'node:stream';
 import { request as networkRequest, readText, validateUrl } from './network.mjs';
 import { createQuarkSearchRequest } from './quark-search.mjs';
-import { searchGoogleQuark } from './quark-google-search.mjs';
+import { searchGoogleQuark, searchBingQuark, quarkPasswordDate } from './quark-google-search.mjs';
 
 const KEY = 'quark-search-pool-v1', DAY = 86_400_000, HEALTH_INTERVAL = 6 * 60 * 60_000;
 const RECALL_KEY = 'quark-search-availability-v3';
@@ -101,22 +101,6 @@ function compatible(body, at) {
   if (payload === data.data && !Array.isArray(payload) && payload.total === 0 && [0, 200, '0', '200'].includes(data.code) && !['results', 'merged_by_type', 'list'].some(key => Object.hasOwn(payload, key))) return [];
   if (!Array.isArray(payload) && !Array.isArray(payload.results) && !Array.isArray(payload.list) && !Array.isArray(payload.items) && !(payload.merged_by_type && typeof payload.merged_by_type === 'object' && !Array.isArray(payload.merged_by_type))) return;
   return shares(data, at);
-}
-function rssShares(body, at) {
-  if (!/<rss\b/i.test(body) || /<!DOCTYPE\b|<!ENTITY\b|captcha|安全验证/i.test(body)) throw failure('公开网页搜索暂不可用');
-  const rows = new Map(); let visited = 0;
-  for (const item of body.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)) {
-    if (++visited > 500) break;
-    const title = (/<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(item[1])?.[1] || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/<[^>]*>/g, '').replace(/&(?:amp|quot|apos|lt|gt);/g, value => ({ '&amp;': '&', '&quot;': '"', '&apos;': "'", '&lt;': '<', '&gt;': '>' })[value]).slice(0, 300);
-    const publishedAt = timestamp(/<pubDate\b[^>]*>([\s\S]*?)<\/pubDate>/i.exec(item[1])?.[1]?.trim(), at);
-    for (const match of item[1].replace(/&amp;/g, '&').matchAll(/https:\/\/pan\.quark\.cn\/s\/[a-z0-9]{6,32}(?:\?pwd=[a-z0-9]{1,16})?/gi)) {
-      const link = share(match[0]);
-      if (link) mergeShare(rows, { ...link, name: title, ...(publishedAt ? { publishedAt } : {}) });
-      if (rows.size >= 10_000) break;
-    }
-    if (rows.size >= 10_000) break;
-  }
-  return [...rows.values()];
 }
 const normalized = value => value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 function queryTerms(keyword, values, yearHint) {
@@ -325,7 +309,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           if (stopping || entry.expires <= now()) return;
           for (const row of rows) {
             const { publishedAt: rawDate, ...item } = row, publishedAt = timestamp(rawDate, now());
-            mergeShare(entry.rows, { ...item, ...(publishedAt ? { publishedAt } : {}) });
+            mergeShare(entry.rows, { ...item, ...(publishedAt ? { publishedAt } : {}), ...(row[quarkPasswordDate] === undefined ? {} : { [passwordDate]: row[quarkPasswordDate] }) });
           }
           entry.rows = new Map(ranked(entry.rows.values(), query).slice(0, 30).map(row => [new URL(row.url).pathname, row]));
         };
@@ -362,10 +346,9 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           if (stopping) throw failure('公开搜索已停止', 503, true);
           return result([...entry.rows.values()], query, entry.reason);
         }
-        const fallback = new URL('https://www.bing.com/search'); fallback.search = new URLSearchParams({ q: query.title + ' site:pan.quark.cn/s', format: 'rss' }).toString();
         const pages = await Promise.allSettled([
           googleSearch(query.title, { aliases: query.aliases, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), true), deadline, now }),
-          text(fallback.href, Math.max(1, deadline - now()), request, 2 * 1024 * 1024, deadline).then(body => rssShares(body, now())),
+          searchBingQuark(query.title, { aliases: query.aliases, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), new URL(url).hostname !== 'www.bing.com'), deadline, now }),
         ]);
         if (stopping) throw failure('公开搜索已停止', 503, true);
         for (const [index, page] of pages.entries()) if (page.status === 'fulfilled') merge(page.value); else report((index === 0 ? 'Google 公开搜索：' : 'Bing 公开搜索：') + safeFailure(page.reason).quarkPoolReason);

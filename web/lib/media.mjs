@@ -69,13 +69,18 @@ export function createMedia({ request = networkRequest, secret = randomBytes(32)
         if (data.type !== 'hls') headers.range = req.headers.range;
       }
       if (!['GET', 'HEAD'].includes(req.method || 'GET')) throw failure('不支持的媒体请求方法', 400);
-      const upstream = await request(data.url, { headers, method: req.method || 'GET', timeout: 8000 });
-      if (req.aborted || res.destroyed) { upstream.destroy(); return; }
-      let clientDisconnected = false;
-      const cancel = () => { if (!res.writableFinished && !upstream.destroyed) clientDisconnected = true; upstream.destroy(); };
+      const controller = new AbortController();
+      let upstream, clientDisconnected = false;
+      const cancel = () => {
+        if (!res.writableFinished && !upstream?.destroyed) clientDisconnected = true;
+        controller.abort(); upstream?.destroy();
+      };
       req.once('aborted', cancel);
       res.once('close', cancel);
       try {
+        if (req.aborted || res.destroyed) { cancel(); return; }
+        upstream = await request(data.url, { headers, method: req.method || 'GET', timeout: 8000, signal: controller.signal });
+        if (req.aborted || res.destroyed) { cancel(); return; }
         if (![200, 206, 304, 416].includes(upstream.statusCode)) throw failure(`媒体源返回 HTTP ${upstream.statusCode}`);
         const finalUrl = upstream.finalUrl || data.url;
         const manifest = data.type === 'hls' || /mpegurl/i.test(String(upstream.headers['content-type'] || '')) || /\.m3u8$/i.test(new URL(finalUrl).pathname);
@@ -103,7 +108,7 @@ export function createMedia({ request = networkRequest, secret = randomBytes(32)
         if (req.method === 'HEAD' || upstream.statusCode === 304 || upstream.statusCode === 416) { upstream.destroy(); res.end(); return; }
         await pipeline(upstream, res);
       } catch (cause) {
-        upstream.destroy();
+        upstream?.destroy();
         if (clientDisconnected || req.aborted) return;
         throw cause.status ? cause : failure('媒体传输中断，请重试或切换线路', 502, cause);
       } finally {

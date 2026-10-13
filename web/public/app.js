@@ -26,6 +26,58 @@ const resourceSnapshots = new Map();
 const resourceRequests = new Map();
 let liveSnapshot;
 let resourceVersion = 0;
+const automaticTv = /VIPVideoWebTV|Android TV|GoogleTV|SMART-TV|SmartTV|HbbTV|NetCast/i.test(navigator.userAgent) || document.documentElement.dataset.tv === 'true';
+let tvPreference = 'auto';
+try { const saved = localStorage.getItem('vipvideo-tv-mode'); if (['auto', 'tv', 'standard'].includes(saved)) tvPreference = saved; } catch {}
+let tvMode = false, tvRoutePending = false;
+const tvFocusHistory = new Map();
+window.__vipTvFocus = true; // The page owns TV navigation; older APKs must not install a second handler.
+function applyTvMode() {
+  tvMode = tvPreference === 'tv' || tvPreference === 'auto' && automaticTv;
+  document.documentElement.dataset.tv = String(tvMode);
+}
+applyTvMode();
+
+function tvControls(root = document) {
+  return [...root.querySelectorAll('a[href],button,input,select,textarea,summary,video[controls],[tabindex]')].filter(element => element.tabIndex >= 0 && !element.disabled && !element.closest('[hidden],[inert],[aria-hidden="true"]') && element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden');
+}
+function tvFocusKey(element) {
+  return `${element.tagName}:${element.getAttribute('aria-label') || element.id || element.getAttribute('href') || element.textContent.trim().slice(0, 120)}`;
+}
+function tvFocusRoute(final = false) {
+  if (!tvMode || $('#app-view').hidden) return;
+  const controls = tvControls(content), saved = tvFocusHistory.get(location.hash);
+  if (!controls.length && !final) return;
+  let target = saved && controls.find(element => tvFocusKey(element) === saved.key);
+  if (saved && !target && !final) return;
+  const home = !location.hash || location.hash.split('?')[0] === '#home';
+  target ||= saved && controls[saved.index] || home && $('.category-tabs .selected', content) || controls.find(element => element.matches('video,.poster-link,.channel-card')) || controls[0] || $('nav a[aria-current="page"]');
+  if (target) { target.focus({ preventScroll: true }); target.scrollIntoView({ block: 'nearest', inline: 'nearest' }); tvRoutePending = false; }
+}
+document.addEventListener('focusin', event => {
+  if (!tvMode || !content.contains(event.target)) return;
+  const controls = tvControls(content); tvFocusHistory.set(location.hash, { key: tvFocusKey(event.target), index: controls.indexOf(event.target) });
+  if (tvFocusHistory.size > 24) tvFocusHistory.delete(tvFocusHistory.keys().next().value);
+});
+new MutationObserver(() => { if (tvRoutePending) tvFocusRoute(); else if (tvMode && document.activeElement === document.body) tvFocusRoute(true); }).observe(content, { childList: true, subtree: true });
+
+function moveTvFocus(key, current) {
+  const candidates = tvControls(), horizontal = key === 'ArrowLeft' || key === 'ArrowRight';
+  if (!candidates.includes(current)) { tvFocusRoute(true); return; }
+  const rect = current.getBoundingClientRect(), x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+  let best, score = Infinity;
+  for (const candidate of candidates) {
+    if (candidate === current) continue;
+    const box = candidate.getBoundingClientRect(), dx = box.left + box.width / 2 - x, dy = box.top + box.height / 2 - y;
+    const primary = key === 'ArrowRight' ? dx : key === 'ArrowLeft' ? -dx : key === 'ArrowDown' ? dy : -dy;
+    if (primary <= 3) continue;
+    const overlap = horizontal ? box.bottom > rect.top && box.top < rect.bottom : box.right > rect.left && box.left < rect.right;
+    const distance = primary + (overlap ? 0 : Math.abs(horizontal ? dy : dx) * 3 + 10000);
+    if (distance < score) { score = distance; best = candidate; }
+  }
+  if (best) { best.focus({ preventScroll: true }); best.scrollIntoView({ block: 'nearest', inline: 'nearest' }); }
+  tvRoutePending = false;
+}
 
 function resourceKey(path) { return `${resourceVersion}:${path}`; }
 
@@ -1621,7 +1673,7 @@ function mountPlayer(current) {
     note.textContent = '第三方网页可能拒绝嵌入；黑屏或无法播放时请切换解析线路或外部打开。这里只保存链接历史，无法同步网页内进度。';
     update(); return;
   }
-  const video = node('video'); video.controls = true; video.playsInline = true; video.preload = 'metadata'; video.setAttribute('aria-label', `${current.detail.title} ${current.episodeName || ''}`); current.video = video; surface.append(video);
+  const video = node('video'); video.controls = true; video.tabIndex = 0; video.playsInline = true; video.preload = 'metadata'; video.setAttribute('aria-label', `${current.detail.title} ${current.episodeName || ''}`); current.video = video; surface.append(video);
   const backward = button('−10 秒', () => seekVideo(current, -10)); backward.setAttribute('aria-label', '快退 10 秒'); backward.disabled = Boolean(current.live);
   const forward = button('+10 秒', () => seekVideo(current, 10)); forward.setAttribute('aria-label', '快进 10 秒'); forward.disabled = Boolean(current.live);
   const speed = node('select'); speed.setAttribute('aria-label', '播放速度');
@@ -1638,6 +1690,10 @@ function mountPlayer(current) {
     catch (error) { notify(error.message, true); }
   });
   toolbar.append(backward, forward, speed, full);
+  const qualitySelect = node('select'); qualitySelect.setAttribute('aria-label', '播放画质'); qualitySelect.hidden = true;
+  const automaticQuality = node('option', '自动画质'); automaticQuality.value = '-1'; qualitySelect.append(automaticQuality); current.qualitySelect = qualitySelect;
+  qualitySelect.addEventListener('change', () => { const level = Number(qualitySelect.value); if (player === current && hls && (level === -1 || Number.isInteger(level) && level >= 0 && level < hls.levels.length)) hls.currentLevel = level; });
+  toolbar.append(qualitySelect);
   if (current.catalog || current.live) {
     current.compatibilityButton = button(current.transcoded ? '重新兼容播放' : '兼容播放', () => void startCompatibility(current));
     current.compatibilityButton.title = '原始线路无法解码或有画面无声音时，通过服务器转换为兼容格式'; toolbar.append(current.compatibilityButton);
@@ -1775,6 +1831,7 @@ async function loadMedia(current, message = '正在连接播放地址…') {
   if (!url) return playbackError(current);
   current.note.className = 'player-note'; current.note.textContent = message;
   const video = current.video;
+  if (current.qualitySelect) { current.qualitySelect.hidden = true; current.qualitySelect.replaceChildren(new Option('自动画质', '-1')); }
   if (current.type === 'hls') {
     try { await ensureHls(); }
     catch (error) {
@@ -1786,16 +1843,27 @@ async function loadMedia(current, message = '正在连接播放地址…') {
   current.loadTimer = setTimeout(() => { if (player === current && generation === current.mediaVersion && video.readyState < 2) playbackError(current); }, 15000);
   if (current.type === 'hls' && window.Hls?.isSupported()) {
     const quality = current.live && !current.transcoded ? liveQuality(current.channel.streams[current.line]) : null;
-    const selectLevel = Boolean(quality);
-    hls = new window.Hls(current.transcoded ? { startPosition: 0 } : selectLevel ? { autoStartLoad: false } : {}); const instance = hls; hls.loadSource(url); hls.attachMedia(video);
+    const selectLevel = Boolean(quality) || !current.live;
+    hls = new window.Hls({ maxBufferLength: 30, maxMaxBufferLength: 60, backBufferLength: 20, maxBufferSize: 32 * 1024 * 1024, ...(current.transcoded ? { startPosition: 0 } : {}), ...(selectLevel ? { autoStartLoad: false } : {}) }); const instance = hls; hls.loadSource(url); hls.attachMedia(video);
     hls.on(window.Hls.Events.ERROR, (_event, data) => { if (player === current && generation === current.mediaVersion && data.fatal) playbackError(current, data); });
     hls.on(window.Hls.Events.MANIFEST_PARSED, (_event, data) => {
       if (player !== current || generation !== current.mediaVersion) return;
+      const levels = data?.levels || instance.levels || [];
+      if (current.qualitySelect) {
+        const heights = new Set();
+        for (let index = 0; index < levels.length; index++) {
+          const height = levels[index].height;
+          if (!Number.isInteger(height) || height < 144 || height > 4320 || heights.has(height)) continue;
+          heights.add(height); const option = new Option(height === 2160 ? '4K' : `${height}p`, String(index)); current.qualitySelect.append(option);
+        }
+        current.qualitySelect.hidden = heights.size < 2;
+      }
       if (selectLevel) {
-        const levels = data?.levels || instance.levels || [];
-        const index = hlsInitialLevel(levels, quality);
+        const choices = levels.map((level, index) => ({ ...level, index })).filter(level => Number.isInteger(level.height) && level.height > 0);
+        const preferred = choices.filter(level => level.height <= 1080).sort((a, b) => b.height - a.height || (a.bitrate || 0) - (b.bitrate || 0))[0] || choices.sort((a, b) => a.height - b.height)[0];
+        const index = quality ? hlsInitialLevel(levels, quality) : preferred?.index ?? -1;
         if (index >= 0) instance.startLevel = index;
-        instance.startLoad?.(-1);
+        instance.startLoad?.(current.transcoded ? 0 : -1);
       }
       attemptPlay(current, generation);
     });
@@ -2009,6 +2077,12 @@ function renderSettings() {
   }, 'button');
   tools.append(save); page.append(tools, node('p', `${draft.sources.length} 个影视源 · ${draft.subscriptions.length} 个订阅 · ${draft.liveSources.length} 个直播源。按需展开设置；新增、排序、停用后点击「保存全部设置」。`, 'settings-note'));
   const sections = node('div', undefined, 'settings-directory'); page.append(sections);
+  const interfaceLabel = node('label', '本机界面模式'); const interfaceMode = node('select'); interfaceMode.setAttribute('aria-label', '本机界面模式');
+  for (const [value, caption] of [['auto', '自动识别'], ['tv', '电视遥控'], ['standard', '手机 / 电脑']]) { const option = node('option', caption); option.value = value; interfaceMode.append(option); }
+  interfaceMode.value = tvPreference;
+  interfaceMode.addEventListener('change', () => { tvPreference = interfaceMode.value; try { localStorage.setItem('vipvideo-tv-mode', tvPreference); } catch {} applyTvMode(); });
+  interfaceLabel.append(interfaceMode); tools.append(interfaceLabel);
+  page.append(node('p', '界面模式仅保存到本机，电视 App 自动启用。遥控方向键移动、确定选择；视频焦点下左右快进快退、确定暂停，下键进入按钮。输入框左右编辑，选择框上下切换、左右离开。', 'settings-note'));
   const display = settingsSection('分类显示', draft.showAdult ? '三级分类已显示 · 全家庭共用' : '三级分类已隐藏 · 全家庭共用');
   const adultLabel = node('label', '显示“三级”分类', 'display-option');
   const adultCheckbox = node('input'); adultCheckbox.type = 'checkbox'; adultCheckbox.checked = draft.showAdult === true; adultCheckbox.setAttribute('aria-label', '显示“三级”分类'); adultCheckbox.addEventListener('change', () => { draft.showAdult = adultCheckbox.checked; });
@@ -2068,6 +2142,12 @@ function updateSourceStatus() {
 
 async function renderRoute() {
   if ($('#app-view').hidden) return;
+  if (tvMode && !tvFocusHistory.has(location.hash)) {
+    const active = document.activeElement;
+    if (content.contains(active) && active.matches('select,input,textarea')) tvFocusHistory.set(location.hash, { key: tvFocusKey(active), index: tvControls(content).indexOf(active) });
+    else window.scrollTo(0, 0);
+  }
+  tvRoutePending = tvMode;
   const stamp = ++routeVersion; void stopPlayer(); detail = null; detailTarget = null;
   const [view, rawQuery = ''] = location.hash.slice(1).split('?'); const params = new URLSearchParams(rawQuery);
   const titles = { home: '首页', search: '搜索影片', favorites: '我的收藏', history: '观看记录', settings: '资源设置', detail: '影片详情', link: '链接播放', live: '电视直播' };
@@ -2096,7 +2176,7 @@ async function renderRoute() {
     if (error.adultHidden) leaveAdultScreen();
     else content.replaceChildren(empty('暂时无法打开', error.message, button('返回首页', () => goto('home'))));
   }
-  finally { if (stamp === routeVersion) content.setAttribute('aria-busy', 'false'); }
+  finally { if (stamp === routeVersion) { content.setAttribute('aria-busy', 'false'); if (tvRoutePending || tvMode && document.activeElement === document.body) tvFocusRoute(true); } }
 }
 
 function showLogin() {
@@ -2123,6 +2203,25 @@ $('#logout').addEventListener('click', async () => {
 window.addEventListener('hashchange', () => void renderRoute());
 window.addEventListener('keydown', event => {
   const current = player, target = event.target;
+  if (tvMode && !event.defaultPrevented && !event.altKey && !event.ctrlKey && !event.metaKey && !event.isComposing && target instanceof Element) {
+    if (target.matches('input[type="number"]') && event.key === 'Enter') { event.preventDefault(); moveTvFocus('ArrowDown', target); return; }
+    if (target.matches('textarea')) {
+      if (event.key === 'ArrowUp' && target.selectionStart === 0 || event.key === 'ArrowDown' && target.selectionEnd === target.value.length) { event.preventDefault(); moveTvFocus(event.key, target); }
+      return;
+    }
+    const textEntry = target.matches('input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="range"]),textarea') || target.isContentEditable;
+    if (target.isContentEditable || textEntry && ['ArrowLeft', 'ArrowRight', 'Enter', ' ', 'Escape', 'Backspace'].includes(event.key) || target.matches('input[type="number"]') && ['ArrowUp', 'ArrowDown'].includes(event.key) || target.matches('select') && ['ArrowUp', 'ArrowDown', 'Enter', ' ', 'Escape'].includes(event.key) || target.matches('input[type="range"]') && ['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+    if (current?.video && (target === current.video || /^Media(?:Play|Pause|PlayPause|FastForward|Rewind)$/.test(event.key))) {
+      if (['Enter', ' ', 'MediaPlay', 'MediaPause', 'MediaPlayPause'].includes(event.key)) {
+        event.preventDefault(); event.stopPropagation(); if (event.key === 'MediaPause' || event.key !== 'MediaPlay' && !current.video.paused) current.video.pause(); else void current.video.play().catch(error => notify(error.message, true)); return;
+      }
+      if (['ArrowLeft', 'ArrowRight', 'MediaFastForward', 'MediaRewind'].includes(event.key)) { event.preventDefault(); event.stopPropagation(); seekVideo(current, ['ArrowRight', 'MediaFastForward'].includes(event.key) ? 10 : -10); return; }
+    }
+    if (event.key === 'Enter' && target.matches('input[type="checkbox"],input[type="radio"]')) { event.preventDefault(); target.click(); return; }
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.key)) { event.preventDefault(); moveTvFocus(event.key, target); return; }
+    if (event.key === 'Escape' && !document.fullscreenElement && location.hash.startsWith('#detail')) { event.preventDefault(); if (history.length > 1) history.back(); else goto('home'); return; }
+    return;
+  }
   if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || !current?.video || !(target instanceof Element) || !$('#player-host')?.contains(target) || target.matches('input,textarea,select') || target.closest('[contenteditable="true"]')) return;
   if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); seekVideo(current, event.key === 'ArrowRight' ? 10 : -10); }
   else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
@@ -2130,7 +2229,7 @@ window.addEventListener('keydown', event => {
     const index = controls.indexOf(target), direction = event.key === 'ArrowDown' ? 1 : -1;
     if (controls.length) { event.preventDefault(); controls[(index + direction + controls.length) % controls.length].focus(); }
   }
-});
+}, true);
 $('.skip-link').addEventListener('click', event => { event.preventDefault(); content.focus({ preventScroll: true }); });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden && player) void saveHistory(player);

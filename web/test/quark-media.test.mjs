@@ -41,6 +41,46 @@ test('cloud credentials stay on exact official origins and HLS child URLs remain
   assert.match(calls[1].url, /sign=keep$/);
 });
 
+test('publishes an adaptive master without disclosing upstream links or account credentials', async t => {
+  const variants = [
+    { type: 'hls', url: 'https://video.quark.cn/720.m3u8?sign=720-secret', width: 1280, height: 720, bandwidth: 3000000 },
+    { type: 'hls', url: 'https://video.quark.cn/1080.m3u8?sign=1080-secret', width: 1920, height: 1080, bandwidth: 6000000 },
+    { type: 'hls', url: 'https://video.quark.cn/2160.m3u8?sign=2160-secret', width: 3840, height: 2160, bandwidth: 18000000 },
+  ];
+  const { cloud, calls, base } = await fixture(t, { quark: { playback: async () => descriptor({ variants: [...variants, variants[0]] }) } });
+  const lease = await cloud.playback('asset');
+  assert.equal(lease.response.quality, '自动画质');
+  const response = await fetch(base + lease.response.url), master = await response.text();
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'application/vnd.apple.mpegurl; charset=utf-8');
+  assert.ok(master.startsWith('#EXTM3U\n'));
+  assert.equal(calls.length, 0, 'Generating the master must not fetch every quality');
+  assert.ok(!master.includes('video.quark.cn') && !master.includes('secret'));
+  assert.match(master, /BANDWIDTH=6000000,RESOLUTION=1920x1080/);
+  const children = master.split('\n').filter(line => line.startsWith('/api/quark/media/'));
+  assert.equal(children.length, 3, 'Duplicate upstream qualities are omitted');
+  assert.ok(children.every(url => url.startsWith(lease.proxyPath + '?token=')));
+  assert.equal((await fetch(base + children[1])).status, 200);
+  assert.equal(calls[0].url, variants[1].url);
+  assert.equal(calls[0].headers.cookie, '__puus=account-secret');
+  const head = await fetch(base + lease.response.url, { method: 'HEAD' });
+  assert.equal(head.status, 200); assert.equal(await head.text(), '');
+  cloud.invalidate();
+  assert.equal((await fetch(base + lease.response.url)).status, 403);
+  assert.equal((await fetch(base + children[0])).status, 403);
+});
+
+test('adaptive master rejects invalid qualities and refuses the master token without variants', async t => {
+  const variant = { type: 'hls', url: 'https://video.quark.cn/720.m3u8', width: 1280, height: 720, bandwidth: 3000000 };
+  for (const variants of ['bad', Array(9).fill(variant), [{ ...variant, url: 'http://127.0.0.1/private' }],
+    [{ ...variant, type: 'mp4' }], [{ ...variant, width: Infinity }], [{ ...variant, bandwidth: -1 }], [{ ...variant, height: 90000 }]]) {
+    const cloud = createQuarkMedia({ quark: { playback: async () => descriptor({ variants }) } });
+    await assert.rejects(cloud.playback('asset'));
+  }
+  const { cloud, base } = await fixture(t), lease = await cloud.playback('asset');
+  assert.equal((await fetch(base + lease.proxyPath + '?token=master')).status, 403);
+});
+
 test('original download forwards Range while account changes invalidate media and in-flight leases', async t => {
   const { cloud, calls, base } = await fixture(t, { quark: { playback: async () => descriptor({ episode: { type: 'mkv', url: 'https://video.quark.cn/file.mkv' } }) } });
   const lease = await cloud.playback('asset');
@@ -88,6 +128,23 @@ test('disconnect closes a delayed upstream before it can stream old-account data
   const lease = await cloud.playback('asset'), result = fetch(base + lease.response.url);
   await ready; cloud.invalidate(); release();
   assert.equal((await result).status, 403); assert.equal(response.destroyed, true);
+});
+
+test('account invalidation aborts pending quality requests before any headers arrive', async t => {
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const { cloud, base } = await fixture(t, { request: async (_url, options) => {
+    entered();
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('uncancelled account request')), 100);
+      options.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(options.signal.reason); }, { once: true });
+    });
+  } });
+  const lease = await cloud.playback('asset'), pending = fetch(base + lease.response.url);
+  await started; cloud.invalidate();
+  const response = await pending;
+  assert.equal(response.status, 403);
+  assert.match(await response.text(), /会话已变更/);
 });
 
 test('disconnect aborts an already streaming original download', async t => {

@@ -55,7 +55,14 @@ export function validateUrl(value) {
 }
 
 export function createRequest({ lookup = dnsLookup, httpRequest = http.request, httpsRequest = https.request } = {}) {
-  return async function safeRequest(value, { headers = {}, timeout = 8000, method = 'GET', body, followRedirects = true } = {}) {
+  const agents = { 'http:': new http.Agent({ keepAlive: true, maxSockets: 6, maxTotalSockets: 24, maxFreeSockets: 2, timeout: 15000 }),
+    'https:': new https.Agent({ keepAlive: true, maxSockets: 6, maxTotalSockets: 24, maxFreeSockets: 2, timeout: 15000 }) };
+  for (const agent of Object.values(agents)) {
+    const getName = agent.getName;
+    // 仅复用同一已验证公网 IP 的连接，DNS 变化仍需重新校验并建连。
+    agent.getName = function (options) { return `${getName.call(this, options)}:${options.validatedAddress}`; };
+  }
+  return async function safeRequest(value, { headers = {}, timeout = 8000, method = 'GET', body, followRedirects = true, signal } = {}) {
     if (!['GET', 'HEAD', 'POST'].includes(method)) throw failure('不支持的请求方法', 400);
     if (typeof followRedirects !== 'boolean') throw failure('重定向设置无效', 400);
     if (body !== undefined && (method !== 'POST' || !(typeof body === 'string' || Buffer.isBuffer(body)) || Buffer.byteLength(body) > 65536)) throw failure('请求正文无效或超过 64 KiB', 400);
@@ -64,6 +71,7 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
     let requestHeaders = { ...headers };
     try {
       for (let redirects = 0; redirects <= 3; redirects++) {
+        signal?.throwIfAborted();
         const remaining = deadline - Date.now();
         if (remaining <= 0) throw failure('影视源请求超时');
         let timer;
@@ -73,6 +81,7 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
           literalFamily ? [{ address: hostname, family: literalFamily }] : lookup(hostname, { all: true, verbatim: true }),
           new Promise((_, reject) => { timer = setTimeout(() => reject(failure('影视源请求超时')), remaining); }),
         ]).finally(() => clearTimeout(timer));
+        signal?.throwIfAborted();
         if (!records.length || records.some(record => !isPublicAddress(record.address))) {
           throw failure('不允许访问内网或保留地址', 403);
         }
@@ -80,7 +89,8 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
         const response = await new Promise((resolve, reject) => {
           const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
           const outgoing = transport(url, {
-            method, agent: false, headers: { 'accept-encoding': 'identity', ...requestHeaders },
+            method, agent: agents[url.protocol], validatedAddress: selected.address, signal,
+            headers: { 'accept-encoding': 'identity', ...requestHeaders },
             // 固定已验证的地址，避免校验后再次 DNS 解析产生重绑定。
             lookup: (_host, options, callback) => options.all
               ? callback(null, [selected]) : callback(null, selected.address, selected.family),

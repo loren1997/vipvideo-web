@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { Readable, Writable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { createHmac } from 'node:crypto';
 import { createMedia } from '../lib/media.mjs';
+import { createRequest } from '../lib/network.mjs';
 
 function response(body, statusCode = 200, headers = {}, finalUrl) { return Object.assign(Readable.from([Buffer.from(body)]), { statusCode, headers, finalUrl }); }
 function detail(url, type = 'hls') { return { source: 'fixture', lines: [{ name: '高清', episodes: [{ name: '正片', url, type }] }] }; }
@@ -153,6 +154,56 @@ test('client disconnect destroys an active upstream stream', async t => {
   controller.abort();
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(upstream.destroyed, true);
+});
+
+test('fully consumed proxy segments retain the upstream keep-alive connection', async t => {
+  let connections = 0;
+  const ranges = [], chunk = Buffer.alloc(65536, 'v');
+  const upstreamServer = createServer(async (req, res) => {
+    ranges.push(req.headers.range);
+    res.setHeader('Content-Type', 'video/mp2t'); res.setHeader('Content-Length', chunk.length * 4);
+    if (req.headers.range) { res.statusCode = 206; res.setHeader('Content-Range', `bytes 0-${chunk.length * 4 - 1}/${chunk.length * 4}`); }
+    for (let index = 0; index < 4; index++) { res.write(chunk); await new Promise(resolve => setImmediate(resolve)); }
+    res.end();
+  });
+  upstreamServer.on('connection', () => connections++);
+  await new Promise(resolve => upstreamServer.listen(0, '127.0.0.1', resolve));
+  const agents = new Set();
+  const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpRequest: (url, options, callback) => {
+    agents.add(options.agent);
+    return httpRequest({ ...options, hostname: '127.0.0.1', port: upstreamServer.address().port, path: url.pathname }, callback);
+  } });
+  t.after(async () => { for (const agent of agents) agent.destroy(); upstreamServer.closeAllConnections(); await new Promise(resolve => upstreamServer.close(resolve)); });
+  const media = createMedia({ request }), base = await serverFor(t, media);
+  const playback = media.playback(detail('http://cdn.example/video.mp4', 'mp4'), 0, 0);
+  for (let index = 0; index < 3; index++) {
+    const response = await fetch(base + playback.proxyUrl, index ? { headers: { range: `bytes=0-${chunk.length * 4 - 1}` } } : {});
+    assert.equal(response.status, index ? 206 : 200);
+    assert.equal((await response.arrayBuffer()).byteLength, chunk.length * 4);
+  }
+  assert.deepEqual(ranges, [undefined, 'bytes=0-262143', 'bytes=0-262143']);
+  assert.equal(connections, 1, 'Normal downstream completion must not abort the reusable upstream socket');
+});
+
+test('a seek or client disconnect cancels upstream work before response headers arrive', async () => {
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const media = createMedia({ request: async (_url, options) => {
+    entered();
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('upstream was not cancelled')), 100);
+      options.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(options.signal.reason); }, { once: true });
+    });
+  } });
+  const req = Object.assign(new EventEmitter(), { headers: { range: 'bytes=500-' }, method: 'GET', aborted: false });
+  const res = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+  res.setHeader = () => {};
+  const playback = media.playback(detail('https://cdn.example/video.mp4', 'mp4'), 0, 0);
+  const pending = media.serve(req, res, tokenOf(playback.proxyUrl));
+  await started; req.aborted = true; req.emit('aborted');
+  await pending;
+  assert.equal(req.listenerCount('aborted'), 0);
+  assert.equal(res.listenerCount('close'), 0);
 });
 
 test('upstream stream errors remain observable after pipeline destroys the response', async () => {

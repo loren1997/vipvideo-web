@@ -18,6 +18,8 @@ HTML、JavaScript、CSS 和 SVG 静态资源支持 gzip、ETag / Last-Modified �
 
 Android 手机与 Android TV 使用同一安装包，连接局域网 NAS 或你已有的外网地址。下载与连接步骤见 [README-ANDROID.md](README-ANDROID.md)。
 
+Android TV App 自动启用电视布局，放大海报、文字与操作控件，并显示清楚的遥控焦点。方向键移动、确定选择；视频获得焦点时左右快进 / 快退、确定暂停 / 继续，下键进入播放控制。路由切换后会为当前页面恢复焦点。也可在“资源设置 → 界面与遥控”手动切换电视模式，偏好只保存在当前设备。此界面由 NAS 网页提供，已有电视 APK 无需重装，更新镜像后重新打开 App 即可。
+
 ## NAS 直接部署镜像
 
 本项目公开源码和镜像。部署前先查看 [镜像发布 Actions](https://github.com/loren1997/vipvideo-web/actions/workflows/docker-publish.yml) 的最新运行是否全部通过。发布工作流构建并检查 `linux/amd64` 和 `linux/arm64` 镜像；NAS 不需要下载源码或本地构建。

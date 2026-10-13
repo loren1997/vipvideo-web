@@ -489,12 +489,27 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (asset.status !== 'ready') throw failure('夸克视频尚未就绪或正在清理', 409);
     asset.leaseUntil = now() + 120000; asset.lastActivity = now(); persist();
     await ownedFile(context, asset); current(context);
-    let target, type, mode = 'official', quality, officialError;
+    let target, type, mode = 'official', quality, variants, officialError;
     const diagnostic = cause => [Number.isInteger(cause?.quarkUpstreamStatus) ? 'HTTP ' + cause.quarkUpstreamStatus : '', Number.isSafeInteger(cause?.quarkUpstreamCode) ? 'API ' + cause.quarkUpstreamCode : ''].filter(Boolean).join('，');
     try {
       const result = await auth(context, '/file/v2/play/project', { method: 'POST', userAgent: PLAYBACK_UA, body: { fid: asset.fid, resolutions: 'low,normal,high,super,2k,4k', supports: 'fmp4_av,m3u8,dolby_vision' } }); current(context);
-      const list = (Array.isArray(result.data?.video_list) ? result.data.video_list : []).filter(row => row?.accessable !== false).map(row => row?.video_info).filter(info => typeof info?.url === 'string' && info.success !== false && info.finish !== false).sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
-      for (const info of list) { try { target = validateUrl(info.url).href; type = /\.m3u8$/i.test(new URL(target).pathname) || /hls|m3u8/i.test(String(info.format || info.hls_type || '')) ? 'hls' : 'mp4'; if (Number.isSafeInteger(info.width) && Number.isSafeInteger(info.height) && info.width > 0 && info.width <= 8192 && info.height > 0 && info.height <= 4320) quality = { width: info.width, height: info.height }; break; } catch {} }
+      const list = (Array.isArray(result.data?.video_list) ? result.data.video_list : []).slice(0, 64).filter(row => row?.accessable !== false).map(row => row?.video_info).filter(info => typeof info?.url === 'string' && info.success !== false && info.finish !== false).sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
+      const streams = [];
+      for (const info of list) {
+        try {
+          const url = validateUrl(info.url).href, type = /\.m3u8$/i.test(new URL(url).pathname) || /hls|m3u8/i.test(String(info.format || info.hls_type || '')) ? 'hls' : 'mp4';
+          const dimensions = Number.isSafeInteger(info.width) && Number.isSafeInteger(info.height) && info.width >= 16 && info.width <= 8192 && info.height >= 16 && info.height <= 4320 ? { width: info.width, height: info.height } : {};
+          // Quark can omit bitrate; a conservative resolution estimate lets HLS adapt after measuring fragments.
+          const bitrate = Number(info.bitrate), bandwidth = Number.isFinite(bitrate) && bitrate >= 100000 && bitrate <= 200000000 ? Math.ceil(bitrate) : Math.ceil((dimensions.width || 1920) * (dimensions.height || 1080) * 3);
+          streams.push({ url, type, ...dimensions, bandwidth });
+        } catch {}
+      }
+      const adaptive = [];
+      for (const stream of streams) if (stream.type === 'hls' && stream.width && stream.height && !adaptive.some(row => row.url === stream.url || row.height === stream.height) && adaptive.length < 8) adaptive.push(stream);
+      const sized = streams.filter(row => row.width && row.height);
+      let selected = sized.find(row => row.height <= 1080) || sized.at(-1) || streams[0];
+      if (adaptive.length >= 2) { variants = adaptive.sort((a, b) => a.height - b.height); selected = [...variants].reverse().find(row => row.height <= 1080) || variants[0]; }
+      if (selected) { target = selected.url; type = selected.type; if (selected.width && selected.height) quality = { width: selected.width, height: selected.height }; }
     } catch (cause) { current(context); if ([401, 429].includes(cause.status)) throw cause; officialError = cause; }
     if (!target) {
       mode = 'download'; let result;
@@ -509,9 +524,9 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       try { target = validateUrl(row.download_url).href; } catch { throw failure('夸克返回的播放地址不符合安全限制'); }
       type = /\.mkv$/i.test(asset.name) ? 'mkv' : /\.webm$/i.test(asset.name) ? 'webm' : /\.avi$/i.test(asset.name) ? 'avi' : /\.(?:ts|m2ts)$/i.test(asset.name) ? 'mpegts' : 'mp4';
     }
-    const parsed = new URL(target), firstParty = parsed.protocol === 'https:' && (parsed.hostname === 'quark.cn' || parsed.hostname.endsWith('.quark.cn') || parsed.hostname === 'uc.cn' || parsed.hostname.endsWith('.uc.cn'));
+    const origins = [...new Set([target, ...(variants || []).map(row => row.url)].map(value => new URL(value)).filter(parsed => parsed.protocol === 'https:' && (parsed.hostname === 'quark.cn' || parsed.hostname.endsWith('.quark.cn') || parsed.hostname === 'uc.cn' || parsed.hostname.endsWith('.uc.cn'))).map(parsed => parsed.origin))];
     current(context);
-    return { episode: { url: target, type }, headers: { referer: REFERER, 'user-agent': PLAYBACK_UA, ...(firstParty ? { cookie: context.cookie } : {}) }, allowCookieOrigins: firstParty ? [parsed.origin] : [], metadata: { assetId: asset.id, name: asset.name, size: asset.size, category: asset.category || '', mode, version: hash(JSON.stringify([asset.fid, mode, quality || null])).slice(0, 24), ...(quality ? { quality } : {}), requiresCompatibility: !['hls', 'mp4', 'webm'].includes(type) } };
+    return { episode: { url: target, type }, ...(variants ? { variants } : {}), headers: { referer: REFERER, 'user-agent': PLAYBACK_UA, ...(origins.length ? { cookie: context.cookie } : {}) }, allowCookieOrigins: origins, metadata: { assetId: asset.id, name: asset.name, size: asset.size, category: asset.category || '', mode, version: hash(JSON.stringify([asset.fid, mode, quality || null, ...(variants ? [variants.map(({ width, height }) => [width, height])] : [])])).slice(0, 24), ...(quality ? { quality } : {}), requiresCompatibility: !['hls', 'mp4', 'webm'].includes(type) } };
   }
   async function progress(assetId, input) {
     const context = await snapshot(), asset = findAsset(assetId, context);

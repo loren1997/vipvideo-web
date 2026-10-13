@@ -178,8 +178,8 @@ try {
   const errors = [];
   const network = [];
   const media = silentMedia();
-  async function context(viewport, nativeMedia = true, realServices = false, initialHash = '') {
-    const value = await browser.newContext({ viewport });
+  async function context(viewport, nativeMedia = true, realServices = false, initialHash = '', userAgent = '') {
+    const value = await browser.newContext({ viewport, ...(userAgent ? { userAgent } : {}) });
     const contextId = ++nextContextId;
     await value.route('**/*', async route => {
       const url = route.request().url();
@@ -397,7 +397,10 @@ try {
     // WAV只验证原生媒体事件，不冒充可被Hls.js解码的MPEG-TS。
     if (nativeMedia) await page.evaluate(() => { window.Hls = { isSupported: () => false, Events: { ERROR: 'hlsError', MANIFEST_PARSED: 'hlsManifestParsed' } }; });
     await page.locator('#password').fill('browser-test-password');
-    await page.locator('#login-form button').click();
+    if (userAgent.includes('VIPVideoWebTV')) {
+      await page.locator('#password').focus(); await page.keyboard.press('ArrowDown');
+      assert.equal(await page.locator('#login-form button').evaluate(element => element === document.activeElement), true, '旧TV APK登录页方向键可到登录按钮'); await page.keyboard.press('Enter');
+    } else await page.locator('#login-form button').click();
     await page.locator('#app-view').waitFor({ state: 'visible' });
     return { value, page, contextId };
   }
@@ -886,6 +889,84 @@ try {
     } finally { liveProgress = previous; await isolated?.value.close(); }
   }
 
+  async function verifyTvRemote() {
+    const before = app.store.config(), savedQuark = structuredClone(quarkSettings); let isolated;
+    const tvChannel = { id: 'tv-remote-fixture', name: '遥控直播样例', group: '测试频道', streams: [{ name: '测试直连', type: 'mp4', status: 'ok', url: 'https://fixtures.example/tv-remote.mp4?token=fixture' }] };
+    channels.push(tvChannel);
+    const tvOutput = resolve('.test-output'); await mkdir(tvOutput, { recursive: true });
+    app.store.setConfig({ ...before, sources: ['first', 'second'].map(id => ({ id, name: id, api: `https://api.example.com/${id}`, enabled: true })), liveSources: [{ id: 'fixture-live', name: '测试直播源', url: 'https://live.example/test.m3u', enabled: true }] });
+    Object.assign(quarkSettings, { enabled: true, configured: true, autoSave: false, account: { connected: true, label: '测试账号' } });
+    try {
+      isolated = await context({ width: 1920, height: 1080 }, true, false, '#home', 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36 VIPVideoWebTV/1.0'); const p = isolated.page;
+      await p.locator('.poster-link').first().waitFor(); assert.equal(await p.locator('html').getAttribute('data-tv'), 'true');
+      assert.equal(await p.evaluate(() => window.__vipTvFocus), true, '既有APK不重复安装方向键处理');
+      await p.locator('nav a[href="#home"]').focus(); await p.keyboard.press('ArrowDown');
+      assert.equal(await p.evaluate(() => document.activeElement.getAttribute('href')), '#search'); await p.keyboard.press('Enter');
+      const search = p.locator('.search-form input'); await search.waitFor(); await until(() => search.evaluate(element => element === document.activeElement), '搜索路由把焦点交给输入框');
+      await p.keyboard.type('播放器样例'); const caret = await search.evaluate(element => element.selectionStart); await p.keyboard.press('ArrowLeft');
+      assert.equal(await search.evaluate(element => element === document.activeElement && element.selectionStart), caret - 1, '文字输入左右保留光标'); await p.keyboard.press('End'); await p.keyboard.press('Enter');
+      const poster = p.getByRole('button', { name: '播放 播放器样例', exact: true }); await poster.waitFor(); if (!(await poster.evaluate(element => element === document.activeElement))) await p.keyboard.press('ArrowDown');
+      try { await until(() => poster.evaluate(element => element === document.activeElement), '搜索结果方向键直达海报'); }
+      catch (error) { console.error('TV_FOCUS_DIAGNOSTIC', await p.evaluate(() => ({ active: [document.activeElement.tagName, document.activeElement.className, document.activeElement.getAttribute('aria-label'), document.activeElement.textContent.slice(0, 60)], controls: [...document.querySelectorAll('#content button,#content input')].slice(0, 8).map(element => ({ text: element.getAttribute('aria-label') || element.textContent, box: element.getBoundingClientRect().toJSON() })) }))); throw error; }
+      await p.keyboard.press('Enter');
+      await until(() => p.locator('video').evaluate(video => video.readyState >= 2).catch(() => false), 'TV播放固定媒体');
+      const video = p.locator('video'); await video.evaluate(video => { video.pause(); video.currentTime = 3; }); await video.focus();
+      await p.keyboard.press('ArrowRight'); assert.ok(Math.abs(await video.evaluate(video => video.currentTime) - 13) < 0.5);
+      await p.keyboard.press('ArrowLeft'); assert.equal(Math.round(await video.evaluate(video => video.currentTime)), 3);
+      await p.keyboard.press('Enter'); await until(() => video.evaluate(video => !video.paused), '遥控确定继续播放'); await p.keyboard.press('Enter'); assert.equal(await video.evaluate(video => video.paused), true);
+      await p.keyboard.press('ArrowDown'); assert.equal(await p.evaluate(() => document.activeElement.closest('.player-toolbar') !== null), true, '下键进入播放按钮');
+      const position = await video.evaluate(video => video.currentTime); await p.keyboard.press('ArrowRight'); assert.equal(await video.evaluate(video => video.currentTime), position, '按钮间左右导航不快进');
+      await video.focus(); await p.screenshot({ path: join(tvOutput, 'tv-player.png') });
+      await p.setViewportSize({ width: 1280, height: 720 }); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '1280电视无横向溢出');
+      await p.locator('nav a[href="#home"]').focus(); await p.keyboard.press('ArrowDown'); assert.equal(await p.evaluate(() => document.activeElement.getAttribute('href')), '#search', '1280电视侧栏仍可遥控');
+      await video.focus(); await p.keyboard.press('ArrowDown'); assert.equal(await p.evaluate(() => document.activeElement.closest('.player-toolbar') !== null), true, '1280电视播放器按钮可达');
+      const line = p.locator('.line-tabs button').first(); await line.focus(); await p.keyboard.press('ArrowDown');
+      assert.equal(await p.evaluate(() => document.activeElement.closest('.episode-grid') !== null), true, '线路到剧集方向键可达');
+      await p.keyboard.press('Enter'); await until(() => video.evaluate(video => video.readyState >= 2).catch(() => false), '遥控选集后恢复播放'); assert.equal(await p.evaluate(() => document.activeElement === document.body), false, '选集重绘后保留可操作焦点');
+      const quarkSelects = p.locator('#quark-resources select'); await quarkSelects.first().waitFor(); await quarkSelects.first().focus(); await p.keyboard.press('ArrowRight');
+      assert.equal(await quarkSelects.nth(1).evaluate(element => element === document.activeElement), true, '夸克资源与单集选择可横向移动');
+      await p.setViewportSize({ width: 1920, height: 1080 });
+      await video.focus(); await p.keyboard.press('Escape'); await poster.waitFor(); await until(() => poster.evaluate(element => element === document.activeElement), '返回保留原海报焦点');
+      await p.locator('nav a[href="#home"]').focus(); await p.keyboard.press('Enter'); await p.locator('.poster-link').first().waitFor();
+      await p.locator('.category-tabs button').first().focus(); await p.keyboard.press('ArrowRight'); assert.equal(await p.evaluate(() => document.activeElement.textContent), '电视剧'); await p.keyboard.press('Enter');
+      await p.getByRole('button', { name: '播放 星海旅途', exact: true }).waitFor(); await p.screenshot({ path: join(tvOutput, 'tv-home.png') });
+      await p.locator('nav a[href="#home"]').focus(); for (let index = 0; index < 4; index++) await p.keyboard.press('ArrowDown'); await p.keyboard.press('Enter');
+      await p.getByLabel('本机界面模式', { exact: true }).waitFor(); const summary = p.locator('details.settings-section > summary').first(); await summary.focus(); await p.keyboard.press('Enter');
+      assert.equal(await summary.evaluate(element => element.parentElement.open), true); await p.keyboard.press('ArrowDown'); assert.equal(await p.evaluate(() => document.activeElement.tagName), 'INPUT');
+      const mode = p.getByLabel('本机界面模式', { exact: true }); await mode.selectOption('standard'); assert.equal(await p.locator('html').getAttribute('data-tv'), 'false');
+      await p.reload(); await mode.waitFor(); assert.equal(await p.locator('html').getAttribute('data-tv'), 'false', '本机模式重启保留'); await mode.selectOption('auto'); assert.equal(await p.locator('html').getAttribute('data-tv'), 'true');
+      await p.evaluate(() => {
+        window.__tvHls = [];
+        class TvFixtureHls {
+          static isSupported() { return true; } static Events = { ERROR: 'error', MANIFEST_PARSED: 'manifest' };
+          constructor(options) { this.options = options; this.levels = [{ height: 720, bitrate: 2000000 }, { height: 1080, bitrate: 4000000 }, { height: 2160, bitrate: 12000000 }]; this.handlers = new Map(); this.selected = -1; window.__tvHls.push(this); }
+          loadSource(url) { this.url = url; } attachMedia(video) { this.video = video; setTimeout(() => this.handlers.get('manifest')?.('manifest', { levels: this.levels }), 0); }
+          on(event, handler) { this.handlers.set(event, handler); } startLoad(position) { this.startPosition = position; this.video.src = this.url.replace('.m3u8', '.mp4'); }
+          get currentLevel() { return this.selected; } set currentLevel(level) { this.selected = level; } get autoLevelEnabled() { return this.selected === -1; } destroy() { this.destroyed = true; }
+        }
+        window.Hls = TvFixtureHls;
+      });
+      await p.evaluate(() => { location.hash = '#detail?source=first&id=ad-hls'; });
+      const quality = p.getByLabel('播放画质', { exact: true }); await quality.waitFor();
+      assert.deepEqual(await quality.locator('option').allTextContents(), ['自动画质', '720p', '1080p', '4K']);
+      assert.equal(await p.evaluate(() => window.__tvHls.at(-1).startLevel), 1); assert.equal(await p.evaluate(() => window.__tvHls.at(-1).autoLevelEnabled), true, '1080起播保持ABR自动');
+      assert.equal(await p.evaluate(() => window.__tvHls.at(-1).options.maxBufferSize), 32 * 1024 * 1024); assert.equal(await p.evaluate(() => window.__tvHls.at(-1).options.backBufferLength), 20);
+      await quality.focus(); for (let index = 0; index < 3; index++) await p.keyboard.press('ArrowDown'); assert.equal(await p.evaluate(() => window.__tvHls.at(-1).currentLevel), 2);
+      await p.keyboard.press('Home'); assert.equal(await p.evaluate(() => window.__tvHls.at(-1).autoLevelEnabled), true);
+      await p.locator('nav a[href="#home"]').focus(); await p.keyboard.press('Enter'); await p.locator('.poster-link').first().waitFor();
+      assert.equal(await p.getByLabel('播放画质', { exact: true }).count(), 0); assert.equal(await p.evaluate(() => window.__tvHls.at(-1).destroyed), true);
+      await p.evaluate(() => { delete window.Hls; location.hash = '#live'; }); const channel = p.locator('.channel-card[data-channel="tv-remote-fixture"]'); await channel.waitFor(); await channel.focus(); await p.keyboard.press('Enter');
+      await until(() => p.locator('video').evaluate(video => video.readyState >= 2 && !video.paused && video.currentSrc.includes('/tv-remote.mp4')).catch(() => false), 'TV频道海报确定后直接播放');
+      assert.equal(await channel.locator('.channel-caption strong').evaluate(element => getComputedStyle(element).fontSize), '18px');
+      for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
+        const ordinary = await context(viewport); try { assert.equal(await ordinary.page.locator('html').getAttribute('data-tv'), 'false'); assert.ok(await ordinary.page.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1); } finally { await ordinary.value.close(); }
+      }
+      console.log('PASS 既有Android TV UA自动适配、侧栏/搜索/分类/海报/剧集/夸克/设置Dpad、输入caret、播放器确定与seek/按钮导航、返回焦点、本机切换与手机桌面；HLS有限缓冲/1080起播ABR/实际清晰度切换与释放');
+    } finally { await isolated?.value.close(); app.store.setConfig(before); Object.assign(quarkSettings, savedQuark); channels.splice(channels.indexOf(tvChannel), 1); }
+  }
+
+  if (process.argv.includes('--tv-only')) await verifyTvRemote();
+  else {
   const { page } = await context({ width: 1440, height: 1000 });
   await page.locator('.notice').filter({ hasText: '还没有影视源' }).waitFor();
   assert.equal(vendorReads.length, 0, '首页不预加载HLS组件');
@@ -1862,6 +1943,8 @@ try {
   await page.locator('#logout').click();
   await page.locator('#login-view').waitFor({ state: 'visible' });
   console.log('PASS 退出登录；浏览器验收完成');
+  await verifyTvRemote();
+  }
   // 显式启用联网验收；固定样例保持可离线重复，不把清单200等同于实际解码。
   if (process.env.VIPVIDEO_REAL_LIVE === '1') {
     const source = defaults.liveSources.find(item => item.id === 'live-presets');

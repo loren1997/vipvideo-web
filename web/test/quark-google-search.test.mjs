@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { searchGoogleQuark } from '../lib/quark-google-search.mjs';
+import * as webSearch from '../lib/quark-google-search.mjs';
 
 const title = '测试影片', time = Date.parse('2026-10-14T00:00:00Z');
 const link = (url, name = title + ' 夸克资源') => `<a href="${url}"><h3>${name}</h3></a>`;
@@ -16,7 +17,7 @@ function fixture(search, pages = {}) {
   return { calls, read, now: () => time };
 }
 
-test('Google requests the title plus Quark and best-effort date order, following only three first-level results', async () => {
+test('Google requests the title plus Quark without filtering undated pages, following only three first-level results', async () => {
   const pages = Object.fromEntries([1, 2, 3, 4].map(id => [`https://posts.example/${id}`, article(link(`https://pan.quark.cn/s/abcdef${id}`))]));
   const input = fixture([
     link('/url?q=' + encodeURIComponent('https://posts.example/1')),
@@ -27,10 +28,86 @@ test('Google requests the title plus Quark and best-effort date order, following
   assert.equal(rows.length, 3); assert.equal(input.calls.length, 4);
   const query = new URL(input.calls[0].url);
   assert.equal(query.origin, 'https://www.google.com'); assert.equal(query.pathname, '/search');
-  assert.equal(query.searchParams.get('q'), title + ' 夸克'); assert.equal(query.searchParams.get('tbs'), 'sbd:1');
+  assert.equal(query.searchParams.get('q'), title + ' 夸克'); assert.equal(query.searchParams.has('tbs'), false);
   assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/1', 'https://posts.example/2', 'https://posts.example/3']);
   for (const call of input.calls) { assert.equal(call.maxBytes, 512 * 1024); assert.equal(call.deadline, time + 3000); assert.ok(call.duration <= 2000); }
   assert.equal(input.calls[0].duration, 2000);
+});
+
+test('a resource article with a site-wide document title still requires a matching main heading', async () => {
+  const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': `<title>高清影视分享站</title><main><h1>${title} (2026) 夸克网盘</h1>${link('https://pan.quark.cn/s/abcdef1', '立即转存')}</main>` });
+  assert.deepEqual((await searchGoogleQuark(title, input)).map(row => row.url), ['https://pan.quark.cn/s/abcdef1']);
+});
+
+test('an article opening can identify the work without trusting an unrelated footer mention', async () => {
+  for (const [opening, expected] of [[title + ' (2026) 4K资源', 1], ['其他电影介绍，相关推荐：' + title, 0]]) {
+    const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': `<title>高清影视分享站</title><article><p>${opening}</p>${link('https://pan.quark.cn/s/abcdef1', '夸克下载')}</article>` });
+    assert.equal((await searchGoogleQuark(title, input)).length, expected);
+  }
+});
+
+test('an empty canonical query tries one supplied alias within the original request budget', async () => {
+  const calls = [];
+  const rows = await searchGoogleQuark(title, { aliases: ['Winter and Summer', 'unused alias'], now: () => time, read: async (url, duration, maxBytes, deadline) => {
+    calls.push({ url, deadline });
+    if (new URL(url).hostname === 'www.google.com') return new URL(url).searchParams.get('q') === 'Winter and Summer 夸克' ? link('https://posts.example/movie', 'Winter and Summer 资源') : '<title>Google</title>';
+    return '<title>Winter and Summer 资源</title><a href="https://pan.quark.cn/s/abcdef1">夸克下载</a>';
+  } });
+  assert.equal(rows.length, 1); assert.equal(calls.length, 3);
+  assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [title + ' 夸克', 'Winter and Summer 夸克']);
+  assert.ok(calls.every(call => call.deadline === time + 3000));
+});
+
+test('an empty Google title-plus-Quark query falls back to title-plus-cloud-drive within the same budget', async () => {
+  const calls = [];
+  const rows = await searchGoogleQuark(title, { now: () => time, read: async (url, duration, maxBytes, deadline) => {
+    calls.push({ url, deadline });
+    const query = new URL(url).searchParams.get('q');
+    if (query) return query === title + ' 网盘' ? link('https://posts.example/movie') : '<title>Google</title>';
+    return article(link('https://pan.quark.cn/s/abcdef1'));
+  } });
+  assert.equal(rows.length, 1);
+  assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [title + ' 夸克', title + ' 网盘']);
+  assert.ok(calls.every(call => call.deadline === time + 3000));
+});
+
+test('Bing searches resource articles and follows relevant first-level pages as well as direct shares', async () => {
+  const calls = [];
+  const rows = await webSearch.searchBingQuark('一路超平安', { now: () => time, read: async (url, duration, maxBytes, deadline) => {
+    calls.push({ url, duration, maxBytes, deadline });
+    if (new URL(url).hostname === 'www.bing.com') return '<rss><channel><item><title><![CDATA[一路超平安 (2026) 4K资源]]></title><link>https://posts.example/movie?from=bing&amp;id=1</link></item><item><title>其他电影</title><link>https://posts.example/other</link></item></channel></rss>';
+    assert.equal(url, 'https://posts.example/movie?from=bing&id=1');
+    return '<title>一路超平安 (2026) 4K资源</title><article><time datetime="2026-10-13"></time><a href="https://pan.quark.cn/s/abcdef1">夸克下载</a> 提取码: A1B2</article>';
+  } });
+  assert.deepEqual(rows, [{ url: 'https://pan.quark.cn/s/abcdef1?pwd=A1B2', name: '一路超平安 (2026) 4K资源', publishedAt: Date.parse('2026-10-13') }]);
+  assert.equal(new URL(calls[0].url).searchParams.get('q'), '一路超平安 夸克');
+  assert.equal(calls.length, 2); assert.ok(calls.every(call => call.deadline === time + 3000));
+});
+
+test('visible resource buttons can encode a canonical Quark share without crawling redirect services', async () => {
+  const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': article('<a href="/go?url=https%3A%2F%2Fpan.quark.cn%2Fs%2Fabcdef1%3Fpwd%3DA1B2">夸克下载</a><a href="/go?url=http%3A%2F%2F127.0.0.1%2Fprivate">查看</a>') });
+  assert.deepEqual((await searchGoogleQuark(title, input)).map(row => row.url), ['https://pan.quark.cn/s/abcdef1?pwd=A1B2']);
+  assert.equal(input.calls.length, 2);
+});
+
+test('short English aliases cannot match a longer unrelated title', async () => {
+  const input = fixture(link('https://posts.example/movie', 'VITALITY 资源') + link('https://posts.example/it', 'IT (2017) 资源'), {
+    'https://posts.example/it': '<title>IT (2017) 网盘</title><a href="https://pan.quark.cn/s/abcdef1">夸克下载</a>',
+  });
+  assert.equal((await searchGoogleQuark('小丑回魂', { ...input, aliases: ['IT'] })).length, 1);
+  assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/it']);
+});
+
+test('Bing bounds article reads and refuses private pages, recursive crawling and XML entities', async () => {
+  const calls = [], pages = [1, 2, 3, 4].map(id => `<item><title>${title}</title><link>https://posts.example/${id}</link></item>`).join('');
+  const read = async url => {
+    calls.push(url);
+    if (new URL(url).hostname === 'www.bing.com') return `<rss><channel><item><title>${title}</title><link>http://127.0.0.1/private</link></item>${pages}</channel></rss>`;
+    return article(link('https://posts.example/child') + link('https://pan.quark.cn/s/abcdef1'));
+  };
+  assert.equal((await webSearch.searchBingQuark(title, { read, now: () => time })).length, 1);
+  assert.equal(calls.length, 4); assert.ok(calls.every(url => !/127\.0\.0\.1|\/child$/.test(url)));
+  await assert.rejects(webSearch.searchBingQuark(title, { now: () => time, read: async () => '<!DOCTYPE rss [<!ENTITY secret SYSTEM "file:///etc/passwd">]><rss><channel></channel></rss>' }), /Bing 公开搜索暂不可用/);
 });
 
 test('a release-year hint never removes matching Google resources which omit that year', async () => {

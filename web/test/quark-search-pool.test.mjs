@@ -202,7 +202,26 @@ test('empty successful searches preserve health and public RSS supplies results 
     const result = await lookup(f.pool);
     assert.equal(result.results[0].url, quarkUrl);
     assert.equal(f.pool.status().candidates.find(row => row.apiUrl === backup).status, 'healthy');
-    const fallback = new URL(f.calls.at(-1).url); assert.equal(fallback.searchParams.get('q'), '电影 site:pan.quark.cn/s');
+    const fallback = new URL(f.calls.at(-1).url); assert.equal(fallback.searchParams.get('q'), '电影 夸克');
+  } finally { await f.pool.stop(); }
+});
+
+test('Bing articles become Quark candidates when Google and the configured API have no results', async () => {
+  const f = fixture({ request: (url, options) => {
+    const parsed = new URL(url);
+    if (parsed.hostname === 'manual.example') return response('{"results":[]}');
+    if (parsed.hostname === 'www.bing.com') {
+      assert.equal(parsed.searchParams.get('q'), '一路超平安 夸克');
+      assert.equal(options.followRedirects, false);
+      return response('<rss><channel><item><title>一路超平安 (2026) 4K资源</title><link>https://posts.example/movie</link></item></channel></rss>');
+    }
+    assert.equal(url, 'https://posts.example/movie'); assert.equal(options.followRedirects, true);
+    return response(`<title>一路超平安 4K资源</title><article><a href="${quarkUrl}">夸克下载</a></article>`);
+  } });
+  try {
+    const result = await lookup(f.pool, 'https://manual.example/api/search?' + new URLSearchParams({ kw: '一路超平安' }));
+    assert.equal(result.results.length, 1); assert.equal(result.results[0].url, quarkUrl);
+    assert.equal(f.calls.length, 3); assert.ok(f.calls.every(call => call.options.timeout <= 5500));
   } finally { await f.pool.stop(); }
 });
 
@@ -470,7 +489,7 @@ test('RSS fallback ranks complete titles while retaining legal weak and unnamed 
     const result = await lookup(f.pool, 'https://manual.example/api/search?kw=' + encodeURIComponent('电影 2026'));
     assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/wrong123456', 'https://pan.quark.cn/s/unnamed12345']);
     assert.equal(result.results.at(-1).name, '未提供资源标题');
-    assert.equal(new URL(f.calls.at(-1).url).searchParams.get('q'), '电影 site:pan.quark.cn/s');
+    assert.equal(new URL(f.calls.at(-1).url).searchParams.get('q'), '电影 夸克');
   } finally { await f.pool.stop(); }
 });
 
@@ -691,7 +710,7 @@ test('canonical web titles and explicit aliases reach Google without stripping n
     const url = 'https://manual.example/api/search?' + new URLSearchParams({ kw: '银翼杀手 2049' });
     const result = JSON.parse(await readText(await f.pool.request(url, { year: '2017', aliases: ['Blade Runner 2049'], webSearch: true })));
     assert.equal(result.results.length, 1);
-    assert.equal(new URL(f.calls[0].url).searchParams.get('q'), '银翼杀手 2049 site:pan.quark.cn/s');
+    assert.equal(new URL(f.calls[0].url).searchParams.get('q'), '银翼杀手 2049 夸克');
   } finally { await f.pool.stop(); }
 });
 

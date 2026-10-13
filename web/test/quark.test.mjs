@@ -1062,12 +1062,42 @@ test('failure of both normal playback routes reports safe phases and numeric cod
   assert.equal(state.calls.filter(call => call.path === '/file/download').length, 1);
 });
 
-test('playback uses the best officially returned quality and keeps stable category/version metadata', async t => {
+test('playback retains official adaptive qualities and keeps stable category/version metadata', async t => {
   const { service, connect, save, state } = await fixture(t); await connect(); const saved = await save({ ...detail, category: 'adult' });
   const result = await service.playback(saved.assetId); assert.equal(result.episode.url, state.playUrl); assert.equal(result.episode.type, 'hls'); assert.deepEqual(result.metadata.quality, { width: 1920, height: 1080 }); assert.equal(result.metadata.category, 'adult'); assert.match(result.metadata.version, /^[a-f0-9]{24}$/);
   assert.deepEqual(result.allowCookieOrigins, ['https://video-cloud.quark.cn']); assert.equal(result.headers.cookie, COOKIE);
   const same = await service.playback(saved.assetId); assert.equal(same.metadata.version, result.metadata.version);
   await assert.rejects(service.playback('user-file'), /登记/); assert.equal(state.deletes.length, 0);
+});
+
+test('official multi-quality HLS starts at 1080p while preserving 4K and excluding invalid or unfinished streams', async t => {
+  const { service, connect, save, state } = await fixture(t); await connect(); const saved = await save();
+  state.beforeRequest = call => call.path === '/file/v2/play/project' ? reply({ video_list: [
+    { video_info: { url: 'https://fourk.quark.cn/movie.m3u8?sig=4K%2B', width: 3840, height: 2160, bitrate: 24000000 } },
+    { video_info: { url: state.playUrl, width: 1920, height: 1080, bitrate: 6000000 } },
+    { video_info: { url: 'https://public-cdn.example/720.m3u8?token=a%2Fb', width: 1280, height: 720, bitrate: 2500000 } },
+    { video_info: { url: state.playUrl, width: 1920, height: 1080 } },
+    { video_info: { url: 'http://127.0.0.1/private.m3u8', width: 8192, height: 4320 } },
+    { video_info: { url: 'https://pending.quark.cn/unfinished.m3u8', width: 7680, height: 4320, finish: false } },
+    { accessable: false, video_info: { url: 'https://locked.quark.cn/locked.m3u8', width: 7680, height: 4320 } },
+  ] }) : undefined;
+  const result = await service.playback(saved.assetId);
+  assert.equal(result.episode.url, state.playUrl); assert.deepEqual(result.metadata.quality, { width: 1920, height: 1080 });
+  assert.deepEqual(result.variants.map(({ height, bandwidth }) => ({ height, bandwidth })), [{ height: 720, bandwidth: 2500000 }, { height: 1080, bandwidth: 6000000 }, { height: 2160, bandwidth: 24000000 }]);
+  assert.match(result.variants[0].url, /token=a%2Fb$/); assert.match(result.variants.at(-1).url, /sig=4K%2B$/);
+  assert.deepEqual(new Set(result.allowCookieOrigins), new Set(['https://video-cloud.quark.cn', 'https://fourk.quark.cn'])); assert.equal(result.headers.cookie, COOKIE);
+  assert.equal(state.calls.filter(call => call.path === '/file/download').length, 0);
+});
+
+test('official nonadaptive qualities also prefer 1080p instead of forcing 4K', async t => {
+  const { service, connect, save, state } = await fixture(t); await connect(); const saved = await save();
+  state.beforeRequest = call => call.path === '/file/v2/play/project' ? reply({ video_list: [
+    { video_info: { url: 'https://video-cloud.quark.cn/4k.mp4', width: 3840, height: 2160 } },
+    { video_info: { url: 'https://video-cloud.quark.cn/1080.mp4', width: 1920, height: 1080 } },
+  ] }) : undefined;
+  const result = await service.playback(saved.assetId);
+  assert.equal(result.episode.url, 'https://video-cloud.quark.cn/1080.mp4'); assert.equal(result.episode.type, 'mp4');
+  assert.deepEqual(result.metadata.quality, { width: 1920, height: 1080 }); assert.equal(result.variants, undefined);
 });
 
 test('download fallback preserves the exact request Cookie snapshot and MKV compatibility metadata', async t => {
