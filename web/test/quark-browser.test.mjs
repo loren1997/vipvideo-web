@@ -93,6 +93,33 @@ test('a context timeout reports its phase and releases the launched browser', as
 });
 
 test('headless Chromium renders through the validated transport', { skip: executablePath ? false : 'No local Chromium; set CHROMIUM_PATH to run rendering and SSRF fixtures.' }, async t => {
+  await t.test('waits for a script-only page to reload into a visible article using temporary public cookies', async () => {
+    const value = fixture({
+      '/delayed-article': (_url, options) => /public_reload=ready/.test(options.headers.cookie || '')
+        ? response('<title>希望 (2026)</title><article><h1>希望 (2026)</h1><a href="https://pan.quark.cn/s/reload26">夸克网盘分享</a></article>')
+        : response('<script>document.cookie="public_reload=ready; Secure; SameSite=Lax";setTimeout(()=>location.reload(),1200)</script>'),
+    });
+    try {
+      const result = await value.renderer.render('https://page.example/delayed-article');
+      assert.equal(result.title, '希望 (2026)');
+      assert.match(result.html, /https:\/\/pan\.quark\.cn\/s\/reload26/);
+      assert.equal(value.calls.length, 2);
+      assert.match(value.calls[1].headers.cookie, /public_reload=ready/);
+      assert.ok(value.calls.every(call => call.addresses.every(record => record.address === '8.8.8.8')));
+    } finally { await value.renderer.close(); }
+    assert.equal(value.active(), 0);
+  });
+
+  await t.test('hidden text and hidden public links cannot make an empty article ready', async () => {
+    const value = fixture({ '/empty-article': () => response('<title>Empty</title><div hidden>隐藏正文</div><div style="opacity:0"><a href="https://pan.quark.cn/s/hidden26">隐藏链接</a></div>') });
+    const started = Date.now();
+    try {
+      await assert.rejects(value.renderer.render('https://page.example/empty-article', { deadline: started + 3500 }), { quarkPoolReason: 'browserTimeout' });
+      assert.ok(Date.now() - started < 5000);
+    } finally { await value.renderer.close(); }
+    assert.equal(value.active(), 0);
+  });
+
   await t.test('keeps dynamic visible article structure while blocking private frames/fetch/redirect/WS and credentials', async () => {
     let directConnections = 0;
     const trap = http.createServer((_request, reply) => { directConnections++; reply.end('private'); });

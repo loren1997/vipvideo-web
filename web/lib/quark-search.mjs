@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { Readable } from 'node:stream';
-import { request as networkRequest, readText, validateUrl } from './network.mjs';
+import { readText, validateUrl } from './network.mjs';
+import { createQuarkPublicRequest } from './quark-search-network.mjs';
 
 const MAX_BODY = 64 * 1024, MAX_RESPONSE = 2 * 1024 * 1024;
 const fields = new Set(['kw', 'cloud_types', 'res', 'src', 'conc', 'channels', 'plugins', 'refresh']);
@@ -19,8 +20,9 @@ function searchBody(body, method) {
 }
 
 // This is one optional Compose service, not a general private-network transport.
-export function createQuarkSearchRequest({ request = networkRequest, httpTransport = http.request } = {}) {
+export function createQuarkSearchRequest({ request = createQuarkPublicRequest(), httpTransport = http.request } = {}) {
   return async function searchRequest(value, options = {}) {
+    options.signal?.throwIfAborted();
     const input = value instanceof URL ? value.href : value;
     if (typeof input !== 'string' || input.length > 8192) throw failure('搜索地址无效', 400);
     const url = validateUrl(input), internal = /^http:\/\/pansou:8888\/api\/search(?:\?[^#]*)?$/.test(input);
@@ -38,7 +40,7 @@ export function createQuarkSearchRequest({ request = networkRequest, httpTranspo
       if (internal) {
         upstream = await new Promise((resolve, reject) => {
           try {
-            pending = httpTransport(url, { method, headers, agent: false }, response => {
+            pending = httpTransport(url, { method, headers, agent: false, signal: options.signal }, response => {
               if (expired) { response.destroy(); reject(failure('网盘搜索超时（8 秒）')); } else resolve(response);
             });
             pending.once('error', cause => reject(cause?.status ? cause : failure('搜索助手连接失败', 502, cause)));
@@ -46,7 +48,7 @@ export function createQuarkSearchRequest({ request = networkRequest, httpTranspo
           } catch (cause) { reject(failure('搜索助手连接失败', 502, cause)); }
         });
       } else {
-        upstream = await request(url, { method, headers, timeout, ...(body === undefined ? {} : { body }), ...(options.followRedirects === false ? { followRedirects: false } : {}) });
+        upstream = await request(url, { method, headers, timeout, signal: options.signal, ...(body === undefined ? {} : { body }), ...(options.followRedirects === false ? { followRedirects: false } : {}) });
       }
       if (expired) { upstream.destroy(); throw failure('网盘搜索超时（8 秒）'); }
       if (upstream.statusCode >= 300 && upstream.statusCode < 400) { upstream.destroy(); throw failure('搜索助手重定向已拒绝', 403); }

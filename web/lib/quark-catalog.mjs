@@ -12,6 +12,7 @@ const failure = (message, status = 502) => Object.assign(new Error(message), { s
 const clone = value => JSON.parse(JSON.stringify(value));
 const idOf = value => /^[1-9]\d{0,15}$/.test(String(value ?? '')) && Number.isSafeInteger(Number(value)) ? String(value) : '';
 const text = (value, limit = 300) => typeof value === 'string' ? value.replace(/<[^>]*>/g, '').trim().slice(0, limit) : '';
+const normalized = value => value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 const scoreOf = value => (typeof value === 'number' || typeof value === 'string' && value.trim()) && Number.isFinite(Number(value)) && Number(value) > 0 && Number(value) <= 10 ? Number(value) : null;
 
 function posterOf(value) {
@@ -44,7 +45,12 @@ function metadata(raw, hint, detailed = false, now = Date.now()) {
   const type = raw.type === 'movie' ? 'movie' : 'series';
   const year = /^(?:18|19|20)\d{2}$/.test(String(raw.year ?? '')) ? String(raw.year) : '';
   const releaseDate = dateOf([...(Array.isArray(raw.pubdate) ? raw.pubdate : [raw.pubdate]), raw.release_date]);
-  const aliases = [...new Set([...names, raw.original_title].map(value => text(value)).filter(value => value && value !== title))];
+  const aliases = [], seen = new Set([normalized(title)]);
+  for (const value of [raw.original_title, ...names].map(value => text(value))) {
+    const key = normalized(value);
+    if (!key || seen.has(key)) continue;
+    seen.add(key); aliases.push(value);
+  }
   const score = raw.rating?.count === 0 || raw.rating?.max !== undefined && raw.rating.max !== 10 ? null : scoreOf(raw.rating?.value ?? raw.rate);
   const votes = Number.isSafeInteger(raw.rating?.count) && raw.rating.count >= 0 ? raw.rating.count : undefined;
   const today = new Date(now).toISOString().slice(0, 10), availableDate = dateOf(raw.playable_date);
@@ -60,7 +66,7 @@ function metadata(raw, hint, detailed = false, now = Date.now()) {
   const count = [raw.episodes_count, raw.last_episode_number].find(value => Number.isSafeInteger(value) && value > 0 && value <= 1000);
   const episodes = type === 'movie' ? [{ name: '正片' }] : Array.from({ length: count || 1 }, (_, index) => ({ name: `第${index + 1}集` }));
   return { source: 'quark-library', id, key: `quark-library:${id}`, title, year, type, category,
-    poster: [raw.pic?.large, raw.pic?.normal, raw.cover].map(posterOf).find(Boolean) || '', genres, releaseDate, aliases,
+    poster: [raw.pic?.large, raw.pic?.normal, raw.cover].map(posterOf).find(Boolean) || '', genres, releaseDate, aliases, originalTitle: text(raw.original_title),
     description, descriptionLanguage: chineseSynopsis ? 'zh' : 'unavailable', ...(synopsis && !chineseSynopsis ? { originalDescription: synopsis } : {}), typeName, releaseStatus,
     episodeCount: type === 'movie' ? 1 : count || null,
     douban: { id, score, ...(votes === undefined ? {} : { votes }), url: `https://movie.douban.com/subject/${id}/`, attribution: detailed ? '豆瓣公开条目' : '豆瓣公开列表' },
@@ -70,7 +76,7 @@ function metadata(raw, hint, detailed = false, now = Date.now()) {
 function restoreItem(item, now) {
   if (!item || item.source !== 'quark-library' || !['movie', 'tv', 'anime', 'variety'].includes(item.category)) return null;
   const normalized = metadata({ id: item.id, title: item.title, type: item.type === 'movie' ? 'movie' : item.type === 'series' ? 'tv' : '',
-    year: item.year, genres: item.genres, pubdate: item.releaseDate, aka: item.aliases, intro: item.originalDescription || (item.descriptionLanguage === 'unavailable' ? '' : item.description),
+    year: item.year, genres: item.genres, pubdate: item.releaseDate, aka: item.aliases, original_title: item.originalTitle, intro: item.originalDescription || (item.descriptionLanguage === 'unavailable' ? '' : item.description),
     is_released: item.releaseStatus === 'released' ? true : item.releaseStatus === 'upcoming' ? false : undefined,
     pic: { large: item.poster }, rating: { value: item.douban?.score, count: item.douban?.votes }, episodes_count: item.episodeCount }, item.category, item.douban?.attribution === '豆瓣公开条目', now);
   return normalized;
@@ -86,9 +92,9 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
       const data = JSON.parse(saved);
       for (const [id, entry] of Array.isArray(data.subjects) ? data.subjects.slice(-300) : []) {
         const item = restoreItem(entry?.item, now());
-        if (item && item.id === id && Number.isFinite(entry.at) && entry.at <= now() && entry.at > now() - 7 * 24 * HOUR) subjects.set(id, { item, at: entry.at, detailed: entry.detailed === true });
+        if (item && item.id === id && Number.isFinite(entry.at) && entry.at <= now() && entry.at > now() - 7 * 24 * HOUR) subjects.set(id, { item, at: entry.at, detailed: data.version === 4 && entry.detailed === true });
       }
-      for (const [key, entry] of data.version === 3 && Array.isArray(data.pages) ? data.pages.slice(-32) : []) {
+      for (const [key, entry] of data.version === 4 && Array.isArray(data.pages) ? data.pages.slice(-32) : []) {
         if (typeof key !== 'string' || key.length > 200 || !Number.isFinite(entry?.at) || entry.at > now() || entry.at <= now() - 7 * 24 * HOUR || !Array.isArray(entry.items)) continue;
         const items = entry.items.slice(0, 40).map(id => subjects.get(idOf(id))?.item).filter(Boolean);
         if (items.length === entry.items.length) pages.set(key, { at: entry.at, items, hasMore: entry.hasMore === true,
@@ -101,7 +107,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
     while (pages.size > 32) pages.delete(pages.keys().next().value);
     while (subjects.size > 300) subjects.delete(subjects.keys().next().value);
     const serialize = () => JSON.stringify({
-      version: 3,
+      version: 4,
       pages: [...pages].map(([key, entry]) => [key, { ...entry, items: entry.items.map(item => item.id) }]),
       subjects: [...subjects].map(([id, entry]) => { const { lines, ...item } = entry.item; return [id, { ...entry, item }]; }),
     });

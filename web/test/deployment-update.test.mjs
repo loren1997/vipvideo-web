@@ -65,6 +65,10 @@ with tempfile.TemporaryDirectory() as directory:
   assert worker["networks"] == {"family": None}, "web's IP/aliases must not be copied to the worker"
   assert worker["read_only"] is True and worker["init"] is True
   assert worker["environment"] == {"PORT": "3020", "HOME": "/tmp"}
+  proxied = copy.deepcopy(original)
+  proxied["services"]["web"]["environment"]["QUARK_SEARCH_PROXY"] = "http://192.168.1.10:7890"
+  proxied_worker = namespace["patch_config"](proxied)["services"]["quark-browser"]
+  assert proxied_worker["environment"] == {"PORT": "3020", "HOME": "/tmp", "QUARK_SEARCH_PROXY": "http://192.168.1.10:7890"}
   assert not any(key in worker for key in ["ports", "volumes", "devices", "privileged"])
   assert worker["cpus"] == .5 and worker["pids_limit"] == 256
   assert any(value.startswith("/app/data:") for value in worker["tmpfs"])
@@ -115,6 +119,7 @@ test('every supplied Compose deploys an isolated browser from the same candidate
     assert.match(browser, /\/app\/data:size=16m,uid=1000,gid=1000,mode=0700/);
     assert.doesNotMatch(browser, /APP_PASSWORD|^    (?:ports|volumes|devices|depends_on):/m);
     assert.match(source, /QUARK_BROWSER_URL: http:\/\/quark-browser:3020/);
+    assert.equal((source.match(/^\s+QUARK_SEARCH_PROXY:/gm) || []).length, 2);
   }
   assert.ok(existsSync(updater));
 });

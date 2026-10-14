@@ -696,7 +696,7 @@ try {
       await panel.getByRole('button', { name: '连接夸克账号', exact: true }).waitFor(); const count = quarkCount('/api/quark/resources'); quarkMode = 'webm';
       await panel.getByRole('button', { name: '重试搜索', exact: true }).click(); await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
       assert.equal(quarkCount('/api/quark/resources'), count + 1); await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-1'); assert.equal(await panel.getByRole('button', { name: '转存所选单集', exact: true }).isDisabled(), true);
-      const google = new URL(await panel.getByRole('link', { name: '用浏览器查 Google ↗', exact: true }).getAttribute('href')); assert.equal(google.searchParams.get('tbs'), 'sbd:1'); assert.equal(google.searchParams.get('udm'), '14');
+      const google = new URL(await panel.getByRole('link', { name: '用浏览器查 Google ↗', exact: true }).getAttribute('href')); assert.equal(google.searchParams.get('q'), `${cloudFilm.title} ${cloudFilm.year} 夸克 网盘`); assert.equal(google.searchParams.get('tbs'), 'sbd:1'); assert.equal(google.searchParams.get('hl'), 'zh-CN'); assert.equal(google.searchParams.has('udm'), false); assert.equal(google.searchParams.has('num'), false);
       await panel.getByRole('button', { name: '查找更多公开资源', exact: true }).click(); await panel.getByText(/找到新增3条可用分享/).waitFor(); assert.equal(await p.locator('video').count(), 0);
       console.log('PASS 未连接账号仍查匿名分享/文件、失败可手动重试和更多搜索、Google日期参数；个人转存保持禁用且不加载播放器');
     });

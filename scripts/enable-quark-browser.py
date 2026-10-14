@@ -31,12 +31,15 @@ def patch_config(config):
     if environment.get("QUARK_BROWSER_URL") not in (None, "", address):
         raise ValueError("已有其他 QUARK_BROWSER_URL，未覆盖。")
     environment["QUARK_BROWSER_URL"] = address
+    worker_environment = {"PORT": "3020", "HOME": "/tmp"}
+    if "QUARK_SEARCH_PROXY" in environment:
+        worker_environment["QUARK_SEARCH_PROXY"] = environment["QUARK_SEARCH_PROXY"]
     services["quark-browser"] = {
         "image": image,
         "command": ["node", "browser-worker.mjs"],
         "restart": "unless-stopped",
         "init": True,
-        "environment": {"PORT": "3020", "HOME": "/tmp"},
+        "environment": worker_environment,
         "networks": {name: None for name in web.get("networks", {"default": None})},
         "read_only": True,
         "tmpfs": ["/tmp:size=192m,mode=1777", "/app/data:size=16m,uid=1000,gid=1000,mode=0700"],

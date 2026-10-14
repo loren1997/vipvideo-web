@@ -1,13 +1,15 @@
 import { existsSync } from 'node:fs';
 import { chromium } from 'playwright-core';
-import { request, readText, validateUrl } from './network.mjs';
+import { readText, validateUrl } from './network.mjs';
+import { createQuarkPublicRequest } from './quark-search-network.mjs';
+import { launchQuarkChromium, chromiumCleanupBudget } from './quark-chromium-launcher.mjs';
 
 let renderQueue = Promise.resolve();
 const failure = (message, reason, status = 502, cause) => Object.assign(new Error(message, cause ? { cause } : undefined), { status, quarkPoolReason: reason });
 const escape = value => String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 const verificationUrl = url => /(?:^|\.)google\.(?:com|[a-z]{2}|(?:com|co)\.[a-z]{2})$/i.test(url.hostname) && /^\/sorry(?:\/|$)/.test(url.pathname);
 
-export function createQuarkBrowser({ safeRequest = request, executablePath = process.env.CHROMIUM_PATH, launch = options => chromium.launch(options) } = {}) {
+export function createQuarkBrowser({ safeRequest = createQuarkPublicRequest(), executablePath = process.env.CHROMIUM_PATH, launch = launchQuarkChromium } = {}) {
   let closed = false;
   const jobs = new Set();
 
@@ -17,11 +19,12 @@ export function createQuarkBrowser({ safeRequest = request, executablePath = pro
     const controller = new AbortController(), end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, Date.now() + 25000);
     let phase = 'queue';
     const timeoutFailure = cause => Object.assign(failure('动态网页读取超时', 'browserTimeout', 502, cause), { quarkBrowserPhase: phase });
-    const remaining = () => Math.max(1, end - Date.now());
+    const workEnd = end - chromiumCleanupBudget(end);
+    const remaining = () => Math.max(1, workEnd - Date.now());
     const abort = () => controller.abort(signal.reason);
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
-    if (end <= Date.now()) controller.abort(timeoutFailure());
+    if (workEnd <= Date.now()) controller.abort(timeoutFailure());
     const timer = setTimeout(() => controller.abort(timeoutFailure()), remaining());
     const stopped = controller.signal.aborted ? Promise.resolve() : new Promise(resolve => controller.signal.addEventListener('abort', resolve, { once: true }));
     jobs.add(controller);
@@ -40,7 +43,7 @@ export function createQuarkBrowser({ safeRequest = request, executablePath = pro
             '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', '--host-resolver-rules=MAP * ~NOTFOUND',
             '--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--disable-features=WebTransport,WebUSB,WebBluetooth',
             '--js-flags=--max-old-space-size=128',
-          ] });
+          ] }, { signal: controller.signal, deadline: end });
           try { browser = await launching; }
           catch (cause) {
             controller.signal.throwIfAborted();
@@ -134,6 +137,26 @@ export function createQuarkBrowser({ safeRequest = request, executablePath = pro
             try { await page.waitForLoadState('networkidle', { timeout: Math.min(4000, remaining()) }); }
             catch (cause) { if (cause.name !== 'TimeoutError') throw cause; }
             if (mainRedirect) await navigate(mainRedirect);
+            const contentEnd = Math.min(workEnd, Date.now() + 4000);
+            let contentReady = false;
+            while (Date.now() < contentEnd) {
+              controller.signal.throwIfAborted();
+              if (mainRedirect) await navigate(mainRedirect);
+              try {
+                await page.waitForFunction(() => {
+                  if (!document.body) return false;
+                  const visible = element => element.checkVisibility({ opacityProperty: true, visibilityProperty: true });
+                  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+                    if (node.textContent.trim() && !node.parentElement.closest('script,style,template,noscript') && visible(node.parentElement)) return true;
+                  }
+                  return [...document.body.querySelectorAll('a[href]')].some(anchor => /^https?:/.test(anchor.href) && visible(anchor));
+                }, null, { timeout: Math.max(1, Math.min(500, contentEnd - Date.now())) });
+                contentReady = !mainRedirect;
+                if (contentReady) break;
+              } catch (cause) { if (cause.name !== 'TimeoutError') throw cause; }
+            }
+            if (!contentReady) throw timeoutFailure();
             controller.signal.throwIfAborted();
             phase = 'snapshot';
             const snapshot = await page.evaluate(() => {

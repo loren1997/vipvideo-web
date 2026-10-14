@@ -2,7 +2,10 @@ import http from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { createQuarkBrowser } from './lib/quark-browser.mjs';
 import { createQuarkRenderedSearch } from './lib/quark-rendered-search.mjs';
-import { request, readText } from './lib/network.mjs';
+import { readText } from './lib/network.mjs';
+import { createQuarkPublicRequest } from './lib/quark-search-network.mjs';
+
+const request = createQuarkPublicRequest();
 
 async function readPublicPage(url, { deadline, signal }) {
     const budget = Math.max(1, deadline - Date.now());

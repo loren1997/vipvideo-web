@@ -308,7 +308,7 @@ test('detail has canonical aliases, true premiere dates, verified scores and all
   const item = await catalog.detail('123456');
   assert.equal(calls[1].url.pathname, '/rexxar/api/v2/tv/123456');
   assert.equal(item.releaseDate, '2025-03-01');
-  assert.deepEqual(item.aliases, ['海边来信', 'Sea Breeze']);
+  assert.deepEqual(item.aliases, ['Sea Breeze', '海边来信']);
   assert.equal(item.description, '完整简介。');
   assert.equal(item.episodeCount, 24);
   assert.equal(item.lines[0].episodes.length, 24);
@@ -317,6 +317,52 @@ test('detail has canonical aliases, true premiere dates, verified scores and all
   assert.ok(item.lines[0].episodes.every(episode => !episode.url));
   assert.equal((await catalog.detail('123456')).lines[0].episodes.length, 24);
   assert.equal(calls.length, 2);
+});
+
+test('the official original title stays in the first two search aliases and survives a catalog restart', async t => {
+  const raw = film({ id: '37068446', title: '生化危机：爆发夜', year: '2026', original_title: 'Resident Evil',
+    aka: ['生化危机9', '生化危机重启', 'Ｒｅｓｉｄｅｎｔ　Ｅｖｉｌ', 'resident-evil', '生化危机-爆发夜'], intro: '故事发生在一个充满危险的城市。' });
+  const { catalog, store } = fixture(url => response(raw, 200, url.href));
+  t.after(() => catalog.stop());
+  const item = await catalog.detail('37068446');
+  assert.equal(item.title, '生化危机：爆发夜');
+  assert.deepEqual(item.aliases, ['Resident Evil', '生化危机9', '生化危机重启']);
+  assert.deepEqual(item.aliases.slice(0, 2), ['Resident Evil', '生化危机9']);
+  assert.equal(item.description, raw.intro);
+  assert.equal(item.poster, raw.pic.normal);
+  assert.equal(item.originalTitle, 'Resident Evil');
+  await catalog.stop();
+  const restored = fixture(() => assert.fail('Fresh official metadata should not be fetched again'), { store });
+  t.after(() => restored.catalog.stop());
+  const cached = await restored.catalog.detail('37068446');
+  assert.equal(cached.title, item.title);
+  assert.equal(cached.originalTitle, 'Resident Evil');
+  assert.deepEqual(cached.aliases, item.aliases);
+  assert.equal(restored.calls.length, 0);
+});
+
+test('old cached aliases refresh from the same official subject while poster IDs and user data remain registered', async t => {
+  const raw = film({ id: '37068446', title: '生化危机：爆发夜', year: '2026', original_title: 'Resident Evil', aka: ['生化危机9', '生化危机重启'] });
+  const old = fixture(url => response(raw, 200, url.href));
+  const item = await old.catalog.detail('37068446');
+  await old.catalog.stop();
+  const saved = JSON.parse(old.store.values.get(CACHE_KEY));
+  saved.version = 3;
+  saved.subjects[0][1].item.aliases = ['生化危机9', '生化危机重启', 'Resident Evil'];
+  delete saved.subjects[0][1].item.originalTitle;
+  old.store.values.set(CACHE_KEY, JSON.stringify(saved));
+  for (const key of ['quark-settings-v1', 'history-marker', 'favorites-marker']) old.store.values.set(key, key + '-preserved');
+  const fresh = fixture(url => response(raw, 200, url.href), { store: old.store });
+  t.after(() => fresh.catalog.stop());
+  assert.equal(fresh.catalog.poster('37068446'), item.poster);
+  const refreshed = await fresh.catalog.detail('37068446');
+  assert.equal(fresh.calls.length, 1);
+  assert.equal(fresh.calls[0].url.pathname, '/rexxar/api/v2/movie/37068446');
+  assert.equal(refreshed.id, item.id);
+  assert.deepEqual(refreshed.aliases.slice(0, 2), ['Resident Evil', '生化危机9']);
+  assert.equal(fresh.catalog.poster('37068446'), item.poster);
+  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 4);
+  for (const key of ['quark-settings-v1', 'history-marker', 'favorites-marker']) assert.equal(old.store.values.get(key), key + '-preserved');
 });
 
 test('an unlisted numeric ID resolves only from canonical official movie or TV metadata', async t => {

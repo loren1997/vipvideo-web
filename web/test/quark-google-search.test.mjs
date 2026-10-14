@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { searchGoogleQuark } from '../lib/quark-google-search.mjs';
 import * as webSearch from '../lib/quark-google-search.mjs';
+import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
+import { createRequest, readText } from '../lib/network.mjs';
 
 const title = '测试影片', time = Date.parse('2026-10-14T00:00:00Z');
 const link = (url, name = title + ' 夸克资源') => `<a href="${url}"><h3>${name}</h3></a>`;
@@ -46,18 +49,193 @@ test('a compact Chinese title and year require independent film-year evidence be
   for (const title of ['2012', '1917']) assert.equal(webSearch.classifyQuarkCandidate(`${title} (2009)`, { title }), 'matched');
 });
 
+test('canonical Chinese titles accept only supplied English aliases joined in either order with one matching film year', () => {
+  const query = { title: '希望', aliases: ['HOPE', '希望：末日血战', '湖浦港'], year: '2026' };
+  for (const label of [
+    '2026韩国电影希望Hope！科幻动作！k：夸克网盘分享',
+    '希望HOPE(2026) （主演：黄政民/赵寅成/郑好娟）[韩国] [剧情/动作/科幻/惊悚/恐怖]1080p',
+    '希望 HOPE (2026) 夸克网盘', 'HOPE希望（2026）1080p',
+    '希望：末日血战HOPE (2026) 网盘',
+  ]) assert.equal(webSearch.classifyQuarkCandidate(label, query), 'matched', label);
+  for (const label of [
+    '希望HOPE (2013) 夸克网盘', '希望HOPE (2013) 页面日期 2026/10/14',
+    '希望HOPE (2013) (2026) 夸克网盘', '希望HOPE 页面发布时间2026',
+    '希望HOPE 夸克网盘', '希望HOPE RETURNS (2026)', '希望HOPE归来 (2026)',
+    '希望OTHER (2026)', '其他电影介绍，希望HOPE (2026)',
+    '希望之歌HOPE (2026)', '2026电影绝望Hope夸克网盘',
+  ]) assert.equal(webSearch.classifyQuarkCandidate(label, query), 'unrelated', label);
+  assert.equal(webSearch.classifyQuarkCandidate('希望HOPE (2026)', { title: '希望', year: '2026' }), 'unrelated');
+  assert.equal(webSearch.classifyQuarkCandidate('VITALITY (2017)', { title: '小丑回魂', aliases: ['IT'], year: '2017' }), 'unrelated');
+  assert.equal(webSearch.classifyQuarkCandidate('一路超平安(2026)', { title: '一路平安', aliases: ['Safe Journey'], year: '2026' }), 'unrelated');
+  assert.equal(webSearch.classifyQuarkCandidate('希望2026 HOPE', { title: '希望2026', aliases: ['HOPE'], year: '2026' }), 'matched');
+  assert.equal(webSearch.classifyQuarkCandidate('希望HOPE (2026)', { title: '希望2026', aliases: ['HOPE'], year: '2026' }), 'matched');
+  const resident = { title: '生化危机：爆发夜', aliases: ['Resident Evil', 'Resident Evil 0'], year: '2026' };
+  for (const label of ['生化危机：爆发夜Resident Evil (2026) 4K', '生化危机：爆发夜Resident Evil 0（2026）夸克网盘']) assert.equal(webSearch.classifyQuarkCandidate(label, resident), 'matched', label);
+  for (const label of ['生化危机：爆发夜Resident Evil (2021)', '生化危机：爆发夜Resident Evil Apocalypse (2026)']) assert.equal(webSearch.classifyQuarkCandidate(label, resident), 'unrelated', label);
+});
+
+test('Google SERP and article parsing retain the same canonical bilingual film instead of filtering its public post', async () => {
+  const heading = '2026韩国电影希望Hope！科幻动作！k：夸克网盘分享';
+  const query = { title: '希望', aliases: ['HOPE'], year: '2026' }, url = 'https://pd.qq.com/g/channel/post/public-post';
+  const html = `<title>${heading}</title><meta itemprop="datePublished" content="2026-09-13T11:48:46+08:00"><main><p>${heading}</p><a href="https://pan.quark.cn/s/canonical1">夸克网盘分享</a></main>`;
+  assert.deepEqual(webSearch.extractQuarkSearchResults(link(url, heading), { ...query, engine: 'Google' }).map(row => row.url), [url]);
+  assert.deepEqual(webSearch.extractQuarkArticle(html, { ...query, url, now: time }), { matched: true, rows: [{ url: 'https://pan.quark.cn/s/canonical1', name: heading, publishedAt: Date.parse('2026-09-13T11:48:46+08:00') }] });
+  const input = fixture(link(url, heading), { [url]: html });
+  assert.deepEqual((await searchGoogleQuark('希望', { ...input, aliases: query.aliases, year: query.year, titleOnly: true })).map(row => row.url), ['https://pan.quark.cn/s/canonical1']);
+});
+
 test('the shared Google URL requests newest web results without imposing a publication date cutoff', () => {
   const url = new URL(webSearch.googleQueryUrl('希望2026 夸克 网盘'));
   assert.equal(url.origin, 'https://www.google.com'); assert.equal(url.pathname, '/search');
   assert.equal(url.searchParams.get('q'), '希望2026 夸克 网盘');
-  assert.equal(url.searchParams.get('tbs'), 'sbd:1'); assert.equal(url.searchParams.get('udm'), '14');
+  assert.deepEqual([...url.searchParams.keys()], ['q', 'hl', 'tbs']);
+  assert.equal(url.searchParams.get('tbs'), 'sbd:1');
+  assert.equal(new URL(webSearch.googleQueryUrl('"希望" 2026 夸克 网盘')).searchParams.get('q'), '希望 2026 夸克 网盘');
 });
 
 test('exact title, official aliases and release year plan bounded search variants and later result pages', () => {
-  assert.deepEqual(webSearch.quarkSearchQueries({ title: '希望2026', aliases: ['Hope', '호프'], year: '2026' }), ['"希望" 2026 夸克 网盘', '"Hope" 2026 夸克 网盘', '"호프" 2026 夸克 网盘']);
+  assert.deepEqual(webSearch.quarkSearchQueries({ title: '希望2026', aliases: ['Hope', '호프'], year: '2026' }), ['"希望" 2026 夸克 网盘', '"Hope" 2026 夸克 网盘', '"호프" 2026 夸克 网盘', '"希望" 夸克']);
   assert.equal(webSearch.quarkSearchQueries({ title: '银翼杀手 2049', year: '2017' })[0], '"银翼杀手 2049" 2017 夸克 网盘');
   assert.equal(new URL(webSearch.googleQueryUrl('test', 2)).searchParams.get('start'), '20');
   assert.equal(new URL(webSearch.bingQueryUrl('test', 2)).searchParams.get('first'), '21');
+});
+
+test('a sanitized Google heading can retain only a same-origin opaque goto with verified film identity', () => {
+  const query = { title: '希望', aliases: ['HOPE', '호프'], year: '2026', url: 'https://www.google.com/search?q=hope' };
+  const jump = '/goto?url=' + 'A'.repeat(40);
+  const heading = '【韩影】《希望HOPE (2026)》【1080P】【内嵌/内封中字】';
+  const html = `<div class="MjjYud"><a class="zReHs" href="${jump}"><h3 class="LC20lb">${heading}</h3><cite>腾讯频道 https://pd.qq.com › post</cite></a></div>`;
+  assert.deepEqual(webSearch.extractQuarkSearchResults(html, query), [{ url: 'https://www.google.com' + jump, name: heading, googleRedirect: true }]);
+  for (const name of ['希望 HOPE (2013)', '希望 HOPE 页面日期 2026/10/14', '希望 HOPE', '希望之歌 (2026)', '其他电影 (2026)', '网盘分享']) {
+    assert.deepEqual(webSearch.extractQuarkSearchResults(link(jump, name), query), [], name);
+  }
+  for (const value of ['/search?q=希望2026', '/sorry/index?url=' + 'A'.repeat(40), jump + '&extra=1', jump + '&url=duplicate', '/goto?url=https%3A%2F%2Fpublic.example%2Fpost', 'https://www.google.com.hk' + jump, 'http://www.google.com' + jump]) {
+    assert.deepEqual(webSearch.extractQuarkSearchResults(link(value, heading), query), [], value.split('?')[0]);
+  }
+  const ordinary = 'https://www.google.com.evil.example' + jump;
+  assert.deepEqual(webSearch.extractQuarkSearchResults(link(ordinary, heading), query), [{ url: ordinary, name: heading }]);
+  assert.deepEqual(webSearch.extractQuarkSearchResults('<title>安全验证</title>' + html, query), []);
+  assert.equal(webSearch.classifyQuarkCandidate('【韩影】《希望HOPE (2013)》', query), 'unrelated');
+  assert.equal(webSearch.classifyQuarkCandidate('【韩影】《VITALITY (2017)》', { title: '小丑回魂', aliases: ['IT'], year: '2017' }), 'unrelated');
+});
+
+test('an exact Google heading without a year can resolve a safe goto but the article must prove the release year', async () => {
+  const query = { title: '遮天 年番1', aliases: ['遮天第一季'], year: '2023' };
+  const jump = 'https://www.google.com/goto?url=' + 'N'.repeat(40), heading = '遮天年番1全集高清下载';
+  assert.deepEqual(webSearch.extractQuarkSearchResults(link(jump, heading), query), [{ url: jump, name: heading, googleRedirect: true }]);
+  for (const title of ['遮天年番1 (2023) 全集高清下载', '遮天年番1 (2025) 全集高清下载', heading]) {
+    const calls = [];
+    const rows = await searchGoogleQuark(query.title, { ...query, titleOnly: true, now: () => time, read: async url => {
+      calls.push(url);
+      if (new URL(url).pathname === '/search') return { url, html: link(jump, heading) };
+      assert.equal(url, jump);
+      return { url: 'https://public.example/shrouding', html: `<title>${title}</title><main><h1>${title}</h1><a href="https://pan.quark.cn/s/series2023">夸克分享</a></main>` };
+    } });
+    assert.deepEqual(rows.map(row => row.url), title.includes('(2023)') ? ['https://pan.quark.cn/s/series2023'] : []);
+    assert.equal(calls.filter(url => url === jump).length, 1);
+  }
+  for (const name of ['网盘资源', '其他影片 (2023)']) assert.deepEqual(webSearch.extractQuarkSearchResults(link(jump, name), query), []);
+});
+
+test('typed Next Flight resources keep each provider, film year and canonical share in the same active object', () => {
+  const query = { title: '星际穿越', aliases: ['Interstellar'], year: '2014', requireYear: true, url: 'https://public.example/interstellar', now: time };
+  const resource = { provider: 'quark', resourceType: 'cloud_share', status: 'active', title: '星际穿越.Interstellar.2014.2160p.BluRay.REMUX.HEVC.DTS-HD.MA.5.1', shareUrl: 'https://pan.quark.cn/s/next2014', accessCode: 'A1b2' };
+  const records = [resource, ...[
+    { provider: 'baidu' }, { resourceType: 'web_video' }, { status: 'cancelled' },
+    { title: '其他电影 (2014)' }, { title: resource.title.replace('2014', '2015') }, { title: '星际穿越.Interstellar' },
+    { shareUrl: 'http://pan.quark.cn/s/next2014' }, { shareUrl: 'https://public.example/redirect?url=https://pan.quark.cn/s/next2014' },
+    { shareUrl: 'https://pan.quark.cn/redirect?url=https://pan.quark.cn/s/next2014' },
+    { shareUrl: 'https://pan.quark.cn.evil.example/s/next2014' }, { shareUrl: 'https://pan.quark.cn/s/next2014#extra' },
+    { shareUrl: 'https://pan.quark.cn/s/next2014?other=1' }, { shareUrl: 'https://pan.quark.cn/s/next2014?pwd=one&pwd=two' },
+    { accessCode: 'bad code' }, { shareUrl: { href: resource.shareUrl } },
+  ].map(overrides => ({ ...resource, ...overrides })),
+  { provider: 'quark', resourceType: 'cloud_share', status: 'active', title: resource.title, nested: { shareUrl: resource.shareUrl } },
+  { provider: 'quark', resources: [{ ...resource, provider: undefined }] }];
+  const flight = '3d:I[1,[],"ResourcePanel"]\n3c:' + JSON.stringify(['$', '$L3d', null, { providers: [{ provider: 'quark', resources: records }] }]) + '\n';
+  const script = `<script>self.__next_f.push(${JSON.stringify([1, flight])})</script>`;
+  const html = '<title>星际穿越 (2014) - 影视资源</title><main><h1>星际穿越</h1></main>' + script;
+  assert.deepEqual(webSearch.extractQuarkArticle(html, query).rows, [{ url: 'https://pan.quark.cn/s/next2014?pwd=A1b2', name: resource.title }]);
+  assert.deepEqual(webSearch.extractQuarkArticle(html.replace('星际穿越 (2014) - 影视资源', '其他电影 (2014)'), query).rows, []);
+  assert.deepEqual(webSearch.extractQuarkArticle(html.replace('星际穿越 (2014) - 影视资源', '星际穿越'), query).rows, []);
+});
+
+test('Next Flight React children wrappers preserve a resource at the observed ninth nesting level', () => {
+  const query = { title: '星际穿越', aliases: ['Interstellar'], year: '2014', requireYear: true, url: 'https://public.example/interstellar', now: time };
+  const resource = { provider: 'quark', resourceType: 'cloud_share', status: 'active', title: '星际穿越.Interstellar.2014.2160p', shareUrl: 'https://pan.quark.cn/s/wrapped14' };
+  const panel = ['$', '$L3c', null, { providers: [{ provider: 'quark', resources: [resource] }] }];
+  const wrapped = ['$', 'div', null, { children: [[['$', 'h2', null, { children: '影片资源' }], panel]] }];
+  const flight = '3c:I[1,[],"ResourcePanel"]\n3a:' + JSON.stringify(wrapped) + '\n';
+  const html = '<title>星际穿越 (2014)</title><main><h1>星际穿越</h1></main>' + `<script>self.__next_f.push(${JSON.stringify([1, flight])})</script>`;
+  assert.deepEqual(webSearch.extractQuarkArticle(html, query).rows, [{ url: resource.shareUrl, name: resource.title }]);
+});
+
+test('Next hydration accepts only JSON push arguments and remains within body, depth and traversal budgets', t => {
+  const query = { title: '星际穿越', aliases: ['Interstellar'], year: '2014', requireYear: true, url: 'https://public.example/interstellar', now: time };
+  const resource = { provider: 'quark', resourceType: 'cloud_share', status: 'active', title: '星际穿越.Interstellar.2014.2160p', shareUrl: 'https://pan.quark.cn/s/bounds14' };
+  const frame = 'a:' + JSON.stringify(resource) + '\n', payload = JSON.stringify([1, frame]);
+  const head = '<title>星际穿越 (2014)</title><main><h1>星际穿越</h1></main>';
+  const script = value => `<script>self.__next_f.push(${JSON.stringify([1, value])})</script>`;
+  let deep = resource;
+  for (let depth = 0; depth < 13; depth++) deep = { child: deep };
+  const wide = Array.from({ length: 100 }, () => Array(100).fill(0));
+  globalThis.__quarkHydrationExecuted = false;
+  t.after(() => { delete globalThis.__quarkHydrationExecuted; });
+  for (const body of [
+    `<script>self.__next_f.push(eval(${JSON.stringify(payload)}))</script>`,
+    `<script>self.__next_f.push([1,${JSON.stringify(frame)}+""])</script>`,
+    `<script>self.__next_f.push(${payload});globalThis.__quarkHydrationExecuted=true;</script>`,
+    `<script>const arbitrary=${JSON.stringify(resource)};</script>`,
+    script('a:' + JSON.stringify(deep) + '\n'),
+    script('a:' + JSON.stringify(wide) + '\n' + frame),
+    script('a:null\n'.repeat(128) + frame),
+    '<script>const unrelated=1;</script>'.repeat(80) + script(frame),
+    'x'.repeat(512 * 1024) + script(frame),
+  ]) assert.deepEqual(webSearch.extractQuarkArticle(head + body, query).rows, []);
+  assert.equal(globalThis.__quarkHydrationExecuted, false);
+  assert.equal(webSearch.extractQuarkArticle(head + script(frame), query).rows.length, 1);
+});
+
+test('title continuations cannot hide behind punctuation or spaces before the correct year', () => {
+  const query = { title: '希望', aliases: ['Hope'], year: 2026, requireYear: true };
+  for (const title of ['Hope Returns (2026)', 'Hope - Returns (2026)', 'Hope: Another Film (2026)', 'Hope - 2 (2026)']) {
+    assert.equal(webSearch.classifyQuarkCandidate(title, query), 'unrelated', title);
+  }
+  for (const title of ['Hope (2026) 1080P 夸克网盘', '【韩影】《希望HOPE (2026)》【1080P】【中字】', '2026韩国电影希望Hope！科幻动作！', '希望 - 4K (2026) 高清资源', '希望 WEB-DL (2026)', '希望 S01E185 (2026)']) {
+    assert.equal(webSearch.classifyQuarkCandidate(title, query), 'matched', title);
+  }
+});
+
+test('static Google goto follows the real safe transport final URL and rejects private redirect DNS', async () => {
+  const jump = 'https://www.google.com/goto?url=' + 'B'.repeat(40), publicUrl = 'https://public.example/posts/hope';
+  for (const privateRedirect of [false, true]) {
+    const calls = [], dns = [], finalUrl = privateRedirect ? 'https://private.example/posts/hope' : publicUrl;
+    const request = createRequest({ lookup: async host => { dns.push(host); return [{ address: host === 'private.example' ? '10.0.0.2' : '8.8.8.8', family: 4 }]; }, httpsRequest: (url, options, callback) => {
+      const outgoing = new EventEmitter(); outgoing.destroy = error => queueMicrotask(() => outgoing.emit('error', error));
+      outgoing.end = () => queueMicrotask(() => options.lookup(url.hostname, { all: true }, (error, addresses) => {
+        assert.equal(error, null); assert.equal(addresses[0].address, '8.8.8.8'); calls.push(url.href);
+        const redirect = url.href === jump;
+        const body = redirect ? '' : url.hostname === 'www.google.com' ? link(jump, '【韩影】希望 HOPE (2026) 夸克网盘') : '<title>希望 HOPE (2026) 夸克网盘</title><main><a href="https://pan.quark.cn/s/gotovalid">夸克网盘分享</a></main>';
+        const response = Object.assign(Readable.from([Buffer.from(body)]), { statusCode: redirect ? 302 : 200, headers: redirect ? { location: finalUrl } : {} });
+        outgoing.emit('response', response); callback(response);
+      })); return outgoing;
+    } });
+    const rows = await searchGoogleQuark('希望', { aliases: ['HOPE'], year: '2026', titleOnly: true, now: () => time, read: async (url, duration, maxBytes) => {
+      const response = await request(url, { timeout: duration });
+      try { return { html: await readText(response, maxBytes), url: response.finalUrl }; } finally { response.destroy(); }
+    } });
+    assert.deepEqual(rows.map(row => row.url), privateRedirect ? [] : ['https://pan.quark.cn/s/gotovalid']);
+    assert.deepEqual(calls.map(value => new URL(value).hostname), privateRedirect ? ['www.google.com', 'www.google.com'] : ['www.google.com', 'www.google.com', 'public.example']);
+    assert.ok(dns.includes(privateRedirect ? 'private.example' : 'public.example'));
+  }
+});
+
+test('goto articles need an external final URL and matching content, including legacy string readers', async () => {
+  const jump = 'https://www.google.com/goto?url=' + 'C'.repeat(40), heading = '希望 HOPE (2026) 夸克资源';
+  const content = '<title>希望 HOPE (2026) 夸克资源</title><main><a href="https://pan.quark.cn/s/finalurl1">夸克下载</a></main>';
+  for (const response of [content, { html: content }, { url: jump, html: content }, { url: 'https://accounts.google.com/login', html: content }, { url: 'http://127.0.0.1/post', html: content }, { url: 'https://public.example/post', html: '<title>希望 HOPE (2013)</title>' + content.replace(/希望 HOPE \(2026\)/g, '希望 HOPE (2013)') }, { url: 'https://public.example/post', html: content.replace(/希望 HOPE \(2026\)/g, '希望') }, { url: 'https://public.example/post', html: '<title>登录</title>' + content }]) {
+    const rows = await searchGoogleQuark('希望', { aliases: ['HOPE'], year: '2026', titleOnly: true, now: () => time, read: async url => url.includes('/search?') ? link(jump, heading) : response });
+    assert.deepEqual(rows, []);
+  }
 });
 
 test('Chinese Bing only trusts result headings, unwraps safe tracking targets and ignores navigation and snippet share links', () => {
@@ -145,7 +323,7 @@ test('Google requests newest results without a date cutoff, following only three
   assert.equal(rows.length, 3); assert.equal(input.calls.length, 4);
   const query = new URL(input.calls[0].url);
   assert.equal(query.origin, 'https://www.google.com'); assert.equal(query.pathname, '/search');
-  assert.equal(query.searchParams.get('q'), `"${title}" 夸克 网盘`); assert.equal(query.searchParams.get('tbs'), 'sbd:1'); assert.equal(query.searchParams.get('udm'), '14');
+  assert.equal(query.searchParams.get('q'), `${title} 夸克 网盘`); assert.equal(query.searchParams.get('tbs'), 'sbd:1'); assert.equal(query.searchParams.has('udm'), false); assert.equal(query.searchParams.has('num'), false);
   assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/1', 'https://posts.example/2', 'https://posts.example/3']);
   for (const call of input.calls) { assert.equal(call.maxBytes, 512 * 1024); assert.equal(call.deadline, time + 3000); assert.ok(call.duration <= 2000); }
   assert.equal(input.calls[0].duration, 1500);
@@ -178,25 +356,44 @@ test('an empty canonical query tries one supplied alias within the original requ
   const calls = [];
   const rows = await searchGoogleQuark(title, { aliases: ['Winter and Summer', 'unused alias'], now: () => time, read: async (url, duration, maxBytes, deadline) => {
     calls.push({ url, deadline });
-    if (new URL(url).hostname === 'www.google.com') return new URL(url).searchParams.get('q') === '"Winter and Summer" 夸克 网盘' ? link('https://posts.example/movie', 'Winter and Summer 资源') : '<title>Google</title>';
+    if (new URL(url).hostname === 'www.google.com') return new URL(url).searchParams.get('q') === 'Winter and Summer 夸克 网盘' ? link('https://posts.example/movie', 'Winter and Summer 资源') : '<title>Google</title>';
     return '<title>Winter and Summer 资源</title><a href="https://pan.quark.cn/s/abcdef1">夸克下载</a>';
   } });
   assert.equal(rows.length, 1); assert.equal(calls.length, 3);
-  assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [`"${title}" 夸克 网盘`, '"Winter and Summer" 夸克 网盘']);
+  assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [`${title} 夸克 网盘`, 'Winter and Summer 夸克 网盘']);
   assert.ok(calls.every(call => call.deadline === time + 3000));
 });
 
-test('an empty Google title-plus-Quark query falls back to title-plus-cloud-drive within the same budget', async () => {
+test('an empty exact Google query falls back to the title and Quark without requiring cloud-drive wording', async () => {
   const calls = [];
   const rows = await searchGoogleQuark(title, { now: () => time, read: async (url, duration, maxBytes, deadline) => {
     calls.push({ url, deadline });
     const query = new URL(url).searchParams.get('q');
-    if (query) return query === `"${title}" 网盘` ? link('https://posts.example/movie') : '<title>Google</title>';
+    if (query) return query === `${title} 夸克` ? link('https://posts.example/movie') : '<title>Google</title>';
     return article(link('https://pan.quark.cn/s/abcdef1'));
   } });
   assert.equal(rows.length, 1);
-  assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [`"${title}" 夸克 网盘`, `"${title}" 网盘`]);
+  assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [`${title} 夸克 网盘`, `${title} 夸克`]);
   assert.ok(calls.every(call => call.deadline === time + 3000));
+});
+
+test('multiple official aliases retain three exact queries and a broad Google fallback with film-year verification', async () => {
+  const query = { title: '希望2026', aliases: ['Hope', '호프', '湖浦港', '希望：末日血战'], year: '2026' };
+  const expected = ['"希望" 2026 夸克 网盘', '"Hope" 2026 夸克 网盘', '"호프" 2026 夸克 网盘', '"希望" 夸克'], calls = [];
+  assert.deepEqual(webSearch.quarkSearchQueries(query), expected);
+  const rows = await searchGoogleQuark(query.title, { ...query, titleOnly: true, now: () => time, read: async (url, duration, maxBytes, deadline) => {
+    calls.push({ url, duration, deadline });
+    const target = new URL(url);
+    if (target.hostname === 'www.google.com') return target.searchParams.get('q') === '希望 夸克'
+      ? link('https://posts.example/correct', '希望 HOPE (2026) 夸克资源') + link('https://posts.example/wrong', '希望 HOPE (2013) 夸克资源')
+      : '<title>Google</title>';
+    assert.equal(url, 'https://posts.example/correct');
+    return '<title>希望 HOPE (2026) 夸克资源</title><article><a href="https://pan.quark.cn/s/fallback1">夸克资源</a></article>';
+  } });
+  assert.deepEqual(calls.slice(0, 4).map(call => new URL(call.url).searchParams.get('q')), ['希望 2026 夸克 网盘', 'Hope 2026 夸克 网盘', '호프 2026 夸克 网盘', '希望 夸克']);
+  assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/fallback1']);
+  assert.equal(calls.length, 5);
+  assert.ok(calls.every(call => call.deadline === time + 3000 && call.duration <= 1800));
 });
 
 test('Bing searches resource articles and follows relevant first-level pages as well as direct shares', async () => {
@@ -243,7 +440,7 @@ test('a release-year hint never removes matching Google resources which omit tha
   const rows = await searchGoogleQuark(title + ' 2026', input);
   assert.equal(rows.length, 1, 'previously the strict title-plus-year filter discarded this fixture before reading the page');
   assert.equal(input.calls.length, 2);
-  assert.equal(new URL(input.calls[0].url).searchParams.get('q'), `"${title}" 2026 夸克 网盘`);
+  assert.equal(new URL(input.calls[0].url).searchParams.get('q'), `${title} 2026 夸克 网盘`);
 });
 
 test('clean titles discover ongoing series collections without confusing publication dates with release years', async t => {
@@ -254,7 +451,7 @@ test('clean titles discover ongoing series collections without confusing publica
   ]) await t.test(keyword, async () => {
     const input = fixture(link('https://posts.example/series', pageTitle), { 'https://posts.example/series': `<title>${pageTitle}</title><article><time datetime="2026-10-13"></time>${link('https://pan.quark.cn/s/abcdef1', queryTitle + ' 夸克全集')}</article>` });
     const rows = await searchGoogleQuark(keyword, input);
-    assert.equal(new URL(input.calls[0].url).searchParams.get('q'), webSearch.quarkSearchQueries({ title: queryTitle, year: /\s+((?:19|20)\d{2})$/.exec(keyword)?.[1] })[0]);
+    assert.equal(new URL(input.calls[0].url).searchParams.get('q'), webSearch.quarkSearchQueries({ title: queryTitle, year: /\s+((?:19|20)\d{2})$/.exec(keyword)?.[1] })[0].replace(/^"([^"]+)"/, '$1'));
     assert.equal(rows.length, 1); assert.equal(rows[0].publishedAt, Date.parse('2026-10-13'));
   });
 });
@@ -273,7 +470,7 @@ test('a canonical title containing a spaced year-like number is preserved withou
     'https://posts.example/2049': '<title>银翼杀手 2049（2017）4K资源</title><article><a href="https://pan.quark.cn/s/abcdef1">银翼杀手2049 夸克高清</a></article>',
   });
   const rows = await searchGoogleQuark(' 银翼杀手 2049 ', { ...input, titleOnly: true });
-  assert.equal(new URL(input.calls[0].url).searchParams.get('q'), '"银翼杀手 2049" 夸克 网盘');
+  assert.equal(new URL(input.calls[0].url).searchParams.get('q'), '银翼杀手 2049 夸克 网盘');
   assert.equal(rows.length, 1); assert.equal(rows[0].name, '银翼杀手2049 夸克高清');
   assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/2049']);
 });

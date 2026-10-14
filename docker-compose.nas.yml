@@ -26,6 +26,7 @@ services:
       LIBVA_DRIVER_NAME: iHD
       QUARK_SEARCH_API: http://pansou:8888/api/search
       QUARK_BROWSER_URL: http://quark-browser:3020
+      QUARK_SEARCH_PROXY: ""
     devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -55,6 +56,7 @@ services:
     environment:
       PORT: "3020"
       HOME: /tmp
+      QUARK_SEARCH_PROXY: ""
     read_only: true
     tmpfs:
       - /tmp:size=192m,mode=1777

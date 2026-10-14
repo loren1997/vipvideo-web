@@ -43,6 +43,10 @@ docker compose -f docker-compose.yml logs --tail=100 web
 
 浏览器访问 `http://NAS的局域网IP:3000`，输入密码后即可浏览内置源的电影、电视剧和动漫，也可在设置页管理或导入其他影视源。需要 Docker Engine 和 Docker Compose v2；含动态网页助手时建议至少 2 GB 可用内存。镜像包含 FFmpeg 和 Chromium，兼容播放和媒体转发会使用部署主机的带宽，软件转码还会使用 CPU。动态浏览器放在独立的 `quark-browser` 容器中，限制为 0.5 CPU / 512 MiB，仅按需执行公开资源搜索；没有主机端口、账号凭证、应用数据卷或 GPU 映射。容器健康检查由镜像提供，使用非 root 用户运行，应用数据保存在原命名卷中。
 
+Google 动态搜索使用容器内的独立 Chromium 和私有虚拟显示，搜索结束后退出，不会打开 NAS 或电脑桌面窗口。搜索结果优先采用 Google 的日期排序，并在打开文章后按可核验的实际发布时间排列；无发布日期的结果排在后面。
+
+需要显式代理时，在现用 Compose 的 `web.environment` 和 `quark-browser.environment` 都填写同一个 `QUARK_SEARCH_PROXY: "http://代理主机IP:端口"`，再重建这两个服务。源码部署可在 `.env` 填写 `QUARK_SEARCH_PROXY`。仅支持不含账号密码的 HTTP 代理；该代理只用于公开资源搜索及文章读取，内部 PanSou 与个人夸克账号、转存、播放继续使用原网络。容器里的 `127.0.0.1` 指容器自身，应填写可从容器访问的局域网地址。NAS 已通过透明代理出网时留空，无需为这一项修改旧 Compose；Google 仍可能对部分出口要求验证，应用会明确提示。
+
 ### Intel 核显 NAS 单文件部署
 
 PVE → Ubuntu Docker、i3-8100T 等 Intel 核显主机推荐使用 [docker-compose.nas.yml](docker-compose.nas.yml)。这个文件已经合并播放器、Intel VAAPI、PanSou 夸克搜索、隔离动态网页助手和 Plex 资源保护；启动、升级都只使用这一个 YAML 文件，不需要 `.env`。

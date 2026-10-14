@@ -31,6 +31,27 @@ test('public Bing and PanSou requests retain the public transport and never rece
   assert.equal(calls.length,2);assert.ok(calls.every(row=>row.options.timeout===8000&&row.options.method==='GET'&&!JSON.stringify(row.options).includes('mock-')));
 });
 
+test('search cancellation reaches public requests and the fixed internal service before their timeout',async()=>{
+  for(const internal of[false,true]){
+    const controller=new AbortController(),reason=new Error('film changed');let calls=0,seenSignal;
+    const request=async(_url,options)=>{
+      calls++;seenSignal=options.signal;
+      return new Promise((_,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true}));
+    };
+    const httpTransport=(_url,options)=>{
+      calls++;seenSignal=options.signal;const pending=new EventEmitter();
+      pending.destroy=()=>{};pending.end=()=>options.signal.addEventListener('abort',()=>pending.emit('error',options.signal.reason),{once:true});
+      return pending;
+    };
+    const search=createQuarkSearchRequest({request,httpTransport});
+    const address=internal?fixed+'?kw=film':'https://search.example/api/search?kw=film';
+    const rejected=assert.rejects(search(address,{signal:controller.signal}),error=>error===reason||error.cause===reason);
+    assert.equal(seenSignal,controller.signal);controller.abort(reason);await rejected;
+    await assert.rejects(search(address,{signal:controller.signal}),error=>error===reason);
+    assert.equal(calls,1);
+  }
+});
+
 test('hostname, port and path disguises cannot access private search or arbitrary local services',async()=>{
   let privateCalls=0,publicCalls=0;
   const guarded=createRequest({lookup:async()=>[{address:'172.20.0.5',family:4}],httpRequest:()=>{publicCalls++;assert.fail('private DNS address must be rejected');}});

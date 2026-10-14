@@ -6,6 +6,7 @@ import { createQuarkSearchPool } from '../lib/quark-search-pool.mjs';
 import { createQuarkSearchRequest } from '../lib/quark-search.mjs';
 import { createRequest, readText } from '../lib/network.mjs';
 import { searchGoogleQuark } from '../lib/quark-google-search.mjs';
+import { createQuarkTelegramSearch } from '../lib/quark-telegram-search.mjs';
 
 const KEY = 'quark-search-pool-v1';
 const official = 'https://so.252035.xyz/api/search', backup = 'https://backup.example/api/search';
@@ -14,11 +15,80 @@ const json = (url = quarkUrl, title = '电影') => JSON.stringify({ code: 0, dat
 const response = (body, statusCode = 200) => Object.assign(Readable.from([body]), { statusCode, headers: {} });
 const rss = (url, title = '电影') => `<rss><channel><item><title>${title}</title><link>${url || 'https://example.org'}</link></item></channel></rss>`;
 const flush = async () => { for (let index = 0; index < 5; index++) await new Promise(done => setImmediate(done)); };
-function fixture({ request, discoveryRequest, webRequest, renderSearch, googleSearch = async () => { throw new Error('Fixture Google search unavailable'); }, saved, now = Date.now } = {}) {
+
+test('public channel results merge after a fast API response, polls reuse work and more advances its page', async () => {
+  const channelCalls = []; let release;
+  const f = fixture({ request: async () => response(json(quarkUrl, '希望 (2026)')),
+    telegramSearch: async (title, options) => {
+      channelCalls.push({ title, page: options.page });
+      assert.equal(options.year, '2026'); assert.ok(options.deadline <= Date.now() + 10000);
+      await options.read('https://t.me/s/Quark_Movies?q=希望', 1000, 512 * 1024, options.deadline);
+      if (channelCalls.length === 1) await new Promise(resolve => { release = resolve; });
+      return [{ name: '希望 (2026)', url: 'https://pan.quark.cn/s/channel2026' }];
+    },
+  });
+  const url = 'https://manual.example/api/search?kw=希望';
+  try {
+    const early = JSON.parse(await readText(await f.pool.request(url, { year: '2026' })));
+    assert.equal(early.results.length, 1); assert.equal(early.pending, true);
+    await f.pool.request(url, { year: '2026', poll: true }); assert.equal(channelCalls.length, 1);
+    release(); await flush();
+    const done = JSON.parse(await readText(await f.pool.request(url, { year: '2026', poll: true })));
+    assert.equal(done.results.length, 2); assert.equal(done.pending, undefined);
+    await f.pool.request(url, { year: '2026', forceRefresh: true }); await flush();
+    assert.deepEqual(channelCalls.map(row => row.page), [0, 1]);
+    assert.ok(f.calls.filter(row => row.url.startsWith('https://t.me/')).every(row => row.options.followRedirects && row.options.signal));
+  } finally { release?.(); await f.pool.stop(); }
+});
+
+test('stopping public channel search cancels its request and late results cannot survive', async () => {
+  let channelSignal, sawAbort = false;
+  const f = fixture({ telegramSearch: async (_title, { signal }) => {
+    channelSignal = signal;
+    await new Promise((_, reject) => signal.addEventListener('abort', () => { sawAbort = true; reject(signal.reason); }, { once: true }));
+    return [{ name: '电影', url: 'https://pan.quark.cn/s/latetelegram' }];
+  } });
+  await f.pool.request('https://manual.example/api/search?kw=电影');
+  await f.pool.stop(); assert.equal(sawAbort, true); assert.equal(channelSignal.aborted, true);
+});
+
+test('channel cursors continue past the fourth page while Google page numbers wrap and polls do not restart work', async () => {
+  const channelCalls = [], renderedPages = [], channel = createQuarkTelegramSearch();
+  const fourth = 'https://pan.quark.cn/s/abc000000070';
+  const f = fixture({ telegramSearch: channel,
+    request: value => {
+      const url = new URL(value);
+      if (url.hostname !== 't.me') return response(url.hostname.includes('bing.com') ? '<rss><channel></channel></rss>' : '{"results":[]}');
+      const q = url.searchParams.get('q'), before = url.searchParams.get('before'), id = before ? Number(before) - 10 : 100;
+      channelCalls.push({ q, before });
+      const body = q === 'Hope' && id === 70 ? `<a href="${fourth}">夸克</a>` : '暂无链接';
+      return response(`<div class="tgme_widget_message_wrap"><div class="tgme_widget_message" data-post="Quark_Movies/${id}"><div class="tgme_widget_message_text">名称：希望 Hope (2026)<br/>${body}</div><a href="https://t.me/Quark_Movies/${id}"><time datetime="2026-10-14T00:00:00Z"></time></a></div></div>`);
+    },
+    renderSearch: async query => { renderedPages.push(query.page); return []; },
+  });
+  const url = 'https://manual.example/api/search?kw=' + encodeURIComponent('希望');
+  const read = async options => JSON.parse(await readText(await f.pool.request(url, { aliases: ['Hope'], year: '2026', ...options })));
+  try {
+    let completed;
+    for (let index = 0; index < 4; index++) {
+      const options = index ? { webSearch: true, forceRefresh: true } : {};
+      await read(options); await flush();
+      const requests = channelCalls.length, renders = renderedPages.length;
+      completed = await read({ ...options, poll: true });
+      assert.equal(channelCalls.length, requests); assert.equal(renderedPages.length, renders);
+      assert.equal(completed.pending, undefined);
+    }
+    for (const q of ['希望', 'Hope']) assert.deepEqual(channelCalls.filter(call => call.q === q).map(call => call.before), [null, '100', '90', '80']);
+    assert.deepEqual(renderedPages, [0, 1, 2, 0]);
+    assert.ok(completed.results.some(row => row.url === fourth));
+  } finally { await f.pool.stop(); }
+});
+
+function fixture({ request, discoveryRequest, webRequest, renderSearch, telegramSearch, googleSearch = async () => { throw new Error('Fixture Google search unavailable'); }, saved, now = Date.now } = {}) {
   const metadata = new Map(saved ? [[KEY, JSON.stringify(saved)]] : []), calls = [], discoveryCalls = [];
   const store = { meta: key => metadata.get(key), setMeta: (key, value) => metadata.set(key, value) };
   const transport = async (url, options) => { calls.push({ url, options }); return request ? request(url, options) : response(json(undefined, new URL(url).searchParams.get('kw') || '电影')); };
-  const pool = createQuarkSearchPool({ store, now, googleSearch, renderSearch, webRequest: webRequest || transport,
+  const pool = createQuarkSearchPool({ store, now, googleSearch, renderSearch, telegramSearch, webRequest: webRequest || transport,
     request: transport,
     discoveryRequest: async (url, options) => {
       discoveryCalls.push({ url, options });
@@ -240,18 +310,18 @@ test('Bing articles become Quark candidates when Google and the configured API h
   try {
     const result = await lookup(f.pool, 'https://manual.example/api/search?' + new URLSearchParams({ kw: '一路超平安' }));
     assert.equal(result.results.length, 1); assert.equal(result.results[0].url, quarkUrl);
-    assert.equal(f.calls.length, 3); assert.ok(f.calls.every(call => call.options.timeout <= 5500));
+    assert.equal(f.calls.length, 3); assert.ok(f.calls.every(call => call.options.timeout <= 8000));
   } finally { await f.pool.stop(); }
 });
 
-test('a healthy fast primary returns before a slow backup and stop waits for the backup without further persistence', async () => {
+test('a healthy fast primary returns before a slow backup and stop cancels the backup without further persistence', async () => {
   let clock = 1000, release;
   const f = fixture({ now: () => clock, saved: savedBackup(clock), request: url => url.includes('backup.example') ? new Promise(done => { release = done; }) : response(json()) });
   try {
     assert.equal((await lookup(f.pool)).results.length, 1);
     assert.equal(f.calls.length, 2); assert.equal(typeof release, 'function');
     let stopped = false; const pending = f.pool.stop().then(() => { stopped = true; });
-    await flush(); assert.equal(stopped, false);
+    await flush(); assert.equal(stopped, true);
     const saved = f.metadata.get(KEY);
     clock = 2000; release(response(json())); await pending;
     assert.equal(stopped, true);
@@ -291,29 +361,59 @@ test('pending or repeatedly failed automatic records cannot fill the pool and bl
   } finally { await f.pool.stop(); }
 });
 
-test('one 7.5-second budget leaves time for RSS after two stalled APIs and destroys late responses', async t => {
+test('switching through nine manual endpoints keeps the ninth usable without growing or weakening discovery limits', async () => {
+  let clock = 1000;
+  const f = fixture({ now: () => clock, request: url => {
+    const index = /^manual(\d+)\.example$/.exec(new URL(url).hostname)?.[1];
+    assert.ok(index, 'only the selected manual endpoint should be queried');
+    return response(json('https://pan.quark.cn/s/endpoint' + index, '电影'));
+  } });
+  try {
+    for (let index = 1; index <= 9; index++) {
+      clock++;
+      const url = `https://manual${index}.example/api/search`;
+      const result = await lookup(f.pool, url + '?kw=电影');
+      assert.deepEqual(result.results.map(row => row.url), [`https://pan.quark.cn/s/endpoint${index}?pwd=1234`]);
+      assert.ok(f.pool.status().candidates.length <= 8);
+      assert.ok(f.pool.status().candidates.some(row => row.apiUrl === url));
+    }
+    assert.equal(f.calls.length, 9);
+    const beforeDiscovery = f.pool.status().candidates.map(row => row.apiUrl);
+    assert.equal(beforeDiscovery.length, 8);
+    assert.ok(!beforeDiscovery.includes('https://manual1.example/api/search'));
+    await f.pool.discover();
+    assert.deepEqual(f.pool.status().candidates.map(row => row.apiUrl), beforeDiscovery, 'automatic discovery must not evict manual history or grow a full pool');
+    assert.equal(f.calls.length, 9);
+  } finally { await f.pool.stop(); }
+});
+
+test('foreground returns pending while two APIs retain eight seconds and RSS then gets a fresh budget', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
   const releases = [];
   const f = fixture({ saved: savedBackup(Date.now()), request: url => url.includes('bing.com') ? response(rss(quarkUrl)) : new Promise(done => releases.push(done)) });
   try {
     const pending = lookup(f.pool); await flush(); assert.equal(releases.length, 2);
-    t.mock.timers.tick(5500); await flush();
-    assert.equal((await pending).results[0].url, quarkUrl); assert.equal(Date.now(), 6500);
+    t.mock.timers.tick(150); await flush(); assert.equal((await pending).pending, true);
+    t.mock.timers.tick(7850); await flush();
+    const result = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?kw=电影', { poll: true })));
+    assert.equal(result.results[0].url, quarkUrl); assert.equal(Date.now(), 9000);
     assert.equal(f.calls.at(-1).options.timeout, 1500);
     for (const done of releases) { const late = response(json()); done(late); await flush(); assert.equal(late.destroyed, true); }
   } finally { await f.pool.stop(); }
 });
 
-test('a stalled RSS response cannot push API failover past 7.5 seconds', async t => {
+test('API and stalled RSS phases remain bounded after the pending foreground response', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
   const stalled = [];
   const f = fixture({ saved: savedBackup(Date.now()), request: () => { const stream = Object.assign(new PassThrough(), { statusCode: 200, headers: {} }); stream.write('{'); stalled.push(stream); return stream; } });
   try {
     const pending = lookup(f.pool); await flush();
-    t.mock.timers.tick(5500); await flush(); assert.equal(stalled.length, 3);
-    t.mock.timers.tick(2000); const result = await pending;
+    t.mock.timers.tick(150); await flush(); assert.equal((await pending).pending, true);
+    t.mock.timers.tick(7850); await flush(); assert.equal(stalled.length, 3);
+    t.mock.timers.tick(3000); await flush();
+    const result = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?kw=电影', { poll: true })));
     assert.deepEqual(result.results, []); assert.match(result.reason, /超时/);
-    assert.equal(Date.now(), 8500); assert.ok(stalled.every(stream => stream.destroyed));
+    assert.equal(Date.now(), 12000); assert.equal(result.pending, undefined); assert.ok(stalled.every(stream => stream.destroyed));
   } finally { await f.pool.stop(); }
 });
 
@@ -443,7 +543,7 @@ test('fast APIs merge within 150 ms and duplicate share IDs retain the extractio
     return response(JSON.stringify({ results: [
       { name: '电影 4K', url: quarkUrl, password: '5678' },
       { name: '电影 HD', url: another },
-      { name: '电影 duplicate', url: another + '?pwd=AB12' },
+      { name: '电影 蓝光', url: another + '?pwd=AB12' },
     ] }));
   } });
   try {
@@ -543,7 +643,7 @@ test('explicit more checks APIs and continues public pages within two network sl
     peak = Math.max(peak, ++active); await new Promise(done => setImmediate(done)); active--;
     return response(url.includes('bing.com') ? `<rss><channel><item><title>电影 2026</title><pubDate>Tue, 01 Sep 2026 00:00:00 GMT</pubDate><link>${quarkUrl}?pwd=1234</link></item><item><title>电影 4K</title><link>https://pan.quark.cn/s/unknown12345</link></item></channel></rss>` : '<html>public index</html>');
   }, googleSearch: async (keyword, { read, deadline, now }) => {
-    googleCalls++; assert.equal(keyword, '电影'); assert.equal(deadline - now(), 7500);
+    googleCalls++; assert.equal(keyword, '电影'); assert.equal(deadline - now(), 3000);
     await read('https://www.google.com/search?q=' + encodeURIComponent(keyword), 3000, 512 * 1024, deadline);
     await read('https://index.example/movie', 3000, 512 * 1024, deadline);
     return [
@@ -599,10 +699,12 @@ test('unmatched APIs automatically use Google and its reads cannot exceed the re
   }, googleSearch: async (_keyword, { read, deadline }) => { await read('https://www.google.com/search?q=movie', 3000, 512 * 1024, deadline); return []; } });
   try {
     const pending = lookup(f.pool); await flush(); assert.equal(stalled.length, 1);
-    t.mock.timers.tick(5500); await flush(); assert.equal(stalled.length, 2);
-    assert.equal(f.calls.find(call => call.url.includes('google.com')).options.timeout, 2000);
-    t.mock.timers.tick(2000); await flush();
-    assert.equal((await pending).results[0].url, quarkUrl); assert.equal(Date.now(), 8500);
+    t.mock.timers.tick(150); await flush(); assert.equal((await pending).pending, true);
+    t.mock.timers.tick(7850); await flush(); assert.equal(stalled.length, 2);
+    assert.equal(f.calls.find(call => call.url.includes('google.com')).options.timeout, 3000);
+    t.mock.timers.tick(3000); await flush();
+    const complete = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?kw=电影', { poll: true })));
+    assert.equal(complete.results[0].url, quarkUrl); assert.equal(Date.now(), 12000);
     assert.ok(stalled.every(stream => stream.destroyed));
   } finally { await f.pool.stop(); }
 });
@@ -834,9 +936,10 @@ test('an optional keyword exhausting its short budget cannot disable an API that
   try {
     const pending = f.pool.request('https://manual.example/api/search?kw=' + encodeURIComponent('你我对抗全世界'), { year: '2026' });
     await flush(); t.mock.timers.tick(4000); await flush();
-    assert.equal(f.calls.filter(call => call.url.includes('manual.example'))[1].options.timeout, 1700);
-    t.mock.timers.tick(1700); await flush();
-    const first = JSON.parse(await readText(await pending));
+    assert.equal(JSON.parse(await readText(await pending)).pending, true);
+    assert.equal(f.calls.filter(call => call.url.includes('manual.example'))[1].options.timeout, 4000);
+    t.mock.timers.tick(4000); await flush();
+    const first = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?kw=' + encodeURIComponent('你我对抗全世界'), { year: '2026', poll: true })));
     assert.deepEqual(first.results, []); assert.match(first.reason, /超时/);
     const primary = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url.includes('manual.example'));
     assert.equal(primary.status, 'pending'); assert.equal(primary.failures, 0); assert.equal(primary.retryAt, 0);
@@ -893,16 +996,17 @@ test('a first request with little budget left after queuing cannot pause an unte
     const parsed = new URL(url);
     if (parsed.hostname.includes('bing.com')) return response('<rss><channel></channel></rss>');
     if (parsed.hostname === 'short.example') throw Object.assign(new Error('private connection detail'), { code: 'ECONNREFUSED' });
-    await new Promise(done => setTimeout(done, 2700)); return response(json());
+    await new Promise(done => setTimeout(done, 3700)); return response(json());
   } });
   try {
     const pending = Promise.all(['https://busy1.example/api/search?kw=电影', 'https://busy2.example/api/search?kw=电影', 'https://short.example/api/search?kw=电影'].map(url => lookup(f.pool, url)));
     await flush(); assert.equal(f.calls.length, 2);
-    t.mock.timers.tick(2700); await flush();
-    const results = await pending;
+    t.mock.timers.tick(3700); await flush();
+    assert.ok((await pending).every(row => row.pending === true));
+    const results = await Promise.all(['https://busy1.example/api/search?kw=电影', 'https://busy2.example/api/search?kw=电影', 'https://short.example/api/search?kw=电影'].map(async url => JSON.parse(await readText(await f.pool.request(url, { poll: true })))));
     assert.deepEqual(results.map(row => row.results.length), [1, 1, 0]);
     const short = f.calls.find(call => call.url.includes('short.example'));
-    assert.equal(short.options.timeout, 3000);
+    assert.equal(short.options.timeout, 4300);
     const state = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url.includes('short.example'));
     assert.equal(state.status, 'pending'); assert.equal(state.failures, 0); assert.equal(state.retryAt, 0);
   } finally { await f.pool.stop(); }
@@ -1020,6 +1124,7 @@ test('pending render work shares normal/web queries and polls only snapshots wit
   try {
     const missing = await read({ ...query, poll: true, forceRefresh: true }); assert.deepEqual(missing.results, []); assert.equal(missing.pending, undefined); assert.equal(f.calls.length, 0); assert.equal(renders, 0);
     const first = await read(query); assert.equal(first.pending, true); assert.equal(first.retryAfterMs, 1500); assert.deepEqual(first.results, []);
+    assert.equal(googleCalls, 0); assert.ok(f.calls.some(call => call.url.includes('bing.com'))); assert.ok(f.calls.some(call => call.url.includes('manual.example')));
     assert.deepEqual(input, { title: '电影', aliases: ['Movie'], year: '2026', page: 0 }); assert.equal(options.signal.aborted, false); assert.ok(options.deadline >= at + 45000);
     const calls = f.calls.length, staticCalls = googleCalls;
     assert.equal((await read({ ...query, poll: true })).pending, true); assert.equal((await read(query)).pending, true);
@@ -1048,20 +1153,20 @@ test('an explicit fresh web search bypasses completed result and render caches w
       assert.equal((await read({ webSearch: initialWeb })).pending, true);
       releases[0]([{ name: '电影', url: quarkUrl }]); await flush();
       assert.equal((await read({ webSearch: initialWeb })).results.length, 1);
-      assert.equal(renders, 1); assert.equal(googleCalls, 1);
+      assert.equal(renders, 1); assert.equal(googleCalls, 0);
       const previousRows = initialWeb ? [quarkUrl] : [];
       const refreshed = await read({ webSearch: true, forceRefresh: true });
       assert.equal(refreshed.pending, true); assert.deepEqual(refreshed.results.map(row => row.url), previousRows);
-      assert.equal(renders, 2); assert.equal(googleCalls, 2);
+      assert.equal(renders, 2); assert.equal(googleCalls, 0);
       const calls = f.calls.length;
       assert.equal((await read({ webSearch: true, forceRefresh: true })).pending, true);
       assert.equal((await read({ webSearch: true, poll: true, forceRefresh: true })).pending, true);
-      assert.equal(renders, 2); assert.equal(googleCalls, 2); assert.equal(f.calls.length, calls);
+      assert.equal(renders, 2); assert.equal(googleCalls, 0); assert.equal(f.calls.length, calls);
       releases[1]([{ name: '电影', url: 'https://pan.quark.cn/s/fresh123456' }, { name: '其他作品', url: 'https://pan.quark.cn/s/unrelated123' }]); await flush();
       const complete = await read({ webSearch: true, poll: true, forceRefresh: true });
       assert.equal(complete.pending, undefined);
       assert.deepEqual(complete.results.map(row => row.url), [...previousRows, 'https://pan.quark.cn/s/fresh123456']);
-      assert.equal(renders, 2); assert.equal(googleCalls, 2); assert.equal(f.calls.length, calls);
+      assert.equal(renders, 2); assert.equal(googleCalls, 0); assert.equal(f.calls.length, calls);
     } finally { for (const release of releases) release([]); await f.pool.stop(); }
   });
 });
@@ -1069,8 +1174,8 @@ test('an explicit fresh web search bypasses completed result and render caches w
 test('simultaneous fresh web requests share the in-flight fast search and do not turn forced polls into searches', async () => {
   let release, googleCalls = 0, renders = 0;
   const f = fixture({ request: value => response(value.includes('bing.com') ? emptyRss : '{"results":[]}'),
-    googleSearch: () => { googleCalls++; return new Promise(resolve => { release = resolve; }); },
-    renderSearch: async () => { renders++; return []; } });
+    googleSearch: async () => { googleCalls++; return []; },
+    renderSearch: () => { renders++; return new Promise(resolve => { release = resolve; }); } });
   const url = 'https://manual.example/api/search?kw=电影', settings = { webSearch: true, forceRefresh: true };
   const read = options => f.pool.request(url, options).then(readText).then(JSON.parse);
   try {
@@ -1078,9 +1183,9 @@ test('simultaneous fresh web requests share the in-flight fast search and do not
     const second = read(settings); await flush();
     const calls = f.calls.length;
     assert.equal((await read({ ...settings, poll: true })).pending, true);
-    assert.equal(googleCalls, 1); assert.equal(f.calls.length, calls);
+    assert.equal(googleCalls, 0); assert.equal(f.calls.length, calls);
     release([]); await Promise.all([first, second]); await flush();
-    assert.equal(googleCalls, 1); assert.equal(renders, 1);
+    assert.equal(googleCalls, 0); assert.equal(renders, 1);
   } finally { release?.([]); await f.pool.stop(); }
 });
 
@@ -1133,9 +1238,8 @@ test('stop aborts render first and drains the actual worker before returning, ig
 test('public article reads use the separate safe web transport with browser headers while APIs keep their own headers', async () => {
   const webCalls = [];
   const f = fixture({ request: value => response(value.includes('bing.com') ? emptyRss : '{"results":[]}'),
-    webRequest: async (url, options) => { webCalls.push({ url, options }); return response('<html>public article</html>'); },
-    googleSearch: async (_title, { read, deadline }) => { assert.match(await read('https://article.example/movie', 3000, 512 * 1024, deadline), /public article/); return [{ name: '电影', url: quarkUrl }]; },
-    renderSearch: () => assert.fail('a matching static article already answers a normal search') });
+    webRequest: async (url, options) => { webCalls.push({ url, options }); return Object.assign(response('<html>public article</html>'), { finalUrl: 'https://article.example/resolved' }); },
+    googleSearch: async (_title, { read, deadline }) => { const page = await read('https://article.example/movie', 3000, 512 * 1024, deadline); assert.match(page.html, /public article/); assert.equal(page.url, 'https://article.example/resolved'); return [{ name: '电影', url: quarkUrl }]; } });
   try {
     assert.equal((await lookup(f.pool)).results[0].url, quarkUrl); assert.equal(webCalls.filter(call => call.url.includes('article.example')).length, 1);
     const options = webCalls[0].options; assert.equal(options.followRedirects, true); assert.match(options.headers['user-agent'], /^Mozilla\/5\.0/);
@@ -1145,11 +1249,12 @@ test('public article reads use the separate safe web transport with browser head
   } finally { await f.pool.stop(); }
 });
 
-test('each completed more request advances a bounded public result page while polls never advance or search', async () => {
+test('each completed more request advances bounded pages with or without a browser while polls never search', async t => {
+  for (const browser of [false, true]) await t.test(browser ? 'browser helper' : 'static Google fallback without helper', async () => {
   const staticPages = [], renderedPages = [];
   const f = fixture({ request: url => response(url.includes('bing.com') ? emptyRss : '{"results":[]}'),
-    googleSearch: async (_title, options) => { staticPages.push(options.page); return []; },
-    renderSearch: async query => { renderedPages.push(query.page); return [{ name: '电影 (2026) 夸克网盘', url: 'https://pan.quark.cn/s/page000' + query.page }]; } });
+    googleSearch: async (_title, options) => { staticPages.push(options.page); return browser ? [] : [{ name: '电影 (2026) 夸克网盘', url: 'https://pan.quark.cn/s/page000' + options.page }]; },
+    ...(browser ? { renderSearch: async query => { renderedPages.push(query.page); return [{ name: '电影 (2026) 夸克网盘', url: 'https://pan.quark.cn/s/page000' + query.page }]; } } : {}) });
   const url = 'https://manual.example/api/search?kw=' + encodeURIComponent('电影 2026');
   const read = async options => JSON.parse(await readText(await f.pool.request(url, options)));
   try {
@@ -1160,8 +1265,9 @@ test('each completed more request advances a bounded public result page while po
       assert.ok(completed.results.some(row => row.url.endsWith('page000' + page)));
       assert.equal(f.calls.length, calls); assert.equal(staticPages.length, searches);
     }
-    assert.deepEqual(staticPages, [0, 1, 2, 0]); assert.deepEqual(renderedPages, [0, 1, 2, 0]);
+    assert.deepEqual(staticPages, browser ? [] : [0, 1, 2, 0]); assert.deepEqual(renderedPages, browser ? [0, 1, 2, 0] : []);
   } finally { await f.pool.stop(); }
+  });
 });
 
 test('an unconfigured default RSS entry tries the fixed PanSou helper and existing healthy backup before web search', async () => {
@@ -1195,4 +1301,133 @@ test('more refreshes the configured helper and retains its matches while continu
     await f.pool.request(url, { webSearch: true, poll: true, forceRefresh: true, year: '2026' });
     assert.equal(f.calls.length, calls); assert.equal(googleCalls, 1);
   } finally { await f.pool.stop(); }
+});
+
+test('a 6.2-second exact-film helper completes after the foreground response and normal/web polls share its snapshot', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const title = '生化危机：爆发夜'; let releaseApi, releaseRender, apiCalls = 0, renders = 0;
+  const f = fixture({ request: url => {
+    if (url.includes('bing.com')) return response(emptyRss);
+    apiCalls++; return new Promise(resolve => { releaseApi = resolve; });
+  }, renderSearch: () => { renders++; return new Promise(resolve => { releaseRender = resolve; }); } });
+  const url = 'http://pansou:8888/api/search?' + new URLSearchParams({ kw: title });
+  const read = async options => JSON.parse(await readText(await f.pool.request(url, { year: '2026', ...options })));
+  try {
+    const initial = read({}); await flush(); t.mock.timers.tick(150); await flush();
+    assert.equal((await initial).pending, true); assert.equal(apiCalls, 1); assert.equal(renders, 0);
+    assert.equal((await read({ webSearch: true, forceRefresh: true })).pending, true);
+    assert.equal(renders, 1, 'only explicit more starts renderer while the helper is still pending');
+    const beforePoll = f.calls.length; await read({ poll: true }); await read({ webSearch: true, poll: true });
+    assert.equal(f.calls.length, beforePoll); assert.equal(apiCalls, 1);
+    t.mock.timers.tick(6050); releaseApi(response(json(quarkUrl, title + ' (2026) 夸克网盘'))); await flush();
+    const late = await read({ poll: true }); assert.equal(late.results[0].url, quarkUrl + '?pwd=1234'); assert.equal(late.pending, true, 'renderer is still pending');
+    releaseRender([]); await flush();
+    const complete = await read({ webSearch: true, poll: true }); assert.equal(complete.results.length, 1); assert.equal(complete.pending, undefined);
+    assert.equal(apiCalls, 1); assert.equal(renders, 1);
+  } finally { releaseApi?.(response('{"results":[]}')); releaseRender?.([]); await f.pool.stop(); }
+});
+
+test('a slow empty helper leaves a complete Google SERP and article budget for the exact film', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const title = '生化危机：爆发夜', budgets = []; let releaseApi, apiCalls = 0;
+  const f = fixture({ googleSearch: searchGoogleQuark,
+    request: () => ++apiCalls === 1 ? new Promise(resolve => { releaseApi = resolve; }) : response('{"results":[]}'),
+    webRequest: async (url, options) => {
+      budgets.push({ article: url.includes('article.example'), timeout: options.timeout });
+      if (url.includes('bing.com')) return response(emptyRss);
+      if (url.includes('google.com')) {
+        await new Promise(resolve => setTimeout(resolve, 1400));
+        return response(`<a href="https://article.example/movie"><h3>${title} (2026) 夸克网盘</h3></a>`);
+      }
+      const stream = Object.assign(new PassThrough(), { statusCode: 200, headers: {} });
+      const timer = setTimeout(() => stream.end(`<title>${title} (2026)</title><article><a href="${quarkUrl}">夸克网盘</a></article>`), 900);
+      stream.once('close', () => clearTimeout(timer)); return stream;
+    } });
+  const url = 'https://manual.example/api/search?' + new URLSearchParams({ kw: title });
+  try {
+    const initial = f.pool.request(url, { year: '2026' }); await flush(); t.mock.timers.tick(150); await flush();
+    assert.equal(JSON.parse(await readText(await initial)).pending, true);
+    t.mock.timers.tick(6050); releaseApi(response('{"results":[]}')); await flush();
+    t.mock.timers.tick(1400); await flush(); t.mock.timers.tick(900); await flush();
+    const complete = JSON.parse(await readText(await f.pool.request(url, { year: '2026', poll: true })));
+    assert.equal(complete.results[0].url, quarkUrl); assert.equal(complete.pending, undefined);
+    assert.equal(budgets.find(row => row.article).timeout, 1600, 'article receives the remainder of a fresh three-second web phase');
+  } finally { releaseApi?.(response('{"results":[]}')); await f.pool.stop(); }
+});
+
+test('stop settles a pending helper and discards its later valid result without restarting a poll', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  let releaseApi;
+  const f = fixture({ request: () => new Promise(resolve => { releaseApi = resolve; }) });
+  try {
+    const initial = lookup(f.pool); await flush(); t.mock.timers.tick(150); await flush(); assert.equal((await initial).pending, true);
+    await f.pool.stop();
+    const late = response(json()); releaseApi(late); await flush(); assert.equal(late.destroyed, true);
+    await assert.rejects(lookup(f.pool), /已停止/);
+  } finally { releaseApi?.(response('{"results":[]}')); await f.pool.stop(); }
+});
+
+test('a normal helper matching after four seconds never starts browser or public search work', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  let releaseApi, renders = 0;
+  const f = fixture({ request: () => new Promise(resolve => { releaseApi = resolve; }),
+    googleSearch: () => assert.fail('a matching normal helper does not need public search'), renderSearch: () => { renders++; return []; } });
+  try {
+    const initial = lookup(f.pool); await flush(); t.mock.timers.tick(150); await flush(); assert.equal((await initial).pending, true); assert.equal(renders, 0);
+    t.mock.timers.tick(3850); releaseApi(response(json())); await flush();
+    const complete = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?kw=电影', { poll: true })));
+    assert.equal(complete.results.length, 1); assert.equal(complete.pending, undefined); assert.equal(renders, 0); assert.equal(f.calls.length, 1);
+  } finally { releaseApi?.(response('{"results":[]}')); await f.pool.stop(); }
+});
+
+test('the default RSS and explicit PanSou endpoint share pending work while a different configured API stays isolated', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const releases = new Map(); let apiCalls = 0;
+  const f = fixture({ request: url => {
+    if (url.includes('bing.com')) return response(emptyRss);
+    apiCalls++; return new Promise(resolve => releases.set(new URL(url).hostname, resolve));
+  } });
+  const input = 'https://www.bing.com/search?' + new URLSearchParams({ q: '电影 site:pan.quark.cn/s', format: 'rss' });
+  const sidecar = 'http://pansou:8888/api/search?kw=电影', other = 'https://changed.example/api/search?kw=电影';
+  try {
+    const initial = f.pool.request(input); await flush(); t.mock.timers.tick(150); await flush(); await initial;
+    await f.pool.request(sidecar); assert.equal(apiCalls, 1, 'same actual helper is reused after configuration switches to its explicit URL');
+    const changed = f.pool.request(other); await flush(); t.mock.timers.tick(150); await flush(); await changed; assert.equal(apiCalls, 2);
+    releases.get('changed.example')(response(json('https://pan.quark.cn/s/newapi123456'))); await flush();
+    releases.get('pansou')(response(json(quarkUrl))); await flush();
+    const current = JSON.parse(await readText(await f.pool.request(other, { poll: true })));
+    assert.deepEqual(current.results.map(row => row.url), ['https://pan.quark.cn/s/newapi123456?pwd=1234']);
+    const previous = JSON.parse(await readText(await f.pool.request(sidecar, { poll: true })));
+    assert.deepEqual(previous.results.map(row => row.url), [quarkUrl + '?pwd=1234']); assert.equal(apiCalls, 2);
+  } finally { for (const release of releases.values()) release(response('{"results":[]}')); await f.pool.stop(); }
+});
+
+test('background queries stay capped at thirty-two while preserving the two transport slots', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  let active = 0, peak = 0;
+  const f = fixture({ request: async url => { peak = Math.max(peak, ++active); await new Promise(resolve => setImmediate(resolve)); active--; return response(url.includes('bing.com') ? emptyRss : '{"results":[]}'); },
+    renderSearch: (_query, { signal }) => new Promise((_, reject) => { if (signal.aborted) reject(signal.reason); else signal.addEventListener('abort', () => reject(signal.reason), { once: true }); }) });
+  try {
+    const requests = Array.from({ length: 32 }, (_, index) => f.pool.request('https://manual.example/api/search?kw=电影' + index));
+    await flush(); t.mock.timers.tick(150); await flush();
+    assert.ok((await Promise.all(requests)).every(Boolean));
+    const calls = f.calls.length;
+    await assert.rejects(f.pool.request('https://manual.example/api/search?kw=另一个影片'), { status: 503 });
+    assert.equal(f.calls.length, calls); assert.ok(peak <= 2);
+  } finally { await f.pool.stop(); }
+});
+
+test('a fast primary result stays pending until the slow backup merges without a duplicate query', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  let releaseBackup;
+  const f = fixture({ saved: savedBackup(Date.now()), request: url => url.includes('backup.example') ? new Promise(resolve => { releaseBackup = resolve; }) : response(json()) });
+  const url = 'https://manual.example/api/search?kw=电影';
+  try {
+    const initial = lookup(f.pool); await flush(); t.mock.timers.tick(150); await flush();
+    const early = await initial; assert.equal(early.results.length, 1); assert.equal(early.pending, true);
+    await f.pool.request(url); assert.equal(f.calls.length, 2);
+    t.mock.timers.tick(6050); releaseBackup(response(json('https://pan.quark.cn/s/latebackup1'))); await flush();
+    const complete = JSON.parse(await readText(await f.pool.request(url, { poll: true })));
+    assert.equal(complete.results.length, 2); assert.equal(complete.pending, undefined); assert.equal(f.calls.length, 2);
+  } finally { releaseBackup?.(response('{"results":[]}')); await f.pool.stop(); }
 });

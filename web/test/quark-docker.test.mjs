@@ -32,7 +32,7 @@ test('optional Quark search companion preserves Compose settings and accepts rea
   assert.deepEqual(browser.command, ['node', 'browser-worker.mjs']);
   assert.equal(browser.ports?.length || 0, 0);
   assert.equal(browser.volumes?.length || 0, 0);
-  assert.deepEqual(browser.environment, { HOME: '/tmp', PORT: '3020' });
+  assert.deepEqual(browser.environment, { HOME: '/tmp', PORT: '3020', QUARK_SEARCH_PROXY: '' });
   assert.equal(browser.read_only, true); assert.equal(browser.init, true);
   assert.equal(browser.cpus, 0.5); assert.equal(Number(browser.mem_limit), 512 * 1024 * 1024);
   assert.equal(Number(browser.memswap_limit), Number(browser.mem_limit));

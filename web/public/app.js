@@ -1390,7 +1390,7 @@ function mountQuark(current) {
   const retry = button('重试搜索', () => void load(false, false), 'button small'); retry.hidden = true;
   const more = button('查找更多公开资源', () => void load(true), 'button small'); more.disabled = true;
   current.cancelQuarkSearch = () => { clearTimeout(current.quarkSearchTimer); delete current.quarkSearchTimer; searchVersion++; loading = false; more.disabled = retry.disabled = false; };
-  const googleQuery = new URLSearchParams({ q: `${current.detail.title} 夸克 网盘`, tbs: 'sbd:1', udm: '14' });
+  const googleQuery = new URLSearchParams({ q: [current.detail.title, current.detail.year, '夸克 网盘'].filter(Boolean).join(' '), hl: 'zh-CN', tbs: 'sbd:1' });
   const searchActions = node('div', undefined, 'settings-actions'); searchActions.append(retry, more, externalLink('用浏览器查 Google ↗', `https://www.google.com/search?${googleQuery}`, 'button subtle small')); panel.append(searchActions);
   const account = button('连接夸克账号', () => goto('settings'), 'button small'); account.hidden = true; searchActions.append(account);
   const accountNote = node('p', '公开分享可继续查找；转存和播放个人文件需要连接并启用夸克账号。', 'muted'); accountNote.hidden = true; panel.append(accountNote);
