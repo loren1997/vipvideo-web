@@ -8,7 +8,7 @@ export function createQuarkBrowserSearch({ fetch = globalThis.fetch } = {}) {
     try {
       const response = await fetch('http://quark-browser:3020/search', {
         method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ title: query.title, aliases: query.aliases || [], year: String(query.year || ''), budgetMs }),
+        body: JSON.stringify({ title: query.title, aliases: query.aliases || [], year: String(query.year || ''), page: query.page ?? 0, budgetMs }),
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
       });
       const result = JSON.parse(await readText(Readable.fromWeb(response.body), 128 * 1024));

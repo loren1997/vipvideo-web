@@ -114,6 +114,8 @@ progress::-moz-progress-bar { background:var(--accent); }
 .detail-info h2 { font-size:26px; margin-bottom:6px; }
 .detail-description { color:var(--muted); font-size:12px; margin:12px 0; white-space:pre-line; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
 .detail-actions { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:13px; }
+.quark-player-host { margin-top:22px; }
+.quark-episode-choice { display:flex; align-items:center; gap:12px; margin-top:16px; }
 .watch-layout { display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:20px; }
 .player-host { min-width:0; }
 .player-surface { aspect-ratio:16/9; border-radius:10px; overflow:hidden; background:#05090f; display:flex; align-items:center; justify-content:center; position:relative; border:1px solid #263142; }

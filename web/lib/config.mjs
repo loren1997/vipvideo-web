@@ -136,6 +136,10 @@ export function validateRecord(input, history = false) {
     if (row.duration > 0) row.position = Math.min(row.position, row.duration);
     if (input.parser) row.parser = text(input.parser, '解析线路', 200);
     if (input.episodeName) row.episodeName = text(input.episodeName, '剧集名称', 200);
+    if (input.quarkAsset !== undefined) {
+      if (row.source !== 'quark-library' || typeof input.quarkAsset !== 'string' || !/^[a-f0-9]{32}$/.test(input.quarkAsset)) throw badRequest('夸克观看记录标识无效');
+      row.quarkAsset = input.quarkAsset;
+    }
   }
   return row;
 }

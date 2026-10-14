@@ -90,3 +90,11 @@ test('progress validates numbers, caps to duration and supports link-only histor
   assert.equal(link.mode, 'parser');
   assert.equal(link.position, 0);
 });
+
+test('cloud library history retains opaque asset identity without requiring a temporary playback URL', () => {
+  const record = { key: 'quark-library:12345', title: '影片', source: 'quark-library', id: '12345', type: 'movie', url: '', quarkAsset: 'a'.repeat(32), episodeName: '影片.mkv', position: 55, duration: 100 };
+  const saved = validateRecord(record, true);
+  assert.equal(saved.quarkAsset, record.quarkAsset); assert.equal(saved.url, undefined); assert.equal(saved.episodeName, '影片.mkv');
+  for (const value of ['https://example.com/movie', 'private-fid', '', 'a'.repeat(33), 123]) assert.throws(() => validateRecord({ ...record, quarkAsset: value }, true), { status: 400 });
+  assert.throws(() => validateRecord({ ...record, source: 'ordinary-source' }, true), { status: 400 });
+});

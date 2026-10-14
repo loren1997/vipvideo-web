@@ -227,7 +227,10 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (context) return auth(context, path, options);
     return api(path, { ...options, guard: () => { if (generation !== epoch) throw failure('夸克账号已变更，分享检查已取消', 409); } });
   } });
-  const publicAsset = (asset, reused = false) => ({ assetId: asset.id, name: asset.name, category: asset.category || '', status: asset.status === 'ready' ? 'ready' : 'pending', saved: asset.status === 'ready', reused, ...(asset.status === 'ready' ? {} : { reason: asset.task ? '转存任务仍在处理，请稍后重试' : '上次转存响应不确定，为避免重复转存请稍后检查专用目录' }) });
+  const publicAsset = (asset, reused = false) => ({ assetId: asset.id, name: asset.name, category: asset.category || '', status: asset.status === 'ready' ? 'ready' : 'pending', saved: asset.status === 'ready', reused,
+    position: Number.isFinite(asset.position) && asset.position >= 0 && asset.position <= 86400 ? asset.position : 0,
+    duration: Number.isFinite(asset.duration) && asset.duration > 0 && asset.duration <= 86400 ? asset.duration : 0,
+    ...(asset.status === 'ready' ? {} : { reason: asset.task ? '转存任务仍在处理，请稍后重试' : '上次转存响应不确定，为避免重复转存请稍后检查专用目录' }) });
   const findAsset = (assetId, context) => { const asset = registry.assets.find(value => value.id === assetId && value.account === context.account && value.managed === true); if (!asset) throw failure('未找到已登记的夸克视频', 404); if (asset.parent !== registry.folders[context.account]?.fid) throw failure('视频不在当前专用目录，已停止操作', 409); return asset; };
   function searchUrl(value) {
     if (value === SIDECAR && searchRequest !== networkRequest) return value;

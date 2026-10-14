@@ -160,7 +160,7 @@ test('Google reader follows public regional redirects with DNS checks and no hou
       if (target.includes('google.com.hk')) { assert.equal(data.results.length, 1); assert.ok(lookups.includes('www.google.com.hk')); }
       else { assert.equal(data.results.length, 0); assert.match(data.reason, /安全检查拒绝/); assert.ok(!calls.some(call => call.url === target)); }
       assert.ok(calls.every(call => !/secret-cookie|secret-token|cookie|authorization/i.test(JSON.stringify(call.headers))));
-      assert.ok(f.calls.filter(call => call.url.includes('bing.com')).every(call => call.options.followRedirects === false));
+      assert.ok(f.calls.filter(call => call.url.includes('bing.com')).every(call => call.options.followRedirects === true));
     } finally { await f.pool.stop(); }
   }
 });
@@ -221,7 +221,7 @@ test('empty successful searches preserve health and public RSS supplies results 
     const result = await lookup(f.pool);
     assert.equal(result.results[0].url, quarkUrl);
     assert.equal(f.pool.status().candidates.find(row => row.apiUrl === backup).status, 'healthy');
-    const fallback = new URL(f.calls.at(-1).url); assert.equal(fallback.searchParams.get('q'), '电影 夸克');
+    const fallback = new URL(f.calls.at(-1).url); assert.equal(fallback.searchParams.get('q'), '"电影" 夸克 网盘');
   } finally { await f.pool.stop(); }
 });
 
@@ -229,9 +229,9 @@ test('Bing articles become Quark candidates when Google and the configured API h
   const f = fixture({ request: (url, options) => {
     const parsed = new URL(url);
     if (parsed.hostname === 'manual.example') return response('{"results":[]}');
-    if (parsed.hostname === 'www.bing.com') {
-      assert.equal(parsed.searchParams.get('q'), '一路超平安 夸克');
-      assert.equal(options.followRedirects, false);
+    if (parsed.hostname.endsWith('.bing.com')) {
+      assert.equal(parsed.searchParams.get('q'), '"一路超平安" 夸克 网盘');
+      assert.equal(options.followRedirects, true);
       return response('<rss><channel><item><title>一路超平安 (2026) 4K资源</title><link>https://posts.example/movie</link></item></channel></rss>');
     }
     assert.equal(url, 'https://posts.example/movie'); assert.equal(options.followRedirects, true);
@@ -299,7 +299,7 @@ test('one 7.5-second budget leaves time for RSS after two stalled APIs and destr
     const pending = lookup(f.pool); await flush(); assert.equal(releases.length, 2);
     t.mock.timers.tick(5500); await flush();
     assert.equal((await pending).results[0].url, quarkUrl); assert.equal(Date.now(), 6500);
-    assert.equal(f.calls.at(-1).options.timeout, 2000);
+    assert.equal(f.calls.at(-1).options.timeout, 1500);
     for (const done of releases) { const late = response(json()); done(late); await flush(); assert.equal(late.destroyed, true); }
   } finally { await f.pool.stop(); }
 });
@@ -509,7 +509,7 @@ test('RSS fallback recommends matching titles and separates unnamed candidates f
     assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234']);
     assert.deepEqual(result.unverified.map(row => row.url), ['https://pan.quark.cn/s/unnamed12345']);
     assert.equal(result.unverified[0].name, '未提供资源标题');
-    assert.equal(new URL(f.calls.at(-1).url).searchParams.get('q'), '电影 夸克');
+    assert.equal(new URL(f.calls.at(-1).url).searchParams.get('q'), '"电影" 2026 夸克 网盘');
   } finally { await f.pool.stop(); }
 });
 
@@ -730,7 +730,7 @@ test('canonical web titles and explicit aliases reach Google without stripping n
     const url = 'https://manual.example/api/search?' + new URLSearchParams({ kw: '银翼杀手 2049' });
     const result = JSON.parse(await readText(await f.pool.request(url, { year: '2017', aliases: ['Blade Runner 2049'], webSearch: true })));
     assert.equal(result.results.length, 1);
-    assert.equal(new URL(f.calls[0].url).searchParams.get('q'), '银翼杀手 2049 夸克');
+    assert.equal(new URL(f.calls[0].url).searchParams.get('q'), '"银翼杀手 2049" 2017 夸克 网盘');
   } finally { await f.pool.stop(); }
 });
 
@@ -1020,7 +1020,7 @@ test('pending render work shares normal/web queries and polls only snapshots wit
   try {
     const missing = await read({ ...query, poll: true, forceRefresh: true }); assert.deepEqual(missing.results, []); assert.equal(missing.pending, undefined); assert.equal(f.calls.length, 0); assert.equal(renders, 0);
     const first = await read(query); assert.equal(first.pending, true); assert.equal(first.retryAfterMs, 1500); assert.deepEqual(first.results, []);
-    assert.deepEqual(input, { title: '电影', aliases: ['Movie'], year: '2026' }); assert.equal(options.signal.aborted, false); assert.ok(options.deadline >= at + 45000);
+    assert.deepEqual(input, { title: '电影', aliases: ['Movie'], year: '2026', page: 0 }); assert.equal(options.signal.aborted, false); assert.ok(options.deadline >= at + 45000);
     const calls = f.calls.length, staticCalls = googleCalls;
     assert.equal((await read({ ...query, poll: true })).pending, true); assert.equal((await read(query)).pending, true);
     assert.equal(f.calls.length, calls); assert.equal(googleCalls, staticCalls); assert.equal(renders, 1);
@@ -1137,10 +1137,29 @@ test('public article reads use the separate safe web transport with browser head
     googleSearch: async (_title, { read, deadline }) => { assert.match(await read('https://article.example/movie', 3000, 512 * 1024, deadline), /public article/); return [{ name: '电影', url: quarkUrl }]; },
     renderSearch: () => assert.fail('a matching static article already answers a normal search') });
   try {
-    assert.equal((await lookup(f.pool)).results[0].url, quarkUrl); assert.equal(webCalls.length, 1);
+    assert.equal((await lookup(f.pool)).results[0].url, quarkUrl); assert.equal(webCalls.filter(call => call.url.includes('article.example')).length, 1);
     const options = webCalls[0].options; assert.equal(options.followRedirects, true); assert.match(options.headers['user-agent'], /^Mozilla\/5\.0/);
     assert.match(options.headers.accept, /text\/html/); assert.equal(options.headers['accept-language'], 'zh-CN,zh;q=0.9');
     assert.equal(options.headers.cookie, undefined); assert.equal(options.headers.authorization, undefined);
     assert.equal(f.calls[0].options.headers['user-agent'], 'VipVideo-Web-quark-search'); assert.match(f.calls[0].options.headers.accept, /application\/json/);
+  } finally { await f.pool.stop(); }
+});
+
+test('each completed more request advances a bounded public result page while polls never advance or search', async () => {
+  const staticPages = [], renderedPages = [];
+  const f = fixture({ request: url => response(url.includes('bing.com') ? emptyRss : '{"results":[]}'),
+    googleSearch: async (_title, options) => { staticPages.push(options.page); return []; },
+    renderSearch: async query => { renderedPages.push(query.page); return [{ name: '电影 (2026) 夸克网盘', url: 'https://pan.quark.cn/s/page000' + query.page }]; } });
+  const url = 'https://manual.example/api/search?kw=' + encodeURIComponent('电影 2026');
+  const read = async options => JSON.parse(await readText(await f.pool.request(url, options)));
+  try {
+    for (const page of [0, 1, 2, 0]) {
+      await read({ webSearch: true, forceRefresh: true }); await flush();
+      const calls = f.calls.length, searches = staticPages.length;
+      const completed = await read({ webSearch: true, poll: true, forceRefresh: true });
+      assert.ok(completed.results.some(row => row.url.endsWith('page000' + page)));
+      assert.equal(f.calls.length, calls); assert.equal(staticPages.length, searches);
+    }
+    assert.deepEqual(staticPages, [0, 1, 2, 0]); assert.deepEqual(renderedPages, [0, 1, 2, 0]);
   } finally { await f.pool.stop(); }
 });

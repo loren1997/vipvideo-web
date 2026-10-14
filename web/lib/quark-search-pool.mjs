@@ -295,14 +295,14 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
       if (rendered.size >= 32) for (const [key, item] of rendered) if (!item.pending) { rendered.delete(key); break; }
       if (rendered.size >= 32) { report('公开网页搜索繁忙，请稍后重试'); return; }
       const controller = new AbortController(), deadline = now() + 45000;
-      work = { controller, pending: true, expires: now() + 2 * 60_000 }; rendered.set(key, work);
+      work = { controller, pending: true, page: entry.page, expires: now() + 2 * 60_000 }; rendered.set(key, work);
       work.promise = track(async () => {
         if (controller.signal.aborted) throw controller.signal.reason;
         let abort;
         const timeout = setTimeout(() => controller.abort(failure('公开网页搜索超时', 504)), 45000);
         try {
           const rows = await Promise.race([
-            track(() => { if (controller.signal.aborted) throw controller.signal.reason; return renderSearch({ title: query.title, aliases: query.aliases, year: query.year }, { signal: controller.signal, deadline }); }),
+            track(() => { if (controller.signal.aborted) throw controller.signal.reason; return renderSearch({ title: query.title, aliases: query.aliases, year: query.year, page: work.page }, { signal: controller.signal, deadline }); }),
             new Promise((_, reject) => { abort = () => reject(controller.signal.reason || failure('公开网页搜索已停止', 503, true)); controller.signal.addEventListener('abort', abort, { once: true }); }),
           ]);
           if (!Array.isArray(rows)) throw failure('公开网页搜索响应格式不兼容');
@@ -343,7 +343,10 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
         }
         if (primary?.url === SIDECAR && primary.status === 'paused' && primary.retryAt > now() + 60_000) { primary.status = 'pending'; primary.retryAt = 0; persist(); }
         for (const [key, entry] of recent) if (entry.expires <= now()) recent.delete(key);
-        const entry = { rows: new Map(forceRefresh && cached?.expires > now() ? cached.rows : []), expires: now() + 2 * 60_000 };
+        const previousRender = rendered.get(JSON.stringify([query.title, query.aliases, query.year]));
+        const previousPage = cached?.page ?? previousRender?.page;
+        const page = previousRender?.pending ? previousRender.page : forceRefresh && previousPage !== undefined ? (previousPage + 1) % 3 : previousPage ?? 0;
+        const entry = { rows: new Map(forceRefresh && cached?.expires > now() ? cached.rows : []), page, expires: now() + 2 * 60_000 };
         let finish;
         entry.fast = new Promise(resolve => { finish = resolve; });
         const notes = new Set(), report = message => { notes.add(message); entry.reason = [...notes].join('；'); };
@@ -395,8 +398,8 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
             return result([...entry.rows.values()], query, entry.reason);
           }
           const pages = await Promise.allSettled([
-            googleSearch(query.title, { aliases: query.aliases, year: query.year, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), true), deadline, now }),
-            searchBingQuark(query.title, { aliases: query.aliases, year: query.year, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), new URL(url).hostname !== 'www.bing.com'), deadline, now }),
+            googleSearch(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), true), deadline, now }),
+            searchBingQuark(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), true), deadline, now }),
           ]);
           if (stopping) throw failure('公开搜索已停止', 503, true);
           for (const [index, page] of pages.entries()) {

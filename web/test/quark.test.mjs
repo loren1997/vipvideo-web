@@ -1188,6 +1188,20 @@ test('official desktop playback protocol accepts completed accessible video_info
   assert.equal(state.calls.filter(call => call.path === '/file/download').length, 0);
 });
 
+test('manual cloud transfers resume only their own saved asset and a different file starts at zero', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect();
+  const film = { ...detail, source: 'quark-library', id: '12345' };
+  const firstSelection = await select(film), first = await service.prepare(film, { ...firstSelection, auto: false });
+  assert.equal(first.position, 0); assert.equal(first.duration, 0);
+  await service.progress(first.assetId, { position: 281, duration: 1200, ended: false });
+  const again = await service.prepare(film, { ...firstSelection, auto: false });
+  assert.equal(again.assetId, first.assetId); assert.equal(again.position, 281); assert.equal(again.duration, 1200);
+  state.source = [sourceVideo('different-video', '影片.2026.1080p.mkv')];
+  const secondSelection = await select(film), second = await service.prepare(film, { ...secondSelection, auto: false });
+  assert.notEqual(second.assetId, first.assetId); assert.equal(second.position, 0); assert.equal(second.duration, 0);
+  assert.equal(state.saved, 2);
+});
+
 test('a normal official download fallback uses desktop credentials and returns the signed MKV for NAS compatibility', async t => {
   const { service, state, connect, save } = await fixture(t); await connect(); state.source = [sourceVideo('mkv-original', '影片.2026.HEVC10bit.DTS.mkv', 16 * GIB)]; const saved = await save();
   const signed = 'https://download.quark.cn/original?auth_key=A%2BB&filename=movie.mkv';

@@ -135,6 +135,53 @@ test('explicit public webpage discovery is a validated option on the authenticat
   assert.equal(options.length, 3);
 });
 
+test('standalone Quark library uses trusted public metadata without a VOD source and permits only explicit single-file transfers', async t => {
+  const film = { ...detail, key: 'quark-library:12345', source: 'quark-library', id: '12345', title: '独立影片', year: '2026', category: 'movie', douban: { id: '12345', score: 8.5 }, lines: [{ name: '夸克网盘', episodes: [{ name: '正片' }] }] };
+  const calls = [], browseCalls = [];
+  const quarkCatalog = { browse: async input => { browseCalls.push(input); return { items: [film], facets: { genres: ['喜剧'], years: ['2026'] }, hasMore: false, errors: [] }; }, detail: async id => {
+    if (id !== film.id) throw Object.assign(new Error('无此可信豆瓣影片'), { status: 404 });
+    return structuredClone(film);
+  }, stop: async () => { calls.push(['stop']); } };
+  const quark = { resources: async (value, options) => { calls.push(['resources', value, options]); return { resources: [{ id: 'share', name: '独立影片' }], resourceSnapshot: true }; },
+    files: async (value, options) => { calls.push(['files', value, options]); return { files: [{ id: 'file', name: '独立影片.mp4' }] }; },
+    prepare: async (value, options) => { calls.push(['prepare', value, options]); return { assetId: 'a'.repeat(32), status: 'ready', saved: true, position: 0, duration: 0 }; } };
+  const ordinary = { detail: async () => { throw new Error('independent library must not query a VOD source'); } };
+  const { app, call, login } = await running(t, { initialConfig: empty, catalog: ordinary, quarkCatalog, quark });
+  for (const path of ['/api/quark/library', '/api/quark/library/detail?id=12345', '/api/quark/resources?source=quark-library&id=12345']) assert.equal((await call(path)).status, 401);
+  assert.equal(browseCalls.length, 0); const cookie = await login();
+  const listing = await call('/api/quark/library?category=movie&genre=喜剧&year=2026&sort=release-score&page=2', undefined, cookie);
+  assert.equal(listing.status, 200); assert.equal((await listing.json()).items[0].douban.score, 8.5);
+  assert.deepEqual(browseCalls[0], { category: 'movie', genre: '喜剧', year: '2026', sort: 'release-score', page: '2' });
+  const ratings = await call('/api/ratings?source=quark-library&id=12345', undefined, cookie);
+  assert.equal(ratings.status, 200); const rated = await ratings.json(); assert.equal(rated.douban.score, 8.5); assert.equal(rated.douban.url, 'https://movie.douban.com/subject/12345/'); assert.match(rated.douban.attribution, /豆瓣公开/);
+  assert.equal((await call('/api/quark/library/detail?id=12345', undefined, cookie)).status, 200);
+  assert.equal((await call('/api/quark/library/detail?id=https://evil.example/', undefined, cookie)).status, 400);
+  assert.equal((await call('/api/quark/library/detail?id=54321', undefined, cookie)).status, 404);
+  const selected = 'source=quark-library&id=12345';
+  assert.equal((await call('/api/quark/resources?' + selected + '&web=1', undefined, cookie)).status, 200);
+  assert.equal(calls.at(-1)[1].title, '独立影片'); assert.equal(calls.at(-1)[2].webSearch, true);
+  assert.equal((await call('/api/quark/files?' + selected + '&shareId=share', undefined, cookie)).status, 200);
+  const selection = { source: film.source, id: film.id, shareId: 'share', fileId: 'file' };
+  assert.equal((await call('/api/quark/prepare', { ...selection, auto: true }, cookie)).status, 400);
+  assert.equal((await call('/api/quark/prepare', { source: film.source, id: film.id, auto: false }, cookie)).status, 400);
+  assert.equal(calls.some(row => row[0] === 'prepare'), false);
+  assert.equal((await call('/api/quark/prepare', selection, cookie)).status, 200);
+  assert.equal(calls.at(-1)[2].auto, false); assert.equal(calls.at(-1)[2].fileId, 'file');
+  assert.equal((await call('/api/quark/resources?' + selected + '&episode=1', undefined, cookie)).status, 400);
+  const history = await call('/api/history', { ...film, quarkAsset: 'a'.repeat(32), episodeName: '独立影片.mp4', position: 55, duration: 100, url: '' }, cookie);
+  assert.equal(history.status, 200); assert.equal(app.store.list('history')[0].quarkAsset, 'a'.repeat(32)); assert.equal(app.store.list('history')[0].url, undefined);
+  film.douban.score = null;
+  const unrated = await (await call('/api/ratings?source=quark-library&id=12345', undefined, cookie)).json(); assert.equal(unrated.douban, null); assert.match(unrated.errors.join(''), /暂无评分/);
+});
+
+test('independent cloud details and searches recheck visibility and login before returning metadata', async t => {
+  const film = { ...detail, source: 'quark-library', id: '12345', category: 'adult' };
+  const { call, login } = await running(t, { quarkCatalog: { detail: async () => film }, quark: { resources: async () => { throw Error('hidden metadata must not reach public search'); } } });
+  const cookie = await login();
+  assert.equal((await call('/api/quark/library/detail?id=12345', undefined, cookie)).status, 403);
+  assert.equal((await call('/api/quark/resources?source=quark-library&id=12345', undefined, cookie)).status, 403);
+});
+
 test('Quark account authentication errors remain distinct from a revoked household session', async t => {
   const source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
   let upstreamStatus = 401;

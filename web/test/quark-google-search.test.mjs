@@ -53,6 +53,33 @@ test('the shared Google URL requests newest web results without imposing a publi
   assert.equal(url.searchParams.get('tbs'), 'sbd:1'); assert.equal(url.searchParams.get('udm'), '14');
 });
 
+test('exact title, official aliases and release year plan bounded search variants and later result pages', () => {
+  assert.deepEqual(webSearch.quarkSearchQueries({ title: '希望2026', aliases: ['Hope', '호프'], year: '2026' }), ['"希望" 2026 夸克 网盘', '"Hope" 2026 夸克 网盘', '"호프" 2026 夸克 网盘']);
+  assert.equal(webSearch.quarkSearchQueries({ title: '银翼杀手 2049', year: '2017' })[0], '"银翼杀手 2049" 2017 夸克 网盘');
+  assert.equal(new URL(webSearch.googleQueryUrl('test', 2)).searchParams.get('start'), '20');
+  assert.equal(new URL(webSearch.bingQueryUrl('test', 2)).searchParams.get('first'), '21');
+});
+
+test('Chinese Bing only trusts result headings, unwraps safe tracking targets and ignores navigation and snippet share links', () => {
+  const encode = url => 'https://www.bing.com/ck/a?u=a1' + Buffer.from(url).toString('base64url');
+  const block = (url, heading) => `<li class="b_algo"><h2><a href="${encode(url)}">${heading}</a></h2><p>2026-10-14</p></li>`;
+  const raw = `<nav><a href="https://nav.example/">希望 2026 夸克</a></nav><ol>` +
+    block('https://posts.example/correct', '2026韩国恐怖片《希望》夸克网盘') +
+    block('http://127.0.0.1/secret', '希望 (2026) 资源') +
+    block('https://user:password@posts.example/secret', '希望 (2026) 资源') +
+    block('https://posts.example/wrong', '希望 (2013) 网盘') + '</ol>';
+  assert.deepEqual(webSearch.extractQuarkSearchResults(raw, { engine: 'Bing', title: '希望', year: '2026' }), [{ url: 'https://posts.example/correct', name: '2026韩国恐怖片《希望》夸克网盘' }]);
+  const rss = '<rss><channel><item><title>希望 (2026) 夸克网盘</title><link>https://posts.example/correct</link><description>相关推荐其他电影 https://pan.quark.cn/s/unrelated1</description></item></channel></rss>';
+  assert.deepEqual(webSearch.extractQuarkSearchResults(rss, { engine: 'Bing', title: '希望', year: '2026' }).map(row => row.url), ['https://posts.example/correct']);
+});
+
+test('article links at the end accept generic action labels without borrowing recommendation dates', () => {
+  const html = '<title>希望 (2026) 夸克网盘</title><script type="application/ld+json">{"headline":"其他电影","datePublished":"2026-10-14"}</script>' +
+    '<article><h1>希望 (2026)</h1>' + '<p>正文介绍</p>'.repeat(100) +
+    '<a href="https://pan.quark.cn/s/lastlink1">点击这里获取</a> 提取码：AB12</article><nav><time datetime="2026-10-14"></time><a href="https://pan.quark.cn/s/wrong123">希望 2026</a></nav>';
+  assert.deepEqual(webSearch.extractQuarkArticle(html, { url: 'https://posts.example/hope', title: '希望', year: '2026', now: time }), { matched: true, rows: [{ url: 'https://pan.quark.cn/s/lastlink1?pwd=AB12', name: '希望 (2026) 夸克网盘' }] });
+});
+
 test('rendered Tencent post headings and labeled body hyperlinks bind the expected film to the actual share href', async () => {
   const name = '2026韩国电影希望Hope！科幻动作！k: 夸克网盘分享';
   const url = 'https://pd.qq.com/post/123456789', query = { title: '希望2026', now: time };
@@ -118,10 +145,10 @@ test('Google requests newest results without a date cutoff, following only three
   assert.equal(rows.length, 3); assert.equal(input.calls.length, 4);
   const query = new URL(input.calls[0].url);
   assert.equal(query.origin, 'https://www.google.com'); assert.equal(query.pathname, '/search');
-  assert.equal(query.searchParams.get('q'), title + ' 夸克'); assert.equal(query.searchParams.get('tbs'), 'sbd:1'); assert.equal(query.searchParams.get('udm'), '14');
+  assert.equal(query.searchParams.get('q'), `"${title}" 夸克 网盘`); assert.equal(query.searchParams.get('tbs'), 'sbd:1'); assert.equal(query.searchParams.get('udm'), '14');
   assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/1', 'https://posts.example/2', 'https://posts.example/3']);
   for (const call of input.calls) { assert.equal(call.maxBytes, 512 * 1024); assert.equal(call.deadline, time + 3000); assert.ok(call.duration <= 2000); }
-  assert.equal(input.calls[0].duration, 2000);
+  assert.equal(input.calls[0].duration, 1500);
 });
 
 test('Google result headings are matched independently of their site attribution and breadcrumbs', async () => {
@@ -151,11 +178,11 @@ test('an empty canonical query tries one supplied alias within the original requ
   const calls = [];
   const rows = await searchGoogleQuark(title, { aliases: ['Winter and Summer', 'unused alias'], now: () => time, read: async (url, duration, maxBytes, deadline) => {
     calls.push({ url, deadline });
-    if (new URL(url).hostname === 'www.google.com') return new URL(url).searchParams.get('q') === 'Winter and Summer 夸克' ? link('https://posts.example/movie', 'Winter and Summer 资源') : '<title>Google</title>';
+    if (new URL(url).hostname === 'www.google.com') return new URL(url).searchParams.get('q') === '"Winter and Summer" 夸克 网盘' ? link('https://posts.example/movie', 'Winter and Summer 资源') : '<title>Google</title>';
     return '<title>Winter and Summer 资源</title><a href="https://pan.quark.cn/s/abcdef1">夸克下载</a>';
   } });
   assert.equal(rows.length, 1); assert.equal(calls.length, 3);
-  assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [title + ' 夸克', 'Winter and Summer 夸克']);
+  assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [`"${title}" 夸克 网盘`, '"Winter and Summer" 夸克 网盘']);
   assert.ok(calls.every(call => call.deadline === time + 3000));
 });
 
@@ -164,11 +191,11 @@ test('an empty Google title-plus-Quark query falls back to title-plus-cloud-driv
   const rows = await searchGoogleQuark(title, { now: () => time, read: async (url, duration, maxBytes, deadline) => {
     calls.push({ url, deadline });
     const query = new URL(url).searchParams.get('q');
-    if (query) return query === title + ' 网盘' ? link('https://posts.example/movie') : '<title>Google</title>';
+    if (query) return query === `"${title}" 网盘` ? link('https://posts.example/movie') : '<title>Google</title>';
     return article(link('https://pan.quark.cn/s/abcdef1'));
   } });
   assert.equal(rows.length, 1);
-  assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [title + ' 夸克', title + ' 网盘']);
+  assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [`"${title}" 夸克 网盘`, `"${title}" 网盘`]);
   assert.ok(calls.every(call => call.deadline === time + 3000));
 });
 
@@ -176,12 +203,12 @@ test('Bing searches resource articles and follows relevant first-level pages as 
   const calls = [];
   const rows = await webSearch.searchBingQuark('一路超平安', { now: () => time, read: async (url, duration, maxBytes, deadline) => {
     calls.push({ url, duration, maxBytes, deadline });
-    if (new URL(url).hostname === 'www.bing.com') return '<rss><channel><item><title><![CDATA[一路超平安 (2026) 4K资源]]></title><link>https://posts.example/movie?from=bing&amp;id=1</link></item><item><title>其他电影</title><link>https://posts.example/other</link></item></channel></rss>';
+    if (new URL(url).hostname.endsWith('.bing.com')) return '<rss><channel><item><title><![CDATA[一路超平安 (2026) 4K资源]]></title><link>https://posts.example/movie?from=bing&amp;id=1</link></item><item><title>其他电影</title><link>https://posts.example/other</link></item></channel></rss>';
     assert.equal(url, 'https://posts.example/movie?from=bing&id=1');
     return '<title>一路超平安 (2026) 4K资源</title><article><time datetime="2026-10-13"></time><a href="https://pan.quark.cn/s/abcdef1">夸克下载</a> 提取码: A1B2</article>';
   } });
   assert.deepEqual(rows, [{ url: 'https://pan.quark.cn/s/abcdef1?pwd=A1B2', name: '一路超平安 (2026) 4K资源', publishedAt: Date.parse('2026-10-13') }]);
-  assert.equal(new URL(calls[0].url).searchParams.get('q'), '一路超平安 夸克');
+  assert.equal(new URL(calls[0].url).searchParams.get('q'), '"一路超平安" 夸克 网盘');
   assert.equal(calls.length, 2); assert.ok(calls.every(call => call.deadline === time + 3000));
 });
 
@@ -203,7 +230,7 @@ test('Bing bounds article reads and refuses private pages, recursive crawling an
   const calls = [], pages = [1, 2, 3, 4].map(id => `<item><title>${title}</title><link>https://posts.example/${id}</link></item>`).join('');
   const read = async url => {
     calls.push(url);
-    if (new URL(url).hostname === 'www.bing.com') return `<rss><channel><item><title>${title}</title><link>http://127.0.0.1/private</link></item>${pages}</channel></rss>`;
+    if (new URL(url).hostname.endsWith('.bing.com')) return `<rss><channel><item><title>${title}</title><link>http://127.0.0.1/private</link></item>${pages}</channel></rss>`;
     return article(link('https://posts.example/child') + link('https://pan.quark.cn/s/abcdef1'));
   };
   assert.equal((await webSearch.searchBingQuark(title, { read, now: () => time })).length, 1);
@@ -216,7 +243,7 @@ test('a release-year hint never removes matching Google resources which omit tha
   const rows = await searchGoogleQuark(title + ' 2026', input);
   assert.equal(rows.length, 1, 'previously the strict title-plus-year filter discarded this fixture before reading the page');
   assert.equal(input.calls.length, 2);
-  assert.equal(new URL(input.calls[0].url).searchParams.get('q'), title + ' 夸克');
+  assert.equal(new URL(input.calls[0].url).searchParams.get('q'), `"${title}" 2026 夸克 网盘`);
 });
 
 test('clean titles discover ongoing series collections without confusing publication dates with release years', async t => {
@@ -227,7 +254,7 @@ test('clean titles discover ongoing series collections without confusing publica
   ]) await t.test(keyword, async () => {
     const input = fixture(link('https://posts.example/series', pageTitle), { 'https://posts.example/series': `<title>${pageTitle}</title><article><time datetime="2026-10-13"></time>${link('https://pan.quark.cn/s/abcdef1', queryTitle + ' 夸克全集')}</article>` });
     const rows = await searchGoogleQuark(keyword, input);
-    assert.equal(new URL(input.calls[0].url).searchParams.get('q'), queryTitle + ' 夸克');
+    assert.equal(new URL(input.calls[0].url).searchParams.get('q'), webSearch.quarkSearchQueries({ title: queryTitle, year: /\s+((?:19|20)\d{2})$/.exec(keyword)?.[1] })[0]);
     assert.equal(rows.length, 1); assert.equal(rows[0].publishedAt, Date.parse('2026-10-13'));
   });
 });
@@ -246,7 +273,7 @@ test('a canonical title containing a spaced year-like number is preserved withou
     'https://posts.example/2049': '<title>银翼杀手 2049（2017）4K资源</title><article><a href="https://pan.quark.cn/s/abcdef1">银翼杀手2049 夸克高清</a></article>',
   });
   const rows = await searchGoogleQuark(' 银翼杀手 2049 ', { ...input, titleOnly: true });
-  assert.equal(new URL(input.calls[0].url).searchParams.get('q'), '银翼杀手 2049 夸克');
+  assert.equal(new URL(input.calls[0].url).searchParams.get('q'), '"银翼杀手 2049" 夸克 网盘');
   assert.equal(rows.length, 1); assert.equal(rows[0].name, '银翼杀手2049 夸克高清');
   assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/2049']);
 });
@@ -349,11 +376,11 @@ test('a slower search page shares the original three-second budget with follow-u
   const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': article(link('https://pan.quark.cn/s/abcdef1')) });
   const rows = await searchGoogleQuark(title, { now: () => current, read: async (...args) => {
     const html = await input.read(...args);
-    if (input.calls.length === 1) { assert.equal(args[1], 2000); current += 1600; }
+    if (input.calls.length === 1) { assert.equal(args[1], 1500); current += 1400; }
     return html;
   } });
   assert.equal(rows.length, 1);
-  assert.equal(input.calls[1].duration, 1400);
+  assert.equal(input.calls[1].duration, 1600);
   assert.ok(input.calls.every(call => call.deadline === time + 3000));
 });
 

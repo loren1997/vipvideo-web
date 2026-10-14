@@ -12,7 +12,7 @@ async function readPublicPage(url, { deadline, signal }) {
       accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8', 'accept-language': 'zh-CN,zh;q=0.9',
     } });
     try {
-      if (response.statusCode !== 200) throw new Error('公开网页暂时不可用');
+      if (response.statusCode !== 200) throw Object.assign(new Error('公开网页暂时不可用'), { status: response.statusCode, quarkPoolReason: [403, 429].includes(response.statusCode) ? 'browserBlocked' : 'browserFailed' });
       return { url: response.finalUrl || url, html: await readText(response, 512 * 1024) };
     } finally { response.destroy(); }
 }
@@ -34,11 +34,11 @@ export function createBrowserWorker({ browser = createQuarkBrowser(), read = rea
       let body = ''; req.setEncoding('utf8');
       for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body) > 6144) return json(413, { reason: '请求过大' }); }
       const input = JSON.parse(body);
-      if (!input || Object.keys(input).some(key => !['title', 'aliases', 'year', 'budgetMs'].includes(key)) || typeof input.title !== 'string' || !input.title.trim() || input.title.length > 300 || !Array.isArray(input.aliases) || input.aliases.length > 2 || input.aliases.some(value => typeof value !== 'string' || value.length > 300) || typeof input.year !== 'string' || !/^(?:(?:19|20)\d{2})?$/.test(input.year) || !Number.isFinite(input.budgetMs)) return json(400, { reason: '搜索参数无效' });
+      if (!input || Object.keys(input).some(key => !['title', 'aliases', 'year', 'page', 'budgetMs'].includes(key)) || typeof input.title !== 'string' || !input.title.trim() || input.title.length > 300 || !Array.isArray(input.aliases) || input.aliases.length > 2 || input.aliases.some(value => typeof value !== 'string' || value.length > 300) || typeof input.year !== 'string' || !/^(?:(?:19|20)\d{2})?$/.test(input.year) || input.page !== undefined && (!Number.isInteger(input.page) || input.page < 0 || input.page > 2) || !Number.isFinite(input.budgetMs)) return json(400, { reason: '搜索参数无效' });
       const deadline = Math.min(started + 45000, Date.now() + Math.max(1, input.budgetMs));
       clearTimeout(timeout);
       timeout = setTimeout(() => controller.abort(new Error('动态网页搜索超时')), Math.max(1, deadline - Date.now()));
-      const rows = await search({ title: input.title, aliases: input.aliases, year: input.year }, { deadline, signal: controller.signal });
+      const rows = await search({ title: input.title, aliases: input.aliases, year: input.year, page: input.page ?? 0 }, { deadline, signal: controller.signal });
       json(200, { results: rows, ...(rows.reason ? { reason: rows.reason } : {}) });
     } catch (cause) { json(controller.signal.aborted ? 504 : cause instanceof SyntaxError ? 400 : 502, { reason: controller.signal.aborted ? 'browserTimeout' : '动态网页暂时无法读取' }); }
     finally { clearTimeout(timeout); res.removeListener('close', disconnect); if (active === controller) active = undefined; }

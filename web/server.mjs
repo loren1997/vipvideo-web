@@ -20,6 +20,7 @@ import { repairImport } from './lib/import-repair.mjs';
 import { createTranscoder } from './lib/transcode.mjs';
 import { createAdMarkers } from './lib/ad-markers.mjs';
 import { createQuark } from './lib/quark.mjs';
+import { createQuarkCatalog } from './lib/quark-catalog.mjs';
 import { createQuarkSearchPool } from './lib/quark-search-pool.mjs';
 import { createQuarkBrowserSearch } from './lib/quark-browser-client.mjs';
 import { createQuarkMedia } from './lib/quark-media.mjs';
@@ -54,7 +55,7 @@ function tokenFrom(req) {
 
 export function createApp({ password = process.env.APP_PASSWORD, dataDir = process.env.DATA_DIR ?? resolve(root, 'data'),
   catalog = createCatalog(), media = createMedia(), initialConfig = defaults, cookieSecure = process.env.COOKIE_SECURE === 'true',
-  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder, adMarkers, quark, quarkMedia, quarkSearchPool } = {}) {
+  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder, adMarkers, quark, quarkMedia, quarkSearchPool, quarkCatalog } = {}) {
   if (typeof password !== 'string' || password.length < 8 || password.length > 1024) throw new Error('APP_PASSWORD 必须设置，且长度为 8–1024 个字符');
   const initial = validateConfig(initialConfig);
   const store = createStore(dataDir, initial);
@@ -79,6 +80,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const transcodeService = transcoder ?? createTranscoder({ media, logger });
   const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store, ...(process.env.QUARK_BROWSER_URL === 'http://quark-browser:3020' ? { renderSearch: createQuarkBrowserSearch() } : {}) });
   const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: searchPool.request, defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
+  const cloudCatalog = quarkCatalog ?? createQuarkCatalog({ store });
   const cloudMedia = quarkMedia ?? createQuarkMedia({ quark: quarkService, visible: category => ensureVisible(category) });
   const salt = store.meta('password-salt') ?? randomBytes(16).toString('hex');
   const passwordHash = scryptSync(password, salt, 32);
@@ -105,6 +107,13 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
     requireSession(owner);
     const snapshot = store.config(), line = Number(input?.line ?? 0), episode = Number(input?.episode ?? 0);
     if (!Number.isSafeInteger(line) || line < 0 || !Number.isSafeInteger(episode) || episode < 0) throw badRequest('请选择有效的剧集');
+    if (input?.source === 'quark-library') {
+      const detail = await cloudCatalog.detail(text(input.id, '豆瓣影片标识', 16));
+      const valid = () => { requireSession(owner); ensureVisible(detail.category); return true; };
+      valid();
+      if (!detail.lines[line]?.episodes[episode]) throw badRequest('请选择有效的影片');
+      return { detail, options: { line, episode }, valid };
+    }
     const source = snapshot.sources.find(item => item.id === input?.source && item.enabled !== false);
     if (!source) throw badRequest('请选择启用的影视源');
     const detail = await catalog.detail(availableConfig(snapshot), source.id, text(input?.id, '影片标识', 200));
@@ -181,6 +190,16 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           return json(res, 200, { api_site: Object.fromEntries(initial.sources.map(({ id, name, api }) => [id, { name, api }])) });
         }
         if (path === '/api/quark/settings' && method === 'GET') return json(res, 200, { ...await quarkService.settings(), searchPool: searchPool.status() });
+        if (path === '/api/quark/library' && method === 'GET') {
+          const result = await cloudCatalog.browse(Object.fromEntries(['category', 'genre', 'year', 'sort', 'page'].filter(key => url.searchParams.has(key)).map(key => [key, url.searchParams.get(key)])));
+          requireSession(hashToken(token));
+          return json(res, 200, result);
+        }
+        if (path === '/api/quark/library/detail' && method === 'GET') {
+          const detail = await cloudCatalog.detail(text(url.searchParams.get('id'), '豆瓣影片标识', 16));
+          requireSession(hashToken(token)); ensureVisible(detail.category);
+          return json(res, 200, detail);
+        }
         if (path === '/api/quark/settings' && method === 'PUT') {
           const result = await quarkService.configure(await readBody(req)); cloudMedia.invalidate();
           return json(res, 200, { ...result, searchPool: searchPool.status() });
@@ -211,9 +230,11 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         if (path === '/api/quark/prepare' && method === 'POST') {
           const input = await readBody(req), selected = await cloudSelection(input, hashToken(token));
           if (input.auto !== undefined && typeof input.auto !== 'boolean') throw badRequest('自动转存选项无效');
+          if (input.source === 'quark-library' && (input.auto === true || !input.fileId || !input.shareId)) throw badRequest('请选择分享和单个视频文件后手动转存');
           const options = { ...selected.options, valid: selected.valid, ...(input.auto === undefined ? {} : { auto: input.auto }),
             ...(input.shareId === undefined ? {} : { shareId: text(input.shareId, '夸克分享标识', 200) }),
             ...(input.fileId === undefined ? {} : { fileId: text(input.fileId, '夸克文件标识', 200) }) };
+          if (input.source === 'quark-library') options.auto = false;
           selected.valid(); const result = await quarkService.prepare(selected.detail, options); selected.valid();
           return json(res, 200, result);
         }
@@ -328,6 +349,13 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           return json(res, 200, { ok: true });
         }
         if (path === '/api/ratings' && method === 'GET') {
+          if (url.searchParams.get('source') === 'quark-library') {
+            const detail = await cloudCatalog.detail(text(url.searchParams.get('id'), '豆瓣影片标识', 16));
+            requireSession(hashToken(token)); ensureVisible(detail.category);
+            const score = detail.douban?.score;
+            return json(res, 200, { douban: Number.isFinite(score) && score > 0 && score <= 10 ? { ...detail.douban, url: `https://movie.douban.com/subject/${detail.id}/`, attribution: detail.douban.attribution || '豆瓣公开条目' } : null,
+              tmdb: null, configured: true, errors: [...(Array.isArray(detail.errors) ? detail.errors : []), ...(Number.isFinite(score) && score > 0 && score <= 10 ? [] : ['豆瓣公开条目暂无评分'])] });
+          }
           const detail = await catalog.detail(availableConfig(store.config()), url.searchParams.get('source'), url.searchParams.get('id'));
           ensureVisible(detail.category);
           const result = await ratingService.get(detail);
@@ -497,8 +525,8 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
   return {
-    server, store, maintenance: sourceService, live: liveService, discovery: discoveryService, quark: quarkService, quarkSearch: searchPool,
-    async close() { cloudMedia.invalidate(); await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.(), transcodeService.close?.(), quarkService.stop?.(), searchPool.stop?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
+    server, store, maintenance: sourceService, live: liveService, discovery: discoveryService, quark: quarkService, quarkSearch: searchPool, quarkCatalog: cloudCatalog,
+    async close() { cloudMedia.invalidate(); await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.(), transcodeService.close?.(), quarkService.stop?.(), searchPool.stop?.(), cloudCatalog.stop?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
   };
 }
 
