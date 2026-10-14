@@ -2,17 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import { chromium } from 'playwright-core';
 import { createQuarkChromiumLauncher } from '../lib/quark-chromium-launcher.mjs';
 
 const safeArgs = ['--mute-audio', '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', '--host-resolver-rules=MAP * ~NOTFOUND', '--js-flags=--max-old-space-size=128'];
 const options = () => ({ executablePath: '/synthetic/chromium', headless: true, timeout: 2500, args: [...safeArgs] });
 const endpoint = port => `ws://127.0.0.1:${port}/devtools/browser/11111111-2222-3333-4444-555555555555`;
 
-function fixture({ message = endpoint(31337), connectImpl, mode = 'ready', reapDelay = 0 } = {}) {
+function fixture({ message = endpoint(31337), connectImpl, mode = 'ready', reapDelay = 0, output = 'stderr', interleave = false } = {}) {
   const children = [], connections = [], signals = [], calls = [], protocol = [];
   let disconnected = false;
   const browser = {
@@ -23,12 +22,15 @@ function fixture({ message = endpoint(31337), connectImpl, mode = 'ready', reapD
   const launch = createQuarkChromiumLauncher({
     platform: 'linux', xvfbRun: () => '/synthetic/xvfb-run', reservePort: async () => 31337,
     spawn(command, args, configuration) {
-      const child = Object.assign(new EventEmitter(), { pid: 500000 + children.length, stderr: new PassThrough(), reaped: false });
+      const child = Object.assign(new EventEmitter(), { pid: 500000 + children.length, stdout: new PassThrough(), stderr: new PassThrough(), reaped: false });
       children.push(child); calls.push({ command, args, configuration });
       setImmediate(() => {
         if (mode === 'ready') {
-          child.stderr.write('Xvfb fixture diagnostic\nDevTools listening on ');
-          child.stderr.write(message + '\n');
+          child[output].write('Xvfb fixture diagnostic\nDevTools listening on ');
+          if (interleave) child[output === 'stdout' ? 'stderr' : 'stdout'].write('Other stream diagnostic\n');
+          child[output].write(message + '\n');
+        } else if (mode === 'oversized') {
+          child[output].write('x'.repeat(65537));
         } else if (mode === 'occupied') {
           child.stderr.write('bind failed: Address already in use\n');
           child.emit('exit', 1); child.reaped = true; child.emit('close', 1);
@@ -63,7 +65,7 @@ test('Linux reports missing Xvfb and refuses conflicting network or automation f
   assert.equal(value.calls.length, 0);
 });
 
-test('only the owned stderr endpoint is attached, with a private display/profile and no startup tab', async () => {
+test('only the owned process endpoint is attached, with a private display/profile and no startup tab', async () => {
   const value = fixture({ reapDelay: 25 });
   const browser = await value.launch(options());
   const { command, args, configuration } = value.calls[0];
@@ -75,7 +77,7 @@ test('only the owned stderr endpoint is attached, with a private display/profile
   assert.ok(args.includes('--remote-debugging-port=31337'));
   assert.ok(!args.includes('about:blank'));
   assert.ok(!args.some(argument => /^--(?:headless|enable-automation|remote-debugging-pipe)/.test(argument)));
-  assert.deepEqual(configuration.stdio, ['ignore', 'ignore', 'pipe']);
+  assert.deepEqual(configuration.stdio, ['ignore', 'pipe', 'pipe']);
   assert.equal(configuration.detached, true);
   assert.equal(configuration.windowsHide, true);
   assert.ok(existsSync(profile));
@@ -90,9 +92,32 @@ test('only the owned stderr endpoint is attached, with a private display/profile
 });
 
 test('foreign or malformed CDP endpoints never attach and their child/profile are cleaned', async () => {
-  for (const message of [endpoint(31338), endpoint(31337).replace('127.0.0.1', '192.168.1.1'), endpoint(31337).replace('/devtools/browser/', '/devtools/page/')]) {
-    const value = fixture({ message });
-    await assert.rejects(value.launch(options()), { code: 'CHROMIUM_CDP_ENDPOINT_INVALID' });
+  for (const output of ['stdout', 'stderr']) {
+    for (const message of [endpoint(31338), endpoint(31337).replace('127.0.0.1', '192.168.1.1'), endpoint(31337).replace('/devtools/browser/', '/devtools/page/')]) {
+      const value = fixture({ message, output });
+      await assert.rejects(value.launch(options()), { code: 'CHROMIUM_CDP_ENDPOINT_INVALID' });
+      assert.equal(value.connections.length, 0);
+      assert.ok(value.children[0].reaped);
+      assert.ok(!existsSync(value.profile()));
+    }
+  }
+});
+
+test('Ubuntu redirected stdout and stderr keep separate buffers when endpoint fragments interleave', async () => {
+  for (const output of ['stdout', 'stderr']) {
+    const value = fixture({ output, interleave: true });
+    const browser = await value.launch(options());
+    assert.equal(value.connections[0].address, endpoint(31337));
+    await browser.close();
+    assert.ok(value.children[0].reaped);
+    assert.ok(!existsSync(value.profile()));
+  }
+});
+
+test('either owned output stream rejects oversized unterminated lines and reaps its child', async () => {
+  for (const output of ['stdout', 'stderr']) {
+    const value = fixture({ output, mode: 'oversized' });
+    await assert.rejects(value.launch(options()), { code: `CHROMIUM_${output.toUpperCase()}_TOO_LARGE` });
     assert.equal(value.connections.length, 0);
     assert.ok(value.children[0].reaped);
     assert.ok(!existsSync(value.profile()));
@@ -142,38 +167,10 @@ const linuxExecutablePath = ['/opt/google/chrome/chrome', '/usr/bin/google-chrom
 const realLinux = process.platform === 'linux' && linuxExecutablePath && existsSync('/usr/bin/xvfb-run');
 test('real isolated Linux Chromium starts without tabs, keeps webdriver unchanged and reaps Xvfb', { skip: !realLinux, timeout: 25000 }, async t => {
   let child, profile;
-  const stages = { spawnCalled: false, spawned: false, pid: null, exit: null, close: null, stderrBytes: 0, devToolsSeen: false, connectStarted: false, connectCompleted: false };
-  let stderrTail = '', xvfbStderr = '', xvfbLogError;
-  const launch = createQuarkChromiumLauncher({
-    spawn(command, args, configuration) {
-      profile = args.find(value => value.startsWith('--user-data-dir='))?.slice('--user-data-dir='.length);
-      stages.spawnCalled = true;
-      child = spawn(command, ['-e', path.join(profile, 'Xvfb.stderr'), ...args], configuration);
-      stages.pid = child.pid ?? null;
-      child.once('spawn', () => { stages.spawned = true; });
-      child.once('exit', (code, signal) => { stages.exit = { code, signal }; });
-      child.once('close', (code, signal) => {
-        stages.close = { code, signal };
-        try { xvfbStderr = readFileSync(path.join(profile, 'Xvfb.stderr'), 'utf8').slice(-32768); }
-        catch (error) { xvfbLogError = error.code || error.name; }
-      });
-      child.stderr.on('data', chunk => {
-        stages.stderrBytes += chunk.length;
-        stderrTail = (stderrTail + chunk.toString()).slice(-2048);
-        stages.devToolsSeen ||= /DevTools listening on /.test(stderrTail);
-      });
-      return child;
-    },
-    async connect(address, configuration) {
-      stages.connectStarted = true;
-      const browser = await chromium.connectOverCDP(address, configuration);
-      stages.connectCompleted = true;
-      return browser;
-    },
-  });
+  const launch = createQuarkChromiumLauncher({ spawn(command, args, configuration) { profile = args.find(value => value.startsWith('--user-data-dir='))?.slice('--user-data-dir='.length); child = spawn(command, args, configuration); return child; } });
   let browser;
   try { browser = await launch({ ...options(), executablePath: linuxExecutablePath, timeout: 20000 }); }
-  catch (error) { t.diagnostic(JSON.stringify({ executablePath: linuxExecutablePath, ...stages, chromiumStderr: error.chromiumStderr || '', xvfbStderr, xvfbLogError })); throw error; }
+  catch (error) { t.diagnostic(JSON.stringify({ executablePath: linuxExecutablePath, chromiumStderr: error.chromiumStderr || '', chromiumStdout: error.chromiumStdout || '' })); throw error; }
   try {
     assert.equal(browser.contexts().flatMap(context => context.pages()).length, 0);
     const context = await browser.newContext({ serviceWorkers: 'block' }), page = await context.newPage();

@@ -57,7 +57,7 @@ export function createQuarkChromiumLauncher({ platform = process.platform, spawn
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
     const timer = setTimeout(() => controller.abort(timeoutFailure()), Math.max(0, workDeadline - Date.now()));
-    let profile, child, browser, disconnect, connecting, closing, reaped = false, stderr = '';
+    let profile, child, browser, disconnect, connecting, closing, reaped = false, stderr = '', stdout = '';
     let resolveReaped;
     const closed = new Promise(resolve => { resolveReaped = resolve; });
     const stopGroup = mode => {
@@ -98,21 +98,25 @@ export function createQuarkChromiumLauncher({ platform = process.platform, spawn
       profile = await mkdtemp(path.join(tmpdir(), 'vipvideo-quark-chromium-'));
       controller.signal.throwIfAborted();
       const rawArgs = [...args, '--remote-debugging-address=127.0.0.1', `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', '--no-sandbox', '--disable-background-networking', '--no-startup-window'];
-      child = spawn(wrapper, ['-a', '-f', path.join(profile, 'Xauthority'), '-s', '-screen 0 1280x900x24 -nolisten tcp', options.executablePath, ...rawArgs], { detached: true, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+      child = spawn(wrapper, ['-a', '-f', path.join(profile, 'Xauthority'), '-s', '-screen 0 1280x900x24 -nolisten tcp', options.executablePath, ...rawArgs], { detached: true, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
       const endpoint = new Promise((resolve, reject) => {
-        let pending = '';
         child.once('error', error => reject(failure('CHROMIUM_PROCESS_START_FAILED', error)));
         child.once('exit', () => reject(failure('CHROMIUM_EXITED_BEFORE_CDP')));
-        child.stderr.on('data', chunk => {
-          pending += chunk.toString();
-          if (pending.length > 65536) { reject(failure('CHROMIUM_STDERR_TOO_LARGE')); pending = ''; return; }
-          const lines = pending.split(/\r?\n/); pending = lines.pop();
-          for (const line of lines) {
-            const match = /^DevTools listening on (\S+)\s*$/.exec(line);
-            if (match) { try { resolve(browserEndpoint(match[1], port)); } catch (error) { reject(error); } }
-            else stderr = (stderr + line + '\n').slice(-32768);
-          }
-        });
+        // Ubuntu xvfb-run redirects the browser's stderr into stdout; Debian keeps them separate.
+        for (const [name, output] of [['stdout', child.stdout], ['stderr', child.stderr]]) {
+          let pending = '';
+          output.on('data', chunk => {
+            pending += chunk.toString();
+            if (pending.length > 65536) { reject(failure(`CHROMIUM_${name.toUpperCase()}_TOO_LARGE`)); pending = ''; return; }
+            const lines = pending.split(/\r?\n/); pending = lines.pop();
+            for (const line of lines) {
+              const match = /^DevTools listening on (\S+)\s*$/.exec(line);
+              if (match) { try { resolve(browserEndpoint(match[1], port)); } catch (error) { reject(error); } }
+              else if (name === 'stderr') stderr = (stderr + line + '\n').slice(-32768);
+              else stdout = (stdout + line + '\n').slice(-32768);
+            }
+          });
+        }
       });
       child.once('close', () => { reaped = true; resolveReaped(); });
       const aborted = new Promise((_, reject) => { const rejectAbort = () => reject(controller.signal.reason); controller.signal.addEventListener('abort', rejectAbort, { once: true }); if (controller.signal.aborted) rejectAbort(); });
@@ -129,6 +133,7 @@ export function createQuarkChromiumLauncher({ platform = process.platform, spawn
     } catch (error) {
       await cleanup();
       if (stderr) error.chromiumStderr = stderr;
+      if (stdout) error.chromiumStdout = stdout;
       throw error;
     }
   };
