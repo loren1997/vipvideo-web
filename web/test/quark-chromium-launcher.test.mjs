@@ -137,11 +137,14 @@ test('a startup deadline includes process termination and profile cleanup', asyn
   assert.ok(!existsSync(value.profile()));
 });
 
-const realLinux = process.platform === 'linux' && existsSync('/usr/bin/chromium') && existsSync('/usr/bin/xvfb-run');
-test('real isolated Linux Chromium starts without tabs, keeps webdriver unchanged and reaps Xvfb', { skip: !realLinux, timeout: 25000 }, async () => {
+const linuxExecutablePath = ['/opt/google/chrome/chrome', '/usr/bin/google-chrome', '/usr/bin/chromium'].find(candidate => existsSync(candidate));
+const realLinux = process.platform === 'linux' && linuxExecutablePath && existsSync('/usr/bin/xvfb-run');
+test('real isolated Linux Chromium starts without tabs, keeps webdriver unchanged and reaps Xvfb', { skip: !realLinux, timeout: 25000 }, async t => {
   let child, profile;
   const launch = createQuarkChromiumLauncher({ spawn(command, args, configuration) { profile = args.find(value => value.startsWith('--user-data-dir='))?.slice('--user-data-dir='.length); child = spawn(command, args, configuration); return child; } });
-  const browser = await launch({ ...options(), executablePath: '/usr/bin/chromium', timeout: 20000 });
+  let browser;
+  try { browser = await launch({ ...options(), executablePath: linuxExecutablePath, timeout: 20000 }); }
+  catch (error) { t.diagnostic(JSON.stringify({ executablePath: linuxExecutablePath, chromiumStderr: error.chromiumStderr || '' })); throw error; }
   try {
     assert.equal(browser.contexts().flatMap(context => context.pages()).length, 0);
     const context = await browser.newContext({ serviceWorkers: 'block' }), page = await context.newPage();
