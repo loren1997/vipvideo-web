@@ -82,10 +82,11 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
           new Promise((_, reject) => { timer = setTimeout(() => reject(failure('影视源请求超时')), remaining); }),
         ]).finally(() => clearTimeout(timer));
         signal?.throwIfAborted();
-        if (!records.length || records.some(record => !isPublicAddress(record.address))) {
+        const publicRecords = records.filter(record => isPublicAddress(record.address));
+        if (!publicRecords.length) {
           throw failure('不允许访问内网或保留地址', 403);
         }
-        const selected = records.find(record => record.family === 4) || records[0];
+        const selected = publicRecords.find(record => record.family === 4) || publicRecords[0];
         const response = await new Promise((resolve, reject) => {
           const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
           const outgoing = transport(url, {

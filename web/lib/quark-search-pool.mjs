@@ -1,7 +1,7 @@
 import { Readable } from 'node:stream';
 import { request as networkRequest, readText, validateUrl } from './network.mjs';
 import { createQuarkSearchRequest } from './quark-search.mjs';
-import { searchGoogleQuark, searchBingQuark, quarkPasswordDate } from './quark-google-search.mjs';
+import { searchGoogleQuark, searchBingQuark, quarkPasswordDate, classifyQuarkCandidate } from './quark-google-search.mjs';
 
 const KEY = 'quark-search-pool-v1', DAY = 86_400_000, HEALTH_INTERVAL = 6 * 60 * 60_000;
 const RECALL_KEY = 'quark-search-availability-v3';
@@ -32,7 +32,7 @@ function safeFailure(cause, reading = false) {
   if (['CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_TLS_HANDSHAKE_TIMEOUT', 'ERR_SSL_WRONG_VERSION_NUMBER', 'ERR_SSL_PROTOCOL_ERROR'].includes(code)) return failure('搜索服务 TLS 验证或握手失败');
   if (['影视源响应过大', '搜索结果超过 2 MiB'].includes(cause?.message)) return failure('搜索响应内容异常（超过大小限制）');
   if (['Z_DATA_ERROR', 'Z_BUF_ERROR'].includes(code) || cause?.message === '影视源使用了不支持的内容编码') return failure('搜索响应内容异常（编码不支持或数据损坏）');
-  if (cause?.status === 403) return failure('搜索地址被安全检查拒绝', 403);
+  if (cause?.status === 403) return failure('搜索地址被安全检查拒绝' + (cause.message === '不允许访问内网或保留地址' ? '（域名解析到内网或保留地址）' : ''), 403);
   return failure(reading ? '搜索响应正文读取失败' : '搜索服务连接失败');
 }
 
@@ -102,22 +102,22 @@ function compatible(body, at) {
   if (!Array.isArray(payload) && !Array.isArray(payload.results) && !Array.isArray(payload.list) && !Array.isArray(payload.items) && !(payload.merged_by_type && typeof payload.merged_by_type === 'object' && !Array.isArray(payload.merged_by_type))) return;
   return shares(data, at);
 }
-const normalized = value => value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 function queryTerms(keyword, values, yearHint) {
   const hinted = /^(?:19|20)\d{2}$/.test(String(yearHint || ''));
   const dated = yearHint !== undefined ? undefined : /^(.*?)\s+((?:19|20)\d{2})$/.exec(keyword), title = dated?.[1] || keyword;
   const aliases = (Array.isArray(values) ? values.slice(0, 10) : []).filter(value => typeof value === 'string' && value.trim() && value.length <= 300 && !/[\u0000-\u001f\u007f]/.test(value)).slice(0, 2).map(value => value.trim());
   const year = hinted ? String(yearHint) : dated?.[2];
-  return { title, aliases, words: [...new Set([title, ...aliases, ...(year ? [title + ' ' + year] : [])])], titles: [...new Set([title, ...aliases].map(normalized).filter(Boolean))].map(word => ({ word, pattern: /^[a-z0-9]+$/.test(word) ? new RegExp('(?:^|[^a-z0-9])' + word.split('').join('[^a-z0-9]*') + '(?:$|[^a-z0-9])', 'i') : undefined })), year };
+  return { title, aliases, words: [...new Set([title, ...aliases, ...(year ? [title + ' ' + year] : [])])], year };
 }
 function relevance(row, query) {
-  const title = normalized(row.name || '');
-  return query?.titles.some(({ word, pattern }) => title.includes(word) && (!pattern || pattern.test((row.name || '').normalize('NFKC')))) ? 1 : 0;
+  return classifyQuarkCandidate(row.name, query) === 'matched' ? 1 : 0;
 }
 const ranked = (rows, query) => [...rows].sort((a, b) => relevance(b, query) - relevance(a, query) || (b.publishedAt || 0) - (a.publishedAt || 0));
 const result = (rows, query, reason) => {
-  const found = ranked(rows, query).slice(0, 30).sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0)).map(row => ({ ...row, name: row.name || '未提供资源标题' }));
-  const body = JSON.stringify({ results: found, ...(reason ? { reason } : {}) });
+  const found = ranked(rows, query).slice(0, 30).sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
+  const results = found.filter(row => classifyQuarkCandidate(row.name, query) === 'matched');
+  const unverified = found.filter(row => classifyQuarkCandidate(row.name, query) === 'unknown').slice(0, 10).map(row => ({ ...row, name: row.name || '未提供资源标题' }));
+  const body = JSON.stringify({ results, ...(unverified.length ? { unverified } : {}), ...(reason ? { reason } : {}) });
   return Object.assign(Readable.from([body]), { statusCode: 200, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } });
 };
 
@@ -308,8 +308,11 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
         const merge = rows => {
           if (stopping || entry.expires <= now()) return;
           for (const row of rows) {
+            if (!share(row.url, row.password || '') || classifyQuarkCandidate(row.name, query) === 'unrelated') continue;
             const { publishedAt: rawDate, ...item } = row, publishedAt = timestamp(rawDate, now());
+            const previous = entry.rows.get(new URL(row.url).pathname);
             mergeShare(entry.rows, { ...item, ...(publishedAt ? { publishedAt } : {}), ...(row[quarkPasswordDate] === undefined ? {} : { [passwordDate]: row[quarkPasswordDate] }) });
+            if (relevance(row, query) && !relevance(previous || {}, query)) entry.rows.get(new URL(row.url).pathname).name = row.name;
           }
           entry.rows = new Map(ranked(entry.rows.values(), query).slice(0, 30).map(row => [new URL(row.url).pathname, row]));
         };
@@ -347,11 +350,15 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           return result([...entry.rows.values()], query, entry.reason);
         }
         const pages = await Promise.allSettled([
-          googleSearch(query.title, { aliases: query.aliases, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), true), deadline, now }),
-          searchBingQuark(query.title, { aliases: query.aliases, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), new URL(url).hostname !== 'www.bing.com'), deadline, now }),
+          googleSearch(query.title, { aliases: query.aliases, year: query.year, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), true), deadline, now }),
+          searchBingQuark(query.title, { aliases: query.aliases, year: query.year, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(deadline, limit ?? deadline), new URL(url).hostname !== 'www.bing.com'), deadline, now }),
         ]);
         if (stopping) throw failure('公开搜索已停止', 503, true);
-        for (const [index, page] of pages.entries()) if (page.status === 'fulfilled') merge(page.value); else report((index === 0 ? 'Google 公开搜索：' : 'Bing 公开搜索：') + safeFailure(page.reason).quarkPoolReason);
+        for (const [index, page] of pages.entries()) {
+          const name = index === 0 ? 'Google 公开搜索：' : 'Bing 公开搜索：';
+          if (page.status === 'fulfilled') { merge(page.value); if (page.value.reason) report(name + page.value.reason); }
+          else report(name + safeFailure(page.reason).quarkPoolReason);
+        }
         return result([...entry.rows.values()], query, entry.reason);
       });
     },

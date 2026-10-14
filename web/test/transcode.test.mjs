@@ -89,6 +89,98 @@ test('cloud AVI and transport-stream files use fixed demuxers through the signed
     } finally { await f.close(); }
   }
 });
+
+test('raw-file resume rejects ignored, mismatched and malformed Range responses before encoding', async () => {
+  for (const reply of [
+    { statusCode: 200, headers: { 'content-length': '1', 'accept-ranges': 'bytes' } },
+    { statusCode: 206, headers: { 'content-length': '1', 'content-range': 'bytes 0-0/1000' } },
+    { statusCode: 206, headers: { 'content-length': '2', 'content-range': 'bytes 1-1/1000' } },
+    { statusCode: 206, headers: { 'content-length': '1', 'content-range': 'bytes 1-1/1' } },
+  ]) {
+    const requests = [], media = createMedia({ request: async (_url, options) => {
+      requests.push(options);
+      return Object.assign(Readable.from([Buffer.from('v')]), { ...reply, headers: { 'content-type': 'video/x-matroska', ...reply.headers } });
+    } });
+    const f = await fixture({ media });
+    try {
+      await assert.rejects(start(f.service, { episode: { type: 'mkv', url: 'https://cloud.quark.cn/file.mkv' }, position: 281 }),
+        error => error.status === 409 && error.code === 'TRANSCODE_INPUT_NOT_SEEKABLE' && /从头播放|官方在线线路/.test(error.message));
+      assert.equal(requests.length, 1); assert.equal(requests[0].headers.range, 'bytes=1-1');
+      assert.equal(f.calls.filter(call => call.args.includes('-i')).length, 0);
+      assert.deepEqual(await readdir(f.root), []);
+    } finally { await f.close(); }
+  }
+});
+
+test('raw-file resume accepts a genuine nonzero byte range and shares the startup deadline', async () => {
+  const requests = [], media = createMedia({ request: async (_url, options) => {
+    requests.push(options);
+    return Object.assign(Readable.from([Buffer.from('v')]), { statusCode: 206,
+      headers: { 'content-type': 'video/x-matroska', 'content-length': '1', 'content-range': 'bytes 1-1/1000' } });
+  } });
+  const f = await fixture({ media });
+  try {
+    const result = await start(f.service, { episode: { type: 'mkv', url: 'https://cloud.quark.cn/file.mkv' }, position: 281 });
+    assert.equal(result.startPosition, 281); assert.equal(requests.length, 1); assert.equal(requests[0].headers.range, 'bytes=1-1');
+    assert.equal(f.calls.filter(call => call.args.includes('-i')).length, 1);
+  } finally { await f.close(); }
+});
+
+test('from-start raw files and HLS resume do not require byte-range support', async () => {
+  for (const input of [{ type: 'mkv', position: 0 }, { type: 'hls', position: 281 }]) {
+    const f = await fixture();
+    try {
+      assert.equal((await start(f.service, { episode: { type: input.type, url }, position: input.position })).startPosition, input.position);
+      assert.equal(f.requests.length, 0);
+      const args = f.calls.find(call => call.args.includes('-i')).args;
+      assert.equal(args.includes('-ss'), input.position > 0);
+    }
+    finally { await f.close(); }
+  }
+});
+
+test('a source that stops honoring Range after the probe keeps the actionable resume error', async () => {
+  let requests = 0;
+  const media = createMedia({ request: async (_url, options) => {
+    requests++;
+    return Object.assign(Readable.from([Buffer.from('v')]), { statusCode: requests === 1 ? 206 : 200,
+      headers: { 'content-type': 'video/x-matroska', 'content-length': '1', ...(requests === 1 ? { 'content-range': 'bytes 1-1/1000' } : {}) } });
+  } });
+  const f = await fixture({ media, run: async ({ input }) => { try { await fetch(input, { headers: { Range: 'bytes=500-' } }); } catch {} } });
+  try {
+    await assert.rejects(start(f.service, { episode: { type: 'mkv', url: 'https://cloud.quark.cn/file.mkv' }, position: 281 }),
+      error => error.code === 'TRANSCODE_INPUT_NOT_SEEKABLE');
+    assert.equal(requests, 2); assert.deepEqual(await readdir(f.root), []);
+  } finally { await f.close(); }
+});
+
+test('closing during a pending resume probe cancels it without leaking resources or replacing 409', async () => {
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const media = createMedia({ request: async (_url, options) => {
+    entered();
+    await new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }));
+  } });
+  const f = await fixture({ media });
+  try {
+    const pending = start(f.service, { episode: { type: 'mkv', url: 'https://cloud.quark.cn/file.mkv' }, position: 281 }).catch(error => error);
+    await started;
+    await Promise.all([f.service.close(), f.service.close()]);
+    assert.equal((await pending).status, 409);
+    assert.deepEqual(await readdir(f.root), []); assert.equal(f.calls.filter(call => call.args.includes('-i')).length, 0);
+  } finally { await f.close(); }
+});
+
+test('a hung resume probe uses the existing startup deadline and never launches an encoder', async () => {
+  const media = createMedia({ request: async (_url, options) => {
+    await new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }));
+  } });
+  const f = await fixture({ media, di: { startupTimeout: 40 } });
+  try {
+    await assert.rejects(start(f.service, { episode: { type: 'mkv', url: 'https://cloud.quark.cn/file.mkv' }, position: 281 }), statusError(504));
+    assert.equal(f.calls.filter(call => call.args.includes('-i')).length, 0); assert.deepEqual(await readdir(f.root), []);
+  } finally { await f.close(); }
+});
 async function assetServer(service, id) {
   const server = createServer(async (req, res) => {
     try { await service.serve(req, res, id, decodeURIComponent(req.url.slice(1))); }

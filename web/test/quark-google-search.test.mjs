@@ -17,6 +17,41 @@ function fixture(search, pages = {}) {
   return { calls, read, now: () => time };
 }
 
+test('resource identity requires the primary title or a supplied alias and separates unnamed links', () => {
+  const query = { title: '一路平安', aliases: ['Safe Journey'], year: '2026' };
+  for (const [label, expected] of [
+    ['【电影】一路平安 (2026) 4K HDR', 'matched'], ['Safe Journey (2026) 1080p', 'matched'],
+    ['一路平安 · 页面日期 2025/10/14', 'matched'], ['一路平安 (2025) 1080p', 'unrelated'],
+    ['一路超平安 (2026)', 'unrelated'], ['出入平安 (2026)', 'unrelated'], ['一路平安归来 (2026)', 'unrelated'],
+    ['', 'unknown'], ['网盘资源链接', 'unknown'], ['未提供资源标题', 'unknown'],
+  ]) assert.equal(webSearch.classifyQuarkCandidate(label, query), expected, label);
+  assert.equal(webSearch.classifyQuarkCandidate('出入平安', { title: '平安' }), 'unrelated');
+  assert.equal(webSearch.classifyQuarkCandidate('VITALITY (2017)', { title: '小丑回魂', aliases: ['IT'], year: '2017' }), 'unrelated');
+  assert.equal(webSearch.classifyQuarkCandidate('遮天 动画持续更新至185集 全季合集2022-2026', { title: '遮天', year: '2023' }), 'matched');
+  assert.equal(webSearch.classifyQuarkCandidate('遮天更新至185集2026年', { title: '遮天', year: '2023' }), 'matched');
+  assert.equal(webSearch.classifyQuarkCandidate('银翼杀手2049 (2017)', { title: '银翼杀手 2049', year: '2017' }), 'matched');
+});
+
+test('a main film article cannot lend its title to recommendations or another film plain-text share', async () => {
+  const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': article(`
+    ${link('https://pan.quark.cn/s/correct123', '夸克下载')}
+    <p>其他电影：https://pan.quark.cn/s/wrong12345</p>
+    <section class="related"><h2>其他电影推荐</h2>${link('https://pan.quark.cn/s/related123', '夸克下载')}</section>`),
+  });
+  assert.deepEqual((await searchGoogleQuark(title, input)).map(row => row.url), ['https://pan.quark.cn/s/correct123']);
+});
+
+test('web search distinguishes unindexed titles, unreadable articles and pages without share links', async () => {
+  const missing = fixture('<title>Google</title><p>No matching documents</p>');
+  assert.match((await searchGoogleQuark(title, missing)).reason, /未找到.*公开网页/);
+  const unreadable = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': Object.assign(new Error(), { quarkPoolReason: '搜索请求超时' }) });
+  assert.match((await searchGoogleQuark(title, unreadable)).reason, /资源网页.*超时/);
+  const withoutLinks = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': article('<p>电影介绍</p>') });
+  assert.match((await searchGoogleQuark(title, withoutLinks)).reason, /已读取.*未找到.*分享/);
+  const javascript = fixture('<title>Google Search</title><noscript><a href="/httpservice/retry/enablejs">Please enable JavaScript to use Google Search.</a></noscript>');
+  assert.match((await searchGoogleQuark(title, javascript)).reason, /JavaScript.*未能读取/);
+});
+
 test('Google requests the title plus Quark without filtering undated pages, following only three first-level results', async () => {
   const pages = Object.fromEntries([1, 2, 3, 4].map(id => [`https://posts.example/${id}`, article(link(`https://pan.quark.cn/s/abcdef${id}`))]));
   const input = fixture([
@@ -34,9 +69,20 @@ test('Google requests the title plus Quark without filtering undated pages, foll
   assert.equal(input.calls[0].duration, 2000);
 });
 
+test('Google result headings are matched independently of their site attribution and breadcrumbs', async () => {
+  const input = fixture(`<a href="https://posts.example/movie"><span>电影分享站 https://posts.example / resources / 2026</span><h3>${title} (2026) 4K夸克资源</h3></a>`, { 'https://posts.example/movie': article(link('https://pan.quark.cn/s/abcdef1', '夸克下载')) });
+  assert.equal((await searchGoogleQuark(title, input)).length, 1);
+  assert.equal(input.calls.length, 2);
+});
+
 test('a resource article with a site-wide document title still requires a matching main heading', async () => {
   const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': `<title>高清影视分享站</title><main><h1>${title} (2026) 夸克网盘</h1>${link('https://pan.quark.cn/s/abcdef1', '立即转存')}</main>` });
   assert.deepEqual((await searchGoogleQuark(title, input)).map(row => row.url), ['https://pan.quark.cn/s/abcdef1']);
+});
+
+test('an explicit article Open Graph title identifies the work when the document title is generic', async () => {
+  const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': `<title>影视分享站</title><meta property="og:title" content="${title} (2026) 4K资源"><article>${link('https://pan.quark.cn/s/abcdef1', '夸克下载')}</article>` });
+  assert.equal((await searchGoogleQuark(title, input)).length, 1);
 });
 
 test('an article opening can identify the work without trusting an unrelated footer mention', async () => {

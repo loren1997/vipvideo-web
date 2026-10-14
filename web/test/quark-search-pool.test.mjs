@@ -32,6 +32,24 @@ function fixture({ request, discoveryRequest, googleSearch = async () => { throw
 const savedBackup = now => ({ candidates: [{ url: backup, automatic: true, status: 'healthy', addedAt: now - 100, checkedAt: now - 1, failures: 0, retryAt: 0 }] });
 const lookup = async (pool, url = 'https://manual.example/api/search?kw=电影') => JSON.parse(await readText(await pool.request(url, { headers: { Cookie: 'user-cookie', Authorization: 'user-token' } })));
 
+test('only matching film titles are recommended; unnamed resources are separate and other films or years are discarded', async () => {
+  const rows = [
+    { name: '【电影】一路平安 (2026) 4K', url: quarkUrl },
+    { name: '一路超平安 (2026)', url: 'https://pan.quark.cn/s/other12345' },
+    { name: '一路平安归来 (2026)', url: 'https://pan.quark.cn/s/sequel1234' },
+    { name: '一路平安 (2025)', url: 'https://pan.quark.cn/s/wrongyear1' },
+    { name: '网盘资源链接', url: 'https://pan.quark.cn/s/unknown123' },
+    { url: 'https://pan.quark.cn/s/unnamed123' },
+  ];
+  const f = fixture({ request: () => response(JSON.stringify({ results: rows })) });
+  try {
+    const data = await lookup(f.pool, 'https://manual.example/api/search?' + new URLSearchParams({ kw: '一路平安 2026' }));
+    assert.deepEqual(data.results.map(row => row.url), [quarkUrl]);
+    assert.deepEqual(data.unverified.map(row => row.url), ['https://pan.quark.cn/s/unknown123', 'https://pan.quark.cn/s/unnamed123']);
+    assert.equal((await lookup(f.pool, 'https://manual.example/api/search?' + new URLSearchParams({ kw: '一路平安 2026' }))).unverified.length, 2);
+  } finally { await f.pool.stop(); }
+});
+
 test('scheduled maintenance removes only automatic endpoints with failures spanning a day without new discovery', async t => {
   const day = 86_400_000, clock = 4 * day;
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: clock });
@@ -379,7 +397,7 @@ test('stop waits for current jobs, scheduled discovery stays single flight, and 
   await assert.rejects(lookup(f.pool), /公开搜索已停止/);
 });
 
-test('complete titles are queried before year hints and weak or conflicting-year candidates stay visible', async () => {
+test('complete titles are queried before year hints and unrelated titles or conflicting release years are excluded', async () => {
   const f = fixture({ request: url => {
     const word = new URL(url).searchParams.get('kw');
     if (word === '电影 2026') return response(json('https://pan.quark.cn/s/wrong123456', '其他电影 2025'));
@@ -392,7 +410,7 @@ test('complete titles are queried before year hints and weak or conflicting-year
   } });
   try {
     const result = await lookup(f.pool, 'https://manual.example/api/search?kw=' + encodeURIComponent('电影 2026'));
-    assert.deepEqual(result.results.map(row => row.url), [quarkUrl, 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/other123456']);
+    assert.deepEqual(result.results.map(row => row.url), [quarkUrl]);
     assert.deepEqual(f.calls.map(call => new URL(call.url).searchParams.get('kw')), ['电影']);
   } finally { await f.pool.stop(); }
 });
@@ -409,7 +427,7 @@ test('explicit bounded aliases improve candidate ranking and English titles requ
   try {
     const url = 'https://manual.example/api/search?kw=' + encodeURIComponent('小丑回魂 2017');
     const result = JSON.parse(await readText(await f.pool.request(url, { aliases: [null, 'IT', 'Bad\nAlias', '第二个别名', '不应搜索'], headers: { Cookie: 'user-cookie' } })));
-    assert.deepEqual(result.results.map(row => row.url), [quarkUrl, 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/wrong123456']);
+    assert.deepEqual(result.results.map(row => row.url), [quarkUrl]);
     assert.deepEqual(f.calls.map(call => new URL(call.url).searchParams.get('kw')), ['小丑回魂', 'IT']);
     assert.ok(f.calls.every(call => !JSON.stringify(call.options).includes('user-cookie')));
   } finally { await f.pool.stop(); }
@@ -479,7 +497,7 @@ test('concurrent requests for one film both receive their results while the cach
   } finally { await f.pool.stop(); }
 });
 
-test('RSS fallback ranks complete titles while retaining legal weak and unnamed candidates for review', async () => {
+test('RSS fallback recommends matching titles and separates unnamed candidates for review', async () => {
   const f = fixture({ request: url => response(url.includes('bing.com') ? '<rss><channel>' +
     `<item><title><![CDATA[电影 (2026) 4K]]></title><link>${quarkUrl}?pwd=1234</link></item>` +
     '<item><title>电影 2025</title><link>https://pan.quark.cn/s/old12345678</link></item>' +
@@ -487,8 +505,9 @@ test('RSS fallback ranks complete titles while retaining legal weak and unnamed 
     '<item><link>https://pan.quark.cn/s/unnamed12345</link></item></channel></rss>' : '{"results":[]}') });
   try {
     const result = await lookup(f.pool, 'https://manual.example/api/search?kw=' + encodeURIComponent('电影 2026'));
-    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/wrong123456', 'https://pan.quark.cn/s/unnamed12345']);
-    assert.equal(result.results.at(-1).name, '未提供资源标题');
+    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234']);
+    assert.deepEqual(result.unverified.map(row => row.url), ['https://pan.quark.cn/s/unnamed12345']);
+    assert.equal(result.unverified[0].name, '未提供资源标题');
     assert.equal(new URL(f.calls.at(-1).url).searchParams.get('q'), '电影 夸克');
   } finally { await f.pool.stop(); }
 });
@@ -537,8 +556,8 @@ test('explicit web lookup skips APIs, shares two network slots and merges Google
     const result = JSON.parse(await readText(await f.pool.request(url, { webSearch: true, headers: { Cookie: 'user-cookie' } })));
     assert.equal(googleCalls, 1); assert.equal(peak, 2);
     assert.ok(f.calls.every(call => !/manual\.example|backup\.example/.test(call.url)));
-    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/wrong123456', 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/unknown12345']);
-    assert.deepEqual(result.results.map(row => row.publishedAt), [latest, latest, older, undefined]);
+    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/unknown12345']);
+    assert.deepEqual(result.results.map(row => row.publishedAt), [latest, older, undefined]);
   } finally { await f.pool.stop(); }
 });
 
@@ -670,20 +689,20 @@ test('future dates are discarded before web results merge and cached ordering', 
 test('discovery retains valid Quark candidates for real catalogue naming variations and incomplete API metadata', async () => {
   const cases = [
     ['quality note', '遮天', { results: [{ title: '遮天 全季合集', links: [{ type: 'quark', url: quarkUrl, note: '4K1080P' }] }] }, '遮天'],
-    ['missing title', '遮天', { results: [{ links: [{ type: 'quark', url: quarkUrl }] }] }, '未提供资源标题'],
+    ['missing title', '遮天', { results: [{ links: [{ type: 'quark', url: quarkUrl }] }] }, '未提供资源标题', [], 'unverified'],
     ['mixed collection years', '遮天', { results: [{ title: '遮天 动画持续更新至EP150 全季合集2022-2026', url: quarkUrl }] }, '遮天'],
-    ['season status suffix', '一念永恒 完结季', { results: [{ title: '一念永恒 第一二三季合集', url: quarkUrl }] }, '一念永恒'],
-    ['abbreviated catalogue name', '转生成为哥布林有什么问题吗？', { results: [{ title: '转生成为哥布林', url: quarkUrl }] }, '转生成为哥布林'],
+    ['season status suffix with canonical alias', '一念永恒 完结季', { results: [{ title: '一念永恒 第一二三季合集', url: quarkUrl }] }, '一念永恒', ['一念永恒']],
+    ['explicit abbreviated catalogue alias', '转生成为哥布林有什么问题吗？', { results: [{ title: '转生成为哥布林', url: quarkUrl }] }, '转生成为哥布林', ['转生成为哥布林']],
     ['recognizable data array', '遮天', { code: 200, data: [{ title: '遮天 全季合集', url: quarkUrl }] }, '遮天'],
     ['target after first 30 links', '遮天', { results: [...Array.from({ length: 30 }, (_, index) => ({ title: '公开资源' + index, url: 'https://pan.quark.cn/s/abcdef' + String(index).padStart(6, '0') })), { title: '遮天 全季合集', url: quarkUrl }] }, '遮天'],
     ['target after first 100 rows', '遮天', { results: [...Array.from({ length: 100 }, () => ({ title: '其他记录', links: [{ type: 'baidu', url: 'https://example.org' }] })), { title: '遮天 全季合集', url: quarkUrl }] }, '遮天'],
   ];
-  for (const [label, keyword, body, expectedName] of cases) {
+  for (const [label, keyword, body, expectedName, aliases = [], group = 'results'] of cases) {
     const f = fixture({ request: url => response(url.includes('bing.com') ? rss() : JSON.stringify(body)) });
     try {
-      const result = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?' + new URLSearchParams({ kw: keyword }), { year: '2023' })));
-      assert.ok(result.results.length > 0, label); assert.ok(result.results.length <= 30, label);
-      assert.equal(result.results[0].url, quarkUrl, label); assert.ok(result.results[0].name.includes(expectedName), label);
+      const result = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?' + new URLSearchParams({ kw: keyword }), { year: '2023', aliases })));
+      assert.ok(result[group].length > 0, label); assert.ok(result[group].length <= 30, label);
+      assert.equal(result[group][0].url, quarkUrl, label); assert.ok(result[group][0].name.includes(expectedName), label);
     } finally { await f.pool.stop(); }
   }
 });
@@ -729,12 +748,13 @@ test('an explicit unknown year still marks a numeric-ending title as canonical a
   } finally { await f.pool.stop(); }
 });
 
-test('weak candidates remain visible while a necessary explicit alias is still searched', async () => {
+test('unknown candidates stay separate while a necessary explicit alias is still searched', async () => {
   const f = fixture({ request: url => response(new URL(url).searchParams.get('kw') === 'IT' ? json(quarkUrl, 'IT (2017)') : json('https://pan.quark.cn/s/weak12345678', '网盘资源链接')) });
   try {
     const result = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?' + new URLSearchParams({ kw: '小丑回魂' }), { year: '2017', aliases: ['IT'] })));
     assert.deepEqual(f.calls.map(call => new URL(call.url).searchParams.get('kw')), ['小丑回魂', 'IT']);
-    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/weak12345678?pwd=1234']);
+    assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234']);
+    assert.deepEqual(result.unverified.map(row => row.url), ['https://pan.quark.cn/s/weak12345678?pwd=1234']);
   } finally { await f.pool.stop(); }
 });
 

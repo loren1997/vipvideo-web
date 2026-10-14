@@ -139,6 +139,19 @@ test('compatibility playback status, trusted selection, assets and stop use the 
   instance.app.store.setConfig({...initialConfig,sources:[]});assert.equal(calls[0].valid(),false);
 });
 
+test('compatibility playback exposes only the supported nonseekable recovery code', async t => {
+  let code = 'TRANSCODE_INPUT_NOT_SEEKABLE';
+  const instance = await running(t, {
+    initialConfig: { ...configured, sources: [{ id: 'demo', name: '可信源', api: 'https://api.example/vod', enabled: true }] },
+    transcoder: { async start() { throw Object.assign(new Error('原文件不支持定位续播'), { status: 409, code }); }, close() {} },
+  }), cookie = await instance.login();
+  const start = () => instance.call('/api/transcode/start', { source: 'demo', id: '1', position: 281 }, cookie);
+  const result = await start(); assert.equal(result.status, 409);
+  assert.deepEqual(await result.json(), { error: '原文件不支持定位续播', code: 'TRANSCODE_INPUT_NOT_SEEKABLE' });
+  code = 'PRIVATE_INTERNAL_CODE';
+  assert.deepEqual(await (await start()).json(), { error: '原文件不支持定位续播' });
+});
+
 test('compatibility playback rejects unconfigured URLs, pages and invalid indices, positions or rates before spawning', async t => {
   let starts=0;
   const initialConfig={...configured,sources:[{id:'demo',name:'可信源',api:'https://api.example/vod',enabled:true}]};

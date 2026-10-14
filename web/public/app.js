@@ -185,6 +185,7 @@ async function api(path, options = {}) {
     if (response.status === 401 && data.quarkAuth !== true && !path.includes('/auth/login')) showLogin();
     const error = new Error(data.error || data.message || `请求失败（${response.status}）`);
     error.status = response.status;
+    if (data.code === 'TRANSCODE_INPUT_NOT_SEEKABLE') error.code = data.code;
     error.adultHidden = response.status === 403 && error.message.includes('三级内容已隐藏');
     if (error.adultHidden) applyConfig(await api('/api/config'));
     throw error;
@@ -653,6 +654,7 @@ function selectionFor(data, reference = {}) {
 }
 
 function playPosition(current) {
+  if (Number.isFinite(current?.quarkRestartPosition)) return current.quarkRestartPosition;
   if (current?.transcodeLoading || (current?.transcoded && !current.transcodeReady)) return current.position || 0;
   return current?.video?.readyState >= 1 ? (current.transcoded ? current.startPosition || 0 : 0) + current.video.currentTime : current?.position || 0;
 }
@@ -697,10 +699,11 @@ async function startCompatibility(current, position = playPosition(current), aut
       const requested = current.pendingTranscodePosition; delete current.pendingTranscodePosition;
       const request = current.request, stamp = current.stamp;
       const valid = () => player === current && current.request === request && playVersion === request && routeVersion === stamp;
-      current.position = requested; current.transcodeLoading = true; current.recovering = true; current.failed = false;
+      current.position = requested; current.transcodeLoading = true; current.recovering = true; current.failed = false; current.compatibilityErrorCode = null;
       clearTimeout(current.loadTimer); clearInterval(current.danmakuTimer); current.danmakuTimer = null;
       if (current.video) current.video.pause();
       current.note.textContent = '正在准备兼容播放，首次启动可能需要约 20 秒…'; current.note.className = 'player-note';
+      setQuarkPlaybackStatus(current, 'loading');
       if (current.compatibilityButton) current.compatibilityButton.disabled = true;
       try {
         const body = current.live ? { liveId: current.channel.id, line: current.line, position: 0, speed: 1 } : current.quarkAsset ? { quarkAsset: current.quarkAsset, position: requested, speed: current.preferences.speed } : { ...playbackSelection(current.detail, current.line, current.episode), id: String(current.detail.id), position: requested, speed: current.preferences.speed };
@@ -718,8 +721,11 @@ async function startCompatibility(current, position = playPosition(current), aut
       } catch (error) {
         if (!valid()) { console.warn('离开播放器后兼容任务启动失败', error.message); return; }
         delete current.pendingTranscodePosition; current.failed = true; current.recovering = false;
-        current.note.textContent = error.status === 409 ? '兼容播放正被另一台设备使用，请稍后再试。' : `兼容播放未启动：${error.message}`;
+        if (Number.isFinite(current.quarkRestartPosition)) { current.position = current.quarkRestartPosition; delete current.quarkRestartPosition; }
+        current.compatibilityErrorCode = error.code;
+        current.note.textContent = error.status === 409 && error.code !== 'TRANSCODE_INPUT_NOT_SEEKABLE' ? '兼容播放正被另一台设备使用，请稍后再试。' : `兼容播放未启动：${error.message}`;
         current.note.className = 'player-note error-message'; console.warn('兼容播放启动失败', error.message);
+        setQuarkPlaybackStatus(current, 'error');
       } finally {
         current.transcodeLoading = false;
         if (player === current && current.compatibilityButton) current.compatibilityButton.disabled = false;
@@ -1244,18 +1250,38 @@ function queueQuarkProgress(current, ended = false, keepalive = false, completed
   return saved.catch(error => { if (!current.quarkSaveFailed) { current.quarkSaveFailed = true; notify(`夸克观看状态未同步：${error.message}`, true); } });
 }
 
+function setQuarkPlaybackStatus(current, status) {
+  if (player !== current || !current.quarkAsset || current.quarkPlaybackStatus === status) return;
+  current.quarkPlaybackStatus = status; current.refreshQuarkPlayback?.();
+}
+
+function quarkPlaybackMessage(current) {
+  return current.quarkPlaybackStatus === 'playing' ? '正在夸克播放。转存保留源文件画质。' : current.quarkPlaybackStatus === 'error' ? '夸克播放未成功，可重试夸克播放或返回原线路。' : '正在准备夸克播放，请稍候…';
+}
+
+function returnFromQuark(current) {
+  if (player === current) void startEpisode(current.detail, current.line, current.episode, playPosition(current), { tried: new Set(), quarkState: current.quarkState, quarkAutomatic: false });
+}
+
+function restartQuarkFromBeginning(current) {
+  if (player !== current || current.compatibilityErrorCode !== 'TRANSCODE_INPUT_NOT_SEEKABLE') return;
+  current.quarkRestartPosition = playPosition(current); current.introHandled = true;
+  void startCompatibility(current, 0);
+}
+
 async function playQuark(current, assetId, valid = () => true) {
   if (player !== current || !current.catalog || !valid()) return;
   const stamp = routeVersion, scope = adScope(current);
+  if (current.quarkAsset === assetId) setQuarkPlaybackStatus(current, 'loading');
   try {
     const [data, preferences] = await Promise.all([api('/api/quark/playback', { method: 'POST', body: { assetId }, timeoutMs: 35000 }), current.preferences ? Promise.resolve(current.preferences) : (current.detail.preferencesPromise ||= api(`/api/player/preferences?${new URLSearchParams({ key: current.detail.key })}`).catch(error => { console.warn('网盘播放偏好读取失败', error.message); return defaultPreferences; }))]);
     if (player !== current || stamp !== routeVersion || scope !== adScope(current) || !valid()) return;
     const url = new URL(data.url, location.origin);
     if (url.origin !== location.origin || url.username || url.password || !url.pathname.startsWith('/api/') || !['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'].includes(data.type) || data.assetId !== assetId) throw new Error('网盘返回了无效的播放地址。');
     const position = playPosition(current), request = ++playVersion; void stopPlayer(false);
-    player = { detail: current.detail, line: current.line, episode: current.episode, episodeName: current.episodeName, position, started: true, catalog: true, flow: { tried: new Set() }, request, stamp, mode: 'direct', preferences: normalizePreferences(preferences), quarkAsset: assetId, quarkVersion: typeof data.version === 'string' ? data.version : JSON.stringify(data.quality ?? 'default'), requiresCompatibility: data.requiresCompatibility === true, quarkState: current.quarkState, quarkUrl: url.href, originalUrl: current.originalUrl || current.url, url: url.href, type: data.type, introHandled: current.introHandled };
+    player = { detail: current.detail, line: current.line, episode: current.episode, episodeName: current.episodeName, position, started: true, catalog: true, flow: { tried: new Set() }, request, stamp, mode: 'direct', preferences: normalizePreferences(preferences), quarkAsset: assetId, quarkPlaybackStatus: 'loading', quarkVersion: typeof data.version === 'string' ? data.version : JSON.stringify(data.quality ?? 'default'), requiresCompatibility: data.requiresCompatibility === true, quarkState: current.quarkState, quarkUrl: url.href, originalUrl: current.originalUrl || current.url, url: url.href, type: data.type, introHandled: current.introHandled };
     mountPlayer(player);
-  } catch (error) { if (player === current && stamp === routeVersion && valid()) notify(`夸克播放未启动：${error.message}`, true); }
+  } catch (error) { if (player === current && stamp === routeVersion && valid()) { setQuarkPlaybackStatus(current, 'error'); notify(`夸克播放未启动：${error.message}`, true); } }
 }
 
 function mountQuark(current) {
@@ -1264,14 +1290,35 @@ function mountQuark(current) {
   const feedback = node('p', '正在按作品名称查找夸克分享…', 'muted'); feedback.setAttribute('aria-live', 'polite');
   const choices = node('div', undefined, 'quark-choices'), result = node('div', undefined, 'quark-ready'); panel.append(feedback, choices, result); host.replaceChildren(panel);
   const state = current.quarkState ||= { resources: [], files: [], version: 0 };
+  const unverified = node('details'); unverified.hidden = true; unverified.className = 'quark-unverified'; panel.append(unverified);
+  function showUnverified(rows) {
+    const links = new Map();
+    for (const row of (Array.isArray(rows) ? rows : []).slice(0, 50)) {
+      try {
+        const url = new URL(row.url), match = /^\/s\/([a-z0-9]{6,32})\/?$/i.exec(url.pathname), pwd = url.searchParams.get('pwd') || '';
+        if (url.protocol !== 'https:' || url.hostname !== 'pan.quark.cn' || url.port || url.username || url.password || !match || !/^[A-Za-z0-9]{0,16}$/.test(pwd)) continue;
+        const safe = `https://pan.quark.cn/s/${match[1]}${pwd ? `?pwd=${pwd}` : ''}`;
+        links.set(safe, externalLink(typeof row.name === 'string' && row.name.trim() ? row.name.slice(0, 240) : '未标注片名的分享', safe, 'button subtle small'));
+      } catch { /* 忽略不符合公开分享格式的外链。 */ }
+    }
+    unverified.replaceChildren(node('summary', '片名待确认的公开链接（不自动转存）'), ...links.values()); unverified.hidden = !links.size;
+    return links.size;
+  }
+  showUnverified(state.unverified);
   const valid = () => player === current && current.stamp === routeVersion && host.contains(panel);
   let searchVersion = 0, loading = false;
   const retry = button('重试搜索', () => void load(false, false), 'button small'); retry.hidden = true;
   const more = button('查找更多公开资源', () => void load(true), 'button small'); more.disabled = true;
-  const searchActions = node('div', undefined, 'settings-actions'); searchActions.append(retry, more); panel.append(searchActions);
+  const googleQuery = new URLSearchParams({ q: `${current.detail.title} 夸克 网盘` });
+  const searchActions = node('div', undefined, 'settings-actions'); searchActions.append(retry, more, externalLink('用浏览器查 Google ↗', `https://www.google.com/search?${googleQuery}`, 'button subtle small')); panel.append(searchActions);
   function ready(data) {
     state.ready = data; result.replaceChildren(node('p', `${data.name || '当前集'}：${data.status === 'ready' ? '已准备好' : data.status === 'pending' ? '正在准备' : '准备未完成'}${data.saved ? ' · 已转存' : ''}`, 'muted'));
-    if (data.status === 'ready' && data.assetId) { const play = button(current.quarkAsset === data.assetId ? '正在夸克播放' : '夸克播放', () => void playQuark(current, data.assetId), 'button primary small'); play.disabled = current.quarkAsset === data.assetId; result.append(play); }
+    if (data.status === 'ready' && data.assetId) {
+      const active = current.quarkAsset === data.assetId, failed = active && current.quarkPlaybackStatus === 'error';
+      const play = button(active ? failed ? '重试夸克播放' : current.quarkPlaybackStatus === 'playing' ? '正在夸克播放' : '正在准备夸克播放' : '夸克播放', () => void playQuark(current, data.assetId), 'button primary small'); play.disabled = active && !failed; result.append(play);
+      if (failed && current.compatibilityErrorCode === 'TRANSCODE_INPUT_NOT_SEEKABLE') result.append(button('从头兼容播放', () => restartQuarkFromBeginning(current), 'button small'));
+      if (failed) result.append(button('返回原线路', () => returnFromQuark(current), 'button small'));
+    }
     if (data.reason) result.append(node('p', data.reason, 'muted'));
     if (data.code === 'QUARK_FOLDER_MISSING' && state.selection) {
       result.append(node('p', '恢复会新建专用目录，保留旧文件与转存记录；旧目录中的文件不再自动清理。', 'muted'));
@@ -1349,19 +1396,21 @@ function mountQuark(current) {
       const settings = await api('/api/quark/settings'); if (!currentSearch()) return;
       if (!settings.configured || !settings.enabled) { feedback.textContent = '连接并启用夸克后，可为当前单集准备网盘版本。'; choices.replaceChildren(button('设置夸克账号', () => goto('settings'), 'button small')); return; }
       configured = true;
-      if (state.ready && !webSearch) { ready(state.ready); feedback.textContent = current.quarkAsset === state.ready.assetId ? '正在夸克播放。转存保留源文件画质。' : '当前集已准备，可点击夸克播放。'; return; }
+      if (state.ready && !webSearch) { ready(state.ready); feedback.textContent = current.quarkAsset === state.ready.assetId ? quarkPlaybackMessage(current) : '当前集已准备，可点击夸克播放。'; return; }
       if (webSearch) { clearTimeout(current.quarkTimer); state.version++; delete state.selection; shareSelect.disabled = true; filePlaceholder('正在查找更多分享…'); feedback.textContent = '正在查询 Google 和公开网页，按可确认的页面发布时间排序…'; }
       const query = new URLSearchParams(playbackSelection(current.detail, current.line, current.episode)); if (webSearch) query.set('web', '1');
       const data = await api(`/api/quark/resources?${query}`, { timeoutMs: 35000 }); if (!currentSearch()) return;
+      state.unverified = data.unverified; const unverifiedCount = showUnverified(state.unverified);
       state.resources = Array.isArray(data.resources) ? data.resources : []; shareSelect.disabled = false; shareSelect.replaceChildren();
       retry.hidden = !!state.resources.length || !data.reason;
-      if (!state.resources.length) { feedback.textContent = data.reason || `暂未找到“${current.detail.title}”的夸克分享，普通播放不受影响。`; choices.replaceChildren(); return; }
+      if (!state.resources.length) { feedback.textContent = unverifiedCount ? `${data.reason ? `${data.reason}；` : ''}找到${unverifiedCount}条待确认链接，请展开后自行核对片名。` : data.reason || `暂未找到“${current.detail.title}”的夸克分享，普通播放不受影响。`; choices.replaceChildren(); return; }
       for (const resource of state.resources) { const dated = Number.isSafeInteger(resource.publishedAt) && resource.publishedAt > 0 ? ` · 页面日期 ${new Date(resource.publishedAt).toLocaleDateString('zh-CN')}` : ''; const option = node('option', (resource.name || resource.id) + dated); option.value = resource.id; shareSelect.append(option); }
       choices.replaceChildren(shareField, fileField, actions);
       void loadFiles(automatic && !webSearch && settings.autoSave === true && current.flow.quarkAutomatic !== false);
     } catch (error) { if (currentSearch()) { feedback.textContent = `夸克资源暂时不可用：${error.message}`; choices.replaceChildren(); retry.hidden = false; } }
     finally { loading = false; if (currentSearch()) more.disabled = retry.disabled = !configured; }
   }
+  current.refreshQuarkPlayback = () => { if (valid() && state.ready?.assetId === current.quarkAsset) { ready(state.ready); feedback.textContent = quarkPlaybackMessage(current); } };
   void load();
 }
 
@@ -1698,7 +1747,7 @@ function mountPlayer(current) {
     current.compatibilityButton = button(current.transcoded ? '重新兼容播放' : '兼容播放', () => void startCompatibility(current));
     current.compatibilityButton.title = '原始线路无法解码或有画面无声音时，通过服务器转换为兼容格式'; toolbar.append(current.compatibilityButton);
   }
-  if (current.quarkAsset) toolbar.append(button('重试夸克播放', () => void playQuark(current, current.quarkAsset)), button('返回原线路', () => void startEpisode(current.detail, current.line, current.episode, playPosition(current), { tried: new Set(), quarkState: current.quarkState })));
+  if (current.quarkAsset) toolbar.append(button('重试夸克播放', () => void playQuark(current, current.quarkAsset)), button('返回原线路', () => returnFromQuark(current)));
   if (current.catalog) {
     const next = button('下一集 →', () => void nextEpisode(current)); next.disabled = !current.detail.lines[current.line]?.episodes[current.episode + 1]; toolbar.append(next);
     playerPreferences(current, host); playerAds(current, host); mountDanmaku(current, surface, host);
@@ -1747,7 +1796,7 @@ function mountPlayer(current) {
   });
   video.addEventListener('ended', () => { if (player === current) { void saveHistory(current, true); if (current.catalog && current.preferences.autoNext && !current.nextPending) { current.nextPending = true; void nextEpisode(current); } } });
   video.addEventListener('loadeddata', () => { if (player === current) { clearTimeout(current.loadTimer); if (current.transcoded) current.transcodeReady = true; if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); updateClock(); resetDanmaku(current); } });
-  video.addEventListener('playing', () => { if (player === current) { clearTimeout(current.loadTimer); note.textContent = `${current.quarkAsset ? '夸克播放 · ' : ''}${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${current.live ? `正在直播 · ${current.detail.title}` : `${current.episodeName || current.detail.title} · 进度每 10 秒自动保存`}`; note.className = 'player-note'; current.overlay?.classList.remove('paused'); if (current.catalog) { startDanmakuSync(current); drawDanmaku(current); } } });
+  video.addEventListener('playing', () => { if (player === current && !current.transcodeLoading && (!current.transcoded || current.transcodeReady)) { delete current.quarkRestartPosition; clearTimeout(current.loadTimer); note.textContent = `${current.quarkAsset ? '夸克播放 · ' : ''}${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${current.live ? `正在直播 · ${current.detail.title}` : `${current.episodeName || current.detail.title} · 进度每 10 秒自动保存`}`; note.className = 'player-note'; setQuarkPlaybackStatus(current, 'playing'); current.overlay?.classList.remove('paused'); if (current.catalog) { startDanmakuSync(current); drawDanmaku(current); } } });
   video.addEventListener('timeupdate', () => {
     if (player !== current) return;
     updateClock();
@@ -1780,6 +1829,7 @@ function playbackError(current, hlsError) {
   if (current.transcoded) {
     current.position = playPosition(current); current.failed = true;
     current.note.textContent = '兼容播放中断，请点击“重新兼容播放”重试。'; current.note.className = 'player-note error-message';
+    setQuarkPlaybackStatus(current, 'error');
     void stopTranscode(current.transcodeId); current.transcodeId = null; return;
   }
   if (current.quarkAsset) {
@@ -1787,7 +1837,7 @@ function playbackError(current, hlsError) {
       ? hlsError.type === 'mediaError' && ['manifestIncompatibleCodecsError', 'bufferAddCodecError', 'bufferIncompatibleCodecsError', 'bufferAppendError', 'bufferAppendingError'].includes(hlsError.details) && !(hlsError.response?.code >= 400)
       : [3, 4].includes(current.video?.error?.code);
     if (decodeError && !current.requiresCompatibility && !current.flow.transcodeTried) { void startCompatibility(current, playPosition(current), true); return; }
-    current.failed = true; current.note.textContent = '夸克播放中断。可重试夸克播放，或返回原线路；原影视源不会因此停用。'; current.note.className = 'player-note error-message'; return;
+    current.failed = true; current.note.textContent = '夸克播放中断。可重试夸克播放，或返回原线路；原影视源不会因此停用。'; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); return;
   }
   if (current.catalog) void recoverPlayback(current);
   else if (current.live) void recoverLive(current);
@@ -1830,12 +1880,13 @@ async function loadMedia(current, message = '正在连接播放地址…') {
   const url = mediaUrl(current.usedProxy ? current.proxyUrl : current.url);
   if (!url) return playbackError(current);
   current.note.className = 'player-note'; current.note.textContent = message;
+  setQuarkPlaybackStatus(current, 'loading');
   const video = current.video;
   if (current.qualitySelect) { current.qualitySelect.hidden = true; current.qualitySelect.replaceChildren(new Option('自动画质', '-1')); }
   if (current.type === 'hls') {
     try { await ensureHls(); }
     catch (error) {
-      if (player === current && generation === current.mediaVersion) { current.failed = true; current.note.textContent = error.message; current.note.className = 'player-note error-message'; }
+      if (player === current && generation === current.mediaVersion) { current.failed = true; current.note.textContent = error.message; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); }
       return;
     }
     if (player !== current || generation !== current.mediaVersion) return;
@@ -1879,7 +1930,7 @@ async function nextEpisode(current) {
 }
 
 function saveHistory(current, ended = false, completed = false) {
-  if (current.live || current.started === false) return Promise.resolve();
+  if (current.live || current.started === false || Number.isFinite(current.quarkRestartPosition)) return Promise.resolve();
   const record = historyRecord(current);
   library.history = [record, ...library.history.filter(item => item.key !== record.key)];
   const saved = historyQueue.catch(() => {}).then(() => api('/api/history', { method: 'POST', body: record }));

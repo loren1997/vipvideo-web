@@ -732,6 +732,46 @@ test('public search preserves PanSou password/work title, validates shares and n
   for (const bad of ['http://127.0.0.1/a', 'https://pan.quark.cn.evil/s/abcdef123456', 'https://evil.example/s/abcdef123456', 'file:///a', 'https://user:pw@pan.quark.cn/s/abcdef123456']) assert.equal((await service.resources({ ...detail, id: bad, quarkShares: [bad] })).resources.length, 1); // Only the safe search result survives.
 });
 
+test('external search requires the film title or an explicit alias and never registers unverified links for transfer', async t => {
+  const { service, state } = await fixture(t);
+  const film = { ...detail, title: '一路超平安', aliases: ['Known Alternate Title'], quarkShares: [] };
+  state.searchBody = JSON.stringify({ results: [
+    { title: '一路超平安 (2026) 4K', url: 'https://pan.quark.cn/s/matched123' },
+    { title: 'Known Alternate Title 2026', url: 'https://pan.quark.cn/s/aliased123' },
+    { title: '一路平安 2026', url: 'https://pan.quark.cn/s/wrongfilm123' },
+    { title: '一路超平安 (2016)', url: 'https://pan.quark.cn/s/wrongyear123' },
+    { url: 'https://pan.quark.cn/s/untitled123' },
+    { title: '资源链接', url: 'https://pan.quark.cn/s/generic123' },
+  ], unverified: [{ url: 'https://pan.quark.cn/s/poolunknown123' }, { url: 'https://pan.quark.cn.evil/s/unsafe123' }] });
+  const result = await service.resources(film);
+  assert.deepEqual(result.resources.map(row => new URL(row.url).pathname), ['/s/matched123', '/s/aliased123']);
+  assert.deepEqual(result.unverified.map(row => new URL(row.url).pathname), ['/s/untitled123', '/s/generic123', '/s/poolunknown123']);
+  assert.equal(result.unverified.every(row => !Object.hasOwn(row, 'id')), true);
+  assert.equal(result.unverified.some(row => row.name === film.title), false);
+  await assert.rejects(service.files(film, { shareId: 'untitled123' }), /分享资源/);
+  assert.deepEqual(await service.resources(film), result); assert.equal(state.searchCalls.length, 1);
+  const provided = await service.resources({ ...film, id: 'trusted-catalog', quarkShares: ['https://pan.quark.cn/s/provided123'] });
+  assert.ok(provided.resources.some(row => new URL(row.url).pathname === '/s/provided123'));
+  assert.equal((await service.resources({ ...film, id: 'wrong-catalog', quarkShares: [{ title: '其他影片', url: 'https://pan.quark.cn/s/wrongcatalog123' }] })).resources.some(row => new URL(row.url).pathname === '/s/wrongcatalog123'), false);
+});
+
+test('irrelevant, unverified and duplicate entries cannot exhaust the matched-resource budget', async t => {
+  const { service, state } = await fixture(t);
+  state.searchBody = JSON.stringify({ results: [
+    ...Array.from({ length: 110 }, (_, i) => ({ title: '其他电影', url: `https://pan.quark.cn/s/wrongfilm${i}` })),
+    ...Array.from({ length: 35 }, (_, i) => ({ url: `https://pan.quark.cn/s/untitled${i}` })),
+    ...Array.from({ length: 35 }, () => ({ title: '影片 2026', url: 'https://pan.quark.cn/s/duplicate123' })),
+    { work_title: '影片 2026', links: [{ note: '4K1080P', url: 'https://pan.quark.cn/s/lastmatch123' }] },
+  ] });
+  const result = await service.resources({ ...detail, quarkShares: [] });
+  assert.deepEqual(result.resources.map(row => new URL(row.url).pathname), ['/s/duplicate123', '/s/lastmatch123']);
+  assert.equal(result.resources[1].name, '影片 2026'); assert.equal(result.unverified.length, 10);
+  state.searchBody = JSON.stringify({ title: '影片 2026', unverified: [{ url: 'https://pan.quark.cn/s/inherited123' }, { title: '影片 2026', url: 'https://pan.quark.cn/s/forcedunknown123' }] });
+  const forced = await service.resources({ ...detail, id: 'force-unverified', quarkShares: [] });
+  assert.equal(forced.resources.length, 0); assert.equal(forced.unverified.length, 2);
+  assert.equal(forced.unverified.every(row => !Object.hasOwn(row, 'id')), true);
+});
+
 test('fixed PanSou sidecar requires explicit safe DI and nonempty saved search setting overrides environment', async t => {
   const { service, state } = await fixture(t, { defaultSearchApi: 'http://pansou:8888/api/search' }); await service.resources(detail); assert.equal(new URL(state.searchCalls[0].value).origin, 'http://pansou:8888');
   await service.configure({ searchApi: 'https://preferred.example/api/search' }); await service.resources(detail); assert.equal(new URL(state.searchCalls.at(-1).value).origin, 'https://preferred.example');
@@ -888,7 +928,7 @@ test('explicit catalog aliases reach the search pool as local options without en
 
 test('public share dates are bounded, sorted newest first and merged without losing extraction passwords', async t => {
   const { service, state } = await fixture(t); const at = state.clock;
-  const row = (id, label, publishedAt, password) => ({ url: 'https://pan.quark.cn/s/' + id, name: label, publishedAt, password });
+  const row = (id, label, publishedAt, password) => ({ url: 'https://pan.quark.cn/s/' + id, name: '影片 ' + label, publishedAt, password });
   state.searchBody = JSON.stringify({ results: [
     row('aaaaaa', '较旧有提取码', at - 20, 'A1'), row('aaaaaa', '较新无提取码', at - 10), row('aaaaaa', '最新无提取码', at - 2), row('aaaaaa', '最新提取码', at - 5, 'B2'), row('aaaaaa', '过时提取码', at - 30, 'C3'),
     row('bbbbbb', '最新资源', at), row('cccccc', '无日期资源', undefined),
@@ -896,7 +936,7 @@ test('public share dates are bounded, sorted newest first and merged without los
   ] });
   const film = { ...detail, quarkShares: [] }, result = await service.resources(film);
   assert.deepEqual(result.resources.map(row => new URL(row.url).pathname), ['/s/bbbbbb', '/s/aaaaaa', '/s/cccccc', '/s/dddddd', '/s/eeeeee', '/s/ffffff']);
-  assert.equal(result.resources[1].name, '最新无提取码'); assert.equal(result.resources[1].publishedAt, at - 2); assert.equal(new URL(result.resources[1].url).searchParams.get('pwd'), 'B2');
+  assert.equal(result.resources[1].name, '影片 最新无提取码'); assert.equal(result.resources[1].publishedAt, at - 2); assert.equal(new URL(result.resources[1].url).searchParams.get('pwd'), 'B2');
   assert.equal(Object.hasOwn(result.resources[1], 'passwordAt'), false);
   assert.equal(result.resources.slice(2).every(row => !Object.hasOwn(row, 'publishedAt')), true);
   assert.deepEqual(await service.resources(film), result); assert.equal(state.searchCalls.length, 1);
@@ -904,13 +944,13 @@ test('public share dates are bounded, sorted newest first and merged without los
 
 test('an explicit web search bypasses the ordinary resource cache and preserves already found API shares', async t => {
   const { service, state } = await fixture(t); const film = { ...detail, quarkShares: [] };
-  state.searchBody = JSON.stringify({ results: [{ url: 'https://pan.quark.cn/s/aaaaaa', name: 'API 资源', publishedAt: state.clock - 10 }] });
+  state.searchBody = JSON.stringify({ results: [{ url: 'https://pan.quark.cn/s/aaaaaa', name: '影片 API 资源', publishedAt: state.clock - 10 }] });
   const ordinary = await service.resources(film); assert.equal(ordinary.resources.length, 1);
   assert.deepEqual(await service.resources(film), ordinary); assert.equal(state.searchCalls.length, 1);
-  state.searchBody = JSON.stringify({ results: [{ url: 'https://pan.quark.cn/s/bbbbbb', name: '公开网页资源', publishedAt: state.clock }] });
+  state.searchBody = JSON.stringify({ results: [{ url: 'https://pan.quark.cn/s/bbbbbb', name: '影片 公开网页资源', publishedAt: state.clock }] });
   const result = await service.resources(film, { webSearch: true });
   assert.equal(state.searchCalls.length, 2); assert.equal(state.searchCalls[1].options.webSearch, true);
-  assert.deepEqual(result.resources.map(row => row.name), ['公开网页资源', 'API 资源']);
+  assert.deepEqual(result.resources.map(row => row.name), ['影片 公开网页资源', '影片 API 资源']);
   assert.deepEqual(await service.resources(film), result); assert.equal(state.searchCalls.length, 2);
 });
 

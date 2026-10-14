@@ -488,7 +488,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
     } catch (error) {
       const status = error.status ?? 500;
       if (status >= 500) logger.error(error);
-      if (!res.headersSent) json(res, status, { error: status === 500 ? '服务发生错误，请查看后台日志' : error.message, ...(status === 401 && error.quarkSafe === true && error.quarkAuth === true ? { quarkAuth: true } : {}) });
+      if (!res.headersSent) json(res, status, { error: status === 500 ? '服务发生错误，请查看后台日志' : error.message, ...(status === 401 && error.quarkSafe === true && error.quarkAuth === true ? { quarkAuth: true } : {}), ...(status === 409 && error.code === 'TRANSCODE_INPUT_NOT_SEEKABLE' ? { code: error.code } : {}) });
       else res.destroy(error);
     }
   });

@@ -117,10 +117,15 @@ test('aborting while waiting for response headers releases the outgoing media co
   await disconnected;
 });
 
-test('mixed public/private DNS and redirects to private IP cannot reach transport', async () => {
+test('mixed DNS pins only a public answer and never connects to reserved answers or private redirect targets', async () => {
+  const mixedCalls = [];
+  const mixed = createRequest({ lookup: async () => [{ address: '10.0.0.1', family: 4 }, { address: '2001:db8::1', family: 6 }, { address: '8.8.8.8', family: 4 }], httpsRequest: transport({ 'https://source.example/': () => response('ok') }, mixedCalls) });
+  assert.equal(await readText(await mixed('https://source.example/')), 'ok');
+  assert.deepEqual(mixedCalls[0].addresses, [{ address: '8.8.8.8', family: 4 }]);
+  assert.equal(mixedCalls[0].options.validatedAddress, '8.8.8.8');
   let count = 0;
-  const mixed = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }, { address: '10.0.0.1', family: 4 }], httpsRequest: () => { count++; } });
-  await assert.rejects(mixed('https://source.example/'), { status: 403 });
+  const privateOnly = createRequest({ lookup: async () => [{ address: '198.18.0.1', family: 4 }, { address: '::ffff:127.0.0.1', family: 6 }], httpsRequest: () => { count++; } });
+  await assert.rejects(privateOnly('https://source.example/'), { status: 403 });
   assert.equal(count, 0);
   const calls = [];
   const redirect = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpsRequest: transport({ 'https://source.example/': () => response('', 302, { location: 'http://127.0.0.1/admin' }) }, calls) });

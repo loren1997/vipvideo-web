@@ -14,6 +14,15 @@ const assetName = /^(?:index\.m3u8|segment\d{6,12}\.ts)$/;
 const failure = (message, status = 502, cause) => Object.assign(new Error(message, cause ? { cause } : undefined), { status });
 const wait = milliseconds => new Promise(done => setTimeout(done, milliseconds));
 const diagnostics = value => String(value).replace(/https?:\/\/[^\s'"<>]+/gi, '[媒体链接]').replace(/[\x00-\x08\x0b-\x1f]/g, '').slice(-4096);
+const notSeekable = () => Object.assign(failure('原文件暂不支持定位续播，请从头播放或换官方在线线路', 409), { code: 'TRANSCODE_INPUT_NOT_SEEKABLE' });
+function matchingRange(status, header, start, end) {
+  const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(String(header('content-range') || ''));
+  if (status !== 206 || !match) return false;
+  const [first, last, size] = match.slice(1).map(Number), length = header('content-length');
+  return [first, last, size].every(Number.isSafeInteger) && first === start && last >= first && size > last &&
+    (end === undefined || last === Math.min(end, size - 1)) &&
+    (length === undefined || length === null || /^\d+$/.test(String(length)) && Number(length) === last - first + 1);
+}
 
 export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeSetPriority, platform = process.platform, env = process.env, now = Date.now, tmpRoot = tmpdir(), device = '/dev/dri/renderD128', startupTimeout = 20_000, probeTimeout = 3000, killTimeout = 1500, idleTimeout = 120_000, pollInterval = 50, logger = console } = {}) {
   const enabled = String(env.TRANSCODE_ENABLED ?? 'true').toLowerCase() !== 'false';
@@ -70,12 +79,16 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     await rm(path, { recursive: true, force: true });
   }
   async function cleanup(task) {
-    task.stopped = true; clearTimeout(task.idleTimer);
-    await terminate(task.attempt);
-    for (const socket of task.sockets || []) socket.destroy();
-    if (task.bridge?.listening) await new Promise(done => task.bridge.close(done));
-    await removeOutput(task);
-    if (current === task) current = undefined;
+    if (task.cleaning) return task.cleaning;
+    task.cleaning = (async () => {
+      task.stopped = true; clearTimeout(task.idleTimer); task.probeController?.abort();
+      await terminate(task.attempt);
+      for (const socket of task.sockets || []) socket.destroy();
+      if (task.bridge?.listening) await new Promise(done => task.bridge.close(done));
+      await removeOutput(task);
+      if (current === task) current = undefined;
+    })().finally(() => { delete task.cleaning; });
+    return task.cleaning;
   }
   function armIdle(task) {
     clearTimeout(task.idleTimer);
@@ -113,6 +126,15 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         if (!['GET', 'HEAD'].includes(req.method) || parsed.origin !== origin || req.headers.host !== new URL(origin).host || !/^\/api\/media\/asset\.(?:m3u8|mp4|mkv|webm|avi|m4s|ts|aac|vtt|key)$/.test(parsed.pathname) || [...parsed.searchParams].length !== 1 || !parsed.searchParams.get('token')) throw failure('转发请求无效', 403);
         const setHeader = res.setHeader.bind(res);
         res.setHeader = (name, value) => { if (String(name).toLowerCase() === 'location') throw failure('媒体转发禁止重定向'); return setHeader(name, value); };
+        const writeHead = res.writeHead.bind(res);
+        res.writeHead = (status, ...args) => {
+          const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '');
+          if (task.position > 0 && task.type !== 'hls' && range && Number(range[1]) > 0 && [200, 206].includes(status) &&
+              !matchingRange(status, name => res.getHeader(name), Number(range[1]), range[2] ? Number(range[2]) : undefined)) {
+            task.inputError = notSeekable(); res.destroy(); return res;
+          }
+          return writeHead(status, ...args);
+        };
         const end = res.end.bind(res);
         res.end = (body, encoding, callback) => {
           if (body && /mpegurl/i.test(String(res.getHeader('Content-Type') || ''))) {
@@ -133,11 +155,36 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     task.origin = `http://127.0.0.1:${server.address().port}`;
     return signedPath(task.playback.proxyUrl, task.origin, task.proxyPath);
   }
+  async function checkResumeRange(task, deadline) {
+    if (task.position === 0 || task.type === 'hls') return;
+    const controller = task.probeController = new AbortController();
+    const remaining = deadline - now();
+    if (remaining <= 0) throw failure('兼容播放启动超时，请切换线路或稍后重试', 504);
+    const timer = setTimeout(() => controller.abort(), Math.min(8000, remaining));
+    let response;
+    try {
+      response = await fetch(task.input, { headers: { Range: 'bytes=1-1' }, redirect: 'error', signal: controller.signal });
+      assertValid(task);
+      if (!matchingRange(response.status, name => response.headers.get(name), 1, 1)) {
+        if ([200, 206, 416].includes(response.status)) throw task.inputError = notSeekable();
+        throw failure('无法检查原文件的定位续播能力，请稍后重试或换官方在线线路');
+      }
+    } catch (error) {
+      assertValid(task);
+      if (task.inputError) throw task.inputError;
+      if (now() >= deadline) throw failure('兼容播放启动超时，请切换线路或稍后重试', 504);
+      throw error.status ? error : failure('无法检查原文件的定位续播能力，请稍后重试或换官方在线线路', 502, error);
+    } finally {
+      clearTimeout(timer);
+      if (response?.body) await response.body.cancel().catch(error => { if (!controller.signal.aborted) logger.error('结束续播检查失败', diagnostics(error.message)); });
+      if (task.probeController === controller) delete task.probeController;
+    }
+  }
   function argumentsFor(task, acceleration) {
     const scale = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
     return ['-hide_banner', '-loglevel', 'info', '-nostats', '-nostdin', '-threads', '1', '-filter_threads', '1',
       ...(acceleration === 'vaapi' ? ['-hwaccel', 'vaapi', '-hwaccel_device', device, '-hwaccel_output_format', 'vaapi'] : []),
-      '-protocol_whitelist', 'http,tcp,crypto', '-readrate', String(task.speed), '-ss', String(task.position), '-f', inputFormats[task.type],
+      '-protocol_whitelist', 'http,tcp,crypto', '-readrate', String(task.speed), ...(task.position > 0 ? ['-ss', String(task.position)] : []), '-f', inputFormats[task.type],
       ...(task.type === 'hls' ? ['-allowed_extensions', 'ALL'] : []), '-i', task.input,
       '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn', '-vf', acceleration === 'vaapi' ? "scale_vaapi=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12" : `${scale},format=yuv420p`,
       '-c:v', acceleration === 'vaapi' ? 'h264_vaapi' : 'libx264', ...(acceleration === 'vaapi' ? ['-rc_mode', 'VBR', '-b:v', '2500k'] : ['-preset', 'veryfast', '-crf', '23']),
@@ -147,6 +194,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
   async function ready(task, deadline) {
     while (now() < deadline) {
       assertValid(task);
+      if (task.inputError) throw task.inputError;
       try {
         const body = await readFile(join(task.dir, 'index.m3u8'), 'utf8');
         const segments = body.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'));
@@ -154,6 +202,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         if (segments.length && (await stat(join(task.dir, segments[0]))).size > 0) { task.produced = true; return; }
       } catch (error) { if (!['ENOENT'].includes(error.code)) throw error; }
       assertValid(task);
+      if (task.inputError) throw task.inputError;
       if (task.attempt.done) throw failure('FFmpeg 未能启动兼容编码，请检查输入格式或硬件权限');
       await wait(Math.min(pollInterval, Math.max(1, deadline - now())));
     }
@@ -183,6 +232,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         }
         if (acceleration === 'software' && !allowSoftware) throw failure('软件兼容编码已关闭，请使用可用的核显或切换播放线路', 503);
         const deadline = now() + startupTimeout;
+        await checkResumeRange(task, deadline); assertValid(task);
         for (;;) {
           assertValid(task);
           task.attempt = runProcess(argumentsFor(task, acceleration), text => {
