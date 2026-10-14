@@ -15,12 +15,14 @@ export function createQuarkBrowser({ safeRequest = request, executablePath = pro
     const url = validateUrl(value).href;
     if (closed) throw failure('网页渲染器已关闭', 'browserUnavailable', 503);
     const controller = new AbortController(), end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, Date.now() + 25000);
+    let phase = 'queue';
+    const timeoutFailure = cause => Object.assign(failure('动态网页读取超时', 'browserTimeout', 502, cause), { quarkBrowserPhase: phase });
     const remaining = () => Math.max(1, end - Date.now());
     const abort = () => controller.abort(signal.reason);
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
-    if (end <= Date.now()) controller.abort(failure('动态网页读取超时', 'browserTimeout'));
-    const timer = setTimeout(() => controller.abort(failure('动态网页读取超时', 'browserTimeout')), remaining());
+    if (end <= Date.now()) controller.abort(timeoutFailure());
+    const timer = setTimeout(() => controller.abort(timeoutFailure()), remaining());
     const stopped = controller.signal.aborted ? Promise.resolve() : new Promise(resolve => controller.signal.addEventListener('abort', resolve, { once: true }));
     jobs.add(controller);
     let started = false;
@@ -32,6 +34,7 @@ export function createQuarkBrowser({ safeRequest = request, executablePath = pro
         const operation = (async () => {
           const path = executablePath || ['/usr/bin/chromium', chromium.executablePath()].find(candidate => existsSync(candidate));
           if (!path) throw failure('未安装动态网页浏览器', 'browserUnavailable', 503);
+          phase = 'launch';
           launching = launch({ executablePath: path, headless: true, timeout: remaining(), args: [
             '--mute-audio', '--noerrdialogs', '--disable-gpu', '--disable-dev-shm-usage', '--disable-quic',
             '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', '--host-resolver-rules=MAP * ~NOTFOUND',
@@ -41,10 +44,11 @@ export function createQuarkBrowser({ safeRequest = request, executablePath = pro
           try { browser = await launching; }
           catch (cause) {
             controller.signal.throwIfAborted();
-            if (cause?.name === 'TimeoutError' || Date.now() >= end) throw failure('动态网页读取超时', 'browserTimeout', 502, cause);
+            if (cause?.name === 'TimeoutError' || Date.now() >= end) throw timeoutFailure(cause);
             throw failure('动态网页浏览器无法启动', 'browserUnavailable', 503, cause);
           }
           controller.signal.throwIfAborted();
+          phase = 'context';
           const platform = process.platform === 'win32' ? 'Windows NT 10.0; Win64; x64' : 'X11; Linux x86_64';
           const context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: false, permissions: [], viewport: { width: 1280, height: 900 }, locale: 'zh-CN', userAgent: `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version()} Safari/537.36` });
           await context.addInitScript(() => {
@@ -111,6 +115,7 @@ export function createQuarkBrowser({ safeRequest = request, executablePath = pro
           });
           try {
             const navigate = async target => {
+              phase = 'navigation';
               for (let redirect = 0; redirect <= 3; redirect++) {
                 mainRedirect = undefined;
                 mainError = undefined;
@@ -124,11 +129,13 @@ export function createQuarkBrowser({ safeRequest = request, executablePath = pro
             };
             // Playwright does not route browser-followed redirects, so start a fresh routed navigation.
             await navigate(url);
+            phase = 'settle';
             await page.waitForTimeout(Math.min(1000, remaining()));
             try { await page.waitForLoadState('networkidle', { timeout: Math.min(4000, remaining()) }); }
             catch (cause) { if (cause.name !== 'TimeoutError') throw cause; }
             if (mainRedirect) await navigate(mainRedirect);
             controller.signal.throwIfAborted();
+            phase = 'snapshot';
             const snapshot = await page.evaluate(() => {
               const visible = element => {
                 const style = getComputedStyle(element);

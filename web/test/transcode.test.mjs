@@ -181,6 +181,31 @@ test('a hung resume probe uses the existing startup deadline and never launches 
     assert.equal(f.calls.filter(call => call.args.includes('-i')).length, 0); assert.deepEqual(await readdir(f.root), []);
   } finally { await f.close(); }
 });
+
+test('a startup-limited resume probe remains a timeout when its timer fires just before the wall-clock deadline', async () => {
+  let clock = 1000;
+  const media = createMedia({ request: async (_url, options) => {
+    clock = 1039;
+    await new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }));
+  } });
+  const f = await fixture({ media, di: { startupTimeout: 40, now: () => clock } });
+  try {
+    await assert.rejects(start(f.service, { episode: { type: 'mkv', url: 'https://cloud.quark.cn/file.mkv' }, position: 281 }),
+      error => error.status === 504 && /启动超时/.test(error.message));
+    assert.equal(clock, 1039); assert.equal(f.calls.filter(call => call.args.includes('-i')).length, 0); assert.deepEqual(await readdir(f.root), []);
+  } finally { await f.close(); }
+});
+
+test('a resume probe upstream failure before the startup deadline remains a check error', async () => {
+  const media = createMedia({ request: async () => { throw new Error('fixture upstream unavailable'); } });
+  const f = await fixture({ media });
+  try {
+    await assert.rejects(start(f.service, { episode: { type: 'mkv', url: 'https://cloud.quark.cn/file.mkv' }, position: 281 }),
+      error => error.status === 502 && /无法检查原文件/.test(error.message));
+    assert.equal(f.calls.filter(call => call.args.includes('-i')).length, 0); assert.deepEqual(await readdir(f.root), []);
+  } finally { await f.close(); }
+});
+
 async function assetServer(service, id) {
   const server = createServer(async (req, res) => {
     try { await service.serve(req, res, id, decodeURIComponent(req.url.slice(1))); }

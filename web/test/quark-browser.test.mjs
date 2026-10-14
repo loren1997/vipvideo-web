@@ -56,7 +56,7 @@ test('rejects malicious entry URLs and an already cancelled job before launching
   const controller = new AbortController();
   controller.abort(new Error('already cancelled'));
   await assert.rejects(renderer.render('https://public.example/', { signal: controller.signal }), /already cancelled/);
-  await assert.rejects(renderer.render('https://public.example/', { deadline: Date.now() - 1 }), { quarkPoolReason: 'browserTimeout' });
+  await assert.rejects(renderer.render('https://public.example/', { deadline: Date.now() - 1 }), { quarkPoolReason: 'browserTimeout', quarkBrowserPhase: 'queue' });
   assert.equal(launches, 0);
   await renderer.close();
 });
@@ -64,9 +64,32 @@ test('rejects malicious entry URLs and an already cancelled job before launching
 test('browser launch timeouts remain distinct from missing or broken browser installations', async t => {
   for (const [name, expected] of [['TimeoutError', 'browserTimeout'], ['Error', 'browserUnavailable']]) {
     const renderer = createQuarkBrowser({ executablePath: 'synthetic-browser', launch: async () => { throw Object.assign(new Error('synthetic launch failure'), { name }); } });
-    try { await assert.rejects(renderer.render('https://public.example/'), { quarkPoolReason: expected }); }
+    try { await assert.rejects(renderer.render('https://public.example/'), { quarkPoolReason: expected, ...(name === 'TimeoutError' ? { quarkBrowserPhase: 'launch' } : {}) }); }
     finally { await renderer.close(); }
   }
+});
+
+test('a context timeout reports its phase and releases the launched browser', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 10000 });
+  let entered, closed = 0;
+  const started = new Promise(resolve => { entered = resolve; });
+  const renderer = createQuarkBrowser({ executablePath: 'synthetic-browser', launch: async () => ({
+    version: () => '1.0',
+    newContext: () => { entered(); return new Promise(() => {}); },
+    close: async () => { closed++; },
+  }) });
+  try {
+    const result = assert.rejects(renderer.render('https://public.example/private-token?pwd=secret', { deadline: Date.now() + 100 }), error => {
+      assert.equal(error.quarkPoolReason, 'browserTimeout');
+      assert.equal(error.quarkBrowserPhase, 'context');
+      assert.doesNotMatch(error.message, /private-token|secret/);
+      return true;
+    });
+    await started;
+    t.mock.timers.tick(100);
+    await result;
+    assert.equal(closed, 1);
+  } finally { await renderer.close(); }
 });
 
 test('headless Chromium renders through the validated transport', { skip: executablePath ? false : 'No local Chromium; set CHROMIUM_PATH to run rendering and SSRF fixtures.' }, async t => {
@@ -95,7 +118,16 @@ test('headless Chromium renders through the validated transport', { skip: execut
       '/dns-redirect': () => response('', 302, { location: 'https://redirect.private.example/secret' }),
     });
     try {
-      const result = await value.renderer.render('https://page.example/start').catch(error => { if (error.cause) console.error(error.cause); throw error; });
+      const render = async url => {
+        try { return await value.renderer.render(url); }
+        catch (error) {
+          const requests = {};
+          for (const call of value.calls) { const path = new URL(call.url).pathname; requests[path] = (requests[path] || 0) + 1; }
+          console.error('Chromium fixture failed:', JSON.stringify({ reason: error.quarkPoolReason, phase: error.quarkBrowserPhase, launches: value.launchOptions.length, launched: value.browsers.length, requests, lookups: value.lookups.length }));
+          throw error;
+        }
+      };
+      const result = await render('https://page.example/start');
       assert.equal(result.url, 'https://page.example/article');
       assert.equal(result.title, '动态电影 2026');
       assert.match(result.html, /<article class="post-content"><h1>动态电影 2026<\/h1>/);
@@ -121,7 +153,7 @@ test('headless Chromium renders through the validated transport', { skip: execut
       const options = value.launchOptions[0];
       assert.equal(options.headless, true);
       for (const flag of ['--mute-audio', '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', '--host-resolver-rules=MAP * ~NOTFOUND']) assert.ok(options.args.includes(flag));
-      await value.renderer.render('https://page.example/clean');
+      await render('https://page.example/clean');
       assert.equal(value.calls.find(call => call.url.endsWith('/clean')).headers.cookie, undefined);
       assert.equal(value.active(), 0);
     } finally {

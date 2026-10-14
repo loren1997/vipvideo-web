@@ -128,7 +128,7 @@ test('cache durations, password keys and force checks preserve a fresh valid res
   const protectedEntry = f.validator.inspect(resource(1, 'NEW1')); await protectedEntry.promise;
   assert.equal(f.calls.length, 6, 'a changed extraction code must be checked separately');
   clock += 120_000;
-  const expired = f.validator.inspect(resource()); assert.equal(expired.status, 'checking'); await expired.promise;
+  const expired = f.validator.inspect(resource()); assert.equal(expired.status, 'valid'); assert.equal(expired.pending, true); await expired.promise;
   assert.equal(f.calls.length, 8);
   let noVideo = true;
   const negative = fixture(t, () => list(noVideo ? [] : [video()]), { now: () => clock });
@@ -137,6 +137,24 @@ test('cache durations, password keys and force checks preserve a fresh valid res
   clock++; noVideo = false;
   const retry = negative.validator.inspect(resource()); assert.equal(retry.status, 'checking'); await retry.promise;
   assert.equal(retry.status, 'valid');
+});
+
+test('an expired valid share stays visible during revalidation and is hidden as soon as that check fails', async t => {
+  let clock = 1000, failing = false, release;
+  const f = fixture(t, async () => {
+    if (failing) { await new Promise(resolve => { release = resolve; }); throw new Error('synthetic-private-failure'); }
+    return list([video()]);
+  }, { now: () => clock });
+  const first = f.validator.inspect(resource()); await first.promise;
+  clock += 120_001; failing = true;
+  const checking = f.validator.inspect(resource());
+  assert.notEqual(checking, first); assert.equal(checking.status, 'valid'); assert.equal(checking.pending, true);
+  assert.equal(f.validator.inspect(resource(), { force: true }), checking);
+  await turn(); assert.equal(f.calls.length, 4);
+  release(); await checking.promise;
+  assert.equal(checking.status, 'unavailable'); assert.equal(checking.pending, false);
+  assert.equal(f.validator.inspect(resource()), checking);
+  assert.doesNotMatch(JSON.stringify(checking), /synthetic-private-failure/);
 });
 
 test('the eight-second active budget spans both token and directory reads and aborts the adapter', async t => {

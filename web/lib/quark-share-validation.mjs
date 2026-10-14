@@ -104,7 +104,7 @@ export function createQuarkShareValidator({ read, now = Date.now, isVideo, isDir
     if (!parsed) return { ...unavailable('夸克分享地址或提取码无效'), pending: false };
     const { pwdId, password, key } = parsed, previous = cache.get(key);
     if (previous?.entry.pending || previous?.expires > now() && !force) return previous.entry;
-    const entry = { status: previous?.entry.status === 'valid' && previous.expires > now() ? 'valid' : 'checking', pending: true };
+    const entry = { status: previous?.entry.status === 'valid' ? 'valid' : 'checking', pending: true };
     const work = { entry, pwdId, password, expires: Infinity, controller: new AbortController(), queuedUntil: now() + 30_000 };
     remember(key, work);
     if (active.size >= 2 && queue.length >= 64) { finish(work, unavailable('分享校验繁忙，请稍后重试')); return entry; }

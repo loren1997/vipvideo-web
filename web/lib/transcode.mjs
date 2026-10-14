@@ -160,7 +160,9 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     const controller = task.probeController = new AbortController();
     const remaining = deadline - now();
     if (remaining <= 0) throw failure('兼容播放启动超时，请切换线路或稍后重试', 504);
-    const timer = setTimeout(() => controller.abort(), Math.min(8000, remaining));
+    const startupLimited = remaining <= 8000;
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, Math.min(8000, remaining));
     let response;
     try {
       response = await fetch(task.input, { headers: { Range: 'bytes=1-1' }, redirect: 'error', signal: controller.signal });
@@ -172,7 +174,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     } catch (error) {
       assertValid(task);
       if (task.inputError) throw task.inputError;
-      if (now() >= deadline) throw failure('兼容播放启动超时，请切换线路或稍后重试', 504);
+      if (timedOut && startupLimited || now() >= deadline) throw failure('兼容播放启动超时，请切换线路或稍后重试', 504);
       throw error.status ? error : failure('无法检查原文件的定位续播能力，请稍后重试或换官方在线线路', 502, error);
     } finally {
       clearTimeout(timer);
