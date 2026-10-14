@@ -235,6 +235,11 @@ function externalLink(label, url, className = 'button subtle') {
 
 function typeLabel(type) { return type === 'series' ? '剧集' : type === 'movie' ? '电影' : '链接'; }
 function sourceName(id) { return id === 'quark-library' ? '夸克影院' : config.sources.find(source => source.id === id)?.name || id || '链接播放'; }
+function posterFor(item) {
+  if (item.source !== 'quark-library') return httpUrl(item.poster);
+  const id = String(item.id ?? '');
+  return /^[1-9]\d{0,15}$/.test(id) && Number.isSafeInteger(Number(id)) ? new URL(`/api/quark/library/poster?${new URLSearchParams({ id })}`, location.origin).href : null;
+}
 function fieldsOf(item) {
   return { key: item.key, title: item.title, year: item.year || '', type: item.type || 'movie', poster: item.poster || '', source: item.source || '', id: String(item.id ?? ''), ...(item.category ? { category: item.category } : {}) };
 }
@@ -293,7 +298,7 @@ function card(item, options = {}) {
   const element = node('article', undefined, 'media-card');
   const cover = button('', () => openItem(item, options.resume), 'poster-link');
   cover.setAttribute('aria-label', `${options.resume ? '继续观看' : item.source === 'quark-library' ? '查看' : '播放'} ${item.title}`);
-  const poster = httpUrl(item.poster);
+  const poster = posterFor(item);
   if (poster) {
     const image = node('img');
     image.src = poster; image.alt = ''; image.loading = options.priority ? 'eager' : 'lazy'; image.decoding = 'async'; image.fetchPriority = options.priority ? 'high' : 'low'; image.referrerPolicy = 'no-referrer';
@@ -538,9 +543,10 @@ async function renderQuarkLibrary(params, stamp) {
   const genre = filter('类型', '夸克影片类型'), year = filter('上映年份', '夸克上映年份'), sort = filter('排列', '夸克影片排序');
   function options(select, values, label, selected) { select.replaceChildren(); for (const value of ['', ...values]) { const option = node('option', value || label); option.value = value; select.append(option); } if (selected && ![...select.options].some(option => option.value === selected)) { const option = node('option', selected); option.value = selected; select.append(option); } select.value = selected; }
   function facets(value = {}) { options(genre, (value.genres || []).filter(value => typeof value === 'string'), '全部类型', filters.genre); options(year, (value.years || []).map(String), '全部年份', filters.year); }
-  facets(); for (const [value, title] of [['release', '官方首映时间'], ['score', '豆瓣评分'], ['release-score', '上映年份优先 · 同年高分']]) { const option = node('option', title); option.value = value; sort.append(option); } sort.value = filters.sort;
+  facets(); for (const [value, title] of [['release', '热门片目 · 年份优先'], ['score', '豆瓣高分'], ['release-score', '热门片目 · 年份+评分']]) { const option = node('option', title); option.value = value; sort.append(option); } sort.value = filters.sort;
   for (const [select, field] of [[genre, 'genre'], [year, 'year'], [sort, 'sort']]) select.addEventListener('change', () => goto('quark', { category, ...filters, [field]: select.value }));
   page.append(filterRow);
+  const sortNote = node('p', undefined, 'filter-note muted'); page.append(sortNote);
   const listing = node('div'); listing.id = 'quark-library-results'; page.append(listing);
   const more = button('加载更多影片', () => void load(), 'button subtle load-more'); more.hidden = true; page.append(more); content.replaceChildren(page);
   let items = [], nextPage = 1, loading = false;
@@ -551,6 +557,7 @@ async function renderQuarkLibrary(params, stamp) {
     try {
       const data = await api(`/api/quark/library?${new URLSearchParams({ category, ...filters, page: nextPage })}`); if (!valid()) return;
       facets(data.facets);
+      sortNote.textContent = `${data.sortLabel || (filters.sort === 'score' ? '已上映片目，豆瓣高分优先' : filters.sort === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先')}；排序针对当前已加载片目。`;
       items = [...new Map([...items, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
       listing.replaceChildren(items.length ? grid(items, { priorityCount: 6 }) : empty('这个分类暂时没有影片', '试试其他类型、年份或稍后重试。'));
       if (data.errors?.length) listing.append(node('p', data.errors.map(error => typeof error === 'string' ? error : error.error || error.message || '目录暂时不可用').join('；'), 'muted'));
@@ -927,12 +934,14 @@ function mountQuarkStub(data, state = { resources: [], files: [], version: 0 }, 
 
 function renderDetail(data, candidates) {
   const summary = node('section', undefined, 'detail-summary');
-  const posterUrl = httpUrl(data.poster);
+  const posterUrl = posterFor(data);
   if (posterUrl) { const image = node('img', undefined, 'detail-poster'); image.src = posterUrl; image.alt = ''; image.decoding = 'async'; image.fetchPriority = 'high'; image.referrerPolicy = 'no-referrer'; image.addEventListener('error', () => image.remove(), { once: true }); summary.append(image); }
   const info = node('div', undefined, 'detail-info');
   info.append(node('h2', data.title), node('p', `${data.year || '年份未知'} · ${data.typeName || typeLabel(data.type)} · ${sourceName(data.source)}`, 'meta'));
   const ratings = node('div', '正在读取评分…', 'film-ratings'); ratings.setAttribute('aria-live', 'polite'); info.append(ratings);
   if (data.description) info.append(node('p', data.description, 'detail-description'));
+  else if (data.source === 'quark-library') info.append(node('p', '暂无中文简介，可参考上映年份和类型。', 'detail-description'));
+  if (data.source === 'quark-library' && data.originalDescription) { const original = node('details'); original.className = 'detail-original-description'; original.append(node('summary', '查看原文简介'), node('p', data.originalDescription, 'muted')); info.append(original); }
   const actions = node('div', undefined, 'detail-actions');
   const history = library.history.find(record => record.key === data.key && record.source === data.source && sameContentCategory(data, record));
   const start = button(history ? `继续播放 · ${formatTime(history.position || 0)}` : '▷ 播放第一集', () => {

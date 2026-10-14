@@ -534,7 +534,7 @@ test('stop during pending RSS rejects a late result without cache or persistence
   await assert.rejects(lookup(f.pool), /公开搜索已停止/);
 });
 
-test('explicit web lookup skips APIs, shares two network slots and merges Google with RSS by date and share ID', async () => {
+test('explicit more checks APIs and continues public pages within two network slots, merging by date and share ID', async () => {
   let active = 0, peak = 0, googleCalls = 0;
   const at = Date.now();
   const latest = Date.parse('2026-10-13T00:00:00Z'), older = Date.parse('2026-09-01T00:00:00Z');
@@ -556,7 +556,7 @@ test('explicit web lookup skips APIs, shares two network slots and merges Google
     const url = 'https://manual.example/api/search?kw=' + encodeURIComponent('电影 2026');
     const result = JSON.parse(await readText(await f.pool.request(url, { webSearch: true, headers: { Cookie: 'user-cookie' } })));
     assert.equal(googleCalls, 1); assert.equal(peak, 2);
-    assert.ok(f.calls.every(call => !/manual\.example|backup\.example/.test(call.url)));
+    assert.ok(f.calls.some(call => /manual\.example/.test(call.url))); assert.ok(f.calls.some(call => /backup\.example/.test(call.url)));
     assert.deepEqual(result.results.map(row => row.url), [quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/old12345678', 'https://pan.quark.cn/s/unknown12345']);
     assert.deepEqual(result.results.map(row => row.publishedAt), [latest, older, undefined]);
   } finally { await f.pool.stop(); }
@@ -584,7 +584,7 @@ test('web results survive one engine failing and API and web caches remain separ
   try {
     assert.equal((await lookup(f.pool)).results[0].url, quarkUrl + '?pwd=1234'); assert.equal(googleCalls, 0);
     const web = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?kw=电影', { webSearch: true })));
-    assert.equal(web.results[0].url, other); assert.equal(googleCalls, 1);
+    assert.deepEqual(new Set(web.results.map(row => row.url)), new Set([quarkUrl + '?pwd=1234', other])); assert.equal(googleCalls, 1);
     await f.pool.request('https://manual.example/api/search?kw=电影', { webSearch: true }); assert.equal(googleCalls, 1);
     assert.equal((await lookup(f.pool)).results[0].url, quarkUrl + '?pwd=1234');
   } finally { await f.pool.stop(); }
@@ -652,7 +652,7 @@ test('cross-engine merging preserves the actual code date through a newer RSS po
     assert.equal(result.results[0].name, '电影 新码');
     assert.equal(result.results[0].publishedAt, Date.parse('2026-10-12T00:00:00Z'));
     const cached = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?kw=电影', { webSearch: true })));
-    assert.deepEqual(cached, result); assert.equal(f.calls.length, 1);
+    assert.deepEqual(cached, result); assert.equal(f.calls.length, 2);
   } finally { await f.pool.stop(); }
 });
 
@@ -730,7 +730,7 @@ test('canonical web titles and explicit aliases reach Google without stripping n
     const url = 'https://manual.example/api/search?' + new URLSearchParams({ kw: '银翼杀手 2049' });
     const result = JSON.parse(await readText(await f.pool.request(url, { year: '2017', aliases: ['Blade Runner 2049'], webSearch: true })));
     assert.equal(result.results.length, 1);
-    assert.equal(new URL(f.calls[0].url).searchParams.get('q'), '"银翼杀手 2049" 2017 夸克 网盘');
+    assert.equal(new URL(f.calls.find(call => call.url.includes('bing.com')).url).searchParams.get('q'), '"银翼杀手 2049" 2017 夸克 网盘');
   } finally { await f.pool.stop(); }
 });
 
@@ -1161,5 +1161,38 @@ test('each completed more request advances a bounded public result page while po
       assert.equal(f.calls.length, calls); assert.equal(staticPages.length, searches);
     }
     assert.deepEqual(staticPages, [0, 1, 2, 0]); assert.deepEqual(renderedPages, [0, 1, 2, 0]);
+  } finally { await f.pool.stop(); }
+});
+
+test('an unconfigured default RSS entry tries the fixed PanSou helper and existing healthy backup before web search', async () => {
+  const sidecar = 'http://pansou:8888/api/search', at = Date.now();
+  const f = fixture({ saved: savedBackup(at), googleSearch: () => assert.fail('matching helpers answer normal default searches'),
+    request: (url, options) => {
+      assert.ok(url.startsWith(sidecar) || url.startsWith(backup));
+      assert.equal(options.followRedirects, false); assert.equal(options.headers.cookie, undefined); assert.equal(options.headers.authorization, undefined);
+      return response(json(url.startsWith(sidecar) ? quarkUrl : 'https://pan.quark.cn/s/backup123456', '希望 (2026) 夸克网盘'));
+    } });
+  try {
+    const input = 'https://www.bing.com/search?' + new URLSearchParams({ q: '希望 site:pan.quark.cn/s', format: 'rss' });
+    const result = JSON.parse(await readText(await f.pool.request(input, { year: '2026', aliases: ['Hope'] })));
+    assert.equal(result.results.length, 2);
+    assert.ok(f.calls.some(call => call.url.startsWith(sidecar))); assert.ok(f.calls.some(call => call.url.startsWith(backup)));
+    const calls = f.calls.length; await f.pool.request(input, { year: '2026', aliases: ['Hope'], poll: true }); assert.equal(f.calls.length, calls);
+  } finally { await f.pool.stop(); }
+});
+
+test('more refreshes the configured helper and retains its matches while continuing independent public pages', async () => {
+  let googleCalls = 0;
+  const f = fixture({ request: url => response(url.includes('bing.com') ? emptyRss : json()),
+    googleSearch: async () => { googleCalls++; return [{ name: '电影 (2026) 夸克资源', url: 'https://pan.quark.cn/s/webadded123' }]; } });
+  const url = 'http://pansou:8888/api/search?kw=电影';
+  try {
+    const result = JSON.parse(await readText(await f.pool.request(url, { webSearch: true, forceRefresh: true, year: '2026' })));
+    assert.deepEqual(new Set(result.results.map(row => row.url)), new Set([quarkUrl + '?pwd=1234', 'https://pan.quark.cn/s/webadded123']));
+    assert.equal(googleCalls, 1);
+    assert.equal(new URL(f.calls.find(call => call.url.startsWith('http://pansou:8888/')).url).searchParams.get('refresh'), 'true');
+    const calls = f.calls.length;
+    await f.pool.request(url, { webSearch: true, poll: true, forceRefresh: true, year: '2026' });
+    assert.equal(f.calls.length, calls); assert.equal(googleCalls, 1);
   } finally { await f.pool.stop(); }
 });

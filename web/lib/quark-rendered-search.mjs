@@ -34,7 +34,13 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
     };
     const report = cause => { signal?.throwIfAborted(); notes.add(reasons[cause?.quarkPoolReason] || '动态网页暂时无法读取'); };
     const searchEnd = Math.min(end - 1000, now() + 12000);
-    let googleStopped = false;
+    let googleStopped = false, googleJavascript;
+    const collect = (result, engine) => {
+      for (const row of extractQuarkSearchResults(result.html, { ...query, engine, url: result.url, now: now() })) {
+        if (direct(row.url)) merge([row]);
+        else if (!articles.has(row.url) && articles.size < 12) articles.set(row.url, row);
+      }
+    };
     const search = async (engine, term, rss = false) => {
       if (now() >= searchEnd || engine === 'Google' && googleStopped) return;
       const url = engine === 'Google' ? googleQueryUrl(term, query.page) : bingQueryUrl(term, query.page, rss);
@@ -43,14 +49,12 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
         const result = read ? await read(url, { signal, deadline: Math.min(searchEnd, now() + 3000) }) : await render(url, { signal, deadline: Math.min(end, now() + 8000) });
         const state = quarkSearchPageState(result.html, result.url);
         if (state !== 'ready') {
+          if (engine === 'Google' && state === 'javascript') googleJavascript = url;
           if (engine === 'Google') googleStopped = true;
           notes.add(state === 'blocked' ? '搜索网页要求验证，已切换其他公开渠道' : '搜索网页需要 JavaScript，已切换其他公开渠道');
           return;
         }
-        for (const row of extractQuarkSearchResults(result.html, { ...query, engine, url: result.url, now: now() })) {
-          if (direct(row.url)) merge([row]);
-          else if (!articles.has(row.url) && articles.size < 12) articles.set(row.url, row);
-        }
+        collect(result, engine);
       } catch (cause) { report(cause); if (engine === 'Google') googleStopped = true; }
     };
     for (const term of quarkSearchQueries(query)) {
@@ -60,6 +64,13 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
       else await search('Google', term);
       if ((read && articles.size < 6 && rows.size < 3) || (!read && !articles.size && !rows.size)) await search('Bing', term, true);
       if (!read && (rows.size || articles.size)) break;
+    }
+    if (read && googleJavascript && !rows.size && !articles.size && now() < end - 1000) {
+      try {
+        const result = await render(googleJavascript, { signal, deadline: Math.min(end - 1000, now() + 8000) });
+        if (quarkSearchPageState(result.html, result.url) === 'blocked') throw Object.assign(new Error('搜索网站要求验证码'), { quarkPoolReason: 'browserBlocked' });
+        collect(result, 'Google');
+      } catch (cause) { report(cause); }
     }
     const sorted = [...articles.values()].sort((a, b) => (b.publishedAt ?? -1) - (a.publishedAt ?? -1));
     for (const row of sorted.slice(0, 5)) {

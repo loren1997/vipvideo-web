@@ -43,9 +43,11 @@ const controlsFilm = fixture('播放器样例', 'series', 'controls', '国产剧
 const compatibilityFilm = fixture('兼容播放样例', 'series', 'compatibility', '国产剧', '全2集', ['first']);
 const adFilm = fixture('广告时段样例', 'series', 'ad-hls', '国产剧', '全2集');
 const quarkFilm = fixture('网盘当前集样例', 'series', 'quark', '国产剧', '全2集');
-const cloudFilm = { ...quarkFilm, key: JSON.stringify(['quark-library', '1234567']), source: 'quark-library', id: '1234567', douban: { id: '1234567', score: 8.3, url: 'https://movie.douban.com/subject/1234567/' }, aliases: [], genres: ['剧情'], episodeCount: 2, lines: [{ name: '夸克网盘', episodes: [{ name: '第1集' }, { name: '第2集' }] }] };
+const cloudFilm = { ...quarkFilm, key: JSON.stringify(['quark-library', '1234567']), source: 'quark-library', id: '1234567', poster: 'https://img3.doubanio.com/view/photo/m_ratio_poster/public/p2935800697.jpg', description: '暂无中文简介。2025年电视剧，剧情类型。', descriptionLanguage: 'unavailable', originalDescription: 'An official English synopsis.', douban: { id: '1234567', score: 8.3, url: 'https://movie.douban.com/subject/1234567/' }, aliases: [], genres: ['剧情'], episodeCount: 2, lines: [{ name: '夸克网盘', episodes: [{ name: '第1集' }, { name: '第2集' }] }] };
 const cloudMovie = { ...cloudFilm, key: JSON.stringify(['quark-library', '7654321']), id: '7654321', title: '夸克电影样例', type: 'movie', category: 'movie', episodeCount: null, lines: [{ name: '夸克网盘', episodes: [{ name: '正片' }] }], douban: { id: '7654321', score: 7.2, url: 'https://movie.douban.com/subject/7654321/' } };
 const cloudAssetId = (shareId, fileId) => createHash('md5').update(shareId + ':' + fileId).digest('hex');
+const cloudPosterPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+const cloudPosterReads = [], cloudPosterDirectReads = [];
 const progressiveFast = fixture('渐进先到样例', 'movie', 'progressive-fast', '剧情片', '正片', ['first']);
 const progressiveSlow = fixture('渐进后到样例', 'movie', 'progressive-slow', '剧情片', '正片', ['second']);
 const progressiveAnime = fixture('动画后到样例', 'series', 'progressive-anime', '国产动漫', '全2集', ['second']);
@@ -247,13 +249,18 @@ try {
           const category = parsed.searchParams.get('category') || 'movie', page = Number(parsed.searchParams.get('page'));
           const newer = { ...cloudMovie, id: '7654322', title: '夸克新片样例', year: '2026', douban: { ...cloudMovie.douban, id: '7654322', score: 9.1 } };
           const peer = { ...cloudMovie, id: '7654324', title: '夸克同年样例', year: '2026', douban: { ...cloudMovie.douban, id: '7654324', score: 6.5 } };
-          let rows = category === 'movie' ? page === 1 ? [cloudMovie, newer, peer] : [{ ...cloudMovie, id: '7654323', title: '夸克下一页样例' }] : [{ ...cloudFilm, category }];
+          let rows = category === 'movie' ? page === 1 ? [cloudMovie, peer, newer] : [{ ...cloudMovie, id: '7654323', title: '夸克下一页样例' }] : [{ ...cloudFilm, category }];
           if (parsed.searchParams.get('sort') === 'score') rows = rows.sort((a, b) => b.douban.score - a.douban.score);
+          if (parsed.searchParams.get('sort') === 'release') rows = rows.sort((a, b) => Number(b.year) - Number(a.year));
           if (parsed.searchParams.get('sort') === 'release-score') rows = rows.sort((a, b) => Number(b.year) - Number(a.year) || b.douban.score - a.douban.score);
           if (parsed.searchParams.get('year')) rows = rows.filter(row => row.year === parsed.searchParams.get('year'));
-          return route.fulfill({ json: { items: rows, hasMore: category === 'movie' && page === 1, facets: { genres: ['剧情', '喜剧'], years: ['2026', '2025'] }, errors: [] } });
+          return route.fulfill({ json: { items: rows, hasMore: category === 'movie' && page === 1, facets: { genres: ['剧情', '喜剧'], years: ['2026', '2025'] }, sortLabel: parsed.searchParams.get('sort') === 'score' ? '已上映片目，豆瓣高分优先' : parsed.searchParams.get('sort') === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先', errors: [] } });
         }
         if (parsed.pathname === '/api/quark/library/detail') return route.fulfill({ json: parsed.searchParams.get('id') === cloudMovie.id ? cloudMovie : cloudFilm });
+        if (parsed.pathname === '/api/quark/library/poster') {
+          assert.deepEqual([...parsed.searchParams.keys()], ['id']); const id = parsed.searchParams.get('id'); cloudPosterReads.push(id);
+          return route.fulfill({ status: [cloudFilm.id, cloudMovie.id, '7654322', '7654323', '7654324'].includes(id) ? 200 : 404, contentType: 'image/png', body: cloudPosterPng });
+        }
         if (parsed.pathname === '/api/quark/settings') {
           if (body) {
             assert.ok(Number.isInteger(body.retentionDays) && body.retentionDays >= 1);
@@ -410,6 +417,7 @@ try {
       if (url.startsWith(base + '/api/media?')) return route.fulfill({ status: 404, body: 'fixture failed proxy' });
       if (url.startsWith(base + '/')) return route.continue();
       if (url === 'https://fixtures.example/channel-logo.svg') return route.fulfill({ status: 404, body: 'fixed unavailable logo' });
+      if (url === cloudFilm.poster) { cloudPosterDirectReads.push(url); return route.abort('blockedbyclient'); }
       if (url === 'https://fixtures.example/movie-poster.svg') return route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="180" height="270"><rect width="180" height="270" fill="#27454a"/><circle cx="90" cy="110" r="40" fill="#62dcc8"/></svg>' });
       if (url.startsWith('https://fixtures.example/fail-')) {
         if (holdDoomedMedia && url.includes('fail-doomed-')) await new Promise(ok => { releaseDoomedMedia = ok; });
@@ -643,15 +651,18 @@ try {
   async function verifyQuarkPublicSearch() {
     await withCloudFixture(async open => {
       app.store.setConfig({ ...app.store.config(), sources: [] });
-      const ordinary = playerRequests.length, probes = playabilityRequests.length, prepares = quarkCount('/api/quark/prepare');
+      const ordinary = playerRequests.length, probes = playabilityRequests.length, prepares = quarkCount('/api/quark/prepare'), directPosters = cloudPosterDirectReads.length;
       const { page: p } = await open({ hash: '#quark' });
       const nav = await p.locator('nav a').allTextContents(); assert.ok(nav.findIndex(text => text.includes('夸克影院')) === nav.findIndex(text => text.includes('我的收藏')) + 1);
       await p.getByRole('button', { name: '查看 夸克电影样例', exact: true }).waitFor();
       assert.equal(await p.getByLabel('夸克影片排序', { exact: true }).inputValue(), 'release-score');
       assert.deepEqual(await p.locator('#quark-library-results .card-title').allTextContents(), ['夸克新片样例', '夸克同年样例', '夸克电影样例'], '默认年份优先且同年高分在前');
+      await until(() => p.locator('#quark-library-results .poster-link img').evaluateAll(images => images.length === 3 && images.every(image => image.complete && image.naturalWidth > 0)), '同源目录海报实际完成解码');
+      assert.ok((await p.locator('#quark-library-results .poster-link img').evaluateAll(images => images.map(image => image.src))).every(src => new URL(src).origin === base && new URL(src).pathname === '/api/quark/library/poster'));
+      await p.locator('.filter-note').getByText(/热门已上映片目.*年份优先、同年高分优先.*当前已加载/).waitFor();
       assert.match(await p.locator('#quark-library-results').textContent(), /豆瓣 7.2/);
-      await p.getByLabel('夸克影片排序', { exact: true }).selectOption('release'); await until(() => p.locator('#quark-library-results .card-title').first().textContent().then(text => text === '夸克电影样例'), '官方首映时间返回目录原顺序');
-      assert.deepEqual(await p.locator('#quark-library-results .card-title').allTextContents(), ['夸克电影样例', '夸克新片样例', '夸克同年样例'], '精确日期未知时不重排官方首映顺序');
+      await p.getByLabel('夸克影片排序', { exact: true }).selectOption('release'); await until(() => p.locator('#quark-library-results .card-title').first().textContent().then(text => text === '夸克同年样例'), '热门候选按上映年份排列');
+      assert.deepEqual(await p.locator('#quark-library-results .card-title').allTextContents(), ['夸克同年样例', '夸克新片样例', '夸克电影样例'], '无精确日期时同年保留热门候选原顺序');
       await p.getByLabel('夸克影片排序', { exact: true }).selectOption('score'); await until(() => p.locator('#quark-library-results .card-title').first().textContent().then(text => text === '夸克新片样例'), '评分排序交给公开目录');
       assert.deepEqual(await p.locator('#quark-library-results .card-title').allTextContents(), ['夸克新片样例', '夸克电影样例', '夸克同年样例'], '纯评分顺序独立于年份');
       await p.getByLabel('夸克影片类型', { exact: true }).selectOption('剧情'); await until(() => quarkRequests.filter(row => row.path === '/api/quark/library').at(-1).query.genre === '剧情', '类型筛选传给目录');
@@ -659,6 +670,8 @@ try {
       await p.getByLabel('夸克上映年份', { exact: true }).selectOption(''); await p.getByRole('button', { name: '加载更多影片', exact: true }).click(); await p.getByRole('button', { name: '查看 夸克下一页样例', exact: true }).waitFor();
       for (const category of ['电视剧', '动漫', '综艺']) { await p.locator('.category-tabs').getByRole('button', { name: category, exact: true }).click(); await p.getByRole('button', { name: `查看 ${cloudFilm.title}`, exact: true }).waitFor(); }
       await p.getByRole('button', { name: `查看 ${cloudFilm.title}`, exact: true }).click();
+      await until(() => p.locator('.detail-poster').evaluate(image => image.complete && image.naturalWidth > 0).catch(() => false), '同源详情海报实际完成解码'); assert.match(await p.locator('.detail-poster').getAttribute('src'), /\/api\/quark\/library\/poster\?id=1234567$/);
+      await p.getByText('暂无中文简介。2025年电视剧，剧情类型。', { exact: true }).waitFor(); assert.equal(await p.locator('.detail-original-description').evaluate(element => element.open), false); assert.equal(await p.getByText('An official English synopsis.', { exact: true }).isVisible(), false);
       await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
       assert.equal(await p.locator('video').count(), 0); assert.equal(await p.getByLabel('夸克视频文件', { exact: true }).inputValue(), ''); assert.equal(await p.getByRole('button', { name: '转存所选单集', exact: true }).isDisabled(), true);
       assert.equal(quarkCount('/api/quark/prepare'), prepares, '即使autoSave开启也必须手动选文件和转存'); assert.equal(playerRequests.length, ordinary); assert.equal(playabilityRequests.length, probes, '独立目录和详情不调用普通播放或来源验证');
@@ -667,7 +680,12 @@ try {
       await p.setViewportSize({ width: 390, height: 844 }); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1); await p.screenshot({ path: join(output, 'mobile-quark-library-detail.png'), fullPage: true });
       const tv = await open({ tv: true, viewport: { width: 1920, height: 1080 }, hash: '#quark' }); await tv.page.locator('nav a[href="#favorites"]').focus(); await tv.page.keyboard.press('ArrowDown'); assert.equal(await tv.page.evaluate(() => document.activeElement.getAttribute('href')), '#quark'); await tv.page.keyboard.press('Enter');
       await tv.page.getByRole('button', { name: '查看 夸克电影样例', exact: true }).waitFor(); await tv.page.screenshot({ path: join(output, 'tv-quark-library.png') });
-      console.log('PASS 独立夸克影院位于收藏下方、四分类/类型/年份/官方时间与评分排序/分页/评分海报、收藏回跳、手机无溢出和TV入口；无普通源也能浏览，打开仅搜索且不自动选择/转存/播放');
+      app.store.setConfig({ ...app.store.config(), sources: ['first', 'second'].map(id => ({ id, name: id, api: `https://api.example.com/${id}`, enabled: true })) });
+      const normal = await open({ hash: '#detail?source=first&id=movie' }); await until(() => normal.page.locator('.detail-poster').evaluate(image => image.complete && image.naturalWidth > 0).catch(() => false), '普通外源海报仍直连并实际解码'); assert.equal(await normal.page.locator('.detail-poster').getAttribute('src'), movie.poster); assert.equal(await normal.page.locator('#quark-resources').count(), 0);
+      await normal.page.locator('#source-row').getByRole('button', { name: 'second', exact: true }).waitFor(); await normal.page.getByText('正在验证可播放来源…', { exact: true }).waitFor({ state: 'hidden' });
+      await until(() => normal.page.locator('video').evaluate(video => video.readyState >= 2).catch(() => false), '普通页面后台请求完成后恢复测试配置');
+      assert.equal(cloudPosterDirectReads.length, directPosters); assert.ok(cloudPosterReads.includes(cloudFilm.id));
+      console.log('PASS 独立夸克影院四分类/筛选/热门年份与评分排序/分页、列表和详情同源海报实际解码/普通外源海报直连、中文缺失说明与折叠原文、收藏回跳/手机/TV；无普通源可浏览且不自动转存播放');
     });
   }
 

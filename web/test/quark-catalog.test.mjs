@@ -21,7 +21,7 @@ function response(value, statusCode = 200, finalUrl) {
 }
 function film(overrides = {}) {
   return { id: '123456', title: '海风来信', type: 'movie', year: '2025', card_subtitle: '2025 / 中国大陆 / 剧情 喜剧 / 导演 / 演员',
-    pic: { normal: 'https://img1.doubanio.com/view/photo/s_ratio_poster/public/p123456.jpg' }, rating: { count: 320, max: 10, value: 8.2 }, comment: '海边的故事。', ...overrides };
+    pic: { normal: 'https://img1.doubanio.com/view/photo/s_ratio_poster/public/p123456.jpg' }, rating: { count: 320, max: 10, value: 8.2 }, is_released: true, comment: '海边的故事。', ...overrides };
 }
 function fixture(handler, options = {}) {
   const store = options.store || memoryStore(), calls = [];
@@ -61,7 +61,7 @@ test('official public catalog supplies posters, scores and metadata without sour
   assert.ok(result.facets.years.includes('1888'));
   assert.equal(calls[0].url.origin, ORIGIN);
   assert.equal(calls[0].url.pathname, '/rexxar/api/v2/movie/recommend');
-  assert.equal(calls[0].url.searchParams.get('sort'), 'R');
+  assert.equal(calls[0].url.searchParams.get('sort'), 'U');
   assert.equal(calls[0].settings.followRedirects, false);
   assert.equal(calls[0].settings.timeout, 8000);
   assert.equal(calls[0].settings.headers.cookie, undefined);
@@ -80,14 +80,156 @@ test('year and genre are sent to Douban and checked again when upstream ignores 
   assert.equal(result.hasMore, true);
 });
 
-test('official release order is preserved while score and release-score use real scores with unrated entries last', async t => {
+test('popular released candidates sort by year or real score without pretending popularity is premiere order', async t => {
   const entries = [film({ id: '1', year: '2026', rating: { value: 0, count: 0 } }), film({ id: '2', year: '2025', rating: { value: 9.3, count: 23 } }), film({ id: '3', year: '2026', rating: { value: 8.6, count: 100 } })];
   const { catalog } = fixture(url => response({ items: entries, total: 3 }, 200, url.href));
   t.after(() => catalog.stop());
-  assert.deepEqual((await catalog.browse({ sort: 'release' })).items.map(item => item.id), ['1', '2', '3']);
+  assert.deepEqual((await catalog.browse({ sort: 'release' })).items.map(item => item.id), ['3', '1', '2']);
   assert.deepEqual((await catalog.browse({ sort: 'score' })).items.map(item => item.id), ['2', '3', '1']);
   assert.deepEqual((await catalog.browse({ sort: 'release-score' })).items.map(item => item.id), ['3', '1', '2']);
-  assert.equal((await catalog.browse()).items[0].douban.score, null);
+  assert.equal((await catalog.browse()).items.find(item => item.id === '1').douban.score, null);
+  assert.match((await catalog.browse()).sortLabel, /热门已上映片目/);
+});
+
+test('default catalog excludes announced future titles but keeps genuinely released unrated films', async t => {
+  const time = Date.UTC(2026, 9, 14), unrated = { count: 0, value: 0 };
+  const entries = [film(), film({ id: '2', is_released: false, rating: { value: 8.9, count: 100 } }),
+    film({ id: '3', is_released: undefined, year: '2027' }), film({ id: '4', is_released: undefined, pubdate: ['2026-12-20'] }),
+    film({ id: '5', rating: unrated }), film({ id: '6', is_released: undefined, rating: unrated, playable_date: '2026-10-13 00:00:00' }),
+    film({ id: '7', is_released: undefined, rating: unrated, pubdate: ['2026-10-12(中国大陆)'] }),
+    film({ id: '8', is_released: true, year: '1994', pubdate: ['2026-12-01(重映)'] })];
+  const { catalog, calls } = fixture(url => response({ items: entries, total: 8 }, 200, url.href), { now: () => time });
+  t.after(() => catalog.stop());
+  const items = (await catalog.browse()).items;
+  assert.deepEqual(new Set(items.map(item => item.id)), new Set(['123456', '5', '6', '7', '8']));
+  assert.ok(items.filter(item => ['5', '6', '7'].includes(item.id)).every(item => item.douban.score === null && item.releaseStatus === 'released'));
+  assert.equal(items.find(item => item.id === '6').releaseDate, '');
+  assert.equal(calls.length, 1);
+});
+
+test('real recommendation fields prioritize popular Chinese rated titles and never treat a user comment as a synopsis', async t => {
+  const { catalog, calls } = fixture(url => response({ items: [film({ is_released: undefined, intro: undefined, comment: { comment: '这是用户短评，不是剧情简介。' } })], total: 1 }, 200, url.href));
+  t.after(() => catalog.stop());
+  const item = (await catalog.browse()).items[0];
+  assert.equal(calls[0].url.searchParams.get('sort'), 'U');
+  assert.equal(calls.length, 1);
+  assert.equal(item.releaseStatus, 'screened');
+  assert.equal(item.descriptionLanguage, 'unavailable');
+  assert.match(item.description, /暂无中文剧情简介.*2025年电影.*剧情/);
+  assert.ok(!item.description.includes('用户短评'));
+});
+
+test('an unrated candidate with unknown release status is checked from canonical detail instead of being dropped for score zero', async t => {
+  const { catalog, calls } = fixture(url => url.pathname.endsWith('/recommend') ? response({ items: [film({ is_released: undefined, rating: { value: 0, count: 0 } })], total: 1 }, 200, url.href)
+    : response(film({ is_released: true, rating: { value: 0, count: 0 }, intro: '这是一个关于故乡的温暖故事。' }), 200, url.href));
+  t.after(() => catalog.stop());
+  const result = await catalog.browse();
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].douban.score, null);
+  assert.equal(result.items[0].releaseStatus, 'released');
+  assert.equal(result.items[0].descriptionLanguage, 'zh');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].url.pathname, '/rexxar/api/v2/movie/123456');
+  assert.deepEqual(result.errors, []);
+});
+
+test('release verification checks at most four candidates and reports remaining unknown titles instead of displaying announced ones', async t => {
+  const unknown = Array.from({ length: 8 }, (_, i) => film({ id: String(i + 1), is_released: undefined, rating: { count: 0, value: 0 } }));
+  const { catalog, calls } = fixture(url => url.pathname.endsWith('/recommend') ? response({ items: [film(), ...unknown], total: 50 }, 200, url.href)
+    : response(film({ id: url.pathname.split('/').at(-1), is_released: false, rating: { count: 0, value: 0 } }), 200, url.href));
+  t.after(() => catalog.stop());
+  const result = await catalog.browse();
+  assert.deepEqual(result.items.map(item => item.id), ['123456']);
+  assert.equal(calls.length, 5);
+  assert.equal(result.hasMore, true);
+  assert.ok(result.errors.some(value => value.includes('未核实上映状态')));
+});
+
+test('the extra release check has one two-second budget and never discards already loaded valid films on timeout', async t => {
+  const signals = [];
+  const { catalog, calls } = fixture((url, options) => {
+    if (url.pathname.endsWith('/recommend')) return response({ items: [film(), ...Array.from({ length: 8 }, (_, i) => film({ id: String(i + 1), is_released: undefined, rating: { count: 0, value: 0 } }))], total: 50 }, 200, url.href);
+    signals.push(options.signal);
+    return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }));
+  });
+  t.after(() => catalog.stop());
+  const started = Date.now(), result = await catalog.browse();
+  assert.ok(Date.now() - started < 5000);
+  assert.deepEqual(result.items.map(item => item.id), ['123456']);
+  assert.ok(signals.length <= 2 && signals.length > 0);
+  assert.ok(signals.every(signal => signal.aborted));
+  assert.ok(calls.length <= 5);
+  assert.ok(result.errors.some(value => value.includes('未核实上映状态')));
+});
+
+test('Chinese canonical aliases and descriptions take precedence while foreign synopsis stays explicitly separate', async t => {
+  const english = 'A lonely sailor returns home and searches for his family.';
+  const { catalog } = fixture(url => response(film({ title: 'Sea Breeze', aka: ['海风来信', '海边来信'], original_title: 'Sea Breeze', intro: english }), 200, url.href));
+  t.after(() => catalog.stop());
+  const item = await catalog.detail('123456');
+  assert.equal(item.title, '海风来信');
+  assert.ok(item.aliases.includes('Sea Breeze'));
+  assert.equal(item.descriptionLanguage, 'unavailable');
+  assert.equal(item.originalDescription, english);
+  assert.match(item.description, /^豆瓣暂无中文剧情简介/);
+  assert.ok(!item.description.includes('lonely sailor'));
+  const chinese = fixture(url => response(film({ intro: '一家人在海边寻找生活的希望。' }), 200, url.href));
+  t.after(() => chinese.catalog.stop());
+  assert.equal((await chinese.catalog.detail('123456')).descriptionLanguage, 'zh');
+  assert.equal((await chinese.catalog.detail('123456')).originalDescription, undefined);
+  const japanese = fixture(url => response(film({ intro: '海辺の町で家族を探している少年は新しい生活を始める。' }), 200, url.href));
+  t.after(() => japanese.catalog.stop());
+  assert.equal((await japanese.catalog.detail('123456')).descriptionLanguage, 'unavailable');
+});
+
+test('old cached premiere-order pages are invalidated without touching account or viewing data', async t => {
+  const store = memoryStore(), old = fixture(undefined, { store });
+  t.after(() => old.catalog.stop());
+  await old.catalog.browse();
+  const saved = JSON.parse(store.values.get(CACHE_KEY)); saved.version = 2;
+  store.values.set(CACHE_KEY, JSON.stringify(saved));
+  store.values.set('quark-settings-v1', 'private-account-marker');
+  store.values.set('history-marker', 'viewing-data-marker');
+  const fresh = fixture(url => response({ items: [film({ id: '2', title: '新目录影片' })], total: 1 }, 200, url.href), { store });
+  t.after(() => fresh.catalog.stop());
+  assert.deepEqual((await fresh.catalog.browse()).items.map(item => item.title), ['新目录影片']);
+  assert.equal(fresh.calls.length, 1);
+  assert.equal(store.values.get('quark-settings-v1'), 'private-account-marker');
+  assert.equal(store.values.get('history-marker'), 'viewing-data-marker');
+});
+
+test('poster lookup stays synchronous and permits only trusted registered image hosts without extra catalog calls', async t => {
+  const { catalog, calls } = fixture(url => response({ items: ['img1', 'img2', 'img3', 'img5', 'img9'].map((host, i) => film({ id: String(i + 1), pic: { large: `https://${host}.doubanio.com/view/photo/public/p1.jpg` } })), total: 5 }, 200, url.href));
+  t.after(() => catalog.stop());
+  assert.equal(catalog.poster('1'), undefined);
+  await catalog.browse();
+  for (let i = 1; i <= 5; i++) assert.match(catalog.poster(String(i)), /^https:\/\/img[12359]\.doubanio\.com\//);
+  assert.equal(catalog.poster('../1'), undefined);
+  assert.equal(catalog.poster('https://attacker.test/'), undefined);
+  assert.equal(calls.length, 1);
+  await catalog.stop();
+  assert.equal(catalog.poster('1'), undefined);
+});
+
+test('a valid normal-size poster survives an invalid large URL and cached page posters survive bounded subject eviction', async t => {
+  const { catalog, calls } = fixture(url => {
+    const start = Number(url.searchParams.get('start'));
+    return response({ items: Array.from({ length: 20 }, (_, index) => film({ id: String(start + index + 1), pic: { large: 'https://attacker.test/wrong.jpg', normal: 'https://img3.doubanio.com/view/photo/public/p1.jpg' } })), total: 400 }, 200, url.href);
+  });
+  t.after(() => catalog.stop());
+  for (let page = 1; page <= 16; page++) await catalog.browse({ page });
+  assert.equal(catalog.poster('1'), 'https://img3.doubanio.com/view/photo/public/p1.jpg');
+  const first = await catalog.browse({ page: 1 });
+  assert.equal(first.items[0].poster, catalog.poster(first.items[0].id));
+  assert.equal(calls.length, 16);
+});
+
+test('cached cards respect a newly verified unreleased detail immediately', async t => {
+  const { catalog } = fixture(url => url.pathname.endsWith('/recommend') ? response({ items: [film()], total: 1 }, 200, url.href) : response(film({ is_released: false }), 200, url.href));
+  t.after(() => catalog.stop());
+  assert.equal((await catalog.browse()).items.length, 1);
+  assert.equal((await catalog.detail('123456')).releaseStatus, 'upcoming');
+  assert.equal((await catalog.browse()).items.length, 0);
 });
 
 test('animation merges movie and television identities, genres and categories without confusing film with series', async t => {
@@ -156,7 +298,7 @@ test('missing, invalid, zero-vote and non-ten-point ratings remain unknown', asy
   const ratings = [{}, { value: 0, count: 0 }, { value: 9.9, count: 0 }, { value: true, count: 2 }, { value: 11 }, { value: -1 }, { value: 5, max: 5 }, { value: '8.1', count: 20, max: 10 }];
   const { catalog } = fixture(url => response({ items: ratings.map((rating, index) => film({ id: String(index + 1), rating })), total: ratings.length }, 200, url.href));
   t.after(() => catalog.stop());
-  assert.deepEqual((await catalog.browse()).items.map(item => item.douban.score), [null, null, null, null, null, null, null, 8.1]);
+  assert.deepEqual((await catalog.browse()).items.sort((a, b) => Number(a.id) - Number(b.id)).map(item => item.douban.score), [null, null, null, null, null, null, null, 8.1]);
 });
 
 test('detail has canonical aliases, true premiere dates, verified scores and all known episodes', async t => {

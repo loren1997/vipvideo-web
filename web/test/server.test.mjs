@@ -174,6 +174,47 @@ test('standalone Quark library uses trusted public metadata without a VOD source
   const unrated = await (await call('/api/ratings?source=quark-library&id=12345', undefined, cookie)).json(); assert.equal(unrated.douban, null); assert.match(unrated.errors.join(''), /暂无评分/);
 });
 
+test('registered cloud posters require login, support private caching and never accept a target URL', async t => {
+  const body = Buffer.from([0xff, 0xd8, 0xff, 0xe0]), calls = [];
+  let resolvePoster, started;
+  const reading = new Promise(resolve => { started = resolve; });
+  const { call, login } = await running(t, { quarkPosters: { get: async id => {
+    calls.push(id);
+    if (id === '54321') { started(); await new Promise(resolve => { resolvePoster = resolve; }); }
+    return { body, type: 'image/jpeg', etag: '"fixture-poster"' };
+  } } });
+  const path = '/api/quark/library/poster?id=12345';
+  assert.equal((await call(path)).status, 401); assert.equal(calls.length, 0);
+  const cookie = await login(), poster = await call(path, undefined, cookie);
+  assert.equal(poster.status, 200); assert.equal(poster.headers.get('content-type'), 'image/jpeg');
+  assert.match(poster.headers.get('cache-control'), /^private/); assert.equal(poster.headers.get('etag'), '"fixture-poster"');
+  assert.deepEqual(Buffer.from(await poster.arrayBuffer()), body);
+  const head = await call(path, undefined, cookie, 'HEAD');
+  assert.equal(head.status, 200); assert.equal(head.headers.get('content-length'), String(body.length)); assert.equal(await head.text(), '');
+  assert.equal((await call(path, undefined, cookie, 'GET', { 'If-None-Match': '"fixture-poster"' })).status, 304);
+  const before = calls.length;
+  assert.equal((await call(path + '&url=http://127.0.0.1/private', undefined, cookie)).status, 400);
+  assert.equal(calls.length, before);
+  const pending = call('/api/quark/library/poster?id=54321', undefined, cookie);
+  await reading; await call('/api/auth/logout', {}, cookie); resolvePoster();
+  assert.equal((await pending).status, 401);
+});
+
+test('leaving a poster request cancels its upstream work without an error response', async t => {
+  let started, cancelled;
+  const reading = new Promise(resolve => { started = resolve; }), stopped = new Promise(resolve => { cancelled = resolve; });
+  const { base, login } = await running(t, { quarkPosters: { get: async (_id, { signal }) => {
+    started();
+    return new Promise((_resolve, reject) => signal.addEventListener('abort', () => { cancelled(); reject(signal.reason); }, { once: true }));
+  } } });
+  const cookie = await login(), controller = new AbortController();
+  const request = fetch(base + '/api/quark/library/poster?id=12345', { headers: { Cookie: cookie }, signal: controller.signal });
+  await reading; controller.abort(); await assert.rejects(request, { name: 'AbortError' });
+  let timer;
+  try { await Promise.race([stopped, new Promise((_resolve, reject) => { timer = setTimeout(() => reject(Error('Poster work did not stop after navigation')), 1000); })]); }
+  finally { clearTimeout(timer); }
+});
+
 test('independent cloud details and searches recheck visibility and login before returning metadata', async t => {
   const film = { ...detail, source: 'quark-library', id: '12345', category: 'adult' };
   const { call, login } = await running(t, { quarkCatalog: { detail: async () => film }, quark: { resources: async () => { throw Error('hidden metadata must not reach public search'); } } });

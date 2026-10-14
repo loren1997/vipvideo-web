@@ -21,6 +21,7 @@ import { createTranscoder } from './lib/transcode.mjs';
 import { createAdMarkers } from './lib/ad-markers.mjs';
 import { createQuark } from './lib/quark.mjs';
 import { createQuarkCatalog } from './lib/quark-catalog.mjs';
+import { createQuarkPosters } from './lib/quark-posters.mjs';
 import { createQuarkSearchPool } from './lib/quark-search-pool.mjs';
 import { createQuarkBrowserSearch } from './lib/quark-browser-client.mjs';
 import { createQuarkMedia } from './lib/quark-media.mjs';
@@ -55,7 +56,7 @@ function tokenFrom(req) {
 
 export function createApp({ password = process.env.APP_PASSWORD, dataDir = process.env.DATA_DIR ?? resolve(root, 'data'),
   catalog = createCatalog(), media = createMedia(), initialConfig = defaults, cookieSecure = process.env.COOKIE_SECURE === 'true',
-  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder, adMarkers, quark, quarkMedia, quarkSearchPool, quarkCatalog } = {}) {
+  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder, adMarkers, quark, quarkMedia, quarkSearchPool, quarkCatalog, quarkPosters } = {}) {
   if (typeof password !== 'string' || password.length < 8 || password.length > 1024) throw new Error('APP_PASSWORD 必须设置，且长度为 8–1024 个字符');
   const initial = validateConfig(initialConfig);
   const store = createStore(dataDir, initial);
@@ -81,6 +82,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store, ...(process.env.QUARK_BROWSER_URL === 'http://quark-browser:3020' ? { renderSearch: createQuarkBrowserSearch() } : {}) });
   const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: searchPool.request, defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
   const cloudCatalog = quarkCatalog ?? createQuarkCatalog({ store });
+  const cloudPosters = quarkPosters ?? createQuarkPosters({ catalog: cloudCatalog });
   const cloudMedia = quarkMedia ?? createQuarkMedia({ quark: quarkService, visible: category => ensureVisible(category) });
   const salt = store.meta('password-salt') ?? randomBytes(16).toString('hex');
   const passwordHash = scryptSync(password, salt, 32);
@@ -199,6 +201,22 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           const detail = await cloudCatalog.detail(text(url.searchParams.get('id'), '豆瓣影片标识', 16));
           requireSession(hashToken(token)); ensureVisible(detail.category);
           return json(res, 200, detail);
+        }
+        if (path === '/api/quark/library/poster' && ['GET', 'HEAD'].includes(method)) {
+          if ([...url.searchParams.keys()].some(key => key !== 'id')) throw badRequest('海报请求只能使用影片标识');
+          const controller = new AbortController(), cancel = () => controller.abort(Object.assign(new Error('海报请求已取消'), { status: 499 }));
+          res.once('close', cancel);
+          try {
+            const poster = await cloudPosters.get(text(url.searchParams.get('id'), '豆瓣影片标识', 16), { signal: controller.signal });
+            requireSession(hashToken(token));
+            res.setHeader('Cache-Control', 'private, max-age=3600');
+            res.setHeader('ETag', poster.etag);
+            if (req.headers['if-none-match'] === poster.etag) { res.writeHead(304); return res.end(); }
+            res.writeHead(200, { 'Content-Type': poster.type, 'Content-Length': poster.body.length });
+            return res.end(method === 'HEAD' ? undefined : poster.body);
+          } catch (error) { if (!res.destroyed || error !== controller.signal.reason) throw error; }
+          finally { res.removeListener('close', cancel); }
+          return;
         }
         if (path === '/api/quark/settings' && method === 'PUT') {
           const result = await quarkService.configure(await readBody(req)); cloudMedia.invalidate();
@@ -526,7 +544,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   server.headersTimeout = 10_000;
   return {
     server, store, maintenance: sourceService, live: liveService, discovery: discoveryService, quark: quarkService, quarkSearch: searchPool, quarkCatalog: cloudCatalog,
-    async close() { cloudMedia.invalidate(); await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.(), transcodeService.close?.(), quarkService.stop?.(), searchPool.stop?.(), cloudCatalog.stop?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
+    async close() { cloudMedia.invalidate(); await Promise.all([sourceService.stop?.(), liveService.stop?.(), discoveryService.stop?.(), transcodeService.close?.(), quarkService.stop?.(), searchPool.stop?.(), cloudCatalog.stop?.(), cloudPosters.stop?.()]); if (server.listening) { const done = new Promise((ok) => server.close(ok)); server.closeIdleConnections(); await done; } store.close(); },
   };
 }
 

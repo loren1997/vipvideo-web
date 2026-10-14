@@ -221,9 +221,9 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
     const delay = row.url === SIDECAR ? Math.min(60_000, 10_000 * 2 ** (row.failures - 1)) : Math.min(HEALTH_INTERVAL, 15 * 60_000 * 2 ** (row.failures - 1));
     row.retryAt = now() + delay; row.error = '接口未通过搜索验证，已暂时避开'; prune(); persist();
   }
-  function apiUrl(base, keyword) {
+  function apiUrl(base, keyword, refresh = false) {
     const url = new URL(base);
-    const params = ['www.pansousuo.com', 'pansousuo.com'].includes(url.hostname) ? { q: keyword, pan: 'quark', sort: 'latest' } : { kw: keyword, cloud_types: 'quark', res: 'results', conc: '1' };
+    const params = ['www.pansousuo.com', 'pansousuo.com'].includes(url.hostname) ? { q: keyword, pan: 'quark', sort: 'latest' } : { kw: keyword, cloud_types: 'quark', res: 'results', conc: '1', ...(refresh ? { refresh: 'true' } : {}) };
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
     return url.href;
   }
@@ -323,7 +323,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
       return track(async () => {
         if (stopping) throw failure('公开搜索已停止', 503, true);
         const input = value instanceof URL ? value.href : value, base = endpoint(input, true), parsed = new URL(input);
-        const webUrl = parsed.hostname === 'www.bing.com' && parsed.pathname === '/search', web = webUrl || _options.webSearch === true;
+        const webUrl = parsed.hostname === 'www.bing.com' && parsed.pathname === '/search', web = _options.webSearch === true;
         const keyword = (parsed.searchParams.get(webUrl ? 'q' : 'kw') || '').replace(/\s+site:pan\.quark\.cn\/s\b/gi, '').trim().slice(0, 1000);
         if (!keyword) throw failure('搜索关键词不能为空', 400);
         const query = queryTerms(keyword, _options.aliases, _options.year), cacheKey = JSON.stringify([base, keyword, query.words, query.year, web]);
@@ -336,7 +336,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           return result([...cached.rows.values()], query, cached.reason, cached.pending);
         }
         currentPrimary = web ? undefined : base;
-        const primary = web ? undefined : add(base, '手动配置', false), deadline = now() + 7500;
+        const primary = add(webUrl ? SIDECAR : base, webUrl ? '内置搜索助手' : '手动配置', false), deadline = now() + 7500;
         if (primary && store.meta(RECALL_KEY) !== '1') {
           store.setMeta(RECALL_KEY, '1');
           if (!primary.automatic && primary.status === 'paused') { primary.status = 'pending'; primary.retryAt = 0; persist(); }
@@ -364,15 +364,15 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           entry.rows = new Map(ranked(entry.rows.values(), query).slice(0, 30).map(row => [new URL(row.url).pathname, row]));
         };
         try {
-          const backups = state.candidates.filter(row => row.automatic && row.url !== base && row.status === 'healthy' && row.retryAt <= now()).sort((a, b) => b.checkedAt - a.checkedAt);
-          const selected = web ? [] : [...(primary && primary.retryAt <= now() ? [primary] : []), ...backups].slice(0, 2);
+          const backups = state.candidates.filter(row => row.automatic && row.url !== primary.url && row.status === 'healthy' && row.retryAt <= now()).sort((a, b) => b.checkedAt - a.checkedAt);
+          const selected = [...(primary.retryAt <= now() ? [primary] : []), ...backups].slice(0, 2);
           const attempts = selected.map(row => track(async () => {
             let answered = false;
             for (const [index, word] of query.words.entries()) {
               if (stopping || index && deadline - 1800 - now() < 250) break;
               const budget = Math.min(5500, deadline - 1800 - now());
               try {
-                const links = compatible(await text(apiUrl(row.url, word), 5500, request, 2 * 1024 * 1024, deadline - 1800), now());
+                const links = compatible(await text(apiUrl(row.url, word, forceRefresh), 5500, request, 2 * 1024 * 1024, deadline - 1800), now());
                 if (links === undefined) throw failure('搜索接口响应格式不兼容'); answered = true; checked(row, links);
                 merge(links); const matched = links.filter(link => relevance(link, query)); if (matched.length) return matched;
               } catch (cause) {
@@ -390,7 +390,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
             for (const attempt of attempts) attempt.then(links => { if (links.length) resolve(links); else if (!--remaining) resolve([]); }, () => { if (!--remaining) resolve([]); });
           });
           if (stopping) throw failure('公开搜索已停止', 503, true);
-          if (first.length) {
+          if (first.length && !web) {
             let timer;
             try { await Promise.race([Promise.allSettled(attempts), new Promise(done => { timer = setTimeout(done, Math.max(1, Math.min(150, deadline - now()))); })]); }
             finally { clearTimeout(timer); }

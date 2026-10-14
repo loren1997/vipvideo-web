@@ -124,6 +124,29 @@ test('worker accepts page two and sends bounded later-page offsets to each publi
   assert.ok(urls.length <= 6);
 });
 
+test('only a pure Google JavaScript shell gets one bounded safe render when other channels have no candidates', async () => {
+  const renders = [], reads = [];
+  const started = Date.now();
+  const search = createQuarkRenderedSearch({ read: async url => {
+    reads.push(url);
+    return { url, html: url.includes('google') ? '<title>Google Search</title><a href="/httpservice/retry/enablejs">Please enable JavaScript to use Google Search.</a>' : url.includes('bing') ? '<rss><channel></channel></rss>' : article('rendered1', '2026-10-01') };
+  }, render: async (url, { deadline }) => { renders.push({ url, deadline }); return { url, html: serp }; } });
+  const rows = await search(query);
+  assert.equal(rows.length, 1); assert.equal(renders.length, 1);
+  assert.ok(renders[0].url.includes('google.com/search')); assert.ok(renders[0].deadline <= started + 8100);
+  assert.equal(reads.filter(url => url.includes('google')).length, 1);
+});
+
+test('Google verification never starts a browser and a rendered verification stops without retrying', async () => {
+  for (const shell of [false, true]) {
+    let renders = 0;
+    const search = createQuarkRenderedSearch({ read: async url => ({ url, html: url.includes('google') ? shell ? 'Please enable JavaScript to use Google Search.' : '<title>安全验证</title>' : '<rss><channel></channel></rss>' }),
+      render: async () => { renders++; throw Object.assign(new Error('verification'), { quarkPoolReason: 'browserBlocked' }); } });
+    const rows = await search(query);
+    assert.equal(rows.length, 0); assert.equal(renders, shell ? 1 : 0); assert.match(rows.reason, /验证/);
+  }
+});
+
 test('worker decodes Chinese titles split across HTTP chunks and aborts its entire search at the supplied budget', async t => {
   let title;
   const app = createBrowserWorker({ browser: { render: async () => { throw new Error('not needed'); }, close: async () => {} }, read: async (url, { signal }) => {
