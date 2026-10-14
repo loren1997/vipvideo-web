@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { createApp } from '../server.mjs';
 import { createStore } from '../lib/store.mjs';
 import { createQuarkMedia } from '../lib/quark-media.mjs';
+import { createQuark } from '../lib/quark.mjs';
 import { Readable } from 'node:stream';
 
 const empty = { showAdult: false, sources: [], platforms: [], parsers: [], subscriptions: [], liveSources: [] };
@@ -97,13 +98,21 @@ test('Quark resource searches use the maintained pool and expose its status only
     stop: async () => {},
   };
   const source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
-  const { app, call, login } = await running(t, { initialConfig: { ...empty, sources: [source] }, quarkSearchPool });
+  const metadata = new Map(), quarkReads = [], cloudData = await mkdtemp(join(tmpdir(), 'vipvideo-quark-server-'));
+  t.after(() => rm(cloudData, { recursive: true, force: true }));
+  const quark = createQuark({ store: { meta: key => metadata.get(key), setMeta: (key, value) => metadata.set(key, value) }, dataDir: cloudData, searchRequest: quarkSearchPool.request, request: async value => {
+    const url = new URL(value); assert.equal(url.origin, 'https://drive.quark.cn'); quarkReads.push(url.pathname);
+    const data = url.pathname.endsWith('/token') ? { stoken: 'fixture-token' } : { list: [{ fid: 'video', file_name: '测试影片.2025.mp4', size: 1024, file: true }] };
+    return Object.assign(Readable.from([JSON.stringify({ code: 0, status: 200, data })]), { statusCode: 200, headers: {} });
+  } });
+  const { app, call, login } = await running(t, { initialConfig: { ...empty, sources: [source] }, quarkSearchPool, quark });
   assert.equal(app.quarkSearch, quarkSearchPool);
   assert.equal((await call('/api/quark/settings')).status, 401);
   const cookie = await login();
   assert.deepEqual((await (await call('/api/quark/settings', undefined, cookie)).json()).searchPool, poolStatus);
   const resources = await call('/api/quark/resources?source=demo&id=1', undefined, cookie);
-  assert.equal(resources.status, 200); assert.equal((await resources.json()).resources.length, 1);
+  assert.equal(resources.status, 200); const body = await resources.json(); assert.equal(body.resources.length, 1); assert.equal(body.resourceSnapshot, true);
+  assert.deepEqual(quarkReads, ['/1/clouddrive/share/sharepage/token', '/1/clouddrive/share/sharepage/detail']);
   assert.equal(searches, 1);
 });
 

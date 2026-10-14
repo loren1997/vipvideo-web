@@ -3,6 +3,7 @@ import { mkdir, open, readFile, chmod, lstat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { request as networkRequest, readText, validateUrl } from './network.mjs';
 import { classifyQuarkCandidate } from './quark-google-search.mjs';
+import { createQuarkShareValidator } from './quark-share-validation.mjs';
 
 const API = 'https://drive.quark.cn/1/clouddrive', REFERER = 'https://pan.quark.cn/';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -163,27 +164,36 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (active >= 2) { if (waiters.length >= 64) throw failure('夸克请求繁忙，请稍后重试', 429); await new Promise(resolve => waiters.push(resolve)); } else active++;
     try { return await operation(); } finally { const next = waiters.shift(); if (next) next(); else active--; }
   }
-  async function api(path, { method = 'GET', body, query = {}, credentials = '', guard, beforeSend, userAgent = UA } = {}) {
+  async function api(path, { method = 'GET', body, query = {}, credentials = '', guard, beforeSend, userAgent = UA, signal, timeout: budget = 8000 } = {}) {
+    signal?.throwIfAborted();
     return limited(async () => {
       if (stopped) throw failure('夸克服务正在关闭', 503);
+      signal?.throwIfAborted();
       guard?.();
       beforeSend?.();
       const target = new URL(API + path); target.search = new URLSearchParams({ pr: 'ucpro', fr: 'pc', ...query }).toString();
-      let response, timeout, expired = false;
+      let response, timeout, onAbort, expired = false;
+      const timeoutMs = Math.max(1, Math.min(8000, budget));
       try {
         const task = (async () => {
-          response = await request(target.href, { method, body: body === undefined ? undefined : JSON.stringify(body), followRedirects: false, timeout: 8000, headers: { accept: 'application/json', 'content-type': 'application/json', referer: REFERER, 'user-agent': userAgent, ...(credentials ? { cookie: credentials } : {}) } });
+          response = await request(target.href, { method, body: body === undefined ? undefined : JSON.stringify(body), followRedirects: false, timeout: timeoutMs, signal, headers: { accept: 'application/json', 'content-type': 'application/json', referer: REFERER, 'user-agent': userAgent, ...(credentials ? { cookie: credentials } : {}) } });
           response.on('error', () => {});
           if (expired) { response.destroy(); throw failure('夸克接口请求超过8秒', 504); }
           if (response.finalUrl && new URL(response.finalUrl).origin !== new URL(API).origin) throw failure('夸克接口返回了非官方目标，已停止请求');
           if (response.statusCode !== 200) throw responseFailure(response.statusCode);
           const json = JSON.parse(await readText(response, 1024 * 1024));
+          signal?.throwIfAborted(); guard?.();
           if (json.code !== 0 || Number(json.status || 200) >= 400) throw responseFailure(Number(json.status || 200), json.code, response.statusCode);
           return json;
         })();
-        return await Promise.race([task, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('夸克接口请求超过8秒', 504)); }, 8000); })]);
+        return await Promise.race([task, new Promise((_, reject) => {
+          onAbort = () => { expired = true; response?.destroy(); reject(failure('夸克分享检查已取消或超时', 504)); };
+          signal?.addEventListener('abort', onAbort, { once: true });
+          if (signal?.aborted) { onAbort(); return; }
+          timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('夸克接口请求超时（最多8秒）', 504)); }, timeoutMs);
+        })]);
       } catch (cause) { if (cause.quarkSafe) throw cause; throw failure('夸克接口连接失败，请稍后重试'); }
-      finally { expired = true; clearTimeout(timeout); response?.destroy(); }
+      finally { expired = true; clearTimeout(timeout); if (onAbort) signal?.removeEventListener('abort', onAbort); response?.destroy(); }
     });
     function responseFailure(status, code, httpStatus = status) {
       const cause = status === 401 ? accountFailure(credentials ? '夸克登录验证未通过，请在设置中更新网页登录 Cookie' : '此夸克分享需要登录，请在设置中连接并启用夸克账号')
@@ -211,6 +221,12 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (context.valid) { try { if (context.valid() !== true) throw failure('影片观看授权已失效，已取消夸克操作', 409); } catch (cause) { throw failure('影片观看授权已失效，已取消夸克操作', [401, 403, 409].includes(cause.status) ? cause.status : 409); } }
   };
   const auth = (context, path, options = {}) => { current(context); return api(path, { ...options, credentials: context.cookie, guard: () => current(context) }); };
+  const shareValidator = createQuarkShareValidator({ now, isVideo: video, isDirectory: directory, read: async (path, options) => {
+    const generation = epoch;
+    const context = config.enabled && config.account ? await snapshot() : undefined;
+    if (context) return auth(context, path, options);
+    return api(path, { ...options, guard: () => { if (generation !== epoch) throw failure('夸克账号已变更，分享检查已取消', 409); } });
+  } });
   const publicAsset = (asset, reused = false) => ({ assetId: asset.id, name: asset.name, category: asset.category || '', status: asset.status === 'ready' ? 'ready' : 'pending', saved: asset.status === 'ready', reused, ...(asset.status === 'ready' ? {} : { reason: asset.task ? '转存任务仍在处理，请稍后重试' : '上次转存响应不确定，为避免重复转存请稍后检查专用目录' }) });
   const findAsset = (assetId, context) => { const asset = registry.assets.find(value => value.id === assetId && value.account === context.account && value.managed === true); if (!asset) throw failure('未找到已登记的夸克视频', 404); if (asset.parent !== registry.folders[context.account]?.fid) throw failure('视频不在当前专用目录，已停止操作', 409); return asset; };
   function searchUrl(value) {
@@ -238,18 +254,18 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (Object.hasOwn(input, 'searchApi')) { if (typeof input.searchApi !== 'string' || input.searchApi.length > 2048) throw failure('公开搜索地址无效', 400); next.searchApi = input.searchApi ? searchUrl(input.searchApi) : ''; }
     if (Object.hasOwn(input, 'cookie')) {
       const value = cookieInput(input.cookie), generation = ++epoch;
-      candidates.clear();
+      candidates.clear(); shareValidator.clear();
       const account = await verify(value);
       if (generation !== epoch) throw failure('账号配置已被更新，本次验证已取消', 409);
       next.account = { id: account, ...await encrypt(value) };
       if (generation !== epoch) throw failure('账号配置已被更新，本次验证已取消', 409);
       cookie = value; loaded = true;
     }
-    Object.assign(config, next); searches.clear(); lastError = ''; persist(); schedule(); return settings();
+    Object.assign(config, next); searches.clear(); shareValidator.clear(); lastError = ''; persist(); schedule(); return settings();
   }
   async function clearAccount() {
     epoch++; cookie = ''; loaded = true; delete config.account; config.enabled = false; config.autoSave = false; config.cleanupEnabled = false;
-    candidates.clear();
+    candidates.clear(); searches.clear(); shareValidator.clear();
     persist(); schedule(); return settings();
   }
   function addShare(info, link, label) {
@@ -265,7 +281,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     return { id: row.id, name: row.name, url: row.url, ...(row.publishedAt === undefined ? {} : { publishedAt: row.publishedAt }) };
   }
   async function lookupResources(detail, options = {}) {
-    const info = detailInfo(detail, options), rows = new Map(), unverified = new Map();
+    const info = detailInfo(detail, options), rows = new Map(), unverified = new Map(), generation = epoch;
     const provided = detail.quarkShares || detail.meta?.quarkShares || [];
     for (const link of (Array.isArray(provided) ? provided : [provided]).slice(0, 20)) {
       const label = name(link?.work_title || link?.name || link?.title);
@@ -286,7 +302,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         const target = configured ? new URL(searchUrl(configured)) : new URL('https://www.bing.com/search');
         if (configured) { target.searchParams.set('kw', info.searchTitle); target.searchParams.set('cloud_types', 'quark'); target.searchParams.set('res', 'results'); target.searchParams.set('conc', '2'); }
         else { target.searchParams.set('q', info.searchTitle + ' site:pan.quark.cn/s'); target.searchParams.set('format', 'rss'); }
-        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, year: info.year, aliases: info.aliases, webSearch: options.webSearch === true, ...(options.poll === true ? { poll: true } : {}), headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
+        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, year: info.year, aliases: info.aliases, webSearch: options.webSearch === true, forceRefresh: options.webSearch === true && options.poll !== true, ...(options.poll === true ? { poll: true } : {}), headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
         const body = await Promise.race([fetch, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('公开夸克搜索超时', 504)); }, 8000); })]);
         let visited = 0;
         const collect = (link, forceUnverified = false) => {
@@ -314,7 +330,23 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       } catch (cause) { reason = publicReason(cause); }
       finally { expired = true; clearTimeout(timeout); response?.destroy(); }
     }
-    return { resources: [...rows.values()].sort((a, b) => (b.publishedAt ?? -1) - (a.publishedAt ?? -1)), ...(unverified.size ? { unverified: [...unverified.values()] } : {}), ...(reason ? { reason } : {}), ...(pending ? { pending: true, retryAfterMs } : {}) };
+    const force = options.webSearch === true && options.poll !== true;
+    const checked = [...rows.values()].map(row => ({ row, entry: shareValidator.inspect(shares.get(row.id), { force }) }));
+    const unknown = [...unverified.values()].map(row => ({ row, entry: shareValidator.inspect(share(row.url), { force }) }));
+    const checking = [...checked, ...unknown].filter(value => value.entry.pending);
+    if (checking.length) {
+      let wait;
+      try { await Promise.race([Promise.allSettled(checking.map(value => value.entry.promise)), new Promise(resolve => { wait = setTimeout(resolve, 150); })]); }
+      finally { clearTimeout(wait); }
+    }
+    const validationPending = [...checked, ...unknown].some(value => value.entry.pending);
+    const valid = checked.filter(value => value.entry.status === 'valid').map(value => value.row);
+    const validUnknown = unknown.filter(value => value.entry.status === 'valid').map(value => value.row);
+    const hidden = [...checked, ...unknown].filter(value => !value.entry.pending && value.entry.status !== 'valid').length;
+    if (stopped || generation !== epoch) throw failure('夸克账号已变更或服务正在关闭，分享检查已取消', 409);
+    if (hidden) reason = [reason, `已隐藏 ${hidden} 条当前无法读取或不含视频的分享`].filter(Boolean).join('；');
+    if (validationPending) reason = [reason, '正在检查分享是否可访问并包含视频'].filter(Boolean).join('；');
+    return { resources: valid.sort((a, b) => (b.publishedAt ?? -1) - (a.publishedAt ?? -1)), resourceSnapshot: true, ...(validUnknown.length ? { unverified: validUnknown } : {}), ...(reason ? { reason } : {}), ...(validationPending ? { validationPending: true } : {}), ...(pending || validationPending ? { pending: true, retryAfterMs: retryAfterMs || 1500 } : {}) };
   }
   async function resources(detail, options = {}) {
     const key = detailInfo(detail, options).key + ':' + (config.searchApi || defaultSearchApi) + ':' + (options.webSearch === true ? 'web' : 'normal') + (options.poll === true ? ':poll' : '');
@@ -324,6 +356,11 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     return structuredClone(await job);
   }
   async function files(detail, options = {}) {
+    const generation = epoch;
+    try { return await listShareFiles(detail, options); }
+    catch (cause) { const resource = shares.get(options.shareId); if (!stopped && generation === epoch && cause.status !== 409 && resource && resource.detail === detailInfo(detail, options).key) shareValidator.invalidate(resource); throw cause; }
+  }
+  async function listShareFiles(detail, options = {}) {
     const info = detailInfo(detail, options), resource = shares.get(options.shareId);
     if (!resource || resource.detail !== info.key || resource.expires <= now()) throw failure('分享资源已过期，请重新搜索', 404);
     const generation = epoch, context = config.enabled && config.account ? await snapshot() : undefined;
@@ -605,7 +642,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   const stop = () => {
     if (stopPromise) return stopPromise;
     stopped = true; started = false; clearTimeout(timer); timer = undefined; epoch++;
-    stopPromise = (async () => { await Promise.allSettled([...jobs]); await tail; })();
+    stopPromise = (async () => { await shareValidator.stop(); await Promise.allSettled([...jobs]); await tail; })();
     return stopPromise;
   };
   return { settings: track(settings), configure: track(configure), clearAccount: track(clearAccount), resources: track(resources), files: track(files), prepare: track(prepare), playback: track(playback), progress: track(progress), repairFolder: track(repairFolder), cleanup: track(cleanup), start, stop };

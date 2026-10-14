@@ -285,12 +285,12 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
     }, delay);
     timer.unref?.();
   }
-  function render(entry, query, merge, report) {
+  function render(entry, query, merge, report, forceRefresh = false) {
     if (stopping || typeof renderSearch !== 'function') return;
     const key = JSON.stringify([query.title, query.aliases, query.year]);
     for (const [key, work] of rendered) if (!work.pending && work.expires <= now()) rendered.delete(key);
     let work = rendered.get(key);
-    if (work && !work.pending && !work.useful) { rendered.delete(key); work = undefined; }
+    if (work && !work.pending && (forceRefresh || !work.useful)) { rendered.delete(key); work = undefined; }
     if (!work) {
       if (rendered.size >= 32) for (const [key, item] of rendered) if (!item.pending) { rendered.delete(key); break; }
       if (rendered.size >= 32) { report('公开网页搜索繁忙，请稍后重试'); return; }
@@ -329,7 +329,8 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
         const query = queryTerms(keyword, _options.aliases, _options.year), cacheKey = JSON.stringify([base, keyword, query.words, query.year, web]);
         const cached = recent.get(cacheKey);
         if (_options.poll === true) return cached && cached.expires > now() ? result([...cached.rows.values()], query, cached.reason, cached.pending || !!cached.fast) : result([], query, '公开搜索检查已结束，请重试搜索');
-        if (cached && cached.expires > now() && (cached.fast || cached.pending || cached.rows.size)) {
+        const forceRefresh = _options.forceRefresh === true;
+        if (cached && cached.expires > now() && (cached.fast || cached.pending || !forceRefresh && cached.rows.size)) {
           if (cached.fast) await cached.fast;
           if (stopping) throw failure('公开搜索已停止', 503, true);
           return result([...cached.rows.values()], query, cached.reason, cached.pending);
@@ -342,7 +343,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
         }
         if (primary?.url === SIDECAR && primary.status === 'paused' && primary.retryAt > now() + 60_000) { primary.status = 'pending'; primary.retryAt = 0; persist(); }
         for (const [key, entry] of recent) if (entry.expires <= now()) recent.delete(key);
-        const entry = { rows: new Map(), expires: now() + 2 * 60_000 };
+        const entry = { rows: new Map(forceRefresh && cached?.expires > now() ? cached.rows : []), expires: now() + 2 * 60_000 };
         let finish;
         entry.fast = new Promise(resolve => { finish = resolve; });
         const notes = new Set(), report = message => { notes.add(message); entry.reason = [...notes].join('；'); };
@@ -403,7 +404,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
             if (page.status === 'fulfilled') { merge(page.value); if (page.value.reason) report(name + page.value.reason); }
             else report(name + safeFailure(page.reason).quarkPoolReason);
           }
-          if (web || ![...entry.rows.values()].some(row => relevance(row, query))) render(entry, query, merge, report);
+          if (web || ![...entry.rows.values()].some(row => relevance(row, query))) render(entry, query, merge, report, forceRefresh);
           return result([...entry.rows.values()], query, entry.reason, entry.pending);
         } finally { delete entry.fast; finish(); }
       });

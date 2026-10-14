@@ -39,7 +39,11 @@ export function createQuarkBrowser({ safeRequest = request, executablePath = pro
             '--js-flags=--max-old-space-size=128',
           ] });
           try { browser = await launching; }
-          catch (cause) { throw failure('动态网页浏览器无法启动', 'browserUnavailable', 503, cause); }
+          catch (cause) {
+            controller.signal.throwIfAborted();
+            if (cause?.name === 'TimeoutError' || Date.now() >= end) throw failure('动态网页读取超时', 'browserTimeout', 502, cause);
+            throw failure('动态网页浏览器无法启动', 'browserUnavailable', 503, cause);
+          }
           controller.signal.throwIfAborted();
           const platform = process.platform === 'win32' ? 'Windows NT 10.0; Win64; x64' : 'X11; Linux x86_64';
           const context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: false, permissions: [], viewport: { width: 1280, height: 900 }, locale: 'zh-CN', userAgent: `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version()} Safari/537.36` });

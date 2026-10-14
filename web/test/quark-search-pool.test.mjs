@@ -1018,13 +1018,13 @@ test('pending render work shares normal/web queries and polls only snapshots wit
     renderSearch: (value, settings) => { renders++; input = value; options = settings; return new Promise(done => { release = done; }); } });
   const read = settings => f.pool.request(url, settings).then(readText).then(JSON.parse);
   try {
-    const missing = await read({ ...query, poll: true }); assert.deepEqual(missing.results, []); assert.equal(missing.pending, undefined); assert.equal(f.calls.length, 0); assert.equal(renders, 0);
+    const missing = await read({ ...query, poll: true, forceRefresh: true }); assert.deepEqual(missing.results, []); assert.equal(missing.pending, undefined); assert.equal(f.calls.length, 0); assert.equal(renders, 0);
     const first = await read(query); assert.equal(first.pending, true); assert.equal(first.retryAfterMs, 1500); assert.deepEqual(first.results, []);
     assert.deepEqual(input, { title: '电影', aliases: ['Movie'], year: '2026' }); assert.equal(options.signal.aborted, false); assert.ok(options.deadline >= at + 45000);
     const calls = f.calls.length, staticCalls = googleCalls;
     assert.equal((await read({ ...query, poll: true })).pending, true); assert.equal((await read(query)).pending, true);
     assert.equal(f.calls.length, calls); assert.equal(googleCalls, staticCalls); assert.equal(renders, 1);
-    assert.equal((await read({ ...query, webSearch: true })).pending, true); assert.equal(renders, 1, 'normal and explicit web requests share one render');
+    assert.equal((await read({ ...query, webSearch: true, forceRefresh: true })).pending, true); assert.equal(renders, 1, 'normal and explicit fresh web requests share one active render');
     release([{ name: '电影 2026 4K', url: quarkUrl, publishedAt: at }, { name: '完全不同作品', url: 'https://pan.quark.cn/s/other123456' }, { name: '未提供资源标题', url: 'https://pan.quark.cn/s/unknown123456' }]);
     await flush(); const completedCalls = f.calls.length;
     for (const webSearch of [false, true]) {
@@ -1033,6 +1033,54 @@ test('pending render work shares normal/web queries and polls only snapshots wit
     }
     assert.equal(f.calls.length, completedCalls); assert.equal(renders, 1);
     await read(query); assert.equal(f.calls.length, completedCalls, 'successful render rows remain cached');
+  } finally { release?.([]); await f.pool.stop(); }
+});
+
+test('an explicit fresh web search bypasses completed result and render caches while preserving valid old rows', async t => {
+  for (const initialWeb of [false, true]) await t.test(initialWeb ? 'refresh a previous web search' : 'refresh a previous normal render', async () => {
+    const releases = [];
+    let renders = 0, googleCalls = 0;
+    const f = fixture({ request: value => response(value.includes('bing.com') ? emptyRss : '{"results":[]}'),
+      googleSearch: async () => { googleCalls++; return []; },
+      renderSearch: () => { renders++; return new Promise(resolve => releases.push(resolve)); } });
+    const url = 'https://manual.example/api/search?kw=电影', read = options => f.pool.request(url, options).then(readText).then(JSON.parse);
+    try {
+      assert.equal((await read({ webSearch: initialWeb })).pending, true);
+      releases[0]([{ name: '电影', url: quarkUrl }]); await flush();
+      assert.equal((await read({ webSearch: initialWeb })).results.length, 1);
+      assert.equal(renders, 1); assert.equal(googleCalls, 1);
+      const previousRows = initialWeb ? [quarkUrl] : [];
+      const refreshed = await read({ webSearch: true, forceRefresh: true });
+      assert.equal(refreshed.pending, true); assert.deepEqual(refreshed.results.map(row => row.url), previousRows);
+      assert.equal(renders, 2); assert.equal(googleCalls, 2);
+      const calls = f.calls.length;
+      assert.equal((await read({ webSearch: true, forceRefresh: true })).pending, true);
+      assert.equal((await read({ webSearch: true, poll: true, forceRefresh: true })).pending, true);
+      assert.equal(renders, 2); assert.equal(googleCalls, 2); assert.equal(f.calls.length, calls);
+      releases[1]([{ name: '电影', url: 'https://pan.quark.cn/s/fresh123456' }, { name: '其他作品', url: 'https://pan.quark.cn/s/unrelated123' }]); await flush();
+      const complete = await read({ webSearch: true, poll: true, forceRefresh: true });
+      assert.equal(complete.pending, undefined);
+      assert.deepEqual(complete.results.map(row => row.url), [...previousRows, 'https://pan.quark.cn/s/fresh123456']);
+      assert.equal(renders, 2); assert.equal(googleCalls, 2); assert.equal(f.calls.length, calls);
+    } finally { for (const release of releases) release([]); await f.pool.stop(); }
+  });
+});
+
+test('simultaneous fresh web requests share the in-flight fast search and do not turn forced polls into searches', async () => {
+  let release, googleCalls = 0, renders = 0;
+  const f = fixture({ request: value => response(value.includes('bing.com') ? emptyRss : '{"results":[]}'),
+    googleSearch: () => { googleCalls++; return new Promise(resolve => { release = resolve; }); },
+    renderSearch: async () => { renders++; return []; } });
+  const url = 'https://manual.example/api/search?kw=电影', settings = { webSearch: true, forceRefresh: true };
+  const read = options => f.pool.request(url, options).then(readText).then(JSON.parse);
+  try {
+    const first = read(settings); await flush();
+    const second = read(settings); await flush();
+    const calls = f.calls.length;
+    assert.equal((await read({ ...settings, poll: true })).pending, true);
+    assert.equal(googleCalls, 1); assert.equal(f.calls.length, calls);
+    release([]); await Promise.all([first, second]); await flush();
+    assert.equal(googleCalls, 1); assert.equal(renders, 1);
   } finally { release?.([]); await f.pool.stop(); }
 });
 

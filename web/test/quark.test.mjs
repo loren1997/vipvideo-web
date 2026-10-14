@@ -495,7 +495,7 @@ test('connected share requests use the stored Cookie only at the fixed official 
   state.beforeRequest = call => call.path.startsWith('/share/') && call.options.headers.cookie !== COOKIE ? reply({}, { http: 403 }) : undefined;
   const listing = await select(); assert.equal(listing.files.files.length, 1);
   const shared = state.calls.filter(call => call.path.startsWith('/share/'));
-  assert.deepEqual(shared.map(call => call.path), ['/share/sharepage/token', '/share/sharepage/detail']);
+  assert.deepEqual(shared.map(call => call.path), ['/share/sharepage/token', '/share/sharepage/detail', '/share/sharepage/token', '/share/sharepage/detail']);
   for (const call of shared) {
     assert.equal(call.options.headers.cookie, COOKIE); assert.equal(call.options.followRedirects, false);
     const target = new URL(call.value); assert.equal(target.origin, 'https://drive.quark.cn');
@@ -510,12 +510,13 @@ test('connected share requests use the stored Cookie only at the fixed official 
 
 test('share failures distinguish authentication, denied access and throttling without leaking upstream messages or retrying', async t => {
   const { service, state, metadata, connect, select } = await fixture(t); await connect();
+  const selected = await select();
   const savedConfig = metadata.get('quark-settings-v1');
   assert.ok(savedConfig);
   for (const channel of ['http', 'json']) for (const status of [401, 403, 429]) {
     const before = state.calls.length;
     state.beforeRequest = call => call.path === '/share/sharepage/token' ? reply({ message: COOKIE }, channel === 'http' ? { http: status } : { code: 1, status }) : undefined;
-    await assert.rejects(select(), error => {
+    await assert.rejects(service.files(detail, { shareId: selected.shareId }), error => {
       assert.equal(error.status, status); assert.equal(error.quarkAuth === true, status === 401);
       assert.ok(!error.message.includes(COOKIE));
       if (status !== 401) assert.match(error.message, new RegExp(String(status)));
@@ -532,13 +533,14 @@ test('share failures distinguish authentication, denied access and throttling wi
 test('share reads cancel after account changes, shutdown or revoked authorization without continuing the old listing', async t => {
   for (const stage of ['token', 'detail']) for (const action of ['disconnect', 'disable', 'switch', 'stop']) await t.test(`${stage}-${action}`, async t => {
     const { service, state, connect, select } = await fixture(t); await connect();
+    const selected = await select(); state.calls.length = 0;
     let release, entered; const reached = new Promise(resolve => { entered = resolve; });
     state.beforeRequest = async call => {
       if (call.path !== `/share/sharepage/${stage}`) return;
       entered(); await new Promise(resolve => { release = resolve; });
       return stage === 'token' ? reply({ stoken: 'synthetic-old-token' }) : reply({ list: [sourceVideo()] });
     };
-    const rejected = assert.rejects(select(), error => error.status === 409);
+    const rejected = assert.rejects(service.files(detail, { shareId: selected.shareId }), error => error.status === 409);
     await reached;
     let stopping;
     try {
@@ -576,7 +578,7 @@ test('partially failed listings still evict old share candidates at the cache li
       if (page === 5) return reply({}, { http: 403 });
       return Object.assign(Readable.from([JSON.stringify({ code: 0, status: 200, data: { list: Array.from({ length: 100 }, (_, i) => sourceVideo(`batch-${batch}-page-${page}-${i}`)) }, metadata: { _total: 600 } })]), { statusCode: 200, headers: {} });
     };
-    await assert.rejects(select(), error => error.status === 403);
+    await assert.rejects(service.files(detail, { shareId: oldest.shareId }), error => error.status === 403);
   }
   state.beforeRequest = null;
   assert.equal((await service.prepare(detail, oldest)).status, 'error');
@@ -902,7 +904,8 @@ test('web and normal callers subscribe to their pool snapshots while sharing one
   assert.equal(normal.resources.length, 1); assert.deepEqual(normal.resources, web.resources);
   assert.equal(normal.resources[0].publishedAt, state.clock);
   assert.equal(requests, beforePoll, 'polls read completed snapshots without making new public requests');
-  assert.equal(renders, 1); assert.equal(state.saved, 0); assert.equal(state.calls.length, 0);
+  assert.equal(renders, 1); assert.equal(state.saved, 0);
+  assert.deepEqual(state.calls.map(call => call.path), ['/share/sharepage/token', '/share/sharepage/detail'], 'only the new candidate is checked at the official read-only endpoints');
 });
 
 test('pending cache expires at its bounded retry interval and never remains pending for a minute', async t => {
@@ -1014,8 +1017,88 @@ test('an explicit web search bypasses the ordinary resource cache and preserves 
   state.searchBody = JSON.stringify({ results: [{ url: 'https://pan.quark.cn/s/bbbbbb', name: '影片 公开网页资源', publishedAt: state.clock }] });
   const result = await service.resources(film, { webSearch: true });
   assert.equal(state.searchCalls.length, 2); assert.equal(state.searchCalls[1].options.webSearch, true);
+  assert.equal(state.searchCalls[1].options.forceRefresh, true);
   assert.deepEqual(result.resources.map(row => row.name), ['影片 公开网页资源', '影片 API 资源']);
   assert.deepEqual(await service.resources(film), result); assert.equal(state.searchCalls.length, 2);
+});
+
+test('only accessible shares containing a video appear, including untitled public links', async t => {
+  const { service, state, connect } = await fixture(t); await connect();
+  const film = { ...detail, quarkShares: [] };
+  state.searchBody = JSON.stringify({ results: [
+    { title: '影片 2026 可用', url: 'https://pan.quark.cn/s/available123' },
+    { title: '影片 2026 已取消', url: 'https://pan.quark.cn/s/canceled123' },
+    { title: '影片 2026 图片', url: 'https://pan.quark.cn/s/images123' },
+    { url: 'https://pan.quark.cn/s/unknownbad123' },
+  ] });
+  state.beforeRequest = call => {
+    if (!call.path.startsWith('/share/sharepage/')) return;
+    assert.equal(call.options.headers.cookie, COOKIE, 'account credentials go only to the fixed official share API');
+    const pwdId = call.body?.pwd_id || new URL(call.value).searchParams.get('pwd_id');
+    if (pwdId === 'canceled123' || pwdId === 'unknownbad123') return reply(null, { code: 41001, status: 404 });
+    if (pwdId === 'images123' && call.path.endsWith('/detail')) return reply({ list: [{ fid: 'poster', file_name: '海报.jpg', file: true, size: 1024 }] });
+  };
+  const result = await service.resources(film);
+  assert.equal(result.resourceSnapshot, true); assert.equal(result.pending, undefined);
+  assert.deepEqual(result.resources.map(row => new URL(row.url).pathname), ['/s/available123']);
+  assert.equal(result.unverified, undefined); assert.match(result.reason, /已隐藏 3 条/);
+  assert.equal(state.calls.some(call => ['/file', '/share/sharepage/save', '/file/delete', '/file/recycle/remove'].includes(call.path)), false);
+  assert.deepEqual(await service.resources(film), result, 'hidden entries stay out of cached snapshots');
+});
+
+test('slow share verification returns a pending snapshot and polling reveals it without another search or probe', async t => {
+  const { service, state } = await fixture(t);
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  state.beforeRequest = async call => { if (call.path === '/share/sharepage/token') await gate; };
+  const initial = await service.resources(detail);
+  assert.deepEqual(initial.resources, []); assert.equal(initial.validationPending, true); assert.equal(initial.resourceSnapshot, true);
+  assert.equal(state.calls.filter(call => call.path.endsWith('/token')).length, 1);
+  release(); await turn();
+  const complete = await service.resources(detail, { poll: true });
+  assert.equal(complete.resources.length, 1); assert.equal(complete.pending, undefined);
+  assert.equal(state.calls.filter(call => call.path.endsWith('/token')).length, 1);
+  assert.equal(state.saved, 0);
+});
+
+test('a share canceled after its first verified search is removed by more and does not lose other shares', async t => {
+  const { service, state } = await fixture(t);
+  const film = { ...detail, quarkShares: [] };
+  state.searchBody = JSON.stringify({ results: [{ title: '影片 2026 原分享', url: 'https://pan.quark.cn/s/original123' }] });
+  const first = await service.resources(film); assert.equal(first.resources.length, 1);
+  state.searchBody = JSON.stringify({ results: [{ title: '影片 2026 新分享', url: 'https://pan.quark.cn/s/newshare123' }] });
+  state.beforeRequest = call => call.path.endsWith('/token') && call.body.pwd_id === 'original123' ? reply(null, { status: 404, code: 41001 }) : undefined;
+  const more = await service.resources(film, { webSearch: true });
+  assert.deepEqual(more.resources.map(row => new URL(row.url).pathname), ['/s/newshare123']);
+  assert.equal(more.resourceSnapshot, true); assert.equal(state.searchCalls.at(-1).options.forceRefresh, true);
+  assert.deepEqual((await service.resources(film)).resources, more.resources);
+});
+
+test('a failed fresh file listing invalidates a previously verified share only temporarily', async t => {
+  const { service, state } = await fixture(t);
+  const first = await service.resources(detail), selected = first.resources[0]; assert.ok(selected);
+  state.beforeRequest = call => call.path.endsWith('/token') ? reply(null, { status: 403, code: 403 }) : undefined;
+  await assert.rejects(service.files(detail, { shareId: selected.id }), /拒绝访问/);
+  assert.equal((await service.resources(detail)).resources.length, 0);
+  state.beforeRequest = null; state.clock += 30001;
+  assert.equal((await service.resources(detail)).resources[0].id, selected.id, 'temporary errors never permanently delete a resource');
+});
+
+test('a late old-account listing failure cannot invalidate a new account share snapshot', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect();
+  const selected = await select();
+  let release, entered; const reached = new Promise(resolve => { entered = resolve; });
+  state.beforeRequest = async call => {
+    if (call.path.endsWith('/token') && call.account === 'A') { entered(); await new Promise(resolve => { release = resolve; }); }
+  };
+  const oldRead = assert.rejects(service.files(detail, { shareId: selected.shareId }), cause => cause.status === 409);
+  await reached;
+  try {
+    await connect({ cookie: COOKIE_B });
+    assert.equal((await service.resources(detail)).resources.length, 1);
+  } finally { release(); }
+  await oldRead;
+  assert.equal((await service.resources(detail)).resources.length, 1, 'old-epoch errors must not poison the current validator');
 });
 
 test('ambiguity, unknown years, mismatched seasons or episodes and incomplete selection prevent automatic saves', async t => {
@@ -1038,7 +1121,8 @@ test('manually chosen opaque video is bound to its detail/share and saves exactl
 test('share traversal stays within three directory levels and six requests and ignores nonvideo/folder leaves', async t => {
   const { service, state, select } = await fixture(t); state.source = [{ fid: 'folder', file_name: 'folder.mp4', file: false }, { fid: 'pdf', file_name: '影片.2026.pdf', file: true }, sourceVideo()];
   state.beforeRequest = call => call.path === '/share/sharepage/detail' ? reply({ list: [{ fid: 'next-' + state.calls.filter(value => value.path === call.path).length, file_name: 'deeper', file: false }, sourceVideo()] }) : null;
-  const selected = await select(); assert.equal(selected.files.truncated, true); assert.ok(selected.files.files.every(file => /\.mp4$/.test(file.name))); assert.ok(state.calls.filter(call => call.path.startsWith('/share/sharepage')).length <= 6);
+  const resource = (await service.resources(detail)).resources[0]; state.calls.length = 0;
+  const listing = await service.files(detail, { shareId: resource.id }); assert.equal(listing.truncated, true); assert.ok(listing.files.every(file => /\.mp4$/.test(file.name))); assert.ok(state.calls.filter(call => call.path.startsWith('/share/sharepage')).length <= 6);
 });
 
 test('singleflight and durable pending tasks deduplicate saves and daily quota accounting', async t => {

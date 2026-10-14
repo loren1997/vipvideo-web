@@ -292,7 +292,7 @@ try {
           return route.fulfill({ json: { assetId, name: quarkAssets.get(assetId).name, status: quarkMode === 'pending-forever' || quarkMode === 'pending' && ++quarkPendingChecks === 1 ? 'pending' : 'ready', saved: !seen } });
         }
         if (parsed.pathname === '/api/quark/playback') { if (holdQuarkPlayback) await new Promise(ok => { releaseQuarkPlayback = ok; }); if (quarkMode === 'playback-error') return route.fulfill({ status: 502, json: { error: '固定夸克播放链接错误' } }); assert.ok(quarkAssets.has(body.assetId)); const type = quarkMode === 'requires' ? 'mkv' : ['webm', 'avi', 'mpegts'].includes(quarkMode) ? quarkMode : 'hls'; return route.fulfill({ json: { assetId: body.assetId, name: quarkAssets.get(body.assetId).name, url: `/api/quark/media/${body.assetId}/index.${type === 'hls' ? 'm3u8' : type}`, type, size: 10485760, version: 'official-fixture-h264-v1', requiresCompatibility: ['requires', 'avi', 'mpegts'].includes(quarkMode), duration: 30 } }); }
-        if (parsed.pathname === '/api/quark/progress') { assert.ok(quarkAssets.has(body.assetId), `未知测试资产 ${body.assetId} / ${[...quarkAssets.keys()].join(',')}`); assert.ok(Number.isFinite(body.position) && Number.isFinite(body.duration) && typeof body.ended === 'boolean'); quarkProgress.push(body); return route.fulfill({ json: { ok: true } }); }
+        if (parsed.pathname === '/api/quark/progress') { assert.ok(quarkAssets.has(body.assetId), `未知测试资产 ${body.assetId} / ${[...quarkAssets.keys()].join(',')}`); assert.ok(Number.isFinite(body.position) && Number.isFinite(body.duration) && typeof body.ended === 'boolean'); assert.ok(body.position >= 0 && body.duration > 0 && body.duration <= 86400 && body.position <= body.duration + 2, '观看进度遵守服务端时长及范围校验'); quarkProgress.push(body); return route.fulfill({ json: { ok: true } }); }
         if (parsed.pathname.startsWith('/api/quark/media/')) return route.fulfill({ contentType: 'audio/wav', body: media, headers: { 'Accept-Ranges': 'bytes' } });
       }
       if (parsed.origin === base && parsed.pathname === '/api/playability/report') {
@@ -662,7 +662,7 @@ try {
       assert.equal(await shares.evaluate(element => element === window.__pendingShare), true); assert.equal(await files.evaluate(element => element === window.__pendingFile), true);
       assert.equal(count('/api/quark/files'), fileReads, '已有选中分享和文件不重复读取');
       quarkResourceReply = { resources: [], pending: false }; await p.clock.fastForward(1500);
-      await p.locator('#quark-resources').getByText(/公开资源查找完成/).waitFor(); assert.equal(await shares.locator('option').count(), 2);
+      await p.locator('#quark-resources').getByText(/找到新增1条可用分享/).waitFor(); assert.equal(await shares.locator('option').count(), 2);
       assert.equal(count('/api/quark/prepare'), prepares);
 
       for (const selection of ['file', 'share']) {
@@ -698,12 +698,38 @@ try {
       await p.clock.fastForward(5000); await p.locator('#quark-resources').getByText(/已暂停自动检查/).waitFor();
       const stopped = count('/api/quark/resources'); await p.clock.fastForward(60000); assert.equal(count('/api/quark/resources'), stopped, '持续pending也只检查60秒');
       assert.equal(count('/api/quark/prepare'), prepares);
-      quarkMode = 'webm'; p = await open(pending()); quarkResourceReply = { resources: [old], pending: false };
+      quarkSettings.autoSave = false;
+      p = await open({ ...pending(), validationPending: true, retryAfterMs: 5000 }); const validating = count('/api/quark/resources');
+      for (let index = 1; index <= 12; index++) { await p.clock.fastForward(5000); await until(() => count('/api/quark/resources') === validating + index, '验证进行中继续跨过60秒'); await until(() => p.getByRole('button', { name: '查找更多公开资源', exact: true }).isEnabled(), '验证快照返回'); }
+      quarkResourceReply = { resourceSnapshot: true, resources: [old], pending: false, validationPending: false }; await p.clock.fastForward(5000);
+      await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' }); assert.equal(count('/api/quark/resources'), validating + 13, '65秒完成的视频验证结果仍可出现');
+      await p.clock.fastForward(60000); assert.equal(count('/api/quark/resources'), validating + 13, '验证完成立即停止轮询');
+      p = await open({ ...pending(), validationPending: true, retryAfterMs: 5000 }); const validationLimit = count('/api/quark/resources');
+      for (let index = 1; index <= 19; index++) { await p.clock.fastForward(5000); await until(() => count('/api/quark/resources') === validationLimit + index, '验证进行中100秒内继续复查'); await until(() => p.getByRole('button', { name: '查找更多公开资源', exact: true }).isEnabled(), '验证本轮返回'); }
+      await p.clock.fastForward(5000); await p.locator('#quark-resources').getByText(/已暂停自动检查/).waitFor(); await p.clock.fastForward(60000);
+      assert.equal(count('/api/quark/resources'), validationLimit + 19, '持续视频验证也只检查100秒'); assert.equal(count('/api/quark/prepare'), prepares);
+      quarkSettings.autoSave = true; quarkMode = 'webm'; p = await open(pending()); quarkResourceReply = { resources: [old], pending: false };
       await p.clock.fastForward(1500); await until(() => count('/api/quark/prepare') === prepares + 1, '初次后台首次找到匹配资源尊重自动准备偏好');
       await p.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
       const autoReads = count('/api/quark/resources'); await p.clock.fastForward(10000);
       assert.equal(count('/api/quark/prepare'), prepares + 1, '后台首次命中仅自动准备一次'); assert.equal(count('/api/quark/resources'), autoReads, '自动准备后取消搜索轮询');
-      console.log('PASS 夸克异步搜索pending间隔/60秒有界、只读poll、结果日期合并保留选择和DOM、初次后台命中自动准备一次/手动搜索不自动转存、换集/线路/源/退出/选择/重试取消迟到响应');
+      const keptShares = p.getByLabel('夸克分享资源', { exact: true }), keptFiles = p.getByLabel('夸克视频文件', { exact: true }), transfer = p.getByRole('button', { name: '转存所选单集', exact: true });
+      const currentFile = await keptFiles.inputValue(), mediaSource = await p.locator('video').evaluate(video => video.currentSrc), keptFileReads = count('/api/quark/files');
+      await keptFiles.evaluate(element => { window.__validatedFile = element; });
+      quarkResourceReply = { ...pending(), resourceSnapshot: true, resources: [old], unverified: [{ name: '待核验分享', url: 'https://pan.quark.cn/s/unknown123' }] };
+      await p.getByRole('button', { name: '查找更多公开资源', exact: true }).click(); await p.locator('#quark-resources').getByText(/正在继续查找公开资源/).waitFor();
+      assert.equal(await keptShares.inputValue(), old.id); assert.equal(await keptFiles.inputValue(), currentFile); assert.equal(await keptFiles.evaluate(element => element === window.__validatedFile), true);
+      quarkResourceReply = { resourceSnapshot: true, resources: [fresh], unverified: [], pending: false, reason: '旧分享已取消，已移除' }; await p.clock.fastForward(1500);
+      await p.locator('#quark-resources').getByText(/旧分享已取消.*找到新增1条可用分享/).waitFor();
+      assert.equal(await keptShares.locator(`option[value="${old.id}"]`).count(), 0, '权威校验移除已取消分享'); assert.equal(await keptShares.inputValue(), '');
+      assert.equal(await keptFiles.isDisabled(), true); assert.equal(await keptFiles.inputValue(), ''); assert.equal(await keptFiles.locator('option').textContent(), '所选分享已不可用，请选择其他分享'); assert.equal(await transfer.isDisabled(), true, '失效分享文件不能与新分享组合转存');
+      assert.equal(await p.locator('.quark-unverified').isVisible(), false, '权威快照移除旧待确认链接');
+      await p.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor(); assert.equal(await p.locator('video').evaluate(video => video.currentSrc), mediaSource, '分享取消不影响已转存资产播放');
+      assert.equal(count('/api/quark/prepare'), prepares + 1); assert.equal(count('/api/quark/files'), keptFileReads);
+      await p.getByRole('button', { name: '查找更多公开资源', exact: true }).click(); await p.locator('#quark-resources').getByText(/本轮未发现新增可用资源/).waitFor();
+      assert.equal(await keptShares.inputValue(), ''); assert.equal(await transfer.isDisabled(), true); assert.equal(count('/api/quark/prepare'), prepares + 1, '后续刷新不自动选择或转存替代分享');
+      await keptShares.selectOption(fresh.id); await until(() => transfer.isEnabled(), '用户选择新分享后重新读取有效文件'); assert.equal(count('/api/quark/files'), keptFileReads + 1); assert.equal(count('/api/quark/prepare'), prepares + 1);
+      console.log('PASS 夸克异步搜索60秒有界/视频验证跨60秒命中且最多100秒、只读poll、日期合并保留选择DOM、初次后台命中仅准备一次、手动搜索不自动转存、操作取消迟到响应；权威校验移除失效分享/旧链接，清旧文件但保留已转存播放并要求手选新分享');
     } finally { holdQuarkResources = false; releaseQuarkResources?.(); releaseQuarkResources = null; quarkResourceReply = null; quarkMode = previousMode; Object.assign(quarkSettings, before); await isolated?.value.close(); }
   }
 
@@ -795,6 +821,9 @@ try {
 
       p = await open('pending'); await decoded(p, 'quark-first-1'); await p.getByRole('button', { name: '刷新准备状态', exact: true }).waitFor();
       await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 7; }); const initial = count('/api/quark/prepare');
+      const fileReads = count('/api/quark/files'), searches = count('/api/quark/resources'); await p.getByRole('button', { name: '查找更多公开资源', exact: true }).click();
+      await until(() => count('/api/quark/resources') === searches + 1, '已有准备结果后更多搜索真实发送请求'); await until(() => p.getByRole('button', { name: '查找更多公开资源', exact: true }).isEnabled(), '更多搜索首轮完成');
+      assert.equal(count('/api/quark/prepare'), initial); assert.equal(count('/api/quark/files'), fileReads, '更多搜索保留已选文件且不重新准备'); await p.getByRole('button', { name: '刷新准备状态', exact: true }).waitFor();
       await p.evaluate(() => { const original = HTMLMediaElement.prototype.play; window.restoreCloudPlay = () => { HTMLMediaElement.prototype.play = original; }; HTMLMediaElement.prototype.play = function () { return this.src.includes('/api/quark/') ? Promise.reject(new DOMException('fixture', 'NotAllowedError')) : original.call(this); }; });
       await p.clock.fastForward(4999); assert.equal(count('/api/quark/prepare'), initial, '等待5秒再检查，不密集轮询');
       await p.clock.fastForward(1); await decoded(p, '/api/quark/media/share-fixture-file-1'); await p.locator('.player-note').getByText(/浏览器需要你点击/).waitFor();
@@ -989,6 +1018,49 @@ try {
     } finally { liveProgress = previous; await isolated?.value.close(); }
   }
 
+  async function verifyQuarkProgressReadiness() {
+    const before = app.store.config(), savedQuark = structuredClone(quarkSettings), previousMode = quarkMode, previousTranscode = transcodeMode, previousDuration = transcodeDuration, previousPreferences = preferences.get(quarkFilm.key), previousHistory = app.store.get('history', quarkFilm.key);
+    let isolated;
+    app.store.setConfig({ ...before, sources: ['first', 'second'].map(id => ({ id, name: id, api: `https://api.example.com/${id}`, enabled: true })) }); app.store.remove('history', quarkFilm.key);
+    Object.assign(quarkSettings, { enabled: true, configured: true, autoSave: false, account: { connected: true, label: '测试账号' } });
+    preferences.set(quarkFilm.key, { introSeconds: 0, outroSeconds: 0, autoNext: false, speed: 1, danmakuEnabled: false });
+    quarkMode = 'requires'; transcodeMode = 'enabled'; transcodeDuration = null; holdTranscode = true;
+    try {
+      isolated = await context({ width: 1440, height: 1000 }); const p = isolated.page; await p.clock.install();
+      await p.evaluate(() => {
+        window.Hls = class ProgressFixtureHls {
+          static Events = { ERROR: 'error', MANIFEST_PARSED: 'manifest' }; static isSupported() { return true; }
+          loadSource(url) { this.url = url; } attachMedia(video) { video.src = this.url.replace('.m3u8', '.mp4'); }
+          on(name, callback) { if (name === 'manifest') queueMicrotask(() => callback(name, { levels: [] })); } startLoad() {} destroy() {}
+        };
+        location.hash = '#detail?source=first&id=quark';
+      });
+      const video = p.locator('video'), panel = p.locator('#quark-resources'), transfer = panel.getByRole('button', { name: '转存所选单集', exact: true });
+      await until(() => video.evaluate(video => video.readyState >= 2 && video.currentSrc.includes('quark-first-1')).catch(() => false), '原线路媒体已实际加载');
+      await video.evaluate(video => { video.pause(); video.currentTime = 5; }); await until(() => video.evaluate(video => video.currentTime === 5), '原线路准确5秒');
+      await until(() => transfer.isEnabled(), '已选当前集文件'); const progress = quarkProgress.length; await transfer.click();
+      await until(() => typeof releaseTranscode === 'function', '夸克兼容任务启动在途');
+      assert.equal(transcodeStarts.at(-1).position, 5); assert.equal(quarkProgress.length, progress, '尚未metadata/playing不发送duration0占位进度');
+      assert.equal(await panel.getByRole('button', { name: '正在夸克播放', exact: true }).count(), 0);
+      holdTranscode = false; releaseTranscode(); releaseTranscode = null;
+      const playing = () => video.evaluate(video => video.readyState >= 2 && !video.paused && video.currentSrc.includes('/api/transcode/')).catch(() => false);
+      await until(playing, '未知总时长的媒体也能真实播放'); await panel.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
+      await p.clock.fastForward(10000); await video.evaluate(video => { video.pause(); video.currentTime = 2; video.dispatchEvent(new Event('pause')); });
+      await p.locator('.player-clock').getByText(/总时长未知/).waitFor(); assert.equal(quarkProgress.length, progress, '原总时长未知时不以HLS局部片长伪造进度');
+      transcodeDuration = 1200; await p.locator('.player-toolbar').getByRole('button', { name: '重新兼容播放', exact: true }).click();
+      await until(playing, '有原总时长的任务真实播放'); const offset = transcodeStarts.at(-1).position; assert.equal(offset, 7, '重新兼容沿用5秒原偏移和2秒本地进度');
+      await panel.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
+      await video.evaluate(video => { video.pause(); video.currentTime = 2; video.dispatchEvent(new Event('pause')); });
+      await until(() => quarkProgress.slice(progress).some(body => body.position === offset + 2 && body.duration === 1200 && body.ended === false), '真实播放后只加一次原偏移并上报原总时长');
+      assert.equal(quarkProgress.slice(progress).some(body => body.duration === 0), false); assert.doesNotMatch(await p.locator('#toast').textContent(), /夸克观看状态未同步|观看进度无效/);
+      console.log('PASS 夸克真实playing前不报占位进度、未知原总时长继续播放但不伪造HLS总时长、已知原时长按本地进度加一次原偏移保存');
+    } finally {
+      holdTranscode = false; releaseTranscode?.(); releaseTranscode = null; await isolated?.value.close(); app.store.setConfig(before); Object.assign(quarkSettings, savedQuark); quarkMode = previousMode; transcodeMode = previousTranscode; transcodeDuration = previousDuration;
+      if (previousPreferences === undefined) preferences.delete(quarkFilm.key); else preferences.set(quarkFilm.key, previousPreferences);
+      if (previousHistory) app.store.save('history', previousHistory); else app.store.remove('history', quarkFilm.key);
+    }
+  }
+
   async function verifyQuarkStartupFailure() {
     const before = app.store.config(), savedQuark = structuredClone(quarkSettings), previousMode = quarkMode, previousTranscode = transcodeMode, previousDuration = transcodeDuration, previousPreferences = preferences.get(quarkFilm.key), errorCount = errors.length;
     let isolated;
@@ -1062,7 +1134,7 @@ try {
       quarkMode = 'unverified';
       await panel.getByRole('button', { name: '查找更多公开资源', exact: true }).click();
       const unknown = panel.locator('.quark-unverified'); await unknown.waitFor(); assert.equal(await unknown.evaluate(element => element.open), false);
-      await panel.getByText(/固定搜索服务连接失败；找到2条待确认链接/).waitFor(); await unknown.locator('summary').click();
+      await panel.getByText(/固定搜索服务连接失败.*找到2条待确认链接/).waitFor(); await panel.getByText(/本轮未发现新增可用资源/).waitFor(); await unknown.locator('summary').click();
       assert.equal(await unknown.locator('a').count(), 2); assert.equal(await unknown.getByRole('link', { name: '未标注片名的分享', exact: true }).getAttribute('href'), 'https://pan.quark.cn/s/unknown123?pwd=A1b2');
       assert.equal(await unknown.locator('img').count(), 0); assert.match(await unknown.locator('a').first().getAttribute('rel'), /noopener/);
       assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').length, prepares, '待确认外链只供人工打开，不转存');
@@ -1159,7 +1231,12 @@ try {
     } finally { await isolated?.value.close(); app.store.setConfig(before); Object.assign(quarkSettings, savedQuark); channels.splice(channels.indexOf(tvChannel), 1); }
   }
 
-  if (process.argv.includes('--quark-startup-only')) await verifyQuarkStartupFailure();
+  if (process.argv.includes('--quark-progress-only')) await verifyQuarkProgressReadiness();
+  else if (process.argv.includes('--quark-search-only')) {
+    app.store.setConfig({ ...app.store.config(), sources: ['first', 'second'].map((id, index) => ({ id, name: ['第一源', '第二源'][index], api: `https://api.example.com/${id}`, enabled: true })) });
+    for (const verify of [verifyQuarkPublicSearch, verifyQuarkPendingSearch, verifyQuarkAutoplay]) { app.store.remove('history', quarkFilm.key); await verify(); }
+  }
+  else if (process.argv.includes('--quark-startup-only')) await verifyQuarkStartupFailure();
   else if (process.argv.includes('--tv-only')) await verifyTvRemote();
   else {
   const { page } = await context({ width: 1440, height: 1000 });
@@ -2107,6 +2184,7 @@ try {
   await verifyQuarantineStatus();
   await verifyQuarkAutoplay();
   await verifyQuarkFlow();
+  await verifyQuarkProgressReadiness();
   await verifyQuarkPublicSearch();
   await verifyQuarkSearchRetry();
   await verifyQuarkPendingSearch();

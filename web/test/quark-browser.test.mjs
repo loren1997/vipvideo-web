@@ -61,6 +61,14 @@ test('rejects malicious entry URLs and an already cancelled job before launching
   await renderer.close();
 });
 
+test('browser launch timeouts remain distinct from missing or broken browser installations', async t => {
+  for (const [name, expected] of [['TimeoutError', 'browserTimeout'], ['Error', 'browserUnavailable']]) {
+    const renderer = createQuarkBrowser({ executablePath: 'synthetic-browser', launch: async () => { throw Object.assign(new Error('synthetic launch failure'), { name }); } });
+    try { await assert.rejects(renderer.render('https://public.example/'), { quarkPoolReason: expected }); }
+    finally { await renderer.close(); }
+  }
+});
+
 test('headless Chromium renders through the validated transport', { skip: executablePath ? false : 'No local Chromium; set CHROMIUM_PATH to run rendering and SSRF fixtures.' }, async t => {
   await t.test('keeps dynamic visible article structure while blocking private frames/fetch/redirect/WS and credentials', async () => {
     let directConnections = 0;
