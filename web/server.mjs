@@ -21,6 +21,7 @@ import { createTranscoder } from './lib/transcode.mjs';
 import { createAdMarkers } from './lib/ad-markers.mjs';
 import { createQuark } from './lib/quark.mjs';
 import { createQuarkSearchPool } from './lib/quark-search-pool.mjs';
+import { createQuarkBrowserSearch } from './lib/quark-browser-client.mjs';
 import { createQuarkMedia } from './lib/quark-media.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -76,7 +77,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const ratingService = ratings ?? createRatings({ store });
   const danmakuService = danmaku ?? createDanmaku({ store });
   const transcodeService = transcoder ?? createTranscoder({ media, logger });
-  const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store });
+  const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store, ...(process.env.QUARK_BROWSER_URL === 'http://quark-browser:3020' ? { renderSearch: createQuarkBrowserSearch() } : {}) });
   const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: searchPool.request, defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
   const cloudMedia = quarkMedia ?? createQuarkMedia({ quark: quarkService, visible: category => ensureVisible(category) });
   const salt = store.meta('password-salt') ?? randomBytes(16).toString('hex');
@@ -201,9 +202,10 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         if (['/api/quark/resources', '/api/quark/files'].includes(path) && method === 'GET') {
           const input = Object.fromEntries(url.searchParams), selected = await cloudSelection(input, hashToken(token));
           if (input.web !== undefined && input.web !== '1') throw badRequest('公开网页搜索选项无效');
+          if (input.poll !== undefined && input.poll !== '1') throw badRequest('搜索状态查询选项无效');
           const result = path.endsWith('/files')
             ? await quarkService.files(selected.detail, { ...selected.options, valid: selected.valid, shareId: text(input.shareId, '夸克分享标识', 200) })
-            : await quarkService.resources(selected.detail, { ...selected.options, ...(input.web === '1' ? { webSearch: true } : {}) });
+            : await quarkService.resources(selected.detail, { ...selected.options, ...(input.web === '1' ? { webSearch: true } : {}), ...(input.poll === '1' ? { poll: true } : {}) });
           selected.valid(); return json(res, 200, result);
         }
         if (path === '/api/quark/prepare' && method === 'POST') {

@@ -272,20 +272,21 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       if (label && classifyQuarkCandidate(label, { title: info.searchTitle, aliases: info.aliases, year: info.year }) === 'unrelated') continue;
       const row = addShare(info, link, label); if (row) rows.set(row.id, row);
     }
-    let reason;
+    let reason, pending = false, retryAfterMs;
     const cached = searches.get(info.key);
     if (cached && cached.expires > now()) reason = cached.reason;
+    if (cached && cached.expires > now() && cached.pending === true) { pending = true; retryAfterMs = cached.retryAfterMs; }
     if (cached && cached.expires > now()) for (const row of cached.rows) { const existing = shares.get(row.id); if (existing) { const fresh = addShare(info, existing, existing.name); rows.set(fresh.id, fresh); } }
     if (cached && cached.expires > now()) for (const row of cached.unverified || []) unverified.set(new URL(row.url).pathname, row);
-    if (!cached || cached.expires <= now() || options.webSearch === true) {
-      reason = undefined;
+    if (!cached || cached.expires <= now() || cached.pending === true || options.webSearch === true || options.poll === true) {
+      reason = undefined; pending = false;
       let response, timeout, expired = false;
       try {
         const configured = config.searchApi || defaultSearchApi;
         const target = configured ? new URL(searchUrl(configured)) : new URL('https://www.bing.com/search');
         if (configured) { target.searchParams.set('kw', info.searchTitle); target.searchParams.set('cloud_types', 'quark'); target.searchParams.set('res', 'results'); target.searchParams.set('conc', '2'); }
         else { target.searchParams.set('q', info.searchTitle + ' site:pan.quark.cn/s'); target.searchParams.set('format', 'rss'); }
-        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, year: info.year, aliases: info.aliases, webSearch: options.webSearch === true, headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
+        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, year: info.year, aliases: info.aliases, webSearch: options.webSearch === true, ...(options.poll === true ? { poll: true } : {}), headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
         const body = await Promise.race([fetch, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('公开夸克搜索超时', 504)); }, 8000); })]);
         let visited = 0;
         const collect = (link, forceUnverified = false) => {
@@ -306,17 +307,17 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
             for (const [field, item] of Object.entries(value).slice(0, 30)) if (['links', 'results', 'unverified', 'data', 'merged_by_type', 'quark', 'list'].includes(field)) visit(item, field === 'unverified' ? '' : title, depth + 1, forceUnverified || field === 'unverified');
           }
         };
-        try { const result = JSON.parse(body); visit(result); if (typeof result?.reason === 'string') reason = name(result.reason); } catch { visit(body); }
-        if (rows.size || unverified.size || !reason) searches.set(info.key, { rows: [...rows.values()], unverified: [...unverified.values()], ...(reason ? { reason } : {}), expires: now() + 60000 });
+        try { const result = JSON.parse(body); visit(result); if (typeof result?.reason === 'string') reason = name(result.reason); if (result?.pending === true) { pending = true; retryAfterMs = Number.isFinite(result.retryAfterMs) ? Math.min(5000, Math.max(500, result.retryAfterMs)) : 1500; } } catch { visit(body); }
+        if (pending || rows.size || unverified.size || !reason) searches.set(info.key, { rows: [...rows.values()], unverified: [...unverified.values()], ...(reason ? { reason } : {}), ...(pending ? { pending: true, retryAfterMs } : {}), expires: now() + (pending ? retryAfterMs : 60000) });
         else searches.delete(info.key);
         while (searches.size > 64) searches.delete(searches.keys().next().value);
       } catch (cause) { reason = publicReason(cause); }
       finally { expired = true; clearTimeout(timeout); response?.destroy(); }
     }
-    return { resources: [...rows.values()].sort((a, b) => (b.publishedAt ?? -1) - (a.publishedAt ?? -1)), ...(unverified.size ? { unverified: [...unverified.values()] } : {}), ...(reason ? { reason } : {}) };
+    return { resources: [...rows.values()].sort((a, b) => (b.publishedAt ?? -1) - (a.publishedAt ?? -1)), ...(unverified.size ? { unverified: [...unverified.values()] } : {}), ...(reason ? { reason } : {}), ...(pending ? { pending: true, retryAfterMs } : {}) };
   }
   async function resources(detail, options = {}) {
-    const key = detailInfo(detail, options).key + ':' + (config.searchApi || defaultSearchApi) + ':' + (options.webSearch === true ? 'web' : 'normal');
+    const key = detailInfo(detail, options).key + ':' + (config.searchApi || defaultSearchApi) + ':' + (options.webSearch === true ? 'web' : 'normal') + (options.poll === true ? ':poll' : '');
     if (searchFlights.has(key)) return structuredClone(await searchFlights.get(key));
     if (searchFlights.size >= 64) return { resources: [], reason: '公开夸克搜索繁忙，请稍后重试' };
     const job = lookupResources(detail, options).finally(() => searchFlights.delete(key)); searchFlights.set(key, job);

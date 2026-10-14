@@ -13,7 +13,7 @@ RUN set -eu; \
       sed -i 's/Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources; \
     fi; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates ffmpeg; \
+    apt-get install -y --no-install-recommends ca-certificates ffmpeg chromium; \
     if [ "$(dpkg --print-architecture)" = amd64 ]; then \
       apt-get install -y --no-install-recommends intel-media-va-driver-non-free; \
     fi; \

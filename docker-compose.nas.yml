@@ -2,6 +2,9 @@
 # 仅需修改 APP_PASSWORD 和 group_add 的核显组号，不需要 .env。
 name: vipvideo-web
 
+x-browser-image: &browser-image
+  image: "${CI_IMAGE:-ghcr.io/loren1997/vipvideo-web:latest}"
+
 services:
   web:
     image: ghcr.io/loren1997/vipvideo-web:latest
@@ -22,6 +25,7 @@ services:
       FFMPEG_PATH: ffmpeg
       LIBVA_DRIVER_NAME: iHD
       QUARK_SEARCH_API: http://pansou:8888/api/search
+      QUARK_BROWSER_URL: http://quark-browser:3020
     devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -42,6 +46,26 @@ services:
       weight: 100
     tmpfs:
       - /tmp:size=128m,mode=1777
+
+  quark-browser:
+    <<: *browser-image
+    command: ["node", "browser-worker.mjs"]
+    restart: unless-stopped
+    init: true
+    environment:
+      PORT: "3020"
+      HOME: /tmp
+    read_only: true
+    tmpfs:
+      - /tmp:size=192m,mode=1777
+      - /app/data:size=16m,uid=1000,gid=1000,mode=0700
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    cpu_shares: 128
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 256
 
   pansou:
     image: ghcr.io/fish2018/pansou@sha256:d371fe5caa87794414dd54cda063fcfc456d5013e18b65dbf1f6ca17f6299492

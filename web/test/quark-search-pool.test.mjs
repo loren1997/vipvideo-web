@@ -14,11 +14,12 @@ const json = (url = quarkUrl, title = '电影') => JSON.stringify({ code: 0, dat
 const response = (body, statusCode = 200) => Object.assign(Readable.from([body]), { statusCode, headers: {} });
 const rss = (url, title = '电影') => `<rss><channel><item><title>${title}</title><link>${url || 'https://example.org'}</link></item></channel></rss>`;
 const flush = async () => { for (let index = 0; index < 5; index++) await new Promise(done => setImmediate(done)); };
-function fixture({ request, discoveryRequest, googleSearch = async () => { throw new Error('Fixture Google search unavailable'); }, saved, now = Date.now } = {}) {
+function fixture({ request, discoveryRequest, webRequest, renderSearch, googleSearch = async () => { throw new Error('Fixture Google search unavailable'); }, saved, now = Date.now } = {}) {
   const metadata = new Map(saved ? [[KEY, JSON.stringify(saved)]] : []), calls = [], discoveryCalls = [];
   const store = { meta: key => metadata.get(key), setMeta: (key, value) => metadata.set(key, value) };
-  const pool = createQuarkSearchPool({ store, now, googleSearch,
-    request: async (url, options) => { calls.push({ url, options }); return request ? request(url, options) : response(json(undefined, new URL(url).searchParams.get('kw') || '电影')); },
+  const transport = async (url, options) => { calls.push({ url, options }); return request ? request(url, options) : response(json(undefined, new URL(url).searchParams.get('kw') || '电影')); };
+  const pool = createQuarkSearchPool({ store, now, googleSearch, renderSearch, webRequest: webRequest || transport,
+    request: transport,
     discoveryRequest: async (url, options) => {
       discoveryCalls.push({ url, options });
       if (discoveryRequest) return discoveryRequest(url, options);
@@ -488,12 +489,12 @@ test('the retry cache stays bounded to 32 queries and is never persisted', async
   } finally { await f.pool.stop(); }
 });
 
-test('concurrent requests for one film both receive their results while the cache remains replaceable', async () => {
+test('concurrent requests for one film share one API request and both receive their cached results', async () => {
   const f = fixture({ request: async () => { await new Promise(done => setImmediate(done)); return response(json()); } });
   try {
     const results = await Promise.all([lookup(f.pool), lookup(f.pool)]);
     assert.deepEqual(results.map(result => result.results.length), [1, 1]);
-    assert.equal((await lookup(f.pool)).results.length, 1); assert.equal(f.calls.length, 2);
+    assert.equal((await lookup(f.pool)).results.length, 1); assert.equal(f.calls.length, 1);
   } finally { await f.pool.stop(); }
 });
 
@@ -563,7 +564,7 @@ test('explicit web lookup skips APIs, shares two network slots and merges Google
 
 test('successful API results avoid web scraping and preserve parent dates in newest-first stable order', async () => {
   const recent = Date.parse('2026-10-13T12:00:00Z');
-  const f = fixture({ googleSearch: () => assert.fail('working APIs do not need Google'), request: () => response(JSON.stringify({ results: [
+  const f = fixture({ googleSearch: () => assert.fail('working APIs do not need Google'), renderSearch: () => assert.fail('matching APIs do not need browser work'), request: () => response(JSON.stringify({ results: [
     { title: '电影', links: [{ type: 'quark', url: quarkUrl }] },
     { title: '电影 HD', datetime: '2025-01-01T00:00:00Z', links: [{ type: 'quark', url: 'https://pan.quark.cn/s/old12345678' }] },
     { title: '电影 4K', datetime: '2026-10-13T12:00:00Z', links: [{ type: 'quark', url: 'https://pan.quark.cn/s/latest123456' }] },
@@ -1007,3 +1008,91 @@ test('a short persisted helper pause survives restart while old public pauses re
 });
 
 const DAY = 86_400_000;
+const emptyRss = '<rss><channel></channel></rss>';
+
+test('pending render work shares normal/web queries and polls only snapshots without repeating any transport', async () => {
+  let release, renders = 0, input, options, googleCalls = 0;
+  const at = Date.now(), url = 'https://manual.example/api/search?kw=电影', query = { year: '2026', aliases: ['Movie'] };
+  const f = fixture({ request: value => response(value.includes('bing.com') ? emptyRss : '{"results":[]}'),
+    googleSearch: async () => { googleCalls++; return []; },
+    renderSearch: (value, settings) => { renders++; input = value; options = settings; return new Promise(done => { release = done; }); } });
+  const read = settings => f.pool.request(url, settings).then(readText).then(JSON.parse);
+  try {
+    const missing = await read({ ...query, poll: true }); assert.deepEqual(missing.results, []); assert.equal(missing.pending, undefined); assert.equal(f.calls.length, 0); assert.equal(renders, 0);
+    const first = await read(query); assert.equal(first.pending, true); assert.equal(first.retryAfterMs, 1500); assert.deepEqual(first.results, []);
+    assert.deepEqual(input, { title: '电影', aliases: ['Movie'], year: '2026' }); assert.equal(options.signal.aborted, false); assert.ok(options.deadline >= at + 45000);
+    const calls = f.calls.length, staticCalls = googleCalls;
+    assert.equal((await read({ ...query, poll: true })).pending, true); assert.equal((await read(query)).pending, true);
+    assert.equal(f.calls.length, calls); assert.equal(googleCalls, staticCalls); assert.equal(renders, 1);
+    assert.equal((await read({ ...query, webSearch: true })).pending, true); assert.equal(renders, 1, 'normal and explicit web requests share one render');
+    release([{ name: '电影 2026 4K', url: quarkUrl, publishedAt: at }, { name: '完全不同作品', url: 'https://pan.quark.cn/s/other123456' }, { name: '未提供资源标题', url: 'https://pan.quark.cn/s/unknown123456' }]);
+    await flush(); const completedCalls = f.calls.length;
+    for (const webSearch of [false, true]) {
+      const result = await read({ ...query, webSearch, poll: true });
+      assert.equal(result.pending, undefined); assert.deepEqual(result.results.map(row => row.url), [quarkUrl]); assert.equal(result.unverified.length, 1);
+    }
+    assert.equal(f.calls.length, completedCalls); assert.equal(renders, 1);
+    await read(query); assert.equal(f.calls.length, completedCalls, 'successful render rows remain cached');
+  } finally { release?.([]); await f.pool.stop(); }
+});
+
+test('completed empty or busy render snapshots remain pollable while a manual retry can start fresh work', async t => {
+  for (const busy of [false, true]) await t.test(busy ? 'busy' : 'empty', async () => {
+    let renders = 0;
+    const f = fixture({ request: value => response(value.includes('bing.com') ? emptyRss : '{"results":[]}'), googleSearch: async () => [],
+      renderSearch: async () => { renders++; if (busy) throw Object.assign(new Error('private upstream secret'), { status: 503 }); return []; } });
+    const url = 'https://manual.example/api/search?kw=电影', read = poll => f.pool.request(url, poll ? { poll: true } : {}).then(readText).then(JSON.parse);
+    try {
+      await read(false); await flush(); const calls = f.calls.length;
+      const completed = await read(true); assert.deepEqual(completed.results, []); assert.equal(completed.pending, undefined); assert.doesNotMatch(completed.reason || '', /private|secret/);
+      await read(true); assert.equal(f.calls.length, calls); assert.equal(renders, 1, 'poll never recreates completed empty work');
+      await read(false); await flush(); assert.equal(renders, 2, 'manual retry can recover from empty or busy work');
+      assert.ok(f.calls.length > calls);
+    } finally { await f.pool.stop(); }
+  });
+});
+
+test('render has its own 45-second deadline and a timed-out poll never queues another browser', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  let renders = 0, aborted = false;
+  const f = fixture({ request: value => response(value.includes('bing.com') ? emptyRss : '{"results":[]}'), googleSearch: async () => [],
+    renderSearch: (_query, { signal, deadline }) => new Promise((_, reject) => {
+      renders++; assert.equal(deadline, 46000); signal.addEventListener('abort', () => { aborted = true; reject(signal.reason); }, { once: true });
+    }) });
+  const url = 'https://manual.example/api/search?kw=电影';
+  try {
+    const first = JSON.parse(await readText(await f.pool.request(url))); assert.equal(first.pending, true);
+    t.mock.timers.tick(44999); await flush(); assert.equal(aborted, false);
+    t.mock.timers.tick(1); await flush(); assert.equal(aborted, true);
+    const completed = JSON.parse(await readText(await f.pool.request(url, { poll: true })));
+    assert.equal(completed.pending, undefined); assert.match(completed.reason, /公开网页搜索超时/); assert.equal(renders, 1);
+  } finally { await f.pool.stop(); }
+});
+
+test('stop aborts render first and drains the actual worker before returning, ignoring late rows', async () => {
+  let release, signal, stopped = false;
+  const f = fixture({ request: value => response(value.includes('bing.com') ? emptyRss : '{"results":[]}'), googleSearch: async () => [],
+    renderSearch: (_query, options) => { signal = options.signal; return new Promise(done => { release = done; }); } });
+  try {
+    assert.equal((await lookup(f.pool)).pending, true); const metadata = f.metadata.get(KEY);
+    const stopping = f.pool.stop().then(() => { stopped = true; }); await flush();
+    assert.equal(signal.aborted, true); assert.equal(stopped, false, 'worker cleanup is drained');
+    release([{ name: '电影', url: quarkUrl }]); await stopping; assert.equal(f.metadata.get(KEY), metadata);
+    await assert.rejects(f.pool.request('https://manual.example/api/search?kw=电影', { poll: true }), { status: 503 });
+  } finally { release?.([]); await f.pool.stop(); }
+});
+
+test('public article reads use the separate safe web transport with browser headers while APIs keep their own headers', async () => {
+  const webCalls = [];
+  const f = fixture({ request: value => response(value.includes('bing.com') ? emptyRss : '{"results":[]}'),
+    webRequest: async (url, options) => { webCalls.push({ url, options }); return response('<html>public article</html>'); },
+    googleSearch: async (_title, { read, deadline }) => { assert.match(await read('https://article.example/movie', 3000, 512 * 1024, deadline), /public article/); return [{ name: '电影', url: quarkUrl }]; },
+    renderSearch: () => assert.fail('a matching static article already answers a normal search') });
+  try {
+    assert.equal((await lookup(f.pool)).results[0].url, quarkUrl); assert.equal(webCalls.length, 1);
+    const options = webCalls[0].options; assert.equal(options.followRedirects, true); assert.match(options.headers['user-agent'], /^Mozilla\/5\.0/);
+    assert.match(options.headers.accept, /text\/html/); assert.equal(options.headers['accept-language'], 'zh-CN,zh;q=0.9');
+    assert.equal(options.headers.cookie, undefined); assert.equal(options.headers.authorization, undefined);
+    assert.equal(f.calls[0].options.headers['user-agent'], 'VipVideo-Web-quark-search'); assert.match(f.calls[0].options.headers.accept, /application\/json/);
+  } finally { await f.pool.stop(); }
+});

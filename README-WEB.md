@@ -39,11 +39,11 @@ docker compose -f docker-compose.yml logs --tail=100 web
 
 本仓库镜像已公开，并通过匿名拉取验证，NAS 无需登录 GitHub。若自行 Fork 或新建发布仓库，首次发布的 GHCR 镜像包默认是私有；仓库所有者需在自己的镜像包设置中完成 **Change visibility → Public**，公开源码不会自动公开镜像。见 [GitHub 包可见性说明](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)。自行改为私有镜像时，NAS 需先登录 GHCR，使用有 `read:packages` 权限的 classic PAT，按 [GHCR 官方认证说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)配置；不要将 PAT 写入 Compose、镜像或仓库。
 
-浏览器访问 `http://NAS的局域网IP:3000`，输入密码后即可浏览内置源的电影、电视剧和动漫，也可在设置页管理或导入其他影视源。需要 Docker Engine 和 Docker Compose v2；建议至少 1 GB 内存。镜像包含 FFmpeg，兼容播放和媒体转发会使用部署主机的带宽，软件转码还会使用 CPU。容器健康检查由镜像提供，使用非 root 用户运行，数据保存在命名卷中。
+浏览器访问 `http://NAS的局域网IP:3000`，输入密码后即可浏览内置源的电影、电视剧和动漫，也可在设置页管理或导入其他影视源。需要 Docker Engine 和 Docker Compose v2；含动态网页助手时建议至少 2 GB 可用内存。镜像包含 FFmpeg 和 Chromium，兼容播放和媒体转发会使用部署主机的带宽，软件转码还会使用 CPU。动态浏览器放在独立的 `quark-browser` 容器中，限制为 0.5 CPU / 512 MiB，仅按需执行公开资源搜索；没有主机端口、账号凭证、应用数据卷或 GPU 映射。容器健康检查由镜像提供，使用非 root 用户运行，应用数据保存在原命名卷中。
 
 ### Intel 核显 NAS 单文件部署
 
-PVE → Ubuntu Docker、i3-8100T 等 Intel 核显主机推荐使用 [docker-compose.nas.yml](docker-compose.nas.yml)。这个文件已经合并播放器、Intel VAAPI、PanSou 夸克搜索和 Plex 资源保护；启动、升级都只使用这一个 YAML 文件，不需要 `.env`。
+PVE → Ubuntu Docker、i3-8100T 等 Intel 核显主机推荐使用 [docker-compose.nas.yml](docker-compose.nas.yml)。这个文件已经合并播放器、Intel VAAPI、PanSou 夸克搜索、隔离动态网页助手和 Plex 资源保护；启动、升级都只使用这一个 YAML 文件，不需要 `.env`。
 
 1. 在原 Compose 项目目录下载文件，填入原部署的 `APP_PASSWORD`，至少 16 位。
 2. 在 Ubuntu 执行 `stat -c '%g' /dev/dri/renderD128`，把 `group_add` 中的 `填写_RENDER_GID` 替换为输出数字，保留引号。已有正确核显组号可直接填入。
@@ -58,10 +58,18 @@ docker compose -f docker-compose.nas.yml ps
 
 以后更新只需再次执行同一条 `up -d --pull always` 命令。停机备份和恢复也使用 `-f docker-compose.nas.yml`；沿用原项目名及数据挂载，夸克 Cookie、配置、收藏和进度继续使用原数据卷。此配置需要 Ubuntu 已有可访问的 `/dev/dri/renderD128`；硬件不可用时兼容转码会提示失败，保护配置禁止回退到 CPU 软件编码。
 
+**已有旧部署此次需新增浏览器助手，拉镜像本身不会新增服务。** 不要覆盖你原来填写过密码、核显组号和数据卷的文件。在原目录执行一次下面的命令；文件名换成你实际使用的单个 Compose 文件：
+
+```sh
+curl -fL -o /tmp/vipvideo-enable-quark-browser.py https://raw.githubusercontent.com/loren1997/vipvideo-web/main/scripts/enable-quark-browser.py && python3 /tmp/vipvideo-enable-quark-browser.py --file docker-compose.nas.yml && docker compose -f docker-compose.nas.yml up -d --pull always web quark-browser
+```
+
+脚本保留原项目名、密码、核显、数据卷和其他服务，先以权限 `0600` 备份原文件，再经 Docker 校验后原子改写；重复运行不变。输出不会包含密码。更新后的原文件使用合法 Compose JSON，环境变量保留为当前展开值，不需要另外维护 YAML。此工具需要 Python 3；已有同名服务冲突、多文件 overlay 或其他项目镜像时停止。多文件部署先按[夸克说明](README-QUARK.md#可选搜索助手)保留全部配置并手动合并，再处理合并文件。
+
 更新后仍显示旧界面时，在原部署目录明确拉取并重建播放器和搜索助手：
 
 ```sh
-docker compose -f docker-compose.nas.yml up -d --pull always --force-recreate web pansou
+docker compose -f docker-compose.nas.yml up -d --pull always --force-recreate web pansou quark-browser
 ```
 
 沿用你原来实际使用的文件名及项目名称；若一体化文件保存为 `docker-compose.yml`，使用 `-f docker-compose.yml`。`docker compose config --images` 查看配置指定的镜像名称，与本地是否已下载镜像无关。目录里同时有 `compose.yaml` 和 `docker-compose.yml` 时，不带 `-f` 会优先读取用于源码构建的 `compose.yaml`，所以仓库内启动发布镜像需明确指定部署文件。新的公开部署文件已设置 `pull_policy: always`；旧文件不必替换，在更新命令中保留 `--pull always` 即可。
@@ -227,7 +235,7 @@ HLS 优先使用支持 MSE 的 HLS.js，浏览器不支持时再尝试原生 HLS
 
 播放器可以开启广告跳过，读取完整点播 HLS 中明确、闭合的 CUE / SCTE 广告标记，或手动标记当前线路与当前剧集的广告起止时间。默认关闭；更换源、剧集或夸克画质版本不会沿用其他版本的区间。只有断点标签、没有结束位置、直播、外部插播资产和无法校准时间的标记都会跳过处理。视频画面中已压制的广告、水印或制作标志不能无损擦除；可以跳过确认的时间段。该功能不下载、重写或转码整个影片。
 
-夸克资源发现、当前单集转存、服务端凭证保存、网页播放及观看完成后的定期清理见 [夸克网盘配置说明](README-QUARK.md)。可选 [compose.quark.yaml](compose.quark.yaml) 增加固定内网 PanSou 搜索伴随服务，不修改原来的密码、数据卷或核显配置。未配置账号时不自动转存；没有唯一匹配的年份 / 季 / 集时要求选单个文件。观看完的文件默认保留 7 天，清理需在设置中启用，仅处理本应用专用目录中登记的文件。
+夸克资源发现、当前单集转存、服务端凭证保存、网页播放及观看完成后的定期清理见 [夸克网盘配置说明](README-QUARK.md)。主部署文件已包含隔离动态网页助手；Google 按发布时间从新到旧搜索，公开文章解析真实分享超链接，验证码或限流会停止该渠道。可选 [compose.quark.yaml](compose.quark.yaml) 增加固定内网 PanSou 搜索伴随服务，不修改原来的密码、数据卷或核显配置。未配置账号时不自动转存；没有唯一匹配的年份 / 季 / 集时要求选单个文件。观看完的文件默认保留 7 天，清理需在设置中启用，仅处理本应用专用目录中登记的文件。
 
 ## 源自动维护与电视直播
 
@@ -274,6 +282,8 @@ HLS 优先使用支持 MSE 的 HLS.js，浏览器不支持时再尝试原生 HLS
 长期运行建议保持固定的 Compose 项目名称和命名卷，每次升级前备份，并按使用频率将完整备份存到 NAS 以外的位置；至少实际演练一次恢复。用 `docker compose -f docker-compose.yml ps` 查看容器健康状态，异常时查看 `logs --tail=100 web` 和设置页的探测时间 / 失败原因。Docker 的 `healthy` 代表应用正常响应，不代表所有第三方源正常。影视源自动维护与容器 / APK 升级是独立的，镜像和客户端版本需要主动更新。
 
 更新前先备份并记录当前镜像。NAS 镜像部署更新：
+
+本次首次启用动态网页提取时，先使用上面的保留配置更新脚本新增 `quark-browser`；之后继续下面的正常更新步骤。仅更新镜像不能把新服务加到旧 Compose 中。
 
 ```sh
 docker compose -f docker-compose.yml pull && \

@@ -120,6 +120,10 @@ test('explicit public webpage discovery is a validated option on the authenticat
   assert.deepEqual(options[0], { line: 0, episode: 0, webSearch: true });
   assert.equal((await call(path, undefined, cookie)).status, 200);
   assert.deepEqual(options[1], { line: 0, episode: 0 });
+  assert.equal((await call(path + '&web=1&poll=1', undefined, cookie)).status, 200);
+  assert.deepEqual(options[2], { line: 0, episode: 0, webSearch: true, poll: true });
+  assert.equal((await call(path + '&poll=wrong', undefined, cookie)).status, 400);
+  assert.equal(options.length, 3);
 });
 
 test('Quark account authentication errors remain distinct from a revoked household session', async t => {

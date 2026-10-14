@@ -32,6 +32,8 @@ const probe = file => JSON.parse(run('ffprobe', [
 ]));
 
 try {
+  await import('playwright-core');
+  assert.match(run('chromium', ['--version']), /^Chromium /);
   await mkdir(fixtures, { mode: 0o700 });
   await mkdir(jobs, { mode: 0o700 });
   const input = join(fixtures, 'source.mp4');

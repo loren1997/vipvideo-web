@@ -1,5 +1,8 @@
 name: vipvideo-web
 
+x-browser-image: &browser-image
+  image: "${CI_IMAGE:-ghcr.io/loren1997/vipvideo-web:latest}"
+
 services:
   web:
     image: ghcr.io/loren1997/vipvideo-web:latest
@@ -18,6 +21,7 @@ services:
       TRANSCODE_ACCEL: "${TRANSCODE_ACCEL:-auto}"
       TRANSCODE_ALLOW_SOFTWARE: "${TRANSCODE_ALLOW_SOFTWARE:-true}"
       FFMPEG_PATH: "${FFMPEG_PATH:-ffmpeg}"
+      QUARK_BROWSER_URL: http://quark-browser:3020
     volumes:
       - vipvideo_data:/app/data
     stop_grace_period: 20s
@@ -28,6 +32,26 @@ services:
     pids_limit: 128
     blkio_config:
       weight: 100
+
+  quark-browser:
+    <<: *browser-image
+    command: ["node", "browser-worker.mjs"]
+    restart: unless-stopped
+    init: true
+    environment:
+      PORT: "3020"
+      HOME: /tmp
+    read_only: true
+    tmpfs:
+      - /tmp:size=192m,mode=1777
+      - /app/data:size=16m,uid=1000,gid=1000,mode=0700
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    cpu_shares: 128
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 256
 
 volumes:
   vipvideo_data:

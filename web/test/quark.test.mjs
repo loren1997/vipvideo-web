@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { resolve, sep, basename } from 'node:path';
 import { setImmediate as turn } from 'node:timers/promises';
 import { createQuark } from '../lib/quark.mjs';
+import { createQuarkSearchPool } from '../lib/quark-search-pool.mjs';
 
 const COOKIE = '__kp=synthetic-account-A-secret; __pus=synthetic-login; __puus=synthetic-session';
 const COOKIE_B = '__kp=synthetic-account-B-secret; __pus=synthetic-login-B; __puus=synthetic-session-B';
@@ -863,6 +864,69 @@ test('safe empty pool failures are not cached and the same work can recover imme
   assert.deepEqual(await service.resources(film), refreshed); assert.equal(state.searchCalls.length, 3);
   const emptyFilm = { ...film, id: 'empty', title: '正常空结果' }, empty = await service.resources(emptyFilm); assert.equal(empty.resources.length, 0); assert.equal(empty.reason, undefined);
   assert.deepEqual(await service.resources(emptyFilm), empty); assert.equal(state.searchCalls.length, 4);
+});
+
+test('pending public searches refresh their pool snapshot while completed share identities stay cached', async t => {
+  const { service, state } = await fixture(t), film = { ...detail, quarkShares: [] };
+  state.searchBody = JSON.stringify({ results: [], reason: '正在继续查找', pending: true, retryAfterMs: 1500 });
+  const first = await service.resources(film); assert.deepEqual(first.resources, []); assert.equal(first.pending, true); assert.equal(first.retryAfterMs, 1500);
+  assert.deepEqual(await service.resources(film), first); assert.equal(state.searchCalls.length, 2);
+  state.searchBody = JSON.stringify({ results: [{ name: '影片 2026', url: 'https://pan.quark.cn/s/completed123', publishedAt: state.clock }] });
+  const complete = await service.resources(film, { poll: true });
+  assert.equal(complete.pending, undefined); assert.equal(complete.resources.length, 1); assert.equal(complete.resources[0].publishedAt, state.clock);
+  assert.equal(state.searchCalls.length, 3); assert.equal(state.searchCalls.at(-1).options.poll, true);
+  assert.deepEqual(await service.resources(film), complete); assert.equal(state.searchCalls.length, 3); assert.equal(state.saved, 0);
+});
+
+test('web and normal callers subscribe to their pool snapshots while sharing one rendered search and share identity', async t => {
+  const metadata = new Map(), store = { meta: key => metadata.get(key), setMeta: (key, value) => metadata.set(key, value) };
+  let release, renders = 0, requests = 0;
+  const request = async url => { requests++; return textReply(url.includes('bing.com') ? '<rss><channel></channel></rss>' : '{"results":[]}'); };
+  const pool = createQuarkSearchPool({ store, request, webRequest: request, googleSearch: async () => [], renderSearch: () => { renders++; return new Promise(resolve => { release = resolve; }); } });
+  t.after(async () => { release?.([]); await pool.stop(); });
+  const { service, state } = await fixture(t, { searchRequest: pool.request, defaultSearchApi: 'https://manual.example/api/search' });
+  const film = { ...detail, quarkShares: [] };
+  assert.equal((await service.resources(film, { webSearch: true })).pending, true);
+  assert.equal((await service.resources(film)).pending, true, 'another normal caller subscribes to its own pool snapshot');
+  assert.equal(renders, 1);
+  const pendingRequests = requests;
+  assert.equal((await service.resources(film)).pending, true);
+  assert.equal(requests, pendingRequests, 'repeated normal subscribers read the existing pending snapshot without public requests');
+  assert.equal(renders, 1);
+  release([{ name: '影片 2026', url: 'https://pan.quark.cn/s/completed123', publishedAt: state.clock }]);
+  for (let index = 0; index < 5; index++) await turn();
+  const beforePoll = requests;
+  const normal = await service.resources(film, { poll: true });
+  const web = await service.resources(film, { webSearch: true, poll: true });
+  assert.equal(normal.pending, undefined); assert.equal(web.pending, undefined);
+  assert.equal(normal.resources.length, 1); assert.deepEqual(normal.resources, web.resources);
+  assert.equal(normal.resources[0].publishedAt, state.clock);
+  assert.equal(requests, beforePoll, 'polls read completed snapshots without making new public requests');
+  assert.equal(renders, 1); assert.equal(state.saved, 0); assert.equal(state.calls.length, 0);
+});
+
+test('pending cache expires at its bounded retry interval and never remains pending for a minute', async t => {
+  const { service, state } = await fixture(t), film = { ...detail, quarkShares: [] };
+  state.searchBody = JSON.stringify({ results: [], pending: true, retryAfterMs: 'unsafe' });
+  assert.equal((await service.resources(film)).retryAfterMs, 1500); state.clock += 1501;
+  state.searchBody = JSON.stringify({ results: [] });
+  const complete = await service.resources(film); assert.equal(complete.pending, undefined); assert.equal(state.searchCalls.length, 2);
+  await service.resources(film, { poll: true }); assert.equal(state.searchCalls.length, 3, 'poll bypasses the completed one-minute cache too');
+  for (const [delay, expected] of [[1, 500], [999999, 5000]]) {
+    state.searchBody = JSON.stringify({ results: [], pending: true, retryAfterMs: delay });
+    assert.equal((await service.resources({ ...film, id: 'delay-' + delay })).retryAfterMs, expected);
+  }
+});
+
+test('explicit web polling passes the existing query scope without another transfer or normal-search substitution', async t => {
+  const { service, state } = await fixture(t), film = { ...detail, quarkShares: [] };
+  state.searchBody = JSON.stringify({ results: [], pending: true });
+  assert.equal((await service.resources(film, { webSearch: true })).pending, true);
+  state.searchBody = JSON.stringify({ results: [{ name: '影片 2026', url: 'https://pan.quark.cn/s/webcomplete123' }] });
+  const complete = await service.resources(film, { webSearch: true, poll: true });
+  assert.equal(complete.pending, undefined); assert.equal(complete.resources.length, 1);
+  assert.equal(state.searchCalls.at(-1).options.webSearch, true); assert.equal(state.searchCalls.at(-1).options.poll, true);
+  assert.equal(state.searchCalls.at(-1).options.year, '2026'); assert.equal(state.saved, 0);
 });
 
 test('automatic single-episode transfers recognize bounded episode notation and Chinese hundreds through the share listing', async t => {

@@ -32,6 +32,61 @@ test('resource identity requires the primary title or a supplied alias and separ
   assert.equal(webSearch.classifyQuarkCandidate('银翼杀手2049 (2017)', { title: '银翼杀手 2049', year: '2017' }), 'matched');
 });
 
+test('a compact Chinese title and year require independent film-year evidence before matching a translated heading', () => {
+  for (const [label, expected] of [
+    ['希望2026 高清资源', 'matched'], ['希望 HOPE (2026) 夸克网盘', 'matched'],
+    ['2026韩国电影希望Hope！科幻动作！k: 夸克网盘分享', 'matched'],
+    ['希望 HOPE (2013) 夸克网盘', 'unrelated'], ['希望 HOPE 页面日期 2026/10/13', 'unrelated'],
+    ['希望 HOPE 发布于2026', 'unrelated'], ['希望 HOPE (2013) 页面发布时间2026', 'unrelated'],
+    ['希望归来 (2026)', 'unrelated'], ['希望 归来 (2026)', 'unrelated'], ['希望之歌 (2026)', 'unrelated'],
+    ['希望：归来 (2026)', 'unrelated'], ['希望 HOPE RETURNS (2026)', 'unrelated'],
+    ['希望 HOPE (2013) (2026)', 'unrelated'], ['其他电影介绍，希望 HOPE (2026)', 'unrelated'],
+  ]) assert.equal(webSearch.classifyQuarkCandidate(label, { title: '希望2026' }), expected, label);
+  assert.equal(webSearch.classifyQuarkCandidate('希望 HOPE (2026)', { title: '希望2026', year: '2013' }), 'unrelated');
+  for (const title of ['2012', '1917']) assert.equal(webSearch.classifyQuarkCandidate(`${title} (2009)`, { title }), 'matched');
+});
+
+test('the shared Google URL requests newest web results without imposing a publication date cutoff', () => {
+  const url = new URL(webSearch.googleQueryUrl('希望2026 夸克 网盘'));
+  assert.equal(url.origin, 'https://www.google.com'); assert.equal(url.pathname, '/search');
+  assert.equal(url.searchParams.get('q'), '希望2026 夸克 网盘');
+  assert.equal(url.searchParams.get('tbs'), 'sbd:1'); assert.equal(url.searchParams.get('udm'), '14');
+});
+
+test('rendered Tencent post headings and labeled body hyperlinks bind the expected film to the actual share href', async () => {
+  const name = '2026韩国电影希望Hope！科幻动作！k: 夸克网盘分享';
+  const url = 'https://pd.qq.com/post/123456789', query = { title: '希望2026', now: time };
+  const search = `<a href="${url}"><span>腾讯频道</span><h3>${name}</h3></a>`;
+  assert.deepEqual(webSearch.extractQuarkSearchResults(search, query), [{ url, name }]);
+  const html = `<title>腾讯频道</title><meta property="article:published_time" content="2026-10-13T12:00:00+08:00"><article><p><a href="https://pan.quark.cn/s/hope2026?utm_source=post">${name}</a> 提取码：A1B2</p><h2>其他电影</h2><a href="https://pan.quark.cn/s/wrong2026">夸克下载</a></article>`;
+  const expected = { rows: [{ url: 'https://pan.quark.cn/s/hope2026?pwd=A1B2', name, publishedAt: Date.parse('2026-10-13T12:00:00+08:00') }], matched: true };
+  assert.deepEqual(webSearch.extractQuarkArticle(html, { ...query, url }), expected);
+  const input = fixture(search, { [url]: html });
+  assert.deepEqual(await searchGoogleQuark('希望2026', input), expected.rows);
+  const noTitle = `<title>腾讯频道</title><article><p>2026-10-13发布</p><a href="https://pan.quark.cn/s/hope2026">夸克下载</a></article>`;
+  assert.deepEqual(webSearch.extractQuarkArticle(noTitle, { ...query, url }), { rows: [], matched: false });
+});
+
+test('Tencent post datePublished metadata and generic hyperlinks work at different positions within the actual main-body structure', () => {
+  const name = '2026韩国电影希望Hope！科幻动作！k：[链接] 夸克网盘分享｜影视资源库｜腾讯频道';
+  const query = { title: '希望2026', year: '2026', url: 'https://pd.qq.com/g/channel/post/public-post', now: time };
+  for (const before of ['', '<div class="post-banner">公开帖子</div>', '<section><div>电影说明</div><div>分享请遵守频道规则</div></section>']) {
+    const html = `<title>${name}</title><meta property="og:title" content="${name}"><meta itemprop="datePublished" content="2026-09-13T11:48:46+08:00"><main>${before}<div class="feed-content"><div class="short-textcontent-container-right"><span class="feed-detail-text">2026韩国电影希望Hope！科幻动作！k：</span><span class="link-container"><object class="object-height"><a href="https://pan.quark.cn/s/public123" class="link" rel="ugc nofollow">夸克网盘分享</a></object></span></div></div><div class="feed-info__detail__time">2026-09-13</div></main>`;
+    assert.deepEqual(webSearch.extractQuarkArticle(html, query), {
+      rows: [{ url: 'https://pan.quark.cn/s/public123', name, publishedAt: Date.parse('2026-09-13T11:48:46+08:00') }], matched: true,
+    });
+  }
+});
+
+test('nested recommendations cannot supply a body title, share or publication date', () => {
+  const query = { title, url: 'https://posts.example/movie', now: time };
+  const recommendation = `<section class="recommendations"><section><h1>${title}</h1></section><time datetime="2026-10-14"></time>${link('https://pan.quark.cn/s/related123', '夸克下载')}</section>`;
+  assert.deepEqual(webSearch.extractQuarkArticle(`<title>影视分享站</title><main>${recommendation}<p>其他电影</p></main>`, query), { rows: [], matched: false });
+  assert.deepEqual(webSearch.extractQuarkArticle(article(`${recommendation}<time datetime="2026-10-12"></time>${link('https://pan.quark.cn/s/correct123', '夸克下载')}`), query), {
+    rows: [{ url: 'https://pan.quark.cn/s/correct123', name: title + ' 资源分享', publishedAt: Date.parse('2026-10-12') }], matched: true,
+  });
+});
+
 test('a main film article cannot lend its title to recommendations or another film plain-text share', async () => {
   const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': article(`
     ${link('https://pan.quark.cn/s/correct123', '夸克下载')}
@@ -52,7 +107,7 @@ test('web search distinguishes unindexed titles, unreadable articles and pages w
   assert.match((await searchGoogleQuark(title, javascript)).reason, /JavaScript.*未能读取/);
 });
 
-test('Google requests the title plus Quark without filtering undated pages, following only three first-level results', async () => {
+test('Google requests newest results without a date cutoff, following only three first-level results', async () => {
   const pages = Object.fromEntries([1, 2, 3, 4].map(id => [`https://posts.example/${id}`, article(link(`https://pan.quark.cn/s/abcdef${id}`))]));
   const input = fixture([
     link('/url?q=' + encodeURIComponent('https://posts.example/1')),
@@ -63,7 +118,7 @@ test('Google requests the title plus Quark without filtering undated pages, foll
   assert.equal(rows.length, 3); assert.equal(input.calls.length, 4);
   const query = new URL(input.calls[0].url);
   assert.equal(query.origin, 'https://www.google.com'); assert.equal(query.pathname, '/search');
-  assert.equal(query.searchParams.get('q'), title + ' 夸克'); assert.equal(query.searchParams.has('tbs'), false);
+  assert.equal(query.searchParams.get('q'), title + ' 夸克'); assert.equal(query.searchParams.get('tbs'), 'sbd:1'); assert.equal(query.searchParams.get('udm'), '14');
   assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/1', 'https://posts.example/2', 'https://posts.example/3']);
   for (const call of input.calls) { assert.equal(call.maxBytes, 512 * 1024); assert.equal(call.deadline, time + 3000); assert.ok(call.duration <= 2000); }
   assert.equal(input.calls[0].duration, 2000);
@@ -213,6 +268,7 @@ test('only explicitly published page dates are returned, never copyright years o
   for (const [label, metadata, expected] of [
     ['time', '<time datetime="2026-10-12">最近发布</time>', Date.parse('2026-10-12')],
     ['JSON-LD', '<script type="application/ld+json">{"@graph":[{"datePublished":"2026-10-11T11:22:33Z"}]}</script>', Date.parse('2026-10-11T11:22:33Z')],
+    ['datePublished metadata', '<meta itemprop="datePublished" content="2026-09-13T11:48:46+08:00">', Date.parse('2026-09-13T11:48:46+08:00')],
     ['malformed JSON-LD', '<script type="application/ld+json">{"datePublished":</script>', undefined],
     ['copyright', '<footer>Copyright 2026. 2026-10-13发布资源</footer>', undefined],
     ['impossible day', '<time datetime="2026-02-31">日期</time>', undefined],

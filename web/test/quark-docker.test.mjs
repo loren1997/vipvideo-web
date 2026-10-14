@@ -28,6 +28,15 @@ test('optional Quark search companion preserves Compose settings and accepts rea
   assert.deepEqual(config.services.web.ports, baseline.services.web.ports);
   assert.deepEqual(config.services.web.volumes, baseline.services.web.volumes);
   assert.equal(config.services.web.environment.QUARK_SEARCH_API, 'http://pansou:8888/api/search');
+  const browser = config.services['quark-browser'];
+  assert.deepEqual(browser.command, ['node', 'browser-worker.mjs']);
+  assert.equal(browser.ports?.length || 0, 0);
+  assert.equal(browser.volumes?.length || 0, 0);
+  assert.deepEqual(browser.environment, { HOME: '/tmp', PORT: '3020' });
+  assert.equal(browser.read_only, true); assert.equal(browser.init, true);
+  assert.equal(browser.cpus, 0.5); assert.equal(Number(browser.mem_limit), 512 * 1024 * 1024);
+  assert.equal(Number(browser.memswap_limit), Number(browser.mem_limit));
+  assert.ok(browser.tmpfs.some(value => value.startsWith('/app/data:')));
   assert.equal(config.services.pansou.ports?.length || 0, 0);
   assert.equal(config.services.pansou.read_only, true);
   assert.equal(config.services.pansou.volumes?.some(row => row.target === '/app/data') || false, false);
@@ -70,7 +79,7 @@ test('optional Quark search companion preserves Compose settings and accepts rea
   assert.equal(combined.services.web.blkio_config.weight, 100);
   assert.deepEqual(combined.services.web.tmpfs, ['/tmp:size=128m,mode=1777']);
   const nasYaml = readFileSync(join(root, 'docker-compose.nas.yml'), 'utf8');
-  assert.doesNotMatch(nasYaml, /\$\{/);
+  assert.doesNotMatch(nasYaml.replace(/\$\{CI_IMAGE:-ghcr\.io\/loren1997\/vipvideo-web:latest\}/g, ''), /\$\{/);
   assert.equal(nasYaml.match(/填写_RENDER_GID/g)?.length, 1);
   const nasFile = join(tmpdir(), `${name}-nas.yml`);
   writeFileSync(nasFile, nasYaml.replace('填写_RENDER_GID', '109'), { flag: 'wx' });
