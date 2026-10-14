@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { chromium } from 'playwright-core';
 import { createQuarkChromiumLauncher } from '../lib/quark-chromium-launcher.mjs';
 
 const safeArgs = ['--mute-audio', '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', '--host-resolver-rules=MAP * ~NOTFOUND', '--js-flags=--max-old-space-size=128'];
@@ -141,10 +142,38 @@ const linuxExecutablePath = ['/opt/google/chrome/chrome', '/usr/bin/google-chrom
 const realLinux = process.platform === 'linux' && linuxExecutablePath && existsSync('/usr/bin/xvfb-run');
 test('real isolated Linux Chromium starts without tabs, keeps webdriver unchanged and reaps Xvfb', { skip: !realLinux, timeout: 25000 }, async t => {
   let child, profile;
-  const launch = createQuarkChromiumLauncher({ spawn(command, args, configuration) { profile = args.find(value => value.startsWith('--user-data-dir='))?.slice('--user-data-dir='.length); child = spawn(command, args, configuration); return child; } });
+  const stages = { spawnCalled: false, spawned: false, pid: null, exit: null, close: null, stderrBytes: 0, devToolsSeen: false, connectStarted: false, connectCompleted: false };
+  let stderrTail = '', xvfbStderr = '', xvfbLogError;
+  const launch = createQuarkChromiumLauncher({
+    spawn(command, args, configuration) {
+      profile = args.find(value => value.startsWith('--user-data-dir='))?.slice('--user-data-dir='.length);
+      stages.spawnCalled = true;
+      child = spawn(command, ['-e', path.join(profile, 'Xvfb.stderr'), ...args], configuration);
+      stages.pid = child.pid ?? null;
+      child.once('spawn', () => { stages.spawned = true; });
+      child.once('exit', (code, signal) => { stages.exit = { code, signal }; });
+      child.once('close', (code, signal) => {
+        stages.close = { code, signal };
+        try { xvfbStderr = readFileSync(path.join(profile, 'Xvfb.stderr'), 'utf8').slice(-32768); }
+        catch (error) { xvfbLogError = error.code || error.name; }
+      });
+      child.stderr.on('data', chunk => {
+        stages.stderrBytes += chunk.length;
+        stderrTail = (stderrTail + chunk.toString()).slice(-2048);
+        stages.devToolsSeen ||= /DevTools listening on /.test(stderrTail);
+      });
+      return child;
+    },
+    async connect(address, configuration) {
+      stages.connectStarted = true;
+      const browser = await chromium.connectOverCDP(address, configuration);
+      stages.connectCompleted = true;
+      return browser;
+    },
+  });
   let browser;
   try { browser = await launch({ ...options(), executablePath: linuxExecutablePath, timeout: 20000 }); }
-  catch (error) { t.diagnostic(JSON.stringify({ executablePath: linuxExecutablePath, chromiumStderr: error.chromiumStderr || '' })); throw error; }
+  catch (error) { t.diagnostic(JSON.stringify({ executablePath: linuxExecutablePath, ...stages, chromiumStderr: error.chromiumStderr || '', xvfbStderr, xvfbLogError })); throw error; }
   try {
     assert.equal(browser.contexts().flatMap(context => context.pages()).length, 0);
     const context = await browser.newContext({ serviceWorkers: 'block' }), page = await context.newPage();
