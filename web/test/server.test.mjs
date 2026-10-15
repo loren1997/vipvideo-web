@@ -65,7 +65,7 @@ test('cloud routes protect account data, resolve trusted selections and proxy on
   const quark = { settings, configure: async input => { calls.push(['configure', input]); return settings(); },
     resources: async (value, options) => { calls.push(['resources', value, options]); return { resources: [{ id: 'share', name: '影片' }] }; },
     files: async () => ({ files: [] }), prepare: async (value, options) => { calls.push(['prepare', options]); return { assetId: 'asset', status: 'ready' }; },
-    playback: async () => ({ episode: { type: 'mp4', url: 'https://video.quark.cn/file.mp4' }, headers: { cookie: 'server-only-secret' },
+    playback: async () => ({ episode: { type: 'mp4', url: 'https://video.quark.cn/file.mp4', colorSpace: 'sdr' }, headers: { cookie: 'server-only-secret' },
       allowCookieOrigins: ['https://video.quark.cn'], metadata: { name: '影片', category: 'movie', version: 'quality-1' } }),
     progress: async (_id, input) => ({ saved: true, ended: input.ended }), cleanup: async () => ({ deleted: 0 }), clearAccount: async () => settings() };
   const cloud = createQuarkMedia({ quark, request: async () => Object.assign(Readable.from([Buffer.from('video')]), { statusCode: 200, headers: { 'content-type': 'video/mp4' } }) });

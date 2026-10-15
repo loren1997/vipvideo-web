@@ -9,6 +9,35 @@ import { createDanmaku } from '../lib/danmaku.mjs';
 import { createStore } from '../lib/store.mjs';
 
 const selection={key:'neutral-film-2024',episode:0};
+
+test('automatic sources merge with family messages only when trusted title metadata is supplied',async()=>{
+  let calls=0;const auto={list:async()=>{calls++;return{comments:[{id:'external:1',time:3,text:'自动弹幕',color:'#ffffff',origin:'腾讯视频'}],errors:[],sources:[{platform:'腾讯视频',count:1,mode:'auto'}]};}};
+  const service=createDanmaku({store:memoryStore(),auto});
+  service.send({...selection,time:1,text:'家庭弹幕'});
+  assert.equal((await service.list(selection)).comments.length,1);assert.equal(calls,0);
+  const result=await service.list({...selection,title:'影片',type:'movie',year:2024});
+  assert.equal(result.comments.length,2);assert.equal(calls,1);assert.equal(result.sources[0].platform,'腾讯视频');
+});
+
+test('manual binding takes precedence and a new binding suppresses an in-flight automatic match',async()=>{
+  let ready,resolve;const started=new Promise(done=>ready=done),waiting=new Promise(done=>resolve=done);
+  const service=createDanmaku({store:memoryStore(),request:async()=>response('<i></i>'),auto:{list:async()=>{ready();await waiting;return{comments:[{id:'external:1',time:1,text:'旧自动',color:'#ffffff',origin:'腾讯视频'}],sources:[{platform:'腾讯视频',count:1}],errors:[]};}}});
+  const pending=service.list({...selection,title:'影片',type:'movie'});await started;
+  await service.bind({...selection,url:'123'});resolve();const result=await pending;
+  assert.equal(result.comments.length,0);assert.deepEqual(result.sources,[]);
+});
+
+test('Bilibili automatic fallback uses only matching licensed season episodes, never UGC search',async()=>{
+  const urls=[];const service=createDanmaku({store:memoryStore(),autoRequest:async()=>{throw new Error('companion unavailable');},request:async url=>{
+    urls.push(url);
+    if(url.includes('/search/type'))return response(JSON.stringify({code:0,data:{result:[{title:'正片动画',season_id:12},{title:'正片动画剪辑',season_id:13}]}}));
+    if(url.includes('/pgc/view/web/season'))return response(JSON.stringify({code:0,result:{title:'正片动画',publish:{pub_time:'2024-01-01'},episodes:[{title:'1',cid:100},{title:'2',cid:101},{title:'2',cid:102,long_title:'预告'}]}}));
+    return response('<i><d p="2,1,25,16777215,0,0,0,1">真正第二集</d></i>');
+  }});
+  const result=await service.list({...selection,title:'正片动画',year:2024,type:'anime',episodeName:'第2集'});
+  assert.equal(result.comments.length,1);assert.equal(result.sources[0].platform,'哔哩哔哩');
+  assert.ok(urls.includes('https://comment.bilibili.com/101.xml'));assert.ok(!urls.some(url=>new URL(url).searchParams.get('search_type')==='video'));
+});
 function memoryStore() {
   const meta=new Map(),entries=new Map();let sequence=0;
   return {entries,meta:key=>meta.get(key),setMeta:(key,value)=>meta.set(key,value),list:kind=>[...(entries.get(kind)?.values()||[])].sort((a,b)=>b.updated-a.updated).map(row=>({...row})),save:(kind,row)=>{if(!entries.has(kind))entries.set(kind,new Map());const value={...row,updated:++sequence};entries.get(kind).set(row.key,value);return value;},remove:(kind,key)=>{if(key===null)entries.delete(kind);else entries.get(kind)?.delete(key);}};

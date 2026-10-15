@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { inflateRawSync, inflateSync } from 'node:zlib';
 import { request as networkRequest, readText, validateUrl } from './network.mjs';
+import { createAutoDanmaku, matchesDanmakuTitle } from './danmaku-auto.mjs';
 
 const LIMIT = 5000;
 const BODY_LIMIT = 4 * 1024 * 1024;
@@ -54,9 +55,10 @@ function parseXml(xml,cid) {
   return comments;
 }
 
-export function createDanmaku({store,request=networkRequest,now=Date.now}={}) {
+export function createDanmaku({store,request=networkRequest,now=Date.now,auto,autoRequest}={}) {
   if(!store?.meta || !store?.setMeta || !store?.list || !store?.save || !store?.remove)throw new Error('弹幕模块需要 SQLite 存储');
   const pending=new Map(),waiting=[];let active=0;
+  const automatic=auto??createAutoDanmaku({now,request:autoRequest,fallback:biliAuto});
   const familyKind=id=>'danmaku-family:'+id;
   const externalKind=id=>'danmaku-external:'+id;
   const bindingKey=id=>'danmaku-binding-v1:'+id;
@@ -69,13 +71,22 @@ export function createDanmaku({store,request=networkRequest,now=Date.now}={}) {
     } catch { console.error('外部弹幕绑定无法读取，请重新绑定'); }
     return{url:'',offset:0};
   }
-  async function fetchBody(url,xml=false) {
-    if(active<2)active++;else await new Promise(resolve=>waiting.push(resolve));
+  async function fetchBody(url,xml=false,timeout=8000) {
+    const end=now()+timeout;
+    if(active<2)active++;
+    else {
+      if(waiting.length>=16)throw fail('外部弹幕请求繁忙，请稍后重试',502);
+      await new Promise((resolve,reject)=>{
+        const entry={resolve,timer:setTimeout(()=>{const index=waiting.indexOf(entry);if(index>=0)waiting.splice(index,1);reject(fail('外部弹幕读取超时',502));},timeout)};
+        waiting.push(entry);
+      });
+    }
+    timeout=Math.max(1,end-now());
     let upstream,timer,expired=false;
     try {
       return await Promise.race([
         (async()=>{
-          upstream=await request(url,{timeout:8000});
+          upstream=await request(url,{timeout});
           if(expired){upstream.destroy();throw fail('外部弹幕读取超时',502);}
           if(upstream.statusCode!==200){upstream.destroy();throw fail(`外部弹幕暂不可访问（HTTP ${upstream.statusCode}）`,502);}
           const final=new URL(upstream.finalUrl||url),expected=new URL(url);
@@ -91,10 +102,10 @@ export function createDanmaku({store,request=networkRequest,now=Date.now}={}) {
           }
           return readText(upstream,xml?BODY_LIMIT:512*1024);
         })(),
-        new Promise((_,reject)=>{timer=setTimeout(()=>{expired=true;upstream?.destroy();reject(fail('外部弹幕读取超时',502));},8000);}),
+        new Promise((_,reject)=>{timer=setTimeout(()=>{expired=true;upstream?.destroy();reject(fail('外部弹幕读取超时',502));},timeout);}),
       ]);
     } finally {
-      clearTimeout(timer);const next=waiting.shift();if(next)next();else active--;
+      clearTimeout(timer);const next=waiting.shift();if(next){clearTimeout(next.timer);next.resolve();}else active--;
     }
   }
   function family(id) {
@@ -106,6 +117,33 @@ export function createDanmaku({store,request=networkRequest,now=Date.now}={}) {
     if(!numericId(cid))throw fail('外部弹幕 CID 无效');
     const work=(async()=>parseXml(await fetchBody(url,true),cid))();pending.set(url,work);
     try{return await work;}finally{pending.delete(url);}
+  }
+  async function biliAuto(info,end) {
+    const normalize=text=>String(text||'').normalize('NFKC').toLowerCase().replace(/<[^>]*>/g,'').replace(/[\p{P}\p{Z}\s]/gu,'');
+    const read=async(url,xml=false)=>{
+      const left=Math.min(3500,end-now());if(left<100)throw fail('自动弹幕匹配超时',502);
+      const body=await fetchBody(url,xml,left);return xml?body:JSON.parse(body);
+    };
+    const types=info.movie?['media_ft']:['media_bangumi','media_ft'];
+    const searches=await Promise.all(types.map(async type=>{
+      try{return await read('https://api.bilibili.com/x/web-interface/search/type?'+new URLSearchParams({search_type:type,keyword:info.title}));}catch{return null;}
+    }));
+    const candidates=searches.flatMap(data=>data?.code===0&&Array.isArray(data.data?.result)?data.data.result:[]).filter(row=>info.titles.some(title=>normalize(title)===normalize(row.title)));
+    for(const row of candidates.slice(0,2)) {
+      const season=numericId(row.season_id);if(!season)continue;
+      const data=await read('https://api.bilibili.com/pgc/view/web/season?'+new URLSearchParams({season_id:season})),result=data.result;
+      if(data.code!==0||!result)continue;
+      const kind=Number(result.type??result.season_type);if(kind>0&&(info.movie?kind!==2:kind===2))continue;
+      const year=String(result.publish?.pub_time||result.publish?.release_date||'').match(/(?:19|20)\d{2}/)?.[0];
+      if(info.year&&year!==info.year)continue;
+      if(!matchesDanmakuTitle(result.title+(year?`(${year})`:''),info))continue;
+      const episodes=(Array.isArray(result.episodes)?result.episodes:[]).filter(ep=>!/(预告|花絮|解说|剪辑|片花|片段|试看|试播)/.test(ep.long_title||'')&&(/^\d+$/.test(String(ep.title))||(info.movie&&ep.title==='正片')));
+      const selected=info.movie?episodes.length===1?episodes[0]:null:episodes.find(ep=>Number(ep.title)===info.episode);
+      const cid=numericId(selected?.cid);if(!cid)continue;
+      const comments=parseXml(await read(`https://comment.bilibili.com/${cid}.xml`,true),cid);
+      return{comments:comments.map(comment=>({...comment,origin:'哔哩哔哩'})),sources:[{platform:'哔哩哔哩',count:comments.length,mode:'auto'}]};
+    }
+    return{comments:[],sources:[]};
   }
   return {
     binding(value) {const {url,offset}=readBinding(scope(value));return{url,offset};},
@@ -150,7 +188,7 @@ export function createDanmaku({store,request=networkRequest,now=Date.now}={}) {
       store.save(kind,{key:comment.id,...comment});return comment;
     },
     async list(value) {
-      const id=scope(value),bound=readBinding(id),errors=[];let external=[];
+      const id=scope(value),bound=readBinding(id),errors=[],sources=[];let external=[];
       if(bound.url){
         const cached=store.list(externalKind(id))[0];
         if(cached?.url===bound.url && cached.expires>now() && Array.isArray(cached.comments))external=cached.comments.slice(0,LIMIT);
@@ -159,12 +197,16 @@ export function createDanmaku({store,request=networkRequest,now=Date.now}={}) {
           if(readBinding(id).url!==bound.url)throw fail('外部弹幕绑定已变更，请重新读取',502);
           store.save(externalKind(id),{key:'cache',url:bound.url,expires:now()+CACHE_TIME,comments:external});
         } catch(error){errors.push(error.status?error.message:'外部弹幕暂不可读取');external=[];}
+        if(external.length)sources.push({platform:'哔哩哔哩',count:external.length,mode:'manual'});
+      } else if(value.title) {
+        const result=await automatic.list(value);
+        external=result.comments;errors.push(...result.errors);sources.push(...result.sources);
       }
       const local=family(id);
       const current=readBinding(id);
       if(current.url!==bound.url){external=[];if(!errors.length)errors.push('外部弹幕绑定已变更，请重新读取');}
       const comments=[...local,...external.slice(0,LIMIT-local.length).map(comment=>({...comment,time:comment.time+current.offset}))].filter(comment=>Number.isFinite(comment.time)&&comment.time>=0&&comment.time<=86400&&cleanText(comment.text)&&colorOf(comment.color)).sort((a,b)=>a.time-b.time);
-      return{comments,updated:now(),errors};
+      return{comments,updated:now(),errors,sources:current.url===bound.url?sources.map(source=>({...source,count:comments.filter(comment=>comment.origin===source.platform||(source.mode==='manual'&&comment.origin==='bilibili')).length})):[]};
     },
   };
 }

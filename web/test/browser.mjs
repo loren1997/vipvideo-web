@@ -100,6 +100,7 @@ let quarkResourceReply = null;
 let quarkAssetPosition = 0;
 let quarkChoicesFixture = false, quarkFilesFixture = 'matched';
 let quarkSubtitleFixture = false, releaseQuarkSubtitle = null;
+let quarkCleanupReply = null, automaticDanmakuFixture = false;
 const subtitleFixtures = {
   srt: '1\n00:00:00,000 --> 00:00:04,000\n开头字幕\n\n2\n00:00:05,000 --> 00:00:10,000\n续播字幕\n\n3\n00:00:20,000 --> 00:00:25,000\n末段字幕\n',
   vtt: 'WEBVTT\n\nNOTE 备注不应显示\n00:00.000 --> 00:03.000\n这不是字幕\n\n00:00.000 --> 00:04.000\nVTT 第一行\n第二行\n',
@@ -270,16 +271,16 @@ try {
         }
         if (parsed.pathname === '/api/quark/settings') {
           if (body) {
-            assert.ok(Number.isInteger(body.retentionDays) && body.retentionDays >= 1);
+            assert.ok(Number.isInteger(body.retentionDays) && body.retentionDays >= 0 && body.retentionDays <= 365);
             assert.ok(Number.isInteger(body.maxDailyTransfers) && body.maxDailyTransfers >= 1 && body.maxDailyTransfers <= 100);
-            assert.equal(Object.hasOwn(body, 'autoSave'), false, '手动独立影院设置不修改旧自动准备配置');
-            Object.assign(quarkSettings, { enabled: body.enabled, cleanupEnabled: body.cleanupEnabled, retentionDays: body.retentionDays, maxDailyTransfers: body.maxDailyTransfers, searchApi: body.searchApi });
+            assert.equal(typeof body.autoSave, 'boolean', '影院可保存自动转存开关');
+            Object.assign(quarkSettings, { enabled: body.enabled, autoSave: body.autoSave, cleanupEnabled: body.cleanupEnabled, retentionDays: body.retentionDays, maxDailyTransfers: body.maxDailyTransfers, searchApi: body.searchApi });
             if (body.cookie) { quarkCookie = body.cookie; quarkSettings.configured = true; quarkSettings.account = { connected: true, label: '测试账号' }; }
           }
           return route.fulfill({ json: quarkSettings });
         }
         if (parsed.pathname === '/api/quark/account') { assert.equal(method, 'DELETE'); quarkCookie = ''; quarkSettings.configured = false; quarkSettings.account = { connected: false, label: '' }; return route.fulfill({ json: { ok: true } }); }
-        if (parsed.pathname === '/api/quark/cleanup') { assert.deepEqual(body, {}); quarkSettings.lastCleanup = Date.now(); return route.fulfill({ json: { removed: 0, failed: 0 } }); }
+        if (parsed.pathname === '/api/quark/cleanup') { assert.deepEqual(body, {}); quarkSettings.lastCleanup = Date.now(); return route.fulfill({ json: quarkCleanupReply || { deleted: 0, errors: 0 } }); }
         if (parsed.pathname === '/api/quark/folder/repair') {
           assert.equal(method, 'POST'); assert.deepEqual(body, {});
           if (holdQuarkFolderRepair) await new Promise(ok => { releaseQuarkFolderRepair = ok; });
@@ -316,7 +317,7 @@ try {
         if (parsed.pathname === '/api/quark/prepare') {
           assert.ok(body.source && body.id && Number.isInteger(body.line) && Number.isInteger(body.episode)); assert.equal(typeof body.auto, 'boolean'); assert.ok(body.fileId && body.shareId);
           if (body.auto) assert.equal(body.fileId, `file-${body.episode + 1}`, '自动仅转当前选中的单集');
-          if (body.source === 'quark-library') assert.equal(body.auto, false, '独立影院始终手动转存');
+          if (body.auto) assert.equal(quarkSettings.autoSave, true, '自动转存必须尊重账号设置');
           if (holdQuarkPrepare) await new Promise(ok => { releaseQuarkPrepare = ok; });
           if (quarkMode === 'prepare-error') return route.fulfill({ json: { status: 'error', reason: '固定专用目录错误，未转存' } });
           if (quarkMode === 'folder-missing') return route.fulfill({ json: { status: 'error', code: 'QUARK_FOLDER_MISSING', reason: '已登记目录未找到，需恢复专用目录' } });
@@ -408,10 +409,14 @@ try {
         const episode = fixtureEpisode(body ? body.episode : parsed.searchParams.get('episode'));
         if (episode === null) return route.fulfill({ status: 400, json: { error: '请选择有效的影片和剧集' } });
         const key = episodeKey(body?.key || parsed.searchParams.get('key'), episode);
-        danmakuRequests.push({ method: route.request().method(), key });
+        danmakuRequests.push({ method: route.request().method(), key, query: Object.fromEntries(parsed.searchParams) });
         const list = comments.get(key) || [];
         if (body) { const comment = { id: `family-${danmakuRequests.length}`, time: body.time, text: body.text, color: '#fff', origin: 'family' }; comments.set(key, [...list, comment]); return route.fulfill({ json: comment }); }
         const binding = bindings.get(key);
+        if (automaticDanmakuFixture && !binding?.url) return route.fulfill({ json: {
+          comments: [...list, { id: 'auto-bili', time: 2, text: '自动匹配B站弹幕', color: '#ffffff', origin: 'bilibili' }, { id: 'auto-tencent', time: 2, text: '自动匹配腾讯弹幕', color: '#ffffff', origin: 'tencent' }],
+          updated: Date.now(), errors: [], sources: [{ platform: 'B站', count: 1, mode: 'auto' }, { platform: '腾讯视频', count: 1, mode: 'auto' }],
+        } });
         return route.fulfill({ json: { comments: [...list, ...(binding?.url ? [{ id: 'bilibili-seed', time: Math.max(0, 6 + binding.offset), text: '外部样例 <img src=x onerror=alert(1)>', color: '#fff', origin: 'bilibili' }] : [])], updated: Date.now(), errors: [] } });
       }
       if (parsed.origin === base && parsed.pathname === '/api/ratings') {
@@ -622,7 +627,7 @@ try {
   async function withCloudFixture(run) {
     const settings = structuredClone(quarkSettings), mode = quarkMode, duration = transcodeDuration, transcode = transcodeMode, configBefore = app.store.config(), pref = preferences.get(cloudFilm.key), history = app.store.get('history', cloudFilm.key), favorite = app.store.get('favorites', cloudFilm.key);
     const contexts = [];
-    Object.assign(quarkSettings, { enabled: true, configured: true, autoSave: true, account: { connected: true, label: '测试账号' } });
+    Object.assign(quarkSettings, { enabled: true, configured: true, autoSave: false, account: { connected: true, label: '测试账号' } });
     quarkMode = 'webm'; quarkResourceReply = null; quarkAssetPosition = 0; app.store.remove('history', cloudFilm.key);
     preferences.set(cloudFilm.key, { introSeconds: 0, outroSeconds: 0, autoNext: true, speed: 1, danmakuEnabled: false });
     async function open({ viewport = { width: 1440, height: 1000 }, clock = false, hash = cloudPath, tv = false } = {}) {
@@ -646,6 +651,7 @@ try {
       releaseQuarkResources = releaseQuarkPrepare = releaseQuarkPlayback = releaseTranscode = releaseQuarkFolderRepair = null;
       for (const release of heldQuarkFileReads.values()) release(); heldQuarkFileReads.clear();
       releaseQuarkSubtitle?.(); releaseQuarkSubtitle = null; quarkSubtitleFixture = false;
+      quarkCleanupReply = null; automaticDanmakuFixture = false;
       for (const c of contexts) await c.value.close();
       quarkResourceReply = null; quarkChoicesFixture = false; quarkFilesFixture = 'matched'; quarkFolderRepairFails = false; quarkAssetPosition = 0;
       Object.assign(quarkSettings, settings); quarkMode = mode; transcodeDuration = duration; transcodeMode = transcode; app.store.setConfig(configBefore);
@@ -669,6 +675,55 @@ try {
     await assertVideoFrames(p.locator('video'), '所选夸克文件');
   }
 
+  async function verifyQuarkAutomaticTransfer() {
+    await withCloudFixture(async open => {
+      quarkSettings.autoSave = true;
+      const prepares = quarkCount('/api/quark/prepare'), { page: p } = await open();
+      await p.locator('#quark-resources').getByRole('button', { name: '夸克播放', exact: true }).waitFor();
+      assert.equal(quarkCount('/api/quark/prepare'), prepares + 1, '唯一匹配的当前集自动转存一次');
+      assert.equal(quarkRequests.filter(request => request.path === '/api/quark/prepare').at(-1).body.auto, true);
+      assert.equal(await p.locator('video').count(), 0, '自动转存不提前启动播放器');
+      await p.getByRole('button', { name: '查找更多公开资源', exact: true }).click();
+      await p.locator('#quark-resources').getByText(/找到新增.*条可用分享/).waitFor();
+      assert.equal(quarkCount('/api/quark/prepare'), prepares + 1, '更多搜索不重复转存或批量转存其他分享');
+      await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-2');
+      await until(() => quarkCount('/api/quark/prepare') === prepares + 2, '明确选择其他文件后自动转存所选文件');
+      const selected = quarkRequests.filter(request => request.path === '/api/quark/prepare').at(-1).body;
+      assert.equal(selected.fileId, 'file-2'); assert.equal(selected.auto, false, '手动指定文件不冒充自动集数匹配');
+      await p.locator('#quark-resources').getByRole('button', { name: '夸克播放', exact: true }).waitFor();
+      await playCloudFile(p);
+      await until(() => Boolean(app.store.get('history', cloudFilm.key)?.quarkAsset), '实际播放后保存已转存资产');
+      await p.locator('nav a[href="#history"]').click();
+      await p.getByRole('button', { name: `继续观看 ${cloudFilm.title}`, exact: true }).click();
+      await p.getByRole('button', { name: '继续播放已转存文件', exact: true }).waitFor();
+      await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
+      assert.equal(quarkCount('/api/quark/prepare'), prepares + 2, '已有续播资产时不因重新搜索而自动转存另一个版本');
+    });
+    await withCloudFixture(async open => {
+      quarkSettings.autoSave = true; quarkMode = 'ambiguous';
+      const prepares = quarkCount('/api/quark/prepare'), { page: p } = await open();
+      await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
+      assert.equal(quarkCount('/api/quark/prepare'), prepares, '同集有多个匹配版本时等待用户选择');
+      assert.equal(await p.getByLabel('夸克视频文件', { exact: true }).inputValue(), '');
+      await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-1');
+      await p.locator('#quark-resources').getByRole('button', { name: '夸克播放', exact: true }).waitFor();
+      assert.equal(quarkCount('/api/quark/prepare'), prepares + 1);
+    });
+    await withCloudFixture(async open => {
+      const { page: p } = await open({ hash: '#settings' });
+      await openSettingsSection(p, '夸克网盘');
+      const automatic = p.getByLabel('自动转存当前影片或剧集', { exact: true });
+      await automatic.check(); await p.getByRole('button', { name: '保存夸克设置', exact: true }).click();
+      await until(() => quarkSettings.autoSave === true, '保存启用自动转存');
+      await automatic.uncheck(); await p.getByRole('button', { name: '保存夸克设置', exact: true }).click();
+      await until(() => quarkSettings.autoSave === false, '保存关闭自动转存');
+      const prepares = quarkCount('/api/quark/prepare'); await p.evaluate(hash => { location.hash = hash; }, cloudPath);
+      await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
+      assert.equal(quarkCount('/api/quark/prepare'), prepares, '关闭设置后即使唯一匹配也不自动转存');
+    });
+    console.log('PASS 影院自动转存当前唯一匹配文件、手动选文件触发、歧义等待、更多搜索不批量转存及开关保存回读');
+  }
+
   async function assertVideoFrames(video, label) {
     const first = await video.evaluate(video => ({ width: video.videoWidth, height: video.videoHeight, frames: video.getVideoPlaybackQuality().totalVideoFrames, time: video.currentTime }));
     assert.ok(first.width > 0 && first.height > 0 && first.frames > 0, `${label}必须有实际视频画面`);
@@ -688,6 +743,14 @@ try {
       let panel = p.locator('.player-subtitles'); await panel.locator('summary').click();
       let select = p.getByLabel('播放字幕', { exact: true }); await select.locator('option[value="sub-srt"]').waitFor({ state: 'attached' });
       assert.equal(await select.locator('option').count(), 6, '外站地址和其他资产字幕不展示');
+      await select.selectOption('sub-srt'); await panel.getByText('字幕已加载。', { exact: true }).waitFor();
+      quarkSubtitleFixture = false;
+      await panel.getByRole('button', { name: '刷新夸克目录字幕', exact: true }).click();
+      await panel.getByText('当前视频目录未找到匹配字幕，可添加本机字幕文件。', { exact: true }).waitFor();
+      assert.equal(await select.locator('option').count(), 1); assert.equal(await select.inputValue(), '', '目录移除的字幕不保留失效选择');
+      quarkSubtitleFixture = true;
+      await panel.getByRole('button', { name: '刷新夸克目录字幕', exact: true }).click();
+      await select.locator('option[value="sub-srt"]').waitFor({ state: 'attached' });
       await select.selectOption('sub-srt'); await panel.getByText('字幕已加载。', { exact: true }).waitFor();
       assert.equal(await p.locator('video').count(), 0, '可先选关联字幕，不自动播放');
       quarkMode = 'hls'; await playCloudFile(p); panel = p.locator('.player-subtitles'); await panel.locator('summary').click(); select = p.getByLabel('播放字幕', { exact: true });
@@ -712,6 +775,10 @@ try {
       await until(() => cues().then(rows => rows[0]?.text === '中文字幕'), 'GBK按GB18030正确解码中文');
       await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: 'UTF16字幕.srt', mimeType: 'text/plain', buffer: Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(subtitleFixtures.srt, 'utf16le')]) });
       await until(() => cues().then(rows => rows.length === 3 && rows[0].text === '开头字幕'), 'UTF16带BOM正确解码中文');
+      await panel.getByRole('button', { name: '刷新夸克目录字幕', exact: true }).click();
+      await panel.getByText('找到 5 个夸克目录字幕，请从列表选择。', { exact: true }).waitFor();
+      assert.equal(await select.inputValue(), 'manual', '刷新目录保留本机字幕选择');
+      assert.equal((await cues())[0].text, '开头字幕', '刷新目录不替换正在显示的本机字幕');
       await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: `${'中英文长字幕名称'.repeat(15)}.srt`, mimeType: 'text/plain', buffer: Buffer.from(subtitleFixtures.srt) });
       await p.setViewportSize({ width: 390, height: 844 }); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '长字幕名在手机不撑破页面');
       await p.setViewportSize({ width: 1440, height: 1000 });
@@ -749,6 +816,47 @@ try {
     });
   }
 
+  async function verifyQuarkCleanupFeedback() {
+    await withCloudFixture(async open => {
+      const { page: p } = await open({ hash: '#settings' }); await openSettingsSection(p, '夸克网盘');
+      const panel = p.locator('.quark-settings'), retention = p.getByLabel('夸克看完后保留天数', { exact: true });
+      quarkCleanupReply = { deleted: 0, errors: 0, retentionDays: 7, notDue: 1, notWatched: 2, leased: 0, nextEligibleAt: Date.now() + 86400000 };
+      await panel.getByRole('button', { name: '清理到期已看完文件', exact: true }).click();
+      await panel.getByText(/1 个仍在保留期内（7 天）.*下次最早可清理/).waitFor();
+      await retention.fill('0'); await panel.getByRole('button', { name: '保存夸克设置', exact: true }).click();
+      await until(() => quarkSettings.retentionDays === 0, '可明确选择看完后保留0天');
+      await panel.getByRole('button', { name: '刷新夸克状态', exact: true }).click(); await until(() => retention.inputValue().then(value => value === '0'), '0天读取后不回退成7天');
+      quarkCleanupReply = { deleted: 0, errors: 0, retentionDays: 0, notDue: 0, notWatched: 0, leased: 1, leaseRemainingMs: 120000, nextEligibleAt: null };
+      await panel.getByRole('button', { name: '清理到期已看完文件', exact: true }).click();
+      await panel.getByText(/1 个正在播放或刚停止，约 120 秒后重试/).waitFor();
+      quarkCleanupReply = { deleted: 1, errors: 0, retentionDays: 0, notDue: 0, notWatched: 0, leased: 0, nextEligibleAt: null };
+      await panel.getByRole('button', { name: '清理到期已看完文件', exact: true }).click(); await panel.getByText('已清理 1 个管理文件', { exact: true }).waitFor();
+      quarkCleanupReply = { deleted: 0, errors: 1, recycled: 1, retentionDays: 0 };
+      await panel.getByRole('button', { name: '清理到期已看完文件', exact: true }).click();
+      await panel.getByText(/1 个已送入回收站，将继续核验释放容量.*1 个清理失败/).waitFor();
+      console.log('PASS 手动清理显示保留期、未看完和播放租约原因，0天设置保存回读及实际清理数量反馈');
+    });
+  }
+
+  async function verifyAutomaticDanmaku() {
+    await withCloudFixture(async open => {
+      automaticDanmakuFixture = true; preferences.delete(cloudFilm.key);
+      const { page: p } = await open(); await prepareCloudFile(p); await playCloudFile(p);
+      assert.equal(await p.getByLabel('显示弹幕', { exact: true }).isChecked(), true, '默认启用弹幕');
+      await p.locator('.danmaku-status').getByText('已加载弹幕：B站 1 条、腾讯视频 1 条', { exact: true }).waitFor();
+      const automatic = danmakuRequests.filter(row => row.method === 'GET' && row.query?.title === cloudFilm.title).at(-1);
+      assert.ok(automatic); assert.equal(automatic.query.year, cloudFilm.year); assert.equal(automatic.query.type, cloudFilm.type); assert.ok(automatic.query.episodeName); assert.ok(Array.isArray(JSON.parse(automatic.query.aliases)));
+      await p.locator('video').evaluate(async video => { video.pause(); video.currentTime = 2.1; await video.play(); });
+      await p.locator('.danmaku-overlay').getByText('自动匹配B站弹幕', { exact: true }).waitFor(); await p.locator('.danmaku-overlay').getByText('自动匹配腾讯弹幕', { exact: true }).waitFor();
+      await p.getByLabel('显示弹幕', { exact: true }).uncheck(); await until(() => preferences.get(cloudFilm.key)?.danmakuEnabled === false, '关闭开关立即保存，不依赖另点保存');
+      assert.equal(await p.locator('.danmaku-comment').count(), 0); assert.equal(await p.getByLabel('家庭弹幕', { exact: true }).isVisible(), false);
+      const reads = danmakuRequests.filter(row => row.method === 'GET').length; await p.clock.install(); await p.clock.fastForward(20000); assert.equal(danmakuRequests.filter(row => row.method === 'GET').length, reads, '关闭时停止自动请求');
+      await p.getByLabel('显示弹幕', { exact: true }).check(); await until(() => preferences.get(cloudFilm.key)?.danmakuEnabled === true, '重新启用开关持久化');
+      await p.locator('.danmaku-status').getByText('已加载弹幕：B站 1 条、腾讯视频 1 条', { exact: true }).waitFor();
+      console.log('PASS 夸克播放默认自动查询片名/年份/集名、多来源弹幕实际显示、关闭清屏/停止请求并立即保存、重新启用');
+    });
+  }
+
   async function verifyQuarkPublicSearch() {
     await withCloudFixture(async open => {
       app.store.setConfig({ ...app.store.config(), sources: [] });
@@ -775,7 +883,7 @@ try {
       await p.getByText('暂无中文简介。2025年电视剧，剧情类型。', { exact: true }).waitFor(); assert.equal(await p.locator('.detail-original-description').evaluate(element => element.open), false); assert.equal(await p.getByText('An official English synopsis.', { exact: true }).isVisible(), false);
       await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
       assert.equal(await p.locator('video').count(), 0); assert.equal(await p.getByLabel('夸克视频文件', { exact: true }).inputValue(), ''); assert.equal(await p.getByRole('button', { name: '转存所选单集', exact: true }).isDisabled(), true);
-      assert.equal(quarkCount('/api/quark/prepare'), prepares, '即使autoSave开启也必须手动选文件和转存'); assert.equal(playerRequests.length, ordinary); assert.equal(playabilityRequests.length, probes, '独立目录和详情不调用普通播放或来源验证');
+      assert.equal(quarkCount('/api/quark/prepare'), prepares, '关闭自动转存时必须手动选文件和转存'); assert.equal(playerRequests.length, ordinary); assert.equal(playabilityRequests.length, probes, '独立目录和详情不调用普通播放或来源验证');
       await p.getByRole('button', { name: '☆ 收藏', exact: true }).click(); await p.locator('nav a[href="#favorites"]').click(); await p.getByRole('button', { name: `查看 ${cloudFilm.title}`, exact: true }).click();
       await until(() => p.evaluate(() => location.hash === '#quark-detail?id=1234567'), '收藏回到独立夸克路由');
       await p.setViewportSize({ width: 390, height: 844 }); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1); await p.screenshot({ path: join(output, 'mobile-quark-library-detail.png'), fullPage: true });
@@ -861,6 +969,11 @@ try {
     await withCloudFixture(async open => {
       const { page: p } = await open(); await prepareCloudFile(p); await playCloudFile(p); const asset = cloudAssetId('share-fixture', 'file-1');
       await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 5; video.dispatchEvent(new Event('pause')); }); await until(() => quarkProgress.some(row => row.assetId === asset && row.position === 5), '保存已选资产的真实进度');
+      const beforeSeek = quarkProgress.length;
+      await p.locator('video').evaluate(video => { video.currentTime = video.duration - 0.2; });
+      await until(() => quarkProgress.slice(beforeSeek).some(row => row.assetId === asset && row.position >= row.duration - 0.3), '暂停时拖到片尾也立即同步进度，不等待10秒计时器或ended');
+      const afterTail = quarkProgress.length; await p.locator('video').evaluate(video => { video.currentTime = 5; });
+      await until(() => quarkProgress.slice(afterTail).some(row => row.assetId === asset && row.position === 5), '继续测试前恢复已保存的5秒位置');
       await until(() => app.store.get('history', cloudFilm.key)?.quarkAsset === asset, '云端历史持久化资产'); const history = app.store.get('history', cloudFilm.key); assert.equal(history.source, 'quark-library'); assert.ok(history.url === undefined || history.url === '', '历史不保存临时播放URL'); assert.match(history.episodeName, /第1集/);
       await p.locator('nav a[href="#history"]').click(); await p.getByRole('button', { name: `继续观看 ${cloudFilm.title}`, exact: true }).click(); await p.getByRole('button', { name: '继续播放已转存文件', exact: true }).waitFor(); assert.equal(await p.locator('video').count(), 0); const prepares = quarkCount('/api/quark/prepare'); await p.getByRole('button', { name: '继续播放已转存文件', exact: true }).click(); await until(() => p.locator('video').evaluate(video => video.readyState >= 2 && video.currentTime >= 5).catch(() => false), '跨路由显式继续已转存文件'); assert.equal(quarkCount('/api/quark/prepare'), prepares);
       const reports = playabilityReports.length; await p.locator('video').evaluate(video => { video.pause(); Object.defineProperty(video, 'error', { configurable: true, value: { code: 2 } }); video.dispatchEvent(new Event('error')); }); await p.locator('#quark-resources').getByRole('button', { name: '重试夸克播放', exact: true }).waitFor(); assert.equal(playabilityReports.length, reports, '云端失败不报告普通影视源');
@@ -923,6 +1036,66 @@ try {
       assert.doesNotMatch(await p.locator('#toast').textContent(), /夸克观看状态未同步|观看进度无效/);
       console.log('PASS 独立手动播放仅按所选资产续播、真实playing前不报占位进度、未知原时长不伪造HLS总长、已知时长只加一次原偏移');
     });
+  }
+
+  async function verifyFullFilmTimeline() {
+    for (const tv of [false, true]) await withCloudFixture(async open => {
+      quarkMode = 'requires'; quarkAssetPosition = 5375; transcodeMode = 'enabled'; transcodeDuration = 7116.05;
+      const { page: p } = await open({ tv }); await prepareCloudFile(p); await playCloudFile(p);
+      const video = p.locator('video'), controls = p.locator('#full-film-controls'), timeline = p.getByLabel('原片进度', { exact: true });
+      await p.getByRole('button', { name: '暂停', exact: true }).click();
+      // Reproduce a newly generated two-second HLS window while the original movie is almost two hours.
+      await video.evaluate(v => { Object.defineProperty(v, 'duration', { configurable: true, get: () => 2.021333 }); v.currentTime = 1; v.dispatchEvent(new Event('timeupdate')); });
+      await controls.waitFor(); assert.equal(await video.evaluate(v => v.controls), false, '完整时间轴替代原生两秒短条');
+      assert.equal(await timeline.getAttribute('max'), '7116.05');
+      assert.match(await p.locator('#full-film-time').textContent(), /1:29:36 \/ 1:58:36/);
+      assert.ok(Number(await timeline.inputValue()) >= 5375);
+      assert.equal(await video.evaluate(v => v.duration), 2.021333, '不伪造原生媒体时长');
+      await video.focus(); await p.keyboard.press(tv ? 'Enter' : 'Space'); await until(() => video.evaluate(v => !v.paused), '完整控件保留视频键盘播放');
+      await p.getByRole('button', { name: '暂停', exact: true }).click();
+      await p.getByRole('button', { name: '静音', exact: true }).click(); assert.equal(await video.evaluate(v => v.muted), true);
+      await p.getByRole('button', { name: '取消静音', exact: true }).click();
+      await p.getByLabel('音量', { exact: true }).fill('0.35'); await p.getByLabel('音量', { exact: true }).dispatchEvent('input');
+      assert.ok(Math.abs(await video.evaluate(v => v.volume) - .35) < .001); assert.equal(await video.evaluate(v => v.muted), false);
+      if (!tv) {
+        await p.locator('.player-subtitles summary').click();
+        await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: 'timeline.srt', mimeType: 'text/plain', buffer: Buffer.from('1\n01:40:00,000 --> 01:40:03,000\n全片定位字幕\n') });
+        await p.getByText('本机字幕已添加。', { exact: true }).waitFor();
+      }
+      await p.getByRole('button', { name: '全屏', exact: true }).click();
+      await until(() => p.evaluate(() => document.fullscreenElement?.classList.contains('player-frame')), '完整时间轴与基本控件共同进入全屏');
+      assert.equal(await controls.evaluate(el => document.fullscreenElement.contains(el)), true);
+      await p.getByRole('button', { name: '退出全屏', exact: true }).click();
+      await until(() => p.evaluate(() => !document.fullscreenElement), '完整播放器退出全屏');
+      const before = transcodeStarts.length, progress = quarkProgress.length;
+      holdTranscode = true; await timeline.fill('6000'); await timeline.dispatchEvent('change');
+      await until(() => transcodeStarts.length === before + 1, '超出当前HLS窗口的完整影片定位');
+      assert.equal(transcodeStarts.at(-1).position, 6000); assert.ok(transcodeStarts.at(-1).quarkAsset);
+      assert.equal(await timeline.isDisabled(), true, '定位在途不能反复拖动');
+      holdTranscode = false; releaseTranscode(); releaseTranscode = null;
+      await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused && v.currentSrc.includes('/api/transcode/')).catch(() => false), '绝对定位后重新解码');
+      await assertVideoFrames(video, '完整影片定位后真实画面');
+      await p.getByRole('button', { name: '暂停', exact: true }).click();
+      await video.evaluate(v => { v.currentTime = 1; v.dispatchEvent(new Event('timeupdate')); v.dispatchEvent(new Event('pause')); });
+      await until(() => quarkProgress.slice(progress).some(row => row.position === 6001 && row.duration === 7116.05), '完整影片定位后只加一次offset并同步原始时长');
+      assert.match(await p.locator('#full-film-time').textContent(), /1:40:01 \/ 1:58:36/);
+      if (!tv) await until(() => video.evaluate(v => [...v.textTracks].some(t => [...(t.activeCues || [])].some(c => c.text === '全片定位字幕'))), '完整时间轴定位保持字幕原片时间');
+      else {
+        const keys = transcodeStarts.length; await timeline.focus(); await p.keyboard.press('ArrowRight');
+        await until(() => transcodeStarts.length === keys + 1, 'TV方向键调整完整影片进度');
+        assert.equal(transcodeStarts.at(-1).position, 6002, 'TV按原片秒数定位而非片段时间');
+        await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused).catch(() => false), 'TV定位后继续播放');
+      }
+      await p.setViewportSize({ width: 390, height: 844 }); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '完整控件手机无横向溢出');
+      await p.screenshot({ path: join(output, `full-film-timeline-${tv ? 'tv' : 'mobile'}.png`), fullPage: true });
+      transcodeDuration = null; await p.locator('.player-toolbar').getByRole('button', { name: '重新兼容播放', exact: true }).click();
+      await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused).catch(() => false), '未知原总长仍能播放');
+      await until(() => controls.isHidden(), '未知总长不展示伪造完整时间轴'); assert.equal(await video.evaluate(v => v.controls), true);
+      quarkMode = 'webm'; await p.locator('.player-toolbar').getByRole('button', { name: '重试夸克播放', exact: true }).click();
+      await until(() => p.locator('video').evaluate(v => v.readyState >= 2 && v.currentSrc.includes('/api/quark/media/')).catch(() => false), '切回直接播放');
+      assert.equal(await p.locator('video').evaluate(v => v.controls), true, '普通直放保留原生控件'); assert.equal(await p.locator('#full-film-controls').isHidden(), true);
+    });
+    console.log('PASS 完整7116.05秒/5375偏移替代两秒HLS短条、播放音量全屏与键盘TV、跨生成窗口绝对定位/进度/字幕、手机与未知时长/直放回退');
   }
 
   async function verifyQuarkPictureReadiness() {
@@ -1059,15 +1232,18 @@ try {
   }
 
   if (process.argv.includes('--quark-library-only')) await verifyQuarkPublicSearch();
-  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkPendingSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
+  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkPendingSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
+  else if (process.argv.includes('--quark-auto-transfer-only')) await verifyQuarkAutomaticTransfer();
   else if (process.argv.includes('--quark-playback-only')) { for (const verify of [verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure]) await verify(); }
   else if (process.argv.includes('--quark-progress-only')) await verifyQuarkProgressReadiness();
+  else if (process.argv.includes('--full-film-timeline-only')) await verifyFullFilmTimeline();
   else if (process.argv.includes('--quark-search-only')) {
     app.store.setConfig({ ...app.store.config(), sources: ['first', 'second'].map((id, index) => ({ id, name: ['第一源', '第二源'][index], api: `https://api.example.com/${id}`, enabled: true })) });
     for (const verify of [verifyQuarkPublicSearch, verifyQuarkPendingSearch, verifyQuarkAutoplay]) { app.store.remove('history', cloudFilm.key); await verify(); }
   }
   else if (process.argv.includes('--quark-startup-only')) await verifyQuarkStartupFailure();
   else if (process.argv.includes('--quark-subtitles-only')) await verifyQuarkSubtitles();
+  else if (process.argv.includes('--playback-fixes-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyFullFilmTimeline, verifyQuarkSubtitles, verifyQuarkCleanupFeedback, verifyAutomaticDanmaku]) await verify(); }
   else if (process.argv.includes('--tv-only')) await verifyTvRemote();
   else {
   const { page } = await context({ width: 1440, height: 1000 });
@@ -2015,6 +2191,7 @@ try {
   await verifyProgressiveMetadata();
   await verifyAdSkipping();
   await verifyQuarantineStatus();
+  await verifyQuarkAutomaticTransfer();
   await verifyQuarkAutoplay();
   await verifyQuarkFlow();
   await verifyQuarkProgressReadiness();
@@ -2064,6 +2241,9 @@ try {
   await verifyTvRemote();
   await verifyQuarkStartupFailure();
   await verifyQuarkSubtitles();
+  await verifyFullFilmTimeline();
+  await verifyQuarkCleanupFeedback();
+  await verifyAutomaticDanmaku();
   }
   // 显式启用联网验收；固定样例保持可离线重复，不把清单200等同于实际解码。
   if (process.env.VIPVIDEO_REAL_LIVE === '1') {

@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
+import { createServer } from 'node:http';
 import { mkdtemp, rm, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, sep, basename } from 'node:path';
 import { setImmediate as turn } from 'node:timers/promises';
 import { createQuark } from '../lib/quark.mjs';
+import { createQuarkMedia } from '../lib/quark-media.mjs';
 import { createQuarkSearchPool } from '../lib/quark-search-pool.mjs';
 
 const COOKIE = '__kp=synthetic-account-A-secret; __pus=synthetic-login; __puus=synthetic-session';
@@ -61,6 +63,7 @@ async function fixture(t, extra = {}) {
     if (path === '/task') { const task = state.tasks.get(parsed.searchParams.get('task_id')); return reply(state.pending || !task ? { status: 1 } : { status: 2, save_as: { save_as_select_top_fids: [task.fid] } }); }
     if (path === '/file/v2/play') { if (state.playError) return reply(null, { code: 403, status: 403 }); return reply({ video_list: [{ resolution: 'high', video_info: { url: 'https://video-cloud.quark.cn/low.m3u8', width: 1280, height: 720, success: true } }, { resolution: 'super', video_info: { url: state.playUrl, width: 1920, height: 1080, success: true } }] }); }
     if (path === '/file/download') { assert.equal(body.fids.length, 1); const file = state.files.find(row => row.fid === body.fids[0]); return reply([{ fid: body.fids[0], download_url: /\.(srt|vtt|ass)$/i.test(file?.file_name || '') ? 'https://subtitle.quark.cn/' + body.fids[0] : state.downloadUrl }]); }
+    if (path === '/file/rename') { assert.equal(options.method, 'POST'); assert.equal(parsed.searchParams.get('uc_param_str'), ''); const file = state.files.find(row => row.fid === body.fid && row.account === account); assert.ok(file); assert.equal(typeof body.file_name, 'string'); file.file_name = body.file_name; return reply({}); }
     if (path === '/file/delete') { assert.deepEqual(body.exclude_fids, []); assert.equal(body.action_type, 2); assert.equal(body.filelist.length, 1); const file = state.files.find(file => file.fid === body.filelist[0] && file.account === account); assert.ok(file); state.deletes.push(body.filelist[0]); state.files = state.files.filter(row => row !== file); state.trash.push({ ...file, record_id: 'trash-' + file.fid }); return reply({}); }
     if (path === '/file/recycle/list') return reply({ list: state.trash });
     if (path === '/file/recycle/remove') { assert.equal(body.select_mode, 2); assert.equal(body.record_list.length, 1); assert.notEqual(body.record_list[0], 'user-trash-record'); state.purges.push(body.record_list[0]); state.trash = state.trash.filter(row => !body.record_list.includes(row.record_id)); return reply({}); }
@@ -271,7 +274,7 @@ test('generic language subtitles require a completely listed single movie direct
     if (mode === 'two-movies') state.source.push(sourceVideo('other', '其他电影.2026.mp4'));
     else state.beforeRequest = call => call.path === '/share/sharepage/detail' ? Object.assign(Readable.from([JSON.stringify({ code: 0, data: { list: state.source }, metadata: { _total: 200 } })]), { statusCode: 200, headers: {} }) : undefined;
     const selected = await select(); const saved = await service.prepare(detail, selected); assert.equal(saved.status, 'ready');
-    assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['影片.2026.eng.srt']);
+    assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['影片 (2026).eng.srt']);
     assert.equal(state.saved, 2);
   });
 });
@@ -282,7 +285,7 @@ test('series subtitles match only the selected episode and season, including epi
   state.source = [sourceVideo('one', '剧集.2026.S01E01.mkv'), sourceVideo('two', '剧集.2026.S01E02.mkv'), sourceSubtitle('right', '剧集.2026.S01E01.chs.srt'), sourceSubtitle('bare', 'S01E01.eng.ass'), sourceSubtitle('numeric', '01.srt'), sourceSubtitle('other-episode', '剧集.2026.S01E02.srt'), sourceSubtitle('other-season', '剧集.2026.S02E01.srt'), sourceSubtitle('other-show', '其他剧.2026.S01E01.srt'), sourceSubtitle('range', '剧集.2026.E01-E02.srt'), sourceSubtitle('generic', 'CHS.srt')];
   const selected = await select(series), saved = await service.prepare(series, { ...selected, episode: 0 });
   assert.equal(saved.status, 'ready'); assert.equal(selected.files.files.length, 2);
-  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['剧集.2026.S01E01.chs.srt', 'S01E01.eng.ass', '01.srt']);
+  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['剧集 (2026) S01E01.chs.srt', '剧集 (2026) S01E01.eng.ass', '剧集 (2026) S01E01.srt']);
   assert.equal(state.saved, 4); assert.equal(state.calls.some(row => row.path === '/share/sharepage/save' && row.body.fid_list.includes('two')), false);
 });
 
@@ -291,7 +294,7 @@ test('a mixed-show directory cannot lend episode-only subtitles to a selected se
   const series = { ...detail, title: '剧集', category: 'tv', season: 1, lines: [{ episodes: [{ name: '第01集' }, { name: '第02集' }] }] };
   state.source = [sourceVideo('one', '剧集.2026.S01E01.mkv'), sourceVideo('foreign', '其他剧.2026.S01E01.mkv'), sourceSubtitle('named', '剧集.2026.S01E01.chs.srt'), sourceSubtitle('unnamed', 'S01E01.srt'), sourceSubtitle('numeric', '01.srt')];
   const saved = await service.prepare(series, await select(series)); assert.equal(saved.status, 'ready');
-  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['剧集.2026.S01E01.chs.srt']); assert.equal(state.saved, 2);
+  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['剧集 (2026) S01E01.chs.srt']); assert.equal(state.saved, 2);
 });
 
 test('a different series with a prefix name cannot supply subtitles to a selected spinoff', async t => {
@@ -299,7 +302,7 @@ test('a different series with a prefix name cannot supply subtitles to a selecte
   const series = { ...detail, title: 'Suits LA', category: 'tv', season: 1, lines: [{ episodes: [{ name: '第01集' }, { name: '第02集' }] }] };
   state.source = [sourceVideo('spinoff', 'Suits.LA.S01E01.1080p.mkv'), sourceVideo('original', 'Suits.S01E01.mkv'), sourceSubtitle('right', 'Suits.LA.S01E01.srt'), sourceSubtitle('right-year', 'Suits.LA.2026.S01E01.eng.srt'), sourceSubtitle('wrong', 'Suits.S01E01.srt')];
   const saved = await service.prepare(series, await select(series)); assert.equal(saved.status, 'ready');
-  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['Suits.LA.S01E01.srt', 'Suits.LA.2026.S01E01.eng.srt']); assert.equal(state.saved, 3);
+  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['Suits LA (2026) S01E01.srt', 'Suits LA (2026) S01E01.eng.srt']); assert.equal(state.saved, 3);
 });
 
 test('ready assets acquire newly discovered captions without saving their video again and survive restart', async t => {
@@ -340,6 +343,131 @@ test('registry storage budget rejects new cloud saves before sending and preserv
   });
 });
 
+test('new transferred movies and language sidecars are named together without losing original color identity', async t => {
+  const { service, state, connect, select, metadata, userFile } = await fixture(t); await connect();
+  const original = '影片.2026.2160p.DV.mkv';
+  state.source = [sourceVideo('film', original), sourceSubtitle('chs', original.replace(/mkv$/, 'chs.srt')), sourceSubtitle('eng', 'English.ass')];
+  const selection = await select(), saved = await service.prepare(detail, selection);
+  assert.equal(saved.name, '影片 (2026).mkv'); assert.equal(saved.renameReason, undefined);
+  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['影片 (2026).chs.srt', '影片 (2026).English.ass']);
+  assert.equal(JSON.parse(metadata.get('quark-registry-v1')).assets[0].sourceName, original);
+  assert.equal(state.source[0].file_name, original); assert.equal(userFile.file_name, '用户原有影片.mp4');
+  const renamed = state.calls.filter(row => row.path === '/file/rename'); assert.equal(renamed.length, 3); assert.ok(renamed.every(row => row.body.fid.startsWith('saved-')));
+  const reused = await service.prepare(detail, selection); assert.equal(reused.name, saved.name); assert.equal(state.saved, 3);
+  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 3);
+  state.playError = true; assert.equal((await service.playback(saved.assetId)).episode.colorSpace, 'dolby-vision');
+});
+
+test('new episode names require consistent season and episode metadata and preserve missing-year originals', async t => {
+  for (const mode of ['complete', 'conflicting-season', 'missing-year']) await t.test(mode, async t => {
+    const { service, state, connect, save } = await fixture(t); await connect();
+    const original = `剧集.2026.S${mode === 'conflicting-season' ? '01' : '02'}E01.1080p.mkv`;
+    const film = { ...detail, title: '剧集第二季', year: mode === 'missing-year' ? '' : 2026, type: 'series', category: 'tv', season: 2, lines: [{ episodes: [{ name: '第1集' }] }] };
+    state.source = [sourceVideo('episode', original)]; if (mode === 'complete') state.source.push(sourceSubtitle('chs', 'S02E01.chs.srt'));
+    const saved = await save(film); assert.equal(saved.status, 'ready');
+    assert.equal(saved.name, mode === 'complete' ? '剧集 (2026) S02E01.mkv' : original);
+    if (mode === 'complete') assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['剧集 (2026) S02E01.chs.srt']);
+    else assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 0);
+  });
+});
+
+test('rename collisions preserve another file and keep the new copy ready under its original name', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect({ cleanupEnabled: true });
+  state.beforeRequest = call => { if (call.path === '/share/sharepage/save') state.files.push({ ...sourceVideo('existing-user-copy', '影片 (2026).mp4'), account: 'A', pdir_fid: state.folders.get('A').fid }); };
+  const saved = await save(); assert.equal(saved.status, 'ready'); assert.equal(saved.name, '影片.2026.mp4'); assert.match(saved.renameReason, /名称已存在/);
+  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 0);
+  await service.progress(saved.assetId, { position: 100, duration: 100, ended: true }); state.clock += 8 * DAY;
+  assert.equal((await service.cleanup()).deleted, 1); assert.ok(state.files.some(row => row.fid === 'existing-user-copy'));
+});
+
+test('failed or lost rename acknowledgements never duplicate transfers and only accept the verified new name', async t => {
+  for (const mode of ['refused', 'lost-reply', 'verification-lost']) await t.test(mode, async t => {
+    const { service, state, connect, select, metadata } = await fixture(t); await connect(); let pendingCheck = false;
+    state.beforeRequest = call => {
+      if (call.path === '/file/rename') {
+        if (mode === 'refused') return reply(null, { code: 500, status: 500 });
+        state.files.find(row => row.fid === call.body.fid).file_name = call.body.file_name;
+        pendingCheck = mode === 'verification-lost'; throw new Error('uncertain rename acknowledgement ' + COOKIE);
+      }
+      if (pendingCheck && call.path === '/file/sort') { pendingCheck = false; throw new Error('one unavailable verification'); }
+    };
+    const selected = await select(), saved = await service.prepare(detail, selected); assert.equal(saved.status, 'ready');
+    assert.equal(saved.name, mode === 'lost-reply' ? '影片 (2026).mp4' : '影片.2026.mp4');
+    if (mode !== 'lost-reply') { assert.match(saved.renameReason, /自动命名未完成/); assert.ok(!saved.renameReason.includes(COOKIE)); }
+    await service.playback(saved.assetId);
+    const again = await service.prepare(detail, selected); assert.equal(again.status, 'ready'); assert.equal(state.saved, 1);
+    assert.equal(again.name, mode === 'refused' ? '影片.2026.mp4' : '影片 (2026).mp4');
+    assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 1);
+    assert.equal(JSON.parse(metadata.get('quark-registry-v1')).assets[0].renameTo, mode === 'refused' ? '影片 (2026).mp4' : undefined);
+  });
+});
+
+test('legacy registered videos without a rename plan are never renamed when prepared again', async t => {
+  const { service, state, connect, select, metadata, options } = await fixture(t); await connect(); const selected = await select(); await service.prepare(detail, selected);
+  await service.stop();
+  const registry = JSON.parse(metadata.get('quark-registry-v1')); registry.assets[0].name = '影片.2026.mp4'; delete registry.assets[0].sourceName;
+  metadata.set('quark-registry-v1', JSON.stringify(registry)); state.files.find(row => row.fid === registry.assets[0].fid).file_name = registry.assets[0].name;
+  const restarted = createQuark(options); t.after(() => restarted.stop());
+  const resource = (await restarted.resources(detail)).resources[0], listing = await restarted.files(detail, { shareId: resource.id });
+  const calls = state.calls.filter(row => row.path === '/file/rename').length;
+  const again = await restarted.prepare(detail, { shareId: resource.id, fileId: listing.files[0].id });
+  assert.equal(again.status, 'ready'); assert.equal(again.name, '影片.2026.mp4'); assert.equal(state.saved, 1);
+  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, calls);
+});
+
+test('a temporarily stale post-rename listing retains the journal until the actual new name appears', async t => {
+  for (const acknowledgement of ['success', 'lost']) await t.test(acknowledgement, async t => {
+    const { service, state, connect, save, metadata } = await fixture(t); await connect(); let stale;
+    state.beforeRequest = call => {
+      if (call.path === '/file/rename') {
+        const file = state.files.find(row => row.fid === call.body.fid); stale = { ...file }; file.file_name = call.body.file_name;
+        if (acknowledgement === 'lost') throw new Error('lost rename acknowledgement');
+        return reply({});
+      }
+      if (stale && call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') === stale.pdir_fid) {
+        const previous = stale; stale = undefined; return reply({ list: state.files.map(row => row.fid === previous.fid ? previous : row) });
+      }
+    };
+    const saved = await save(); assert.equal(saved.status, 'ready'); assert.equal(saved.name, '影片.2026.mp4');
+    assert.equal(JSON.parse(metadata.get('quark-registry-v1')).assets[0].renameAttempted, true);
+    await service.playback(saved.assetId);
+    const asset = JSON.parse(metadata.get('quark-registry-v1')).assets[0]; assert.equal(asset.name, '影片 (2026).mp4'); assert.equal(asset.renameTo, undefined);
+    assert.equal(state.saved, 1); assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 1);
+  });
+});
+
+test('subtitle refresh reconciles stale video and caption rename journals without another prepare or mutation', async t => {
+  const { service, state, connect, save, metadata } = await fixture(t); await connect(); state.source.push(sourceSubtitle()); let stale;
+  state.beforeRequest = call => {
+    if (call.path === '/file/rename') { const file = state.files.find(row => row.fid === call.body.fid); stale = { ...file }; file.file_name = call.body.file_name; return reply({}); }
+    if (stale && call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') === stale.pdir_fid) { const previous = stale; stale = undefined; return reply({ list: state.files.map(row => row.fid === previous.fid ? previous : row) }); }
+  };
+  const saved = await save(); assert.equal(saved.status, 'ready'); assert.match(saved.renameReason, /自动命名未完成/);
+  const rows = await service.subtitles(saved.assetId); assert.deepEqual(rows.map(row => row.name), ['影片 (2026).chs.srt']);
+  assert.equal(await service.subtitle(saved.assetId, rows[0].id), SRT);
+  const asset = JSON.parse(metadata.get('quark-registry-v1')).assets[0]; assert.equal(asset.name, '影片 (2026).mp4'); assert.equal(asset.renameReason, undefined);
+  assert.equal(asset.renameTo, undefined); assert.equal(asset.subtitles[0].renameTo, undefined);
+  assert.equal(state.saved, 2); assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 2);
+});
+
+test('revoking a rename response leaves a verifiable journal and never authorizes another save', async t => {
+  const { service, state, connect, select, metadata } = await fixture(t); await connect(); const selected = await select(); let valid = true;
+  state.beforeRequest = call => { if (call.path === '/file/rename') { state.files.find(row => row.fid === call.body.fid).file_name = call.body.file_name; valid = false; return reply({}); } };
+  const canceled = await service.prepare(detail, { ...selected, valid: () => valid }); assert.equal(canceled.status, 'error');
+  const pending = JSON.parse(metadata.get('quark-registry-v1')).assets[0]; assert.equal(pending.name, '影片.2026.mp4'); assert.equal(pending.renameAttempted, true);
+  valid = true; const resumed = await service.prepare(detail, { ...selected, valid: () => valid }); assert.equal(resumed.status, 'ready'); assert.equal(resumed.name, '影片 (2026).mp4');
+  assert.equal(state.saved, 1); assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 1);
+});
+
+test('a rename acknowledgement cannot adopt a moved, resized or nonvideo object', async t => {
+  for (const change of ['parent', 'size', 'type']) await t.test(change, async t => {
+    const { service, state, connect, save } = await fixture(t); await connect();
+    state.beforeRequest = call => { if (call.path === '/file/rename') { const file = state.files.find(row => row.fid === call.body.fid); file.file_name = call.body.file_name; if (change === 'parent') file.pdir_fid = 'user-folder'; else if (change === 'size') file.size++; else file.file = false; return reply({}); } };
+    const saved = await save(); assert.equal(saved.status, 'ready'); assert.match(saved.renameReason, /自动命名未完成/);
+    await assert.rejects(service.playback(saved.assetId), cause => cause.status === 409); assert.equal(state.saved, 1); assert.deepEqual(state.deletes, []);
+  });
+});
+
 test('pending or uncertain caption acknowledgements retain a playable video and never repeat a save', async t => {
   for (const mode of ['pending', 'lost-reply']) await t.test(mode, async t => {
     const { service, state, connect, select, metadata } = await fixture(t); await connect(); state.source.push(sourceSubtitle());
@@ -357,6 +485,47 @@ test('pending or uncertain caption acknowledgements retain a playable video and 
   });
 });
 
+test('refresh alone finishes an acknowledged pending caption and concurrent reads never save or rename it twice', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); state.source.push(sourceSubtitle()); let pending = true;
+  state.beforeRequest = call => call.path === '/task' && new URL(call.value).searchParams.get('task_id') === 'task-2' && pending ? reply({ status: 1 }) : undefined;
+  const saved = await save(); assert.equal(saved.status, 'ready'); assert.match(saved.subtitleReason, /字幕未全部就绪/); pending = false;
+  const taskReads = state.calls.filter(row => row.path === '/task').length;
+  const lists = await Promise.all([service.subtitles(saved.assetId), service.subtitles(saved.assetId)]);
+  assert.equal(lists[0].length, 1); assert.deepEqual(lists[0], lists[1]); assert.equal(lists[0][0].name, '影片 (2026).chs.srt');
+  assert.equal(await service.subtitle(saved.assetId, lists[0][0].id), SRT); await service.subtitles(saved.assetId);
+  assert.equal(state.calls.filter(row => row.path === '/task').length, taskReads + 1);
+  assert.equal(state.calls.filter(row => row.path === '/file/rename' && row.body.fid === 'saved-2').length, 1); assert.equal(state.saved, 2);
+});
+
+test('refresh rejects wrong pending-task files without hiding another ready caption or repeating a save', async t => {
+  for (const wrong of ['video-fid', 'unlisted-fid', 'size']) await t.test(wrong, async t => {
+    const { service, state, connect, save } = await fixture(t); await connect(); state.source.push(sourceSubtitle('ready', '影片.2026.eng.srt'), sourceSubtitle('pending', '影片.2026.chs.srt')); let phase = 'pending';
+    state.beforeRequest = call => {
+      if (call.path !== '/task' || new URL(call.value).searchParams.get('task_id') !== 'task-3') return;
+      if (phase === 'pending') return reply({ status: 1 });
+      if (phase === 'wrong' && wrong !== 'size') return reply({ save_as: { save_as_select_top_fids: [wrong === 'video-fid' ? 'saved-1' : 'unlisted-file'] } });
+    };
+    const saved = await save(); assert.equal(saved.status, 'ready'); phase = 'wrong';
+    if (wrong === 'size') state.files.find(row => row.fid === 'saved-3').size++;
+    assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['影片 (2026).eng.srt']);
+    assert.equal(state.calls.filter(row => row.path === '/file/download').length, 0); assert.equal(state.saved, 3);
+    phase = 'correct'; if (wrong === 'size') state.files.find(row => row.fid === 'saved-3').size--;
+    const rows = await service.subtitles(saved.assetId); assert.equal(rows.length, 2); assert.equal(await service.subtitle(saved.assetId, rows[1].id), SRT); assert.equal(state.saved, 3);
+  });
+});
+
+test('refresh cancellation after a pending-task response cannot adopt or rename the caption', async t => {
+  const { service, state, connect, save, metadata } = await fixture(t); await connect(); state.source.push(sourceSubtitle());
+  state.beforeRequest = call => call.path === '/task' && new URL(call.value).searchParams.get('task_id') === 'task-2' ? reply({ status: 1 }) : undefined;
+  const saved = await save(); let valid = true, enter, release; const entered = new Promise(resolve => { enter = resolve; });
+  state.beforeRequest = async call => { if (call.path === '/task' && new URL(call.value).searchParams.get('task_id') === 'task-2') { enter(); await new Promise(resolve => { release = resolve; }); return reply({ save_as: { save_as_select_top_fids: ['saved-2'] } }); } };
+  const listing = service.subtitles(saved.assetId, { valid: () => valid }); await entered; valid = false; release();
+  await assert.rejects(listing, cause => cause.status === 409);
+  assert.equal(JSON.parse(metadata.get('quark-registry-v1')).assets[0].subtitles[0].status, 'saving');
+  assert.equal(state.calls.filter(row => row.path === '/file/rename' && row.body.fid === 'saved-2').length, 0);
+  state.beforeRequest = undefined; assert.equal((await service.subtitles(saved.assetId)).length, 1); assert.equal(state.saved, 2);
+});
+
 test('subtitle text decoding supports UTF8, UTF16 BOM and GB18030 without exposing cloud credentials', async t => {
   const { service, state, connect, save } = await fixture(t); await connect(); state.source.push(sourceSubtitle()); const saved = await save(), [row] = await service.subtitles(saved.assetId);
   const utf16 = Buffer.from(SRT, 'utf16le');
@@ -365,6 +534,65 @@ test('subtitle text decoding supports UTF8, UTF16 BOM and GB18030 without exposi
   }
   const download = state.calls.find(call => call.path === '/file/download'); assert.deepEqual(download.body.fids, ['saved-2']);
   assert.equal(state.calls.filter(call => call.value.startsWith('https://subtitle.quark.cn')).every(call => call.options.headers.cookie === COOKIE), true);
+});
+
+test('refresh discovers later same-video subtitles without adopting them for transfers or cleanup', async t => {
+  const { service, state, connect, save, metadata } = await fixture(t); await connect({ cleanupEnabled: true });
+  const saved = await save(), parent = state.folders.get('A').fid;
+  assert.deepEqual(await service.subtitles(saved.assetId), []);
+  for (const [fid, filename] of [['later-srt', '影片.2026.chs.srt'], ['later-vtt', '影片.2026.en.vtt'], ['later-ass', '影片.2026.cht.ass']]) state.files.push({ ...sourceSubtitle(fid, filename, parent), account: 'A' });
+  state.files.push({ ...sourceSubtitle('unrelated-caption', '另一影片.2026.srt', parent), account: 'A' });
+  const rows = await service.subtitles(saved.assetId);
+  assert.deepEqual(rows.map(row => row.type), ['srt', 'vtt', 'ass']);
+  assert.ok(rows.every(row => /^[a-f0-9]{32}$/.test(row.id) && !('fid' in row) && !('url' in row)));
+  for (const row of rows) {
+    state.subtitleBody = row.type === 'srt' ? SRT : row.type === 'vtt' ? 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n中文\n' : '[Script Info]\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,中文\n';
+    assert.equal(await service.subtitle(saved.assetId, row.id), state.subtitleBody);
+  }
+  assert.equal(state.saved, 1);
+  assert.equal(JSON.parse(metadata.get('quark-registry-v1')).assets[0].subtitles, undefined);
+  await service.progress(saved.assetId, { position: 100, duration: 100, ended: true }); state.clock += 8 * DAY;
+  assert.equal((await service.cleanup()).deleted, 1);
+  assert.deepEqual(state.deletes, ['saved-1']);
+  assert.ok(state.files.some(row => row.fid === 'later-srt'));
+  assert.ok(state.files.some(row => row.fid === 'unrelated-caption'));
+});
+
+test('owned subtitle subdirectories are scoped to the current video and attachment identity is revalidated', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect();
+  const saved = await save(), parent = state.folders.get('A').fid;
+  state.files.push({ fid: 'later-subs', file_name: '字幕', file: false, pdir_fid: parent, account: 'A' },
+    { ...sourceSubtitle('late-child', '影片.2026.chs.srt', 'later-subs'), account: 'A' },
+    { ...sourceSubtitle('outside-caption', '影片.2026.chs.srt', 'user-folder'), account: 'A' });
+  const [caption] = await service.subtitles(saved.assetId); assert.ok(caption);
+  assert.equal(await service.subtitle(saved.assetId, caption.id), SRT);
+  state.files.find(row => row.fid === 'late-child').file_name = '另一影片.srt';
+  await assert.rejects(service.subtitle(saved.assetId, caption.id), cause => cause.status === 404);
+  assert.deepEqual(await service.subtitles(saved.assetId), []);
+  assert.equal(state.calls.filter(call => call.path === '/file/download').length, 1);
+});
+
+test('a stale registered subtitle cannot block a valid later addition or be re-adopted under its changed name', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); state.source.push(sourceSubtitle());
+  const saved = await save(), [old] = await service.subtitles(saved.assetId), parent = state.folders.get('A').fid;
+  state.files.find(row => row.fid === 'saved-2').file_name = '影片.2026.en.srt';
+  state.files.push({ ...sourceSubtitle('later-caption', '影片.2026.cht.srt', parent), account: 'A' });
+  const rows = await service.subtitles(saved.assetId); assert.equal(rows.length, 1); assert.equal(rows[0].name, '影片.2026.cht.srt');
+  await assert.rejects(service.subtitle(saved.assetId, old.id), /无法核验/);
+  assert.equal(await service.subtitle(saved.assetId, rows[0].id), SRT);
+});
+
+test('later episode-only sidecars require an unambiguous current episode in the owned directory', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect();
+  const film = { ...detail, title: '剧集', category: 'tv', type: 'series', lines: [{ episodes: [{ name: '第1集' }] }] };
+  state.source = [sourceVideo('episode-one', '剧集.S01E01.mkv')];
+  const saved = await save(film), parent = state.folders.get('A').fid;
+  state.files.push({ ...sourceSubtitle('episode-only', 'E01.chs.srt', parent), account: 'A' }, { ...sourceSubtitle('wrong-season', '剧集.S02E01.srt', parent), account: 'A' });
+  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['E01.chs.srt']);
+  state.files.push({ ...sourceVideo('other-show', '另一剧.S01E01.mkv'), pdir_fid: parent, account: 'A' });
+  assert.deepEqual(await service.subtitles(saved.assetId), []);
+  state.files.push({ ...sourceSubtitle('named-current', '剧集.S01E01.chs.srt', parent), account: 'A' });
+  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['剧集.S01E01.chs.srt']);
 });
 
 test('subtitle retrieval rejects hidden movies, foreign IDs, renamed files, HTML and oversized text', async t => {
@@ -400,7 +628,7 @@ test('subtitle-only children beyond the video traversal depth are scoped to the 
   state.source = [{ fid: 'show', file_name: '剧集.2026', file: false, pdir_fid: '0' }, { fid: 'season', file_name: '第二季', file: false, pdir_fid: 'show' }, { ...sourceVideo('one', 'S02E01.mkv'), pdir_fid: 'season' }, { ...sourceVideo('two', 'S02E02.mkv'), pdir_fid: 'season' }, { fid: 'subs', file_name: '字幕', file: false, pdir_fid: 'season' }, sourceSubtitle('right', 'E01.chs.srt', 'subs'), sourceSubtitle('wrong', 'S01E01.srt', 'subs'), sourceSubtitle('two-sub', 'E02.srt', 'subs')];
   const selected = await select(series); assert.equal(selected.files.truncated, true);
   const saved = await service.prepare(series, selected); assert.equal(saved.status, 'ready');
-  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['E01.chs.srt']);
+  assert.deepEqual((await service.subtitles(saved.assetId)).map(row => row.name), ['剧集 (2026) S02E01.chs.srt']);
   assert.equal(state.calls.filter(row => row.path === '/share/sharepage/save').at(-1).body.pdir_fid, 'subs');
   assert.equal(state.saved, 2);
 });
@@ -944,11 +1172,44 @@ test('partially failed listings still evict old share candidates at the cache li
   assert.equal(state.saved, 0); assert.equal(state.folders.size, 0);
 });
 
-test('defaults are disconnected and all automatic cloud mutations are disabled', async t => {
+test('fresh defaults prefer automatic saves but remain disconnected and disabled until an account is connected', async t => {
   const { service, state } = await fixture(t); const settings = await service.settings();
-  assert.equal(settings.configured, false); assert.equal(settings.enabled, false); assert.equal(settings.autoSave, false); assert.equal(settings.cleanupEnabled, false); assert.equal(settings.retentionDays, 7);
+  assert.equal(settings.configured, false); assert.equal(settings.enabled, false); assert.equal(settings.autoSave, true); assert.equal(settings.cleanupEnabled, false); assert.equal(settings.retentionDays, 7);
   assert.equal(settings.maxDailyTransfers, 100); assert.equal(settings.maxDailyBytes, DAILY_BYTES); assert.equal(state.calls.length, 0);
   assert.equal((await service.cleanup()).checked, 0); assert.equal((await service.prepare(detail, { auto: true })).status, 'error'); assert.equal(state.saved, 0);
+});
+
+test('an explicit disabled automatic-save preference survives restart and blocks stale automatic file IDs', async t => {
+  const { service, state, connect, select, options } = await fixture(t); await connect({ autoSave: false }); const selected = await select();
+  const denied = await service.prepare(detail, { ...selected, auto: true }); assert.equal(denied.status, 'needsSelection'); assert.match(denied.reason, /自动转存已关闭/);
+  assert.equal(state.saved, 0); assert.equal(state.folders.size, 0);
+  await service.configure({ autoSave: true }); state.beforeRequest = async call => { if (call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') === '0') { state.beforeRequest = undefined; await service.configure({ autoSave: false }); } };
+  assert.equal((await service.prepare(detail, { ...selected, auto: true })).status, 'error'); assert.equal(state.saved, 0); assert.equal(state.folders.size, 0);
+  await service.stop();
+  const restarted = createQuark(options); t.after(() => restarted.stop()); assert.equal((await restarted.settings()).autoSave, false);
+  const resource = (await restarted.resources(detail)).resources[0], listing = await restarted.files(detail, { shareId: resource.id });
+  const manual = await restarted.prepare(detail, { shareId: resource.id, fileId: listing.files[0].id, auto: false }); assert.equal(manual.status, 'ready'); assert.equal(state.saved, 1);
+});
+
+test('automatic file IDs require an unambiguous complete listing for the exact current episode', async t => {
+  for (const mode of ['unrelated', 'multiple', 'incomplete', 'changed-episode']) await t.test(mode, async t => {
+    const { service, state, connect, select } = await fixture(t); await connect({ autoSave: true });
+    let film = detail;
+    if (mode === 'unrelated') state.source = [sourceVideo('wrong', '其他影片.2026.mp4')];
+    if (mode === 'multiple') state.source.push(sourceVideo('second', '影片.2026.1080p.mkv'));
+    if (mode === 'changed-episode') { film = { ...detail, title: '剧集', category: 'tv', season: 1, lines: [{ episodes: [{ name: '第1集' }, { name: '第2集' }] }] }; state.source = [sourceVideo('first', '剧集.2026.S01E01.mkv')]; }
+    if (mode === 'incomplete') state.beforeRequest = call => call.path === '/share/sharepage/detail' ? textReply(JSON.stringify({ code: 0, data: { list: state.source }, metadata: { _total: 200 } })) : undefined;
+    const selected = await select(film), result = await service.prepare(film, { ...selected, auto: true, ...(mode === 'changed-episode' ? { episode: 1 } : {}) });
+    assert.equal(result.status, 'needsSelection'); assert.equal(state.saved, 0); assert.equal(state.folders.size, 0);
+  });
+});
+
+test('a full hundred-row page without totals is incomplete even when it contains exactly one matching video', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect({ autoSave: true });
+  state.source = [sourceVideo(), ...Array.from({ length: 99 }, (_, index) => ({ fid: 'document-' + index, file_name: '资料' + index + '.pdf', file: true, pdir_fid: '0', size: 100 }))];
+  const selected = await select(); assert.equal(selected.files.files.filter(row => row.match).length, 1); assert.equal(selected.files.truncated, true); assert.equal(selected.files.ambiguous, true);
+  assert.equal((await service.prepare(detail, { ...selected, auto: true })).status, 'needsSelection'); assert.equal(state.saved, 0);
+  assert.equal((await service.prepare(detail, { ...selected, auto: false })).status, 'ready'); assert.equal(state.saved, 1);
 });
 
 test('the old default limit upgrades once to 100 without resetting later choices or the encrypted account', async t => {
@@ -1073,7 +1334,7 @@ test('anonymous config success is insufficient and invalid Cookie/settings are n
   const { service, state, metadata } = await fixture(t);
   state.beforeRequest = call => call.path === '/file/sort' ? reply(null, { code: 401, status: 401 }) : null;
   await assert.rejects(service.configure({ cookie: COOKIE, enabled: true }), /拒绝|登录/); assert.equal(metadata.has('quark-settings-v1'), false);
-  for (const input of [{ cookie: '__puus=only-anonymous' }, { cookie: '__kp=x\r\nHost: evil' }, { cookie: '__kp=x; __kp=y' }, { retentionDays: 0 }, { retentionDays: 366 }, { maxDailyTransfers: 0 }, { cleanupEnabled: 'true' }, { searchApi: 'http://127.0.0.1:8888/api/search' }]) await assert.rejects(service.configure(input));
+  for (const input of [{ cookie: '__puus=only-anonymous' }, { cookie: '__kp=x\r\nHost: evil' }, { cookie: '__kp=x; __kp=y' }, { retentionDays: -1 }, { retentionDays: 366 }, { maxDailyTransfers: 0 }, { cleanupEnabled: 'true' }, { searchApi: 'http://127.0.0.1:8888/api/search' }]) await assert.rejects(service.configure(input));
   assert.equal((await service.settings()).configured, false);
 });
 
@@ -1422,13 +1683,13 @@ test('automatic single-episode transfers recognize bounded episode notation and 
     ['ＥＰ１２', '剧集.2026.EP12.mkv'],
     ['S01E012', '012.mkv', 1, '剧集.2026'],
   ]) await t.test(selected + ' / ' + fileName, async t => {
-    const { service, state, connect } = await fixture(t); await connect({ autoSave: true });
+    const { service, state, connect, metadata } = await fixture(t); await connect({ autoSave: true });
     const series = { ...detail, id: 'episodes', title: '剧集', category: 'tv', season, lines: [{ episodes: [{ name: selected }] }] };
     state.source = [sourceVideo('target', fileName), sourceVideo('other', '剧集.2026.EP121.mkv')];
     if (folder) state.beforeRequest = call => call.path === '/share/sharepage/detail' ? reply({ list: new URL(call.value).searchParams.get('pdir_fid') === '0' ? [{ fid: 'series-folder', file_name: folder, file: false }] : state.source }) : undefined;
     const resources = await service.resources(series), listing = await service.files(series, { shareId: resources.resources[0].id });
     assert.deepEqual(listing.files.filter(file => file.match).map(file => file.name), [fileName]); assert.equal(listing.ambiguous, false);
-    const result = await service.prepare(series, { auto: true }); assert.equal(result.status, 'ready'); assert.equal(result.name, fileName);
+    const result = await service.prepare(series, { auto: true }); assert.equal(result.status, 'ready'); assert.equal(JSON.parse(metadata.get('quark-registry-v1')).assets[0].sourceName, fileName);
     const transfer = state.calls.find(call => call.path === '/share/sharepage/save'); assert.deepEqual(transfer.body.fid_list, ['target']); assert.equal(state.saved, 1);
   });
 });
@@ -1672,8 +1933,69 @@ test('official file_format identifies a signed HLS URL without a playlist suffix
     { accessable: 1, video_info: { url: signed, file_format: 'm3u8', width: 1920, height: 1080, codec: 'h264', audio: { codec: 'aac' } } },
   ] }) : undefined;
   const result = await service.playback(saved.assetId);
-  assert.deepEqual(result.episode, { url: signed, type: 'hls' }); assert.equal(result.metadata.mode, 'official'); assert.equal(result.metadata.requiresCompatibility, false);
+  assert.deepEqual(result.episode, { url: signed, type: 'hls', colorSpace: 'unknown' }); assert.equal(result.metadata.mode, 'official'); assert.equal(result.metadata.requiresCompatibility, true);
   assert.equal(state.calls.filter(call => call.path === '/file/download').length, 0);
+});
+
+test('official SDR streams are preferred and their adaptive master never mixes HDR, Dolby Vision or unknown colors', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); state.source = [sourceVideo('color-video', '影片.2026.DV.mkv')]; const saved = await save();
+  const cloud = (label, height, dynamic_range) => ({ resolution: height >= 1080 ? 'super' : 'high', video_info: { url: `https://video-cloud.quark.cn/${label}.m3u8`, width: height * 16 / 9, height, codec: 'h264', audio: { codec: 'aac' }, ...(dynamic_range ? { dynamic_range } : {}) } });
+  state.beforeRequest = call => call.path === '/file/v2/play' ? reply({ video_list: [cloud('dv', 1080, 'Dolby Vision'), cloud('sdr1080', 1080, 'SDR'), cloud('sdr720', 720, 'SDR'), cloud('pq', 1080, 'PQ'), cloud('unknown', 720)] }) : undefined;
+  const result = await service.playback(saved.assetId);
+  assert.equal(result.episode.colorSpace, 'sdr'); assert.equal(result.metadata.colorSpace, 'sdr');
+  assert.ok(result.episode.url.includes('/sdr'));
+  assert.equal(result.variants.length, 2); assert.ok(result.variants.every(row => row.colorSpace === 'sdr'));
+  assert.equal(result.metadata.requiresCompatibility, false); assert.equal(result.metadata.mode, 'official');
+  assert.equal(state.calls.filter(call => call.path === '/file/download').length, 0, 'compatible explicit SDR never fetches the original DV file');
+});
+
+test('original Dolby Vision uses one owned-file download instead of cloud AVC that lost its color and RPU metadata', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); state.source = [sourceVideo('color-video', '影片.2026.DoVi.mkv')]; const saved = await save();
+  const rows = [1080, 720, 480].map((height, index) => ({ resolution: index ? 'high' : 'super', video_info: { url: `https://video-cloud.quark.cn/color-${height}.m3u8`, width: height === 1080 ? 1920 : height === 720 ? 1280 : 854, height, ...(index < 2 ? { codec: 'h264', audio: { codec: 'aac' } } : {}) } }));
+  state.beforeRequest = call => call.path === '/file/v2/play' ? reply({ video_list: rows }) : undefined;
+  rows.push({ video_info: { url: 'https://video-cloud.quark.cn/incompatible-sdr.m3u8', dynamic_range: 'SDR', codec: 'hevc', audio: { codec: 'aac' } } });
+  const result = await service.playback(saved.assetId); assert.deepEqual(result.episode, { url: state.downloadUrl, type: 'mkv', colorSpace: 'dolby-vision' }); assert.equal(result.metadata.sourceColorSpace, 'dolby-vision');
+  assert.equal(result.variants, undefined); assert.equal(result.metadata.requiresCompatibility, true);
+  assert.equal(result.candidates, undefined); assert.equal(result.metadata.quality, undefined); assert.equal(result.metadata.mode, 'download');
+  const download = state.calls.filter(call => call.path === '/file/download'); assert.equal(download.length, 1);
+  assert.equal(download[0].body.fids.length, 1); assert.ok(state.files.some(file => file.fid === download[0].body.fids[0] && file.file_name === saved.name));
+  assert.deepEqual(result.allowCookieOrigins, ['https://download.quark.cn']); assert.ok(!JSON.stringify(result.metadata).includes(state.downloadUrl));
+  state.downloadUrl += '&renewed=synthetic'; const renewed = await service.playback(saved.assetId);
+  assert.notEqual(renewed.metadata.version, result.metadata.version); assert.equal(renewed.metadata.mode, 'download');
+});
+
+test('verified original file color risk stays separate from unmarked cloud candidates and invalidates their version', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
+  const first = await service.playback(saved.assetId); assert.equal(first.metadata.sourceColorSpace, 'unknown'); assert.equal(first.episode.colorSpace, 'unknown');
+  const file = state.files.find(row => row.file_name === saved.name);
+  assert.ok(file); file.video_info = { dynamic_range: 'HDR' };
+  const hdr = await service.playback(saved.assetId); assert.equal(hdr.metadata.sourceColorSpace, 'hdr'); assert.notEqual(hdr.metadata.version, first.metadata.version);
+  file.video_info = { dolby_vision: true };
+  const dv = await service.playback(saved.assetId); assert.equal(dv.metadata.sourceColorSpace, 'dolby-vision'); assert.notEqual(dv.metadata.version, hdr.metadata.version); assert.equal(dv.episode.colorSpace, 'dolby-vision'); assert.equal(dv.metadata.mode, 'download');
+});
+
+test('official color candidates stay bounded, exclude unusable URLs and invalidate cached verification when a stream changes', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
+  const cloud = index => ({ video_info: { url: `https://quality${index}.quark.cn/cloud-${index}.m3u8`, width: 1920, height: 1080 + index * 100, codec: 'h264', audio: { codec: 'aac' } } });
+  const list = Array.from({ length: 12 }, (_, index) => cloud(index));
+  list.push({ trans_status: 'fail', ...cloud(20) }, { accessable: 0, ...cloud(21) }, { video_info: { url: 'http://127.0.0.1/private.m3u8' } });
+  state.beforeRequest = call => call.path === '/file/v2/play' ? reply({ video_list: list }) : undefined;
+  const first = await service.playback(saved.assetId);
+  assert.equal(first.candidates.length, 8); assert.equal(first.candidates[0].url, first.episode.url); assert.equal(first.variants, undefined);
+  assert.ok(first.candidates.every(row => row.colorSpace === 'unknown' && row.url.startsWith('https://quality') && row.height < 3000));
+  assert.ok(first.candidates.every(row => first.allowCookieOrigins.includes(new URL(row.url).origin)));
+  list[1].video_info.url = 'https://replacement.quark.cn/cloud-1.m3u8';
+  const changed = await service.playback(saved.assetId); assert.notEqual(changed.metadata.version, first.metadata.version);
+  assert.ok(changed.candidates.some(row => row.url.includes('replacement')));
+});
+
+test('known cloud HDR and original Dolby Vision are marked for safe compatibility instead of ordinary SDR scaling', async t => {
+  for (const [name, tags, expected] of [['影片.2026.mp4', { color_transfer: 'smpte2084' }, 'pq'], ['影片.2026.mp4', { color_transfer: 'arib-std-b67' }, 'hlg'], ['影片.2026.mp4', { codec: 'dvhe.05.06' }, 'dolby-vision'], ['影片.2026.DV.mkv', null, 'dolby-vision'], ['影片.2026.HDR10.mkv', null, 'hdr']]) await t.test(expected, async () => {
+    const { service, state, connect, save } = await fixture(t); await connect(); state.source = [sourceVideo('color-video', name)]; const saved = await save();
+    state.beforeRequest = call => call.path === '/file/v2/play' ? tags ? reply({ video_list: [{ resolution: 'super', video_info: { url: state.playUrl, codec: 'h264', audio: { codec: 'aac' }, ...tags } }] }) : reply({ video_list: [] }) : undefined;
+    const result = await service.playback(saved.assetId); assert.equal(result.episode.colorSpace, expected); assert.equal(result.metadata.colorSpace, expected);
+    assert.equal(result.metadata.requiresCompatibility, true); assert.equal(result.variants, undefined);
+  });
 });
 
 test('official pending, failed and inaccessible cloud streams never enter playback qualities', async t => {
@@ -1687,7 +2009,8 @@ test('official pending, failed and inaccessible cloud streams never enter playba
     { video_info: { url: legacy, width: 1280, height: 720, codec: { name: 'unknown' }, audio: { codec: null } } },
   ] }) : undefined;
   const result = await service.playback(saved.assetId);
-  assert.equal(result.episode.url, ready); assert.deepEqual(result.variants.map(row => row.url), [legacy, ready]);
+  assert.equal(result.episode.url, ready); assert.deepEqual(result.candidates.map(row => row.url), [ready, legacy]);
+  assert.equal(result.variants, undefined);
   assert.deepEqual(result.allowCookieOrigins, ['https://video-cloud.quark.cn']);
   assert.equal(state.calls.filter(call => call.path === '/file/download').length, 0);
 });
@@ -1700,13 +2023,13 @@ test('explicit AVC and AAC win same-resolution duplicates without mixing known i
     { video_info: { url: 'https://video-cloud.quark.cn/dolby-4k.m3u8', width: 3840, height: 2160, codec: 'dvhe.05.06', audio: { codec: 'aac' } } },
     { video_info: { url: 'https://video-cloud.quark.cn/dts-1080.m3u8', width: 1920, height: 1080, codec: 'h264', audio: { codec: 'dts' } } },
     { video_info: { url: 'https://video-cloud.quark.cn/hevc-1080.m3u8', width: 1920, height: 1080, codec: 'HEVC', audio: { codec: 'aac' } } },
-    { video_info: { url: avc, width: 1920, height: 1080, codec: 'H264', audio: { codec: 'AAC' } } },
-    { video_info: { url: fourk, width: 3840, height: 2160, codec: 'avc1.640033', audio: { codec: 'mp4a.40.2' } } },
+    { video_info: { url: avc, width: 1920, height: 1080, codec: 'H264', audio: { codec: 'AAC' }, dynamic_range: 'SDR' } },
+    { video_info: { url: fourk, width: 3840, height: 2160, codec: 'avc1.640033', audio: { codec: 'mp4a.40.2' }, dynamic_range: 'SDR' } },
     { video_info: { url: legacy, width: 1280, height: 720 } },
   ] }) : undefined;
   const result = await service.playback(saved.assetId);
   assert.equal(result.episode.url, avc); assert.deepEqual(result.metadata.quality, { width: 1920, height: 1080 });
-  assert.deepEqual(result.variants.map(row => row.url), [legacy, avc, fourk]);
+  assert.deepEqual(result.variants.map(row => row.url), [avc, fourk]);
   assert.equal(state.calls.filter(call => call.path === '/file/download').length, 0);
 });
 
@@ -1720,7 +2043,7 @@ test('a compatible cloud stream is not replaced by unknown adaptive alternatives
       { video_info: { url: signed, file_format: type === 'hls' ? 'm3u8' : 'mp4', ...(type === 'mp4' ? { width: 1920, height: 1080 } : {}), codec: 'h264', audio: { codec: 'aac' } } },
     ] }) : undefined;
     const result = await service.playback(saved.assetId);
-    assert.deepEqual(result.episode, { url: signed, type }); assert.equal(result.variants, undefined); assert.equal(result.metadata.mode, 'official');
+    assert.deepEqual(result.episode, { url: signed, type, colorSpace: 'unknown' }); assert.equal(result.variants, undefined); assert.equal(result.metadata.mode, 'official');
     assert.equal(state.calls.filter(call => call.path === '/file/download').length, 0);
   });
 });
@@ -1755,6 +2078,121 @@ test('a normal official download fallback uses desktop credentials and returns t
   assert.equal(result.headers['user-agent'], state.calls.find(call => call.path === '/file/download').options.headers['user-agent']);
   assert.equal(result.headers.cookie, COOKIE); assert.deepEqual(result.allowCookieOrigins, ['https://download.quark.cn']);
   assert.equal(state.calls.filter(call => call.path === '/file/download').length, 1);
+});
+
+test('a download response refreshes only the signed media Cookie while the account and public response stay unchanged', async t => {
+  const { service, state, connect, save, metadata } = await fixture(t); await connect(); const saved = await save();
+  const previous = metadata.get('quark-settings-v1'), fresh = 'synthetic-fresh-download-session';
+  state.beforeRequest = call => {
+    if (call.path === '/file/v2/play') return reply({ video_list: [] });
+    if (call.path === '/file/download') {
+      assert.equal(call.options.headers.cookie, COOKIE);
+      return reply([{ fid: 'saved-1', download_url: state.downloadUrl }], { headers: { 'set-cookie': ['__pus=unrelated-response; Domain=.quark.cn; Path=/', `__puus=${fresh}; Domain=.quark.cn; Path=/; Secure; HttpOnly; Max-Age=60`] } });
+    }
+  };
+  let mediaReads = 0;
+  const cloud = createQuarkMedia({ quark: service, now: () => state.clock, probeColor: async () => ({ colorSpace: 'sdr' }), request: async (target, options) => {
+    mediaReads++; assert.equal(String(target), state.downloadUrl);
+    assert.equal(options.headers.cookie, COOKIE.replace('synthetic-session', fresh));
+    assert.equal(options.headers.referer, 'https://pan.quark.cn/'); assert.match(options.headers['user-agent'], /quark-cloud-drive\//);
+    return Object.assign(Readable.from([Buffer.alloc(188)]), { statusCode: 206, headers: { 'content-type': 'video/mp4', 'content-length': '188', 'content-range': 'bytes 0-187/4096' }, finalUrl: String(target) });
+  } });
+  const lease = await cloud.playback(saved.assetId, { owner: 'fixture-owner' });
+  const server = createServer(async (req, res) => {
+    try { await cloud.serve(req, res, lease.id, new URL(req.url, 'http://localhost').searchParams.get('token')); }
+    catch (error) { res.statusCode = error.status || 500; res.end('media test failed'); }
+  });
+  t.after(async () => { cloud.invalidate(); server.closeAllConnections(); await new Promise(done => server.close(done)); });
+  await new Promise(done => server.listen(0, '127.0.0.1', done));
+  const response = await fetch(`http://127.0.0.1:${server.address().port}${lease.response.url}`, { headers: { Range: 'bytes=0-187' } });
+  assert.equal(response.status, 206); assert.equal((await response.arrayBuffer()).byteLength, 188); assert.equal(mediaReads, 1);
+  assert.equal(JSON.stringify(lease.response).includes(fresh), false); assert.equal(JSON.stringify(await service.settings()).includes(fresh), false);
+  assert.equal(metadata.get('quark-settings-v1'), previous); assert.equal(JSON.stringify([...metadata.values()]).includes(fresh), false);
+});
+
+test('download Cookie updates reject unrelated, expired, malformed and incorrectly scoped headers without changing the prior Cookie', async t => {
+  const { service, state, connect, save, metadata } = await fixture(t); await connect(); const saved = await save();
+  const previous = metadata.get('quark-settings-v1'), valid = '__puus=fresh; Domain=.quark.cn; Path=/; Secure';
+  for (const header of [
+    undefined, '__pus=unrelated; Domain=.quark.cn; Path=/', '__puus=fresh; Path=/',
+    '__puus=fresh; Domain=.uc.cn; Path=/', '__puus=fresh; Domain=.cn; Path=/', '__puus=fresh; Domain=.quark.cn.evil.example; Path=/',
+    '__puus=fresh; Domain=.quark.cn', '__puus=fresh; Domain=.quark.cn; Path=/private',
+    valid + '; Domain=.quark.cn', valid + '; Path=/', valid + '; Max-Age=0', valid + '; Max-Age=-1', valid + '; Max-Age=invalid',
+    valid + '; Expires=Thu, 01 Jan 1970 00:00:00 GMT', valid + '; Expires=invalid',
+    '__puus=bad value; Domain=.quark.cn; Path=/', '__puus=bad,value; Domain=.quark.cn; Path=/', valid + '\r\nInjected: value',
+    '__puus=' + 'x'.repeat(8192) + '; Domain=.quark.cn; Path=/', Array(17).fill(valid), [valid, 42],
+  ]) {
+    state.beforeRequest = call => {
+      if (call.path === '/file/v2/play') return reply({ video_list: [] });
+      if (call.path === '/file/download') return reply([{ fid: 'saved-1', download_url: state.downloadUrl }], { headers: { 'set-cookie': header } });
+    };
+    assert.equal((await service.playback(saved.assetId)).headers.cookie, COOKIE);
+  }
+  assert.equal(metadata.get('quark-settings-v1'), previous);
+});
+
+test('download response host-only Cookies stay on the exact API host while explicit Domain permits its subdomains', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
+  for (const [domain, target, refreshed] of [
+    ['', 'https://cdn.drive.quark.cn/file', false],
+    ['; Domain=', 'https://cdn.drive.quark.cn/file', false],
+    ['', 'https://drive.quark.cn/file', true],
+    ['; Domain=', 'https://drive.quark.cn/file', true],
+    ['; Domain=.drive.quark.cn', 'https://cdn.drive.quark.cn/file', true],
+  ]) {
+    state.beforeRequest = call => {
+      if (call.path === '/file/v2/play') return reply({ video_list: [] });
+      if (call.path === '/file/download') return reply([{ fid: 'saved-1', download_url: target }], { headers: { 'set-cookie': `__puus=host-scope-fresh${domain}; Path=/; Secure` } });
+    };
+    const descriptor = await service.playback(saved.assetId);
+    assert.equal(descriptor.headers.cookie, refreshed ? COOKIE.replace('synthetic-session', 'host-scope-fresh') : COOKIE);
+    assert.deepEqual(descriptor.allowCookieOrigins, [new URL(target).origin]);
+  }
+});
+
+test('download Cookie refresh stays within the original total size cap and never follows an unrelated media origin', async t => {
+  const { service, state, connect, save } = await fixture(t);
+  const large = COOKIE + '; padding=' + 'x'.repeat(8000); await connect({ cookie: large }); const saved = await save();
+  state.beforeRequest = call => {
+    if (call.path === '/file/v2/play') return reply({ video_list: [] });
+    if (call.path === '/file/download') return reply([{ fid: 'saved-1', download_url: state.downloadUrl }], { headers: { 'set-cookie': `__puus=${'f'.repeat(400)}; Domain=.quark.cn; Path=/; Secure` } });
+  };
+  assert.equal((await service.playback(saved.assetId)).headers.cookie, large);
+  state.downloadUrl = 'https://download.uc.cn/file'; assert.equal((await service.playback(saved.assetId)).headers.cookie, large);
+  state.downloadUrl = 'https://external.example/file'; assert.equal((await service.playback(saved.assetId)).headers.cookie, undefined);
+});
+
+test('a changed account rejects a download response before its refreshed Cookie can be captured', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
+  let enter, release, reads = 0; const entered = new Promise(done => { enter = done; });
+  state.beforeRequest = async call => {
+    if (call.path === '/file/v2/play') return reply({ video_list: [] });
+    if (call.path === '/file/download') {
+      enter(); await new Promise(done => { release = done; });
+      const headers = {}; Object.defineProperty(headers, 'set-cookie', { get() { reads++; return ['__puus=fresh; Domain=.quark.cn; Path=/']; } });
+      return reply([{ fid: 'saved-1', download_url: state.downloadUrl }], { headers });
+    }
+  };
+  const playback = service.playback(saved.assetId); await entered; await service.clearAccount(); release();
+  await assert.rejects(playback, error => error.status === 409); assert.equal(reads, 0);
+});
+
+test('subtitle downloads use their own fresh response Cookie and the same desktop User-Agent without persisting either', async t => {
+  const { service, state, connect, save, metadata } = await fixture(t); await connect(); state.source.push(sourceSubtitle());
+  const saved = await save(), [subtitle] = await service.subtitles(saved.assetId), previous = metadata.get('quark-settings-v1');
+  let userAgent;
+  state.beforeRequest = call => {
+    if (call.path === '/file/download') {
+      assert.equal(new URL(call.value).searchParams.get('uc_param_str'), ''); assert.equal(call.options.headers.cookie, COOKIE);
+      userAgent = call.options.headers['user-agent']; assert.match(userAgent, /quark-cloud-drive\//);
+      return reply([{ fid: 'saved-2', download_url: 'https://subtitle.quark.cn/caption.srt' }], { headers: { 'set-cookie': '__puus=fresh-subtitle; Domain=.quark.cn; Path=/; Secure' } });
+    }
+    if (call.value.startsWith('https://subtitle.quark.cn/')) {
+      assert.equal(call.options.headers.cookie, COOKIE.replace('synthetic-session', 'fresh-subtitle')); assert.equal(call.options.headers['user-agent'], userAgent);
+    }
+  };
+  assert.equal(await service.subtitle(saved.assetId, subtitle.id), SRT);
+  assert.equal(metadata.get('quark-settings-v1'), previous); assert.equal(JSON.stringify([...metadata.values()]).includes('fresh-subtitle'), false);
 });
 
 test('official playback login rejection and rate limits never continue to the download endpoint', async t => {
@@ -1812,10 +2250,10 @@ test('playback retains official adaptive qualities and keeps stable category/ver
 test('official multi-quality HLS starts at 1080p while preserving 4K and excluding invalid or unfinished streams', async t => {
   const { service, connect, save, state } = await fixture(t); await connect(); const saved = await save();
   state.beforeRequest = call => call.path === '/file/v2/play' ? reply({ video_list: [
-    { video_info: { url: 'https://fourk.quark.cn/movie.m3u8?sig=4K%2B', width: 3840, height: 2160, bitrate: 24000000 } },
-    { video_info: { url: state.playUrl, width: 1920, height: 1080, bitrate: 6000000 } },
-    { video_info: { url: 'https://public-cdn.example/720.m3u8?token=a%2Fb', width: 1280, height: 720, bitrate: 2500000 } },
-    { video_info: { url: state.playUrl, width: 1920, height: 1080 } },
+    { video_info: { url: 'https://fourk.quark.cn/movie.m3u8?sig=4K%2B', width: 3840, height: 2160, bitrate: 24000000, dynamic_range: 'SDR' } },
+    { video_info: { url: state.playUrl, width: 1920, height: 1080, bitrate: 6000000, dynamic_range: 'SDR' } },
+    { video_info: { url: 'https://public-cdn.example/720.m3u8?token=a%2Fb', width: 1280, height: 720, bitrate: 2500000, dynamic_range: 'SDR' } },
+    { video_info: { url: state.playUrl, width: 1920, height: 1080, dynamic_range: 'SDR' } },
     { video_info: { url: 'http://127.0.0.1/private.m3u8', width: 8192, height: 4320 } },
     { video_info: { url: 'https://pending.quark.cn/unfinished.m3u8', width: 7680, height: 4320, finish: false } },
     { accessable: false, video_info: { url: 'https://locked.quark.cn/locked.m3u8', width: 7680, height: 4320 } },
@@ -1860,10 +2298,38 @@ test('unknown CDN, insecure first-party HTTP and deceptive suffixes never receiv
   state.downloadUrl = 'http://127.0.0.1/movie.mp4'; await assert.rejects(service.playback(saved.assetId), /安全/);
 });
 
-test('only ended plus a known near-end position marks watched; replay and active leases block deletion', async t => {
+test('cleanup reports retention and lease deferrals without changing the default seven-day policy', async t => {
   const { service, state, connect, save } = await fixture(t); await connect({ cleanupEnabled: true }); const saved = await save();
-  assert.equal((await service.progress(saved.assetId, { position: 99, duration: 100, ended: false })).ended, false); assert.equal((await service.progress(saved.assetId, { position: 50, duration: 100, ended: true })).watchedAt, null);
-  const finished = await service.progress(saved.assetId, { position: 100, duration: 100, ended: true }); assert.equal(finished.ended, true);
+  assert.equal((await service.settings()).retentionDays, 7);
+  assert.equal((await service.cleanup()).notWatched, 1);
+  const watched = await service.progress(saved.assetId, { position: 100, duration: 100, ended: true });
+  const result = await service.cleanup();
+  assert.equal(result.checked, 0); assert.equal(result.notDue, 1); assert.equal(result.leased, 1);
+  assert.equal(result.nextEligibleAt, watched.watchedAt + 7 * DAY); assert.equal(result.leaseRemainingMs, 120000);
+  assert.equal(state.deletes.length, 0);
+});
+
+test('explicit zero-day retention survives restart and still protects incomplete videos and the active lease', async t => {
+  const { service, state, connect, save, options } = await fixture(t); await connect({ cleanupEnabled: true, retentionDays: 0 }); const saved = await save();
+  await service.progress(saved.assetId, { position: 90, duration: 100, ended: false });
+  assert.equal((await service.cleanup()).notWatched, 1);
+  await service.progress(saved.assetId, { position: 100, duration: 100, ended: true });
+  await service.stop(); const restarted = createQuark(options); t.after(() => restarted.stop());
+  assert.equal((await restarted.settings()).retentionDays, 0);
+  const waiting = await restarted.cleanup(); assert.equal(waiting.deleted, 0); assert.equal(waiting.leased, 1); assert.equal(waiting.notDue, 0);
+  assert.equal(waiting.nextEligibleAt, state.clock + 120000);
+  state.clock += 120000; assert.equal((await restarted.cleanup()).deleted, 1);
+  assert.deepEqual(state.deletes, ['saved-1']);
+  await assert.rejects(restarted.configure({ retentionDays: -1 }), cause => cause.status === 400);
+});
+
+test('a known near-end position marks watched after a paused seek; replay and active leases block deletion', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect({ cleanupEnabled: true }); const saved = await save();
+  assert.equal((await service.progress(saved.assetId, { position: 97, duration: 100, ended: false })).ended, false); assert.equal((await service.progress(saved.assetId, { position: 50, duration: 100, ended: true })).watchedAt, null);
+  assert.equal((await service.progress(saved.assetId, { position: 0, duration: 1, ended: true })).ended, false);
+  assert.equal((await service.progress(saved.assetId, { position: .97, duration: 1, ended: false })).ended, false);
+  const finished = await service.progress(saved.assetId, { position: 99, duration: 100, ended: false }); assert.equal(finished.ended, true);
+  state.clock += 1000; assert.equal((await service.progress(saved.assetId, { position: 100, duration: 100, ended: true })).watchedAt, finished.watchedAt);
   state.clock += 6 * DAY; assert.equal((await service.cleanup()).checked, 0);
   state.clock += 2 * DAY; await service.playback(saved.assetId); assert.equal((await service.cleanup()).checked, 0);
   await service.progress(saved.assetId, { position: 0, duration: 100, ended: false }); state.clock += 8 * DAY; assert.equal((await service.cleanup()).checked, 0); assert.equal(state.deletes.length, 0);

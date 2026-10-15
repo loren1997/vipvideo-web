@@ -79,6 +79,38 @@ with tempfile.TemporaryDirectory() as directory:
   with contextlib.redirect_stdout(output): namespace["main"]()
   assert path.read_bytes() == written and len(list(path.parent.glob("*.bak"))) == 1
   assert secret not in output.getvalue()
+  danmaku_path = path.parent / "docker-danmaku.json"
+  danmaku_path.write_bytes(before)
+  message = namespace["update_file"](danmaku_path, danmaku=True)
+  enriched = config(danmaku_path)
+  token = enriched["services"]["web"]["environment"]["DANMAKU_API_TOKEN"]
+  assert re.fullmatch(r"[A-Za-z0-9_-]{32}", token)
+  assert token not in message and secret not in message
+  assert enriched["services"]["pansou"] == original["services"]["pansou"]
+  assert enriched["services"]["plex"] == original["services"]["plex"]
+  assert enriched["volumes"] == original["volumes"] and enriched["networks"] == original["networks"]
+  expected_danmaku_web = copy.deepcopy(expected_web)
+  expected_danmaku_web["environment"].update({"DANMAKU_API_URL": "http://danmaku:9321", "DANMAKU_API_TOKEN": token})
+  assert enriched["services"]["web"] == expected_danmaku_web
+  helper = enriched["services"]["danmaku"]
+  assert helper["environment"]["TOKEN"] == token
+  assert helper["environment"]["SOURCE_ORDER"] == "tencent,iqiyi,youku,imgo,bilibili"
+  assert helper["environment"]["YOUKU_CONCURRENCY"] == "2" and helper["environment"]["DANMU_LIMIT"] == "5"
+  assert helper["environment"]["SEARCH_CACHE_MINUTES"] == "5"
+  assert helper["environment"]["OTHER_SERVER"] == "http://127.0.0.1:9321/disabled"
+  assert helper["networks"] == {"family": None}
+  assert helper["read_only"] and helper["cpus"] == .5 and helper["mem_limit"] == "512m"
+  assert not any(key in helper for key in ("ports", "devices", "privileged", "volumes"))
+  enriched_bytes = danmaku_path.read_bytes()
+  namespace["update_file"](danmaku_path, danmaku=True)
+  assert danmaku_path.read_bytes() == enriched_bytes, "random token must remain stable on a repeated update"
+  enriched["services"]["danmaku"]["ports"] = ["9321:9321"]
+  danmaku_path.write_text(json.dumps(enriched))
+  conflict_danmaku = danmaku_path.read_bytes()
+  try: namespace["update_file"](danmaku_path, danmaku=True)
+  except ValueError: pass
+  else: raise AssertionError("custom danmaku service must not be overwritten")
+  assert danmaku_path.read_bytes() == conflict_danmaku
   after["services"]["quark-browser"]["ports"] = ["3020:3020"]
   path.write_text(json.dumps(after))
   conflict = path.read_bytes()
@@ -112,13 +144,22 @@ test('every supplied Compose deploys an isolated browser from the same candidate
   for (const filename of ['compose.yaml', 'docker-compose.yml', 'docker-compose.nas.yml']) {
     const source = readFileSync(new URL('../../' + filename, import.meta.url), 'utf8');
     assert.match(source, /x-browser-image: &browser-image\r?\n  image: "\$\{CI_IMAGE:-/);
-    assert.equal((source.match(/^    image:/gm) || []).length, filename === 'docker-compose.nas.yml' ? 2 : 1);
+    assert.equal((source.match(/^    image:/gm) || []).length, filename === 'docker-compose.nas.yml' ? 3 : 2);
     const browser = source.split('  quark-browser:')[1].split(/^  [\w-]+:/m)[0];
     assert.match(browser, /<<: \*browser-image/);
     assert.match(browser, /HOME: \/tmp/);
     assert.match(browser, /\/app\/data:size=16m,uid=1000,gid=1000,mode=0700/);
     assert.doesNotMatch(browser, /APP_PASSWORD|^    (?:ports|volumes|devices|depends_on):/m);
     assert.match(source, /QUARK_BROWSER_URL: http:\/\/quark-browser:3020/);
+    assert.match(source, /DANMAKU_API_URL: http:\/\/danmaku:9321/);
+    const danmaku = source.split('  danmaku:')[1].split(/^  [\w-]+:/m)[0];
+    assert.match(danmaku, /image: logvar\/danmu-api@sha256:[a-f0-9]{64}/);
+    assert.match(danmaku, /read_only: true/); assert.match(danmaku, /mem_limit: 512m/); assert.match(danmaku, /cpus: 0\.5/);
+    assert.doesNotMatch(danmaku, /^    (?:ports|volumes|devices|privileged):/m);
+    assert.match(danmaku, /SOURCE_ORDER: tencent,iqiyi,youku,imgo,bilibili/);
+    assert.match(danmaku, /YOUKU_CONCURRENCY: "2"/); assert.match(danmaku, /DANMU_LIMIT: "5"/);
+    assert.match(danmaku, /SEARCH_CACHE_MINUTES: "5"/);
+    assert.match(danmaku, /OTHER_SERVER: http:\/\/127\.0\.0\.1:9321\/disabled/);
     assert.equal((source.match(/^\s+QUARK_SEARCH_PROXY:/gm) || []).length, 2);
   }
   assert.ok(existsSync(updater));

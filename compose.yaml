@@ -22,6 +22,8 @@ services:
       FFMPEG_PATH: "${FFMPEG_PATH:-ffmpeg}"
       QUARK_BROWSER_URL: http://quark-browser:3020
       QUARK_SEARCH_PROXY: "${QUARK_SEARCH_PROXY:-}"
+      DANMAKU_API_URL: http://danmaku:9321
+      DANMAKU_API_TOKEN: "${DANMAKU_API_TOKEN:-vipvideo-local-danmaku}"
     volumes:
       - vipvideo_data:/app/data
     stop_grace_period: 20s
@@ -53,6 +55,37 @@ services:
     mem_limit: 512m
     memswap_limit: 512m
     pids_limit: 256
+
+  danmaku:
+    image: logvar/danmu-api@sha256:7c6c80e6e51d0a77aaa8745a1cbaf95fe333118697d3fdaaabc5ca3bc24e5529
+    restart: unless-stopped
+    init: true
+    environment:
+      TOKEN: "${DANMAKU_API_TOKEN:-vipvideo-local-danmaku}"
+      SOURCE_ORDER: tencent,iqiyi,youku,imgo,bilibili
+      RATE_LIMIT_MAX_REQUESTS: "0"
+      YOUKU_CONCURRENCY: "2"
+      DANMU_LIMIT: "5"
+      SEARCH_CACHE_MINUTES: "5"
+      OTHER_SERVER: http://127.0.0.1:9321/disabled
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /app/.cache:size=96m,mode=1777
+      - /app/config:size=2m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    cpu_shares: 128
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9321/'+process.env.TOKEN+'/api/v2/search/anime?keyword=',{signal:AbortSignal.timeout(3000)}).then(async r=>{if(!r.ok)throw Error();const j=await r.json();if(j.success!==true||!Array.isArray(j.animes))throw Error()}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   vipvideo_data:

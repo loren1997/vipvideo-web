@@ -9,7 +9,7 @@ const API = 'https://drive.quark.cn/1/clouddrive', SAVE_API = 'https://drive-h.q
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const PLAYBACK_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch';
 const DAY = 86400000, GIB = 1024 ** 3, DAILY_BYTES = 3_000_000_000_000, SIDECAR = 'http://pansou:8888/api/search';
-const defaults = { enabled: false, autoSave: false, cleanupEnabled: false, retentionDays: 7, maxDailyTransfers: 100, maxDailyBytes: DAILY_BYTES, searchApi: '' };
+const defaults = { enabled: false, autoSave: true, cleanupEnabled: false, retentionDays: 7, maxDailyTransfers: 100, maxDailyBytes: DAILY_BYTES, searchApi: '' };
 const id = () => randomBytes(16).toString('hex');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const validFid = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
@@ -22,6 +22,16 @@ const video = file => !directory(file) && (file?.file === true || file?.dir === 
 const SUBTITLE_BYTES = 2 * 1024 * 1024, SUBTITLE_LIMIT = 8;
 const subtitleType = value => /\.(srt|vtt|ass)$/i.exec(value || '')?.[1].toLowerCase();
 const subtitleFile = file => !directory(file) && !!subtitleType(file?.file_name);
+function streamColor(info) {
+  const tags = [info.color_space, info.color_transfer, info.transfer_characteristics, info.hdr_type, info.dynamic_range, info.codec].filter(value => typeof value === 'string').join(' ').toLowerCase();
+  if ([true, 1, '1'].includes(info.dolby_vision) || /dolby[ _.-]*vision|dvhe|dvh1|dvav|dva1/.test(tags)) return 'dolby-vision';
+  if (/\bhlg\b|arib-std-b67/.test(tags)) return 'hlg';
+  if (/\bpq\b|smpte[-_ ]?2084|hdr10/.test(tags)) return 'pq';
+  if ([true, 1, '1'].includes(info.is_hdr) || /\bhdr\b/.test(tags)) return 'hdr';
+  if (/\bsdr\b/.test(tags) || /^(?:bt709|gamma22|gamma28|iec61966-2-1)$/i.test(info.color_transfer || info.transfer_characteristics || '')) return 'sdr';
+}
+const fileColorRisk = value => /(?:^|[^a-z0-9])(?:dv|dovi|dolby[ ._-]*vision)(?:[^a-z0-9]|$)|杜比视界/i.test(value) ? 'dolby-vision'
+  : /(?:^|[^a-z0-9])hlg(?:[^a-z0-9]|$)/i.test(value) ? 'hlg' : /(?:^|[^a-z0-9])hdr(?:10\+?)?(?:[^a-z0-9]|$)/i.test(value) ? 'hdr' : undefined;
 const subtitleFolder = value => /^(?:subs?|subtitles?|字幕|字幕文件|外挂字幕)$/i.test(String(value).normalize('NFKC').trim());
 const languageName = value => /^(?:chs|cht|chi|zho|zh(?:[-_.]?(?:cn|tw|hans|hant))?|en(?:g|glish)?|ja(?:p|pn)?|ko(?:r)?|es|spa|fr|fra|fre|de|deu|ger|ru|rus|it|ita|pt|por|简(?:体|中|体中文)|繁(?:体|中|体中文)|中文|英文|英语|双语|中英|中英双语|中字|字幕|sub(?:title)?s?|forced|sdh|cc)$/i.test(value);
 const subtitleStem = value => {
@@ -75,6 +85,38 @@ function cookieInput(value) {
   return parts.join('; ');
 }
 
+function downloadMediaCookie(cookie, setCookies, target, timestamp) {
+  const source = new URL(API), media = new URL(target);
+  if (media.protocol !== 'https:' || media.username || media.password) return cookie;
+  const rows = typeof setCookies === 'string' ? [setCookies] : setCookies;
+  if (!Array.isArray(rows) || rows.length > 16 || rows.some(row => typeof row !== 'string') || rows.reduce((size, row) => size + Buffer.byteLength(row), 0) > 8192) return cookie;
+  let fresh;
+  for (const row of rows) {
+    if (/[\u0000-\u001f\u007f]/.test(row)) continue;
+    const parts = row.split(';').map(part => part.trim()), pair = /^__puus=([\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]+)$/.exec(parts.shift());
+    if (!pair) continue;
+    const attributes = new Map(); let invalid = false;
+    for (const part of parts) {
+      const index = part.indexOf('='), name = (index < 0 ? part : part.slice(0, index)).trim().toLowerCase();
+      if (!['domain', 'path', 'max-age', 'expires'].includes(name)) continue;
+      if (index < 0 || attributes.has(name)) { invalid = true; break; }
+      attributes.set(name, part.slice(index + 1).trim());
+    }
+    const domain = (attributes.get('domain') || source.hostname).replace(/^\./, '').toLowerCase();
+    if (!attributes.get('domain') && media.hostname !== source.hostname) continue;
+    if (invalid || ![source.hostname, 'quark.cn'].includes(domain) || media.hostname !== domain && !media.hostname.endsWith('.' + domain)) continue;
+    // A descriptor forwards across paths on its one origin, so only a root-path update is safe.
+    if (attributes.get('path') !== '/') continue;
+    const age = attributes.get('max-age'), expires = attributes.get('expires');
+    if (age !== undefined) { if (!/^\d+$/.test(age) || !Number.isFinite(Number(age)) || Number(age) <= 0) continue; }
+    else if (expires !== undefined && (!Number.isFinite(Date.parse(expires)) || Date.parse(expires) <= timestamp)) continue;
+    fresh = pair[1];
+  }
+  if (!fresh) return cookie;
+  const merged = [...cookie.split(';').map(part => part.trim()).filter(part => part && !/^__puus\s*=/.test(part)), '__puus=' + fresh].join('; ');
+  return Buffer.byteLength(merged) <= 8192 ? merged : cookie;
+}
+
 function accountId(config, root, cookie) {
   const uid = config?.data?.uid ?? config?.data?.user_id ?? config?.data?.member_config?.uid ?? root?.data?.uid;
   if (typeof uid === 'string' && uid.length > 0 && uid.length <= 128 || Number.isSafeInteger(uid) && uid > 0) return hash('uid:' + uid);
@@ -101,6 +143,27 @@ function detailInfo(detail, options = {}) {
   return { title, searchTitle: searchTitle.length >= 2 ? searchTitle : title, aliases, series, titleSeason: seasonNumber(rawTitle), year: /^(?:19|20)\d{2}$/.test(year) ? year : '', key, selected, line, index, season: detail.season };
 }
 
+function videoRename(info, file) {
+  if (!info.year) return;
+  const title = info.searchTitle.replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').replace(/^[ .]+|[ .]+$/g, '').slice(0, 180).trim();
+  const extension = /\.[a-z0-9]{2,5}$/i.exec(file.name)?.[0].toLowerCase();
+  if (!title || !extension) return;
+  let suffix = '';
+  if (info.series) {
+    const seasons = [Number.isInteger(info.season) ? info.season : undefined, info.titleSeason, seasonNumber(info.selected?.name), seasonNumber(file.name), ...(file.path || []).map(seasonNumber)].filter(value => value !== undefined);
+    const episodes = [episodeNumber(info.selected?.name), episodeNumber(file.name)].filter(value => value !== undefined);
+    if (!seasons.length || !episodes.length || seasons.some(value => !Number.isInteger(value) || value < 1 || value > 99 || value !== seasons[0]) || episodes.some(value => !Number.isInteger(value) || value < 1 || value > 999 || value !== episodes[0])) return;
+    suffix = ` S${String(seasons[0]).padStart(2, '0')}E${String(episodes[0]).padStart(2, '0')}`;
+  } else if (episodeNumber(file.name) !== undefined) return;
+  return `${title} (${info.year})${suffix}${extension}`;
+}
+function subtitleRename(asset, candidate) {
+  const original = candidate.name.normalize('NFKC').replace(/\.[^.]+$/, ''), stem = subtitleStem(candidate.name);
+  const suffix = languageName(stem) ? '.' + stem : original.slice(stem.length);
+  const target = (asset.renameTo || asset.name).replace(/\.[^.]+$/, '') + suffix + '.' + candidate.type;
+  return target.length <= 300 && !/[\\/:*?"<>|\u0000-\u001f\u007f]/.test(target) ? target : undefined;
+}
+
 function number(value) {
   if (/^\d{1,3}$/.test(value || '')) return Number(value);
   const digits = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
@@ -119,6 +182,7 @@ const episodeNumber = value => {
   return /^(?:\d{1,3})(?:\.[a-z0-9]+)?$/i.test(text) ? Number(text.split('.')[0]) : undefined;
 };
 const normalized = value => String(value).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+const automaticScope = info => JSON.stringify([info.line, info.index, info.selected?.name, Number.isInteger(info.season) ? info.season : null]);
 function matches(info, file) {
   if (!info.selected || info.title.length < 2) return false;
   const parts = [...file.path, file.name], title = normalized(info.title);
@@ -140,7 +204,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   const parse = (key, fallback) => { try { const text = store.meta(key); return text && text.length <= 2 * 1024 * 1024 ? JSON.parse(text) : fallback; } catch { return fallback; } };
   const initial = parse('quark-settings-v1', {}), config = { ...defaults, installId: /^[a-f0-9]{32}$/.test(initial.installId || '') ? initial.installId : id() };
   for (const field of ['enabled', 'autoSave', 'cleanupEnabled']) if (typeof initial[field] === 'boolean') config[field] = initial[field];
-  for (const [field, minimum, maximum] of [['retentionDays', 1, 365], ['maxDailyTransfers', 1, 100], ['maxDailyBytes', 1024 * 1024, DAILY_BYTES]]) if (Number.isSafeInteger(initial[field]) && initial[field] >= minimum && initial[field] <= maximum) config[field] = initial[field];
+  for (const [field, minimum, maximum] of [['retentionDays', 0, 365], ['maxDailyTransfers', 1, 100], ['maxDailyBytes', 1024 * 1024, DAILY_BYTES]]) if (Number.isSafeInteger(initial[field]) && initial[field] >= minimum && initial[field] <= maximum) config[field] = initial[field];
   if (typeof initial.searchApi === 'string' && initial.searchApi.length <= 2048) config.searchApi = initial.searchApi;
   if (/^[a-f0-9]{64}$/.test(initial.account?.id || '') && ['iv', 'tag', 'ciphertext'].every(field => typeof initial.account[field] === 'string' && initial.account[field].length <= 16384)) config.account = { id: initial.account.id, iv: initial.account.iv, tag: initial.account.tag, ciphertext: initial.account.ciphertext };
   if (store.meta('quark-transfer-default-100-v1') !== '1') {
@@ -206,7 +270,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (active >= 2) { if (waiters.length >= 64) throw failure('夸克请求繁忙，请稍后重试', 429); await new Promise(resolve => waiters.push(resolve)); } else active++;
     try { return await operation(); } finally { const next = waiters.shift(); if (next) next(); else active--; }
   }
-  async function api(path, { method = 'GET', body, query = {}, credentials = '', guard, beforeSend, userAgent = UA, signal, timeout: budget = 8000 } = {}) {
+  async function api(path, { method = 'GET', body, query = {}, credentials = '', guard, beforeSend, onResponseHeaders, userAgent = UA, signal, timeout: budget = 8000 } = {}) {
     signal?.throwIfAborted();
     return limited(async () => {
       if (stopped) throw failure('夸克服务正在关闭', 503);
@@ -234,6 +298,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
           const json = JSON.parse(await readText(response, 1024 * 1024));
           signal?.throwIfAborted(); guard?.();
           if (json.code !== 0 || Number(json.status || 200) >= 400) throw responseFailure(Number(json.status || 200), json.code, response.statusCode);
+          if (path === '/file/download' && credentials) { onResponseHeaders?.(response.headers); guard?.(); }
           return json;
         })();
         return await Promise.race([task, new Promise((_, reject) => {
@@ -281,6 +346,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     position: Number.isFinite(asset.position) && asset.position >= 0 && asset.position <= 86400 ? asset.position : 0,
     duration: Number.isFinite(asset.duration) && asset.duration > 0 && asset.duration <= 86400 ? asset.duration : 0,
     ...(asset.subtitleReason ? { subtitleReason: name(asset.subtitleReason).slice(0, 180) } : {}),
+    ...(asset.renameReason ? { renameReason: name(asset.renameReason).slice(0, 180) } : {}),
     ...(asset.status === 'ready' ? {} : { reason: asset.task ? '转存任务仍在处理，请稍后重试' : '上次转存响应不确定，为避免重复转存请稍后检查专用目录' }) });
   const findAsset = (assetId, context) => { const asset = registry.assets.find(value => value.id === assetId && value.account === context.account && value.managed === true); if (!asset) throw failure('未找到已登记的夸克视频', 404); if (asset.parent !== registry.folders[context.account]?.fid) throw failure('视频不在当前专用目录，已停止操作', 409); return asset; };
   function searchUrl(value) {
@@ -304,7 +370,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw failure('夸克设置格式无效', 400);
     const next = { ...config };
     for (const field of ['enabled', 'autoSave', 'cleanupEnabled']) if (Object.hasOwn(input, field)) { if (typeof input[field] !== 'boolean') throw failure('夸克开关设置无效', 400); next[field] = input[field]; }
-    for (const [field, minimum, maximum] of [['retentionDays', 1, 365], ['maxDailyTransfers', 1, 100], ['maxDailyBytes', 1024 * 1024, DAILY_BYTES]]) if (Object.hasOwn(input, field)) { if (!Number.isSafeInteger(input[field]) || input[field] < minimum || input[field] > maximum) throw failure('夸克容量或保留期设置无效', 400); next[field] = input[field]; }
+    for (const [field, minimum, maximum] of [['retentionDays', 0, 365], ['maxDailyTransfers', 1, 100], ['maxDailyBytes', 1024 * 1024, DAILY_BYTES]]) if (Object.hasOwn(input, field)) { if (!Number.isSafeInteger(input[field]) || input[field] < minimum || input[field] > maximum) throw failure('夸克容量或保留期设置无效', 400); next[field] = input[field]; }
     if (Object.hasOwn(input, 'searchApi')) { if (typeof input.searchApi !== 'string' || input.searchApi.length > 2048) throw failure('公开搜索地址无效', 400); next.searchApi = input.searchApi ? searchUrl(input.searchApi) : ''; }
     if (Object.hasOwn(input, 'cookie')) {
       const value = cookieInput(input.cookie), generation = ++epoch;
@@ -470,9 +536,10 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       listing.complete = Number.isSafeInteger(total) && total >= 0 ? total === listing.seen.size : result.data.list.length < 100;
       if (Number.isFinite(total) && total > folder.page * 100) queue.push({ ...folder, page: folder.page + 1 });
     }
-    for (const file of found) file.listings = listings;
-    truncated ||= queue.length > 0;
+    truncated ||= queue.length > 0 || [...listings.values()].some(listing => !listing.complete);
     const output = found.map(file => ({ id: file.id, name: file.name, size: Number.isSafeInteger(file.size) && file.size > 0 ? file.size : null, match: matches(info, file), episode: episodeNumber(file.name.replace(/\.[^.]+$/, '')) }));
+    const unique = !truncated && output.filter(file => file.match).length === 1;
+    for (const file of found) { file.listings = listings; file.automatic = unique && matches(info, file); file.autoScope = automaticScope(info); }
     return { files: output, truncated, ambiguous: truncated || output.filter(file => file.match).length !== 1 };
   }
   async function ownList(context, parent) {
@@ -560,9 +627,40 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (record.parent !== asset.parent || !file || !(record === asset ? video(file) : subtitleFile(file) && subtitleType(file.file_name) === record.type) || file.file_name !== record.name || Number(file.size) !== record.size || file.pdir_fid && file.pdir_fid !== parent) throw failure('无法核验本应用登记的单个视频或字幕，已停止操作', 409);
     return file;
   }
+  function currentRegisteredFile(asset, record, parent, list) {
+    if (record.renameAttempted && typeof record.renameTo === 'string' && name(record.renameTo) === record.renameTo && record.renameFrom === record.name) {
+      const file = list.find(row => row.fid === record.fid);
+      if (file?.file_name === record.renameTo) {
+        const previous = record.name; record.name = record.renameTo;
+        try { registeredFile(asset, record, parent, list); } catch (cause) { record.name = previous; throw cause; }
+        delete record.renameTo; delete record.renameFrom; delete record.renameAttempted; delete record.renameWarning;
+        if (!asset.renameWarning && !(asset.subtitles || []).some(row => row.renameWarning)) delete asset.renameReason;
+        persist();
+      }
+    }
+    return registeredFile(asset, record, parent, list);
+  }
   async function ownedFile(context, asset, record = asset) {
     const folder = await ownedFolder(context), result = await ownList(context, folder.fid);
-    return registeredFile(asset, record, folder.fid, result.list);
+    return currentRegisteredFile(asset, record, folder.fid, result.list);
+  }
+  async function renameOwned(context, asset, record = asset) {
+    if (!record.renameTo || record.status !== 'ready') return;
+    const reason = record === asset ? '视频已转存，自动命名未完成，已保留现有文件，请刷新后确认' : '字幕已转存，自动命名未完成，已保留现有文件，请刷新后确认';
+    try {
+      if (record.renameAttempted) { await ownedFile(context, asset, record); return; }
+      const folder = await ownedFolder(context), listing = await ownList(context, folder.fid); current(context);
+      registeredFile(asset, record, folder.fid, listing.list);
+      if (record.renameTo === record.name) { delete record.renameTo; persist(); return; }
+      if (!listing.complete || listing.list.some(row => row.fid !== record.fid && row.file_name === record.renameTo)) {
+        delete record.renameTo; record.renameWarning = true; asset.renameReason = '目标名称已存在或目录未完整核验，已保留转存文件原名'; persist(); return;
+      }
+      const target = record.renameTo;
+      record.renameFrom = record.name; record.renameAttempted = true; reserveRegistration(); persist();
+      try { await auth(context, '/file/rename', { method: 'POST', query: { uc_param_str: '' }, body: { fid: record.fid, file_name: target } }); } catch { current(context); }
+      await ownedFile(context, asset, record); current(context);
+      if (record.name !== target) { record.renameWarning = true; asset.renameReason = reason; persist(); }
+    } catch { current(context); record.renameWarning = true; asset.renameReason = reason; persist(); }
   }
   const dailyBytes = (account, day) => registry.assets.filter(asset => asset.account === account).reduce((sum, asset) => sum + (asset.day === day && asset.status !== 'queued' ? asset.size : 0) + (asset.subtitles || []).reduce((bytes, row) => bytes + (row.day === day && row.status !== 'queued' ? row.size : 0), 0), 0);
   function reserveRegistration(record) {
@@ -595,18 +693,21 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     }).slice(0, SUBTITLE_LIMIT);
   }
   async function resumeSubtitle(context, asset, record) {
-    if (record.status === 'ready') { await ownedFile(context, asset, record); return; }
+    if (record.status === 'ready') { await ownedFile(context, asset, record); await renameOwned(context, asset, record); return; }
     if (!record.task) throw failure('字幕转存响应不确定，请稍后检查专用目录');
     const result = await auth(context, '/task', { query: { task_id: record.task, retry_index: '0' } }); current(context);
     const fids = result.data?.save_as?.save_as_select_top_fids || result.data?.save_as?.save_as_top_fids;
     if (!Array.isArray(fids) || fids.length !== 1 || !validFid(fids[0]) || fids[0] === asset.fid || (asset.subtitles || []).some(row => row !== record && row.fid === fids[0])) throw failure('字幕转存尚未完成或响应无法核验');
-    record.fid = fids[0]; await ownedFile(context, asset, record); current(context); record.status = 'ready'; persist();
+    record.fid = fids[0]; await ownedFile(context, asset, record); current(context); record.status = 'ready'; persist(); await renameOwned(context, asset, record);
   }
   async function prepareSubtitles(context, info, selected, resource, asset, reused = false) {
     if (asset.status !== 'ready') return publicAsset(asset, reused);
+    asset.subtitleTitle = info.searchTitle; asset.series = info.series;
+    if (Number.isInteger(info.season ?? info.titleSeason)) asset.subtitleSeason = info.season ?? info.titleSeason;
     let queuedSubtitle;
     try {
       if (asset.subtitleRegistryInvalid) throw failure('字幕登记无效，请先检查专用目录', 409);
+      await renameOwned(context, asset);
       const matching = await matchingSubtitles(context, info, selected, resource); current(context);
       for (const candidate of matching) {
         queuedSubtitle = undefined;
@@ -617,7 +718,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         const day = new Date(now()).toISOString().slice(0, 10);
         if (dailyBytes(context.account, day) + candidate.size > config.maxDailyBytes) throw failure('字幕转存达到每日容量上限', 429);
         if (!record) {
-          record = { id: id(), source, parent: asset.parent, name: candidate.name, size: candidate.size, type: candidate.type, day, status: 'queued' };
+          record = { id: id(), source, parent: asset.parent, name: candidate.name, size: candidate.size, type: candidate.type, day, status: 'queued', ...(subtitleRename(asset, candidate) ? { renameTo: subtitleRename(asset, candidate) } : {}) };
           reserveRegistration(record);
           queuedSubtitle = record; (asset.subtitles ||= []).push(record); persist();
         } else reserveRegistration();
@@ -637,31 +738,71 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     asset.leaseUntil = now() + 120000; asset.lastActivity = now(); persist();
     return { context, asset };
   }
-  async function subtitles(assetId, options = {}) {
-    const { context, asset } = await subtitleAsset(assetId, options), rows = (asset.subtitles || []).filter(row => row.status === 'ready');
-    if (rows.length) {
-      const folder = await ownedFolder(context), result = await ownList(context, folder.fid);
-      registeredFile(asset, asset, folder.fid, result.list); for (const row of rows) registeredFile(asset, row, folder.fid, result.list);
+  async function availableSubtitles(context, asset) {
+    const pending = (asset.subtitles || []).filter(record => record.status === 'saving' && validFid(record.task)).slice(0, SUBTITLE_LIMIT);
+    if (pending.length) await serialize(async () => {
+      current(context);
+      for (const record of pending) {
+        if (record.status !== 'saving' || !validFid(record.task)) continue;
+        try { await resumeSubtitle(context, asset, record); }
+        catch (cause) { current(context); asset.subtitleReason = '字幕未全部就绪：' + publicReason(cause); persist(); }
+      }
+      current(context);
+    });
+    const folder = await ownedFolder(context), listing = await ownList(context, folder.fid), rows = [], known = new Set((asset.subtitles || []).map(row => row.fid));
+    currentRegisteredFile(asset, asset, folder.fid, listing.list); current(context);
+    for (const record of (asset.subtitles || []).filter(row => row.status === 'ready')) {
+      try { currentRegisteredFile(asset, record, folder.fid, listing.list); rows.push(record); } catch (cause) { if (cause.status !== 409) throw cause; }
     }
+    if ((asset.subtitles || []).some(row => ['queued', 'saving'].includes(row.status))) return rows;
+    const videos = listing.list.filter(video), stem = asset.name.replace(/\.[^.]+$/, '');
+    if (videos.filter(row => normalized(row.file_name.replace(/\.[^.]+$/, '')) === normalized(stem)).length !== 1) return rows;
+    const title = name(asset.subtitleTitle) || stem.split(/[ ._-]+(?:s\d{1,2}[ ._-]*)?(?:episode|ep|e)[ ._-]*\d{1,3}(?!\d)/i)[0];
+    const info = { title, searchTitle: title, series: typeof asset.series === 'boolean' ? asset.series : ['tv', 'anime'].includes(asset.category) || episodeNumber(stem) !== undefined, titleSeason: seasonNumber(stem), season: asset.subtitleSeason };
+    const selected = { name: asset.name, path: [] }, original = { name: asset.sourceName || asset.name, path: [] }, episode = episodeNumber(stem), uniqueMovie = listing.complete && videos.length === 1;
+    const episodeScope = listing.complete && Number.isInteger(episode) && videos.filter(row => episodeNumber(row.file_name.replace(/\.[^.]+$/, '')) === episode).length === 1;
+    const lists = [{ parent: folder.fid, list: listing.list, path: [] }];
+    for (const child of listing.list.filter(row => directory(row) && validFid(row.fid) && subtitleFolder(row.file_name) && (!row.pdir_fid || row.pdir_fid === folder.fid)).slice(0, 3)) {
+      const childListing = await ownList(context, child.fid); current(context);
+      lists.push({ parent: child.fid, list: childListing.list, path: [name(child.file_name)] });
+    }
+    for (const group of lists) for (const file of group.list) {
+      if (rows.length >= SUBTITLE_LIMIT) break;
+      if (!subtitleFile(file) || !validFid(file.fid) || known.has(file.fid) || file.pdir_fid && file.pdir_fid !== group.parent) continue;
+      const record = { fid: file.fid, parent: group.parent, name: name(file.file_name), size: Number(file.size), type: subtitleType(file.file_name), path: group.path };
+      if (record.name !== file.file_name || !Number.isSafeInteger(record.size) || record.size <= 0 || record.size > SUBTITLE_BYTES || !(matchingSubtitle(info, selected, record, uniqueMovie, episodeScope) || matchingSubtitle(info, original, record, uniqueMovie, episodeScope))) continue;
+      // Later additions are readable attachments, never registrations granting cleanup permission.
+      record.id = hash(JSON.stringify(['subtitle-attachment', context.account, asset.id, record.parent, record.fid, record.name, record.size])).slice(0, 32);
+      rows.push(record); known.add(record.fid);
+    }
+    current(context); return rows;
+  }
+  async function subtitles(assetId, options = {}) {
+    const { context, asset } = await subtitleAsset(assetId, options), rows = await availableSubtitles(context, asset);
     current(context); return rows.map(({ id, name, type }) => ({ id, name, type }));
   }
   async function subtitle(assetId, subtitleId, options = {}) {
     const { context, asset } = await subtitleAsset(assetId, options);
-    const record = (asset.subtitles || []).find(row => row.id === subtitleId && row.status === 'ready');
-    if (!record) throw failure('未找到本视频已登记的字幕', 404);
-    const folder = await ownedFolder(context), listing = await ownList(context, folder.fid);
-    registeredFile(asset, asset, folder.fid, listing.list); registeredFile(asset, record, folder.fid, listing.list); current(context);
-    const result = await auth(context, '/file/download', { method: 'POST', body: { fids: [record.fid] } }); current(context);
+    const record = (await availableSubtitles(context, asset)).find(row => row.id === subtitleId);
+    if (!record) {
+      const registered = (asset.subtitles || []).find(row => row.id === subtitleId && row.status === 'ready');
+      if (registered) await ownedFile(context, asset, registered);
+      throw failure('未找到当前视频可读取的字幕', 404);
+    }
+    current(context);
+    let downloadCookies;
+    const result = await auth(context, '/file/download', { method: 'POST', userAgent: PLAYBACK_UA, query: { uc_param_str: '' }, body: { fids: [record.fid] }, onResponseHeaders: headers => { downloadCookies = headers?.['set-cookie']; } }); current(context);
     const rows = Array.isArray(result.data) ? result.data : result.data?.list;
     if (!Array.isArray(rows) || rows.length !== 1 || rows[0].fid !== record.fid || typeof rows[0].download_url !== 'string') throw failure('字幕下载响应无法核验');
     let target; try { target = validateUrl(rows[0].download_url); } catch { throw failure('字幕下载地址不符合安全限制'); }
     if (target.protocol !== 'https:') throw failure('字幕下载地址必须使用 HTTPS');
     const official = /(?:^|\.)(?:quark|uc)\.cn$/.test(target.hostname);
+    const mediaCookie = downloadMediaCookie(context.cookie, downloadCookies, target, now());
     const bytes = await limited(async () => {
       current(context); let response, timer, expired = false;
       try {
         const operation = (async () => {
-          response = await request(target.href, { followRedirects: false, timeout: 8000, headers: { accept: 'text/plain', referer: REFERER, 'user-agent': PLAYBACK_UA, ...(official ? { cookie: context.cookie } : {}) } });
+          response = await request(target.href, { followRedirects: false, timeout: 8000, headers: { accept: 'text/plain', referer: REFERER, 'user-agent': PLAYBACK_UA, ...(official ? { cookie: mediaCookie } : {}) } });
           response.on('error', () => {}); current(context);
           if (expired) throw failure('字幕下载超时', 504);
           if (response.statusCode !== 200 || response.finalUrl && new URL(response.finalUrl).origin !== target.origin || /(?:text\/html|application\/json)/i.test(response.headers?.['content-type'] || '')) throw failure('字幕下载不可用或返回了网页');
@@ -697,6 +838,8 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       try {
         const context = await snapshot(); context.valid = typeof options.valid === 'function' ? options.valid : undefined; current(context);
         if (!info.selected) return { status: 'needsSelection', saved: false, reason: '请先选择当前影片的单集' };
+        if (options.auto === true && !config.autoSave) return { status: 'needsSelection', saved: false, reason: '自动转存已关闭，请手动选择文件后转存' };
+        if (options.auto === true) { const authorized = context.valid; context.valid = () => config.autoSave === true && (!authorized || authorized() === true); }
         if (!options.fileId && (!config.autoSave || options.auto === false)) return { status: 'needsSelection', saved: false, reason: '请选择单个文件，或在设置中开启自动转存' };
         let file;
         if (options.fileId) { file = candidates.get(options.fileId); if (!file || file.detail !== info.key || file.expires <= now() || options.shareId && file.share !== options.shareId) throw failure('所选单个视频已过期，请重新选取', 404); }
@@ -707,6 +850,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
           if (result.ambiguous) return { status: 'needsSelection', saved: false, reason: '无法唯一匹配影片年份及当前单集，请手动选择文件' };
           file = candidates.get(result.files.find(row => row.match).id);
         }
+        if (options.auto === true && (!file.automatic || file.autoScope !== automaticScope(info) || !matches(info, file))) return { status: 'needsSelection', saved: false, reason: '无法唯一匹配影片年份及当前单集，请手动选择文件' };
         current(context);
         if (!validFid(file.fid) || typeof file.token !== 'string' || !file.token || file.token.length > 4096 || !Number.isSafeInteger(file.size) || file.size <= 0 || file.size > 100 * GIB) throw failure('视频大小或分享凭证无法核验，已停止转存', 400);
         const resource = shares.get(file.share); if (!resource || resource.detail !== info.key || resource.expires <= now()) throw failure('分享资源已过期，请重新搜索', 404);
@@ -722,7 +866,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         if (reconnected) { if (detail.category === 'adult' || !reconnected.category) { reconnected.category = name(detail.category).slice(0, 32); persist(); } if (reconnected.status === 'ready') await ownedFile(context, reconnected); else await resume(context, reconnected); return await prepareSubtitles(context, info, file, resource, reconnected, true); }
         const reconnectedToday = registry.assets.filter(asset => asset.account === context.account && asset.day === day && asset.status !== 'queued');
         if (reconnectedToday.length >= config.maxDailyTransfers || dailyBytes(context.account, day) + file.size > config.maxDailyBytes || registry.assets.length >= 1000) throw failure('已达到本应用每日转存数量或容量上限', 429);
-        const asset = { id: id(), account: context.account, managed: true, source, parent: folder.fid, name: file.name, size: file.size, category: name(detail.category).slice(0, 32), day, createdAt: now(), lastActivity: now(), status: 'queued' };
+        const asset = { id: id(), account: context.account, managed: true, source, parent: folder.fid, name: file.name, sourceName: file.name, ...(videoRename(info, file) ? { renameTo: videoRename(info, file) } : {}), size: file.size, category: name(detail.category).slice(0, 32), day, createdAt: now(), lastActivity: now(), status: 'queued' };
         reserveRegistration(asset);
         queuedAsset = asset;
         registry.assets.push(asset); persist();
@@ -738,8 +882,10 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     const asset = findAsset(assetId, context);
     if (asset.status !== 'ready') throw failure('夸克视频尚未就绪或正在清理', 409);
     asset.leaseUntil = now() + 120000; asset.lastActivity = now(); persist();
-    await ownedFile(context, asset); current(context);
-    let target, type, mode = 'official', quality, variants, officialError;
+    const file = await ownedFile(context, asset); current(context);
+    const sourceColors = [fileColorRisk(asset.sourceName || asset.name), streamColor(file), streamColor(file.video_info || {})];
+    const sourceColorSpace = ['dolby-vision', 'pq', 'hlg', 'hdr', 'sdr'].find(value => sourceColors.includes(value)) || 'unknown';
+    let target, type, mode = 'official', quality, variants, candidates, officialError, colorSpace, downloadCookies;
     const diagnostic = cause => [Number.isInteger(cause?.quarkUpstreamStatus) ? 'HTTP ' + cause.quarkUpstreamStatus : '', Number.isSafeInteger(cause?.quarkUpstreamCode) ? 'API ' + cause.quarkUpstreamCode : ''].filter(Boolean).join('，');
     try {
       const result = await auth(context, '/file/v2/play', { method: 'POST', userAgent: PLAYBACK_UA, body: { fid: asset.fid, resolutions: 'normal,low,high,super,2k,4k', supports: 'fmp4,m3u8' } }); current(context);
@@ -754,12 +900,14 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
           const videoCodec = typeof info.codec === 'string' ? info.codec.trim().toLowerCase() : '', audioCodec = typeof info.audio?.codec === 'string' ? info.audio.codec.trim().toLowerCase() : '';
           const preferred = /^(?:h264|h\.264|avc1)(?:$|\.)/.test(videoCodec) && /^(?:aac|mp4a|mp3)(?:$|\.)/.test(audioCodec);
           const incompatible = /^(?:hevc|h265|h\.265|hvc1|hev1|dvhe|dvh1|dolby_vision)(?:$|\.)/.test(videoCodec) || /^(?:dts|dca|truehd|mlp|ac3|eac3)(?:$|\.)/.test(audioCodec);
-          streams.push({ url, type, ...dimensions, bandwidth, preferred, incompatible });
+          const colorSpace = streamColor(info) || 'unknown';
+          streams.push({ url, type, ...dimensions, bandwidth, preferred, incompatible, colorSpace });
         } catch {}
       }
       streams.sort((a, b) => Number(b.preferred) - Number(a.preferred));
-      const preferred = streams.filter(row => row.preferred), available = preferred.length ? preferred : streams, adaptive = [];
-      for (const stream of streams) if ((!preferred.length || !stream.incompatible) && stream.type === 'hls' && stream.width && stream.height && !adaptive.some(row => row.url === stream.url || row.height === stream.height) && adaptive.length < 8) adaptive.push(stream);
+      const sdr = streams.filter(row => row.colorSpace === 'sdr'), safe = streams.filter(row => ['unknown', 'sdr'].includes(row.colorSpace));
+      const preferred = (sdr.length ? sdr : safe).filter(row => row.preferred), available = preferred.length ? preferred : sdr.length ? sdr : safe.length ? safe : streams, adaptive = [];
+      for (const stream of streams) if (!stream.incompatible && stream.colorSpace === 'sdr' && (!preferred.length || stream.preferred) && stream.type === 'hls' && stream.width && stream.height && !adaptive.some(row => row.url === stream.url || row.height === stream.height) && adaptive.length < 8) adaptive.push(stream);
       const sized = available.filter(row => row.width && row.height);
       let selected = sized.find(row => row.height <= 1080) || sized.at(-1) || available[0];
       if (adaptive.length >= 2 && (!preferred.length || selected?.type === 'hls' && adaptive.some(row => row.preferred))) {
@@ -767,11 +915,18 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         selected = choices.find(row => row.height <= 1080) || choices.at(-1);
         variants = adaptive.sort((a, b) => a.height - b.height).map(({ preferred, incompatible, ...row }) => row);
       }
-      if (selected) { target = selected.url; type = selected.type; if (selected.width && selected.height) quality = { width: selected.width, height: selected.height }; }
+      if (sourceColorSpace === 'dolby-vision' && !sdr.some(row => !row.incompatible)) { selected = undefined; variants = undefined; }
+      if (selected) {
+        target = selected.url; type = selected.type; colorSpace = selected.colorSpace;
+        if (selected.width && selected.height) quality = { width: selected.width, height: selected.height };
+        const alternatives = streams.filter(row => row !== selected && (!variants || variants.some(other => other.url === row.url))).sort((a, b) => (a.height || Infinity) - (b.height || Infinity));
+        candidates = [selected, ...alternatives].filter((row, index, rows) => rows.findIndex(other => other.url === row.url) === index).slice(0, 8)
+          .map(({ url, type, colorSpace, width, height, bandwidth }) => ({ url, type, colorSpace, ...(width && height ? { width, height } : {}), bandwidth }));
+      }
     } catch (cause) { current(context); if ([401, 429].includes(cause.status)) throw cause; officialError = cause; }
     if (!target) {
-      mode = 'download'; let result;
-      try { result = await auth(context, '/file/download', { method: 'POST', userAgent: PLAYBACK_UA, query: { uc_param_str: '' }, body: { fids: [asset.fid] } }); current(context); }
+      mode = 'download'; colorSpace = sourceColorSpace === 'dolby-vision' ? 'dolby-vision' : fileColorRisk(asset.sourceName || asset.name) || 'unknown'; let result;
+      try { result = await auth(context, '/file/download', { method: 'POST', userAgent: PLAYBACK_UA, query: { uc_param_str: '' }, body: { fids: [asset.fid] }, onResponseHeaders: headers => { downloadCookies = headers?.['set-cookie']; } }); current(context); }
       catch (cause) {
         current(context); if ([401, 429].includes(cause.status)) throw cause;
         const project = diagnostic(officialError), download = diagnostic(cause);
@@ -782,16 +937,16 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       try { target = validateUrl(row.download_url).href; } catch { throw failure('夸克返回的播放地址不符合安全限制'); }
       type = /\.mkv$/i.test(asset.name) ? 'mkv' : /\.webm$/i.test(asset.name) ? 'webm' : /\.avi$/i.test(asset.name) ? 'avi' : /\.(?:ts|m2ts)$/i.test(asset.name) ? 'mpegts' : 'mp4';
     }
-    const origins = [...new Set([target, ...(variants || []).map(row => row.url)].map(value => new URL(value)).filter(parsed => parsed.protocol === 'https:' && (parsed.hostname === 'quark.cn' || parsed.hostname.endsWith('.quark.cn') || parsed.hostname === 'uc.cn' || parsed.hostname.endsWith('.uc.cn'))).map(parsed => parsed.origin))];
+    const origins = [...new Set([target, ...(variants || []).map(row => row.url), ...(candidates || []).map(row => row.url)].map(value => new URL(value)).filter(parsed => parsed.protocol === 'https:' && (parsed.hostname === 'quark.cn' || parsed.hostname.endsWith('.quark.cn') || parsed.hostname === 'uc.cn' || parsed.hostname.endsWith('.uc.cn'))).map(parsed => parsed.origin))];
     current(context);
-    return { episode: { url: target, type }, ...(variants ? { variants } : {}), headers: { referer: REFERER, 'user-agent': PLAYBACK_UA, ...(origins.length ? { cookie: context.cookie } : {}) }, allowCookieOrigins: origins, metadata: { assetId: asset.id, name: asset.name, size: asset.size, category: asset.category || '', mode, version: hash(JSON.stringify([asset.fid, mode, quality || null, ...(variants ? [variants.map(({ width, height }) => [width, height])] : [])])).slice(0, 24), ...(quality ? { quality } : {}), requiresCompatibility: !['hls', 'mp4', 'webm'].includes(type) } };
+    return { episode: { url: target, type, colorSpace }, ...(variants ? { variants } : {}), ...(candidates ? { candidates } : {}), headers: { referer: REFERER, 'user-agent': PLAYBACK_UA, ...(origins.length ? { cookie: downloadMediaCookie(context.cookie, downloadCookies, target, now()) } : {}) }, allowCookieOrigins: origins, metadata: { assetId: asset.id, name: asset.name, size: asset.size, category: asset.category || '', mode, sourceColorSpace, version: hash(JSON.stringify([asset.fid, mode, target, quality || null, colorSpace, sourceColorSpace, ...(variants ? [variants.map(({ width, height }) => [width, height])] : []), ...(candidates ? [candidates] : [])])).slice(0, 24), ...(quality ? { quality } : {}), colorSpace, requiresCompatibility: !['hls', 'mp4', 'webm'].includes(type) || colorSpace !== 'sdr' } };
   }
   async function progress(assetId, input) {
     const context = await snapshot(), asset = findAsset(assetId, context);
     if (asset.status !== 'ready' || !input || typeof input.ended !== 'boolean' || !Number.isFinite(input.position) || !Number.isFinite(input.duration) || input.position < 0 || input.duration <= 0 || input.duration > 86400 || input.position > input.duration + 2) throw failure('夸克观看进度无效', 400);
     asset.leaseUntil = now() + 120000; asset.lastActivity = now(); asset.position = input.position; asset.duration = input.duration;
-    const ended = input.ended && input.position >= input.duration - 2;
-    if (ended) asset.watchedAt = now(); else if (input.position < input.duration - 2) delete asset.watchedAt;
+    const ended = input.position >= Math.max(input.duration - 2, input.duration * .98);
+    if (ended) { if (!(asset.watchedAt > 0)) asset.watchedAt = now(); } else delete asset.watchedAt;
     persist(); return { saved: true, ended, watchedAt: asset.watchedAt || null };
   }
   async function recycleList(context) {
@@ -801,12 +956,22 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   }
   async function cleanup() {
     return serialize(async () => {
-      const result = { checked: 0, deleted: 0, recycled: 0, skipped: 0, errors: 0, at: now() };
+      const result = { checked: 0, deleted: 0, recycled: 0, skipped: 0, errors: 0, at: now(), retentionDays: config.retentionDays,
+        disabled: !config.cleanupEnabled || !config.enabled || !config.account, notWatched: 0, notDue: 0, leased: 0, nextEligibleAt: null, leaseRemainingMs: 0 };
       if (!config.cleanupEnabled || !config.enabled || !config.account) return result;
       try {
         const context = await snapshot();
         if (await verify(context.cookie) !== context.account) throw failure('夸克账号身份变化，已停止清理', 409); current(context); const folder = await ownedFolder(context);
-        const eligible = registry.assets.filter(asset => asset.account === context.account && asset.parent === folder.fid && asset.managed && asset.watchedAt > 0 && now() - Math.max(asset.watchedAt, asset.lastActivity || 0) >= config.retentionDays * DAY && !(asset.leaseUntil > now()) && ['ready', 'recycling', 'purging'].includes(asset.status));
+        const managed = registry.assets.filter(asset => asset.account === context.account && asset.parent === folder.fid && asset.managed && ['ready', 'recycling', 'purging'].includes(asset.status));
+        for (const asset of managed) {
+          if (!(asset.watchedAt > 0)) { result.notWatched++; continue; }
+          const due = Math.max(asset.watchedAt, asset.lastActivity || 0) + config.retentionDays * DAY, lease = Math.max(0, (asset.leaseUntil || 0) - now());
+          if (due > now()) result.notDue++;
+          if (lease) { result.leased++; result.leaseRemainingMs = Math.max(result.leaseRemainingMs, lease); }
+          const eligibleAt = Math.max(due, asset.leaseUntil || 0);
+          if (eligibleAt > now()) result.nextEligibleAt = result.nextEligibleAt === null ? eligibleAt : Math.min(result.nextEligibleAt, eligibleAt);
+        }
+        const eligible = managed.filter(asset => asset.watchedAt > 0 && now() - Math.max(asset.watchedAt, asset.lastActivity || 0) >= config.retentionDays * DAY && !(asset.leaseUntil > now()));
         const work = eligible.flatMap(owner => [...(owner.subtitles || []).filter(row => ['ready', 'recycling', 'purging'].includes(row.status)).map(asset => ({ owner, asset })), { owner, asset: owner }]).slice(0, 5);
         for (const { owner, asset } of work) {
           result.checked++;

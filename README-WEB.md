@@ -64,13 +64,13 @@ docker compose -f docker-compose.nas.yml ps
 
 以后更新只需再次执行同一条 `up -d --pull always` 命令。停机备份和恢复也使用 `-f docker-compose.nas.yml`；沿用原项目名及数据挂载，夸克 Cookie、配置、收藏和进度继续使用原数据卷。此配置需要 Ubuntu 已有可访问的 `/dev/dri/renderD128`；硬件不可用时兼容转码会提示失败，保护配置禁止回退到 CPU 软件编码。
 
-**已有旧部署此次需新增浏览器助手，拉镜像本身不会新增服务。** 不要覆盖你原来填写过密码、核显组号和数据卷的文件。在原目录执行一次下面的命令；文件名换成你实际使用的单个 Compose 文件：
+**已有旧部署此次需新增多平台弹幕助手，拉镜像本身不会新增服务。** 不要覆盖你原来填写过密码、核显组号和数据卷的文件。在原目录执行一次下面的命令；文件名换成你实际使用的单个 Compose 文件：
 
 ```sh
-curl -fL -o /tmp/vipvideo-enable-quark-browser.py https://raw.githubusercontent.com/loren1997/vipvideo-web/main/scripts/enable-quark-browser.py && python3 /tmp/vipvideo-enable-quark-browser.py --file docker-compose.nas.yml && docker compose -f docker-compose.nas.yml up -d --pull always web quark-browser
+curl -fL -o /tmp/vipvideo-enable-quark-browser.py https://raw.githubusercontent.com/loren1997/vipvideo-web/main/scripts/enable-quark-browser.py && python3 /tmp/vipvideo-enable-quark-browser.py --file docker-compose.nas.yml --danmaku && docker compose -f docker-compose.nas.yml up -d --pull always web quark-browser danmaku
 ```
 
-脚本保留原项目名、密码、核显、数据卷和其他服务，先以权限 `0600` 备份原文件，再经 Docker 校验后原子改写；重复运行不变。输出不会包含密码。更新后的原文件使用合法 Compose JSON，环境变量保留为当前展开值，不需要另外维护 YAML。此工具需要 Python 3；已有同名服务冲突、多文件 overlay 或其他项目镜像时停止。多文件部署先按[夸克说明](README-QUARK.md#可选搜索助手)保留全部配置并手动合并，再处理合并文件。
+脚本保留原项目名、密码、核显、数据卷和其他服务，先以权限 `0600` 备份原文件，再经 Docker 校验后原子改写；重复运行不变。`--danmaku` 同时加入固定版本的弹幕服务，缺少令牌时生成独立随机值，已有值保留，不使用家庭密码或夸克 Cookie；不带此参数仍只配置浏览器助手。新部署模板使用内部服务默认令牌，也可通过 `.env` 的 `DANMAKU_API_TOKEN` 修改。输出不会包含密码或令牌。更新后的原文件使用合法 Compose JSON，环境变量保留为当前展开值，不需要另外维护 YAML。此工具需要 Python 3；已有同名服务冲突、多文件 overlay 或其他项目镜像时停止。多文件部署先按[夸克说明](README-QUARK.md#可选搜索助手)保留全部配置并手动合并，再处理合并文件。
 
 更新后仍显示旧界面时，在原部署目录明确拉取并重建播放器和搜索助手：
 
@@ -112,7 +112,7 @@ docker compose -f compose.yaml logs --tail=100 web
 
 播放器先尝试直连、受限媒体转发和同影片换源；仍无法播放时会尝试“兼容播放”，也可手动点击该按钮。服务端把当前剧集转为浏览器常见的 H.264/AAC HLS，最多 720p，并保留原影片进度。兼容播放每台服务器同时只运行一个任务；其他设备占用时会提示。没有请求达 120 秒后回收任务与临时分片，收藏、进度和配置仍保存在数据卷。
 
-默认 `TRANSCODE_ACCEL=auto` 且 `TRANSCODE_ALLOW_SOFTWARE=true`：有权限读写 `/dev/dri/renderD128` 时先尝试 VAAPI，启动阶段初始化或编码失败后改用 CPU；没有设备时直接使用 CPU。软件编码、解码和滤镜限制为单线程，Linux 上 FFmpeg 使用 nice 19 降低竞争优先级；实际 CPU 消耗仍取决于输入编码、分辨率和倍速，高码率或高分辨率输入可能无法实时处理。arm64 镜像提供软件模式，未安装 x86 Intel 驱动。`compose.gpu.yaml` 现在强制 `vaapi`，设备缺失、权限不足或硬件编码失败时直接提示失败。
+默认 `TRANSCODE_ACCEL=auto` 且 `TRANSCODE_ALLOW_SOFTWARE=true`：有权限读写 `/dev/dri/renderD128` 时先尝试 VAAPI，启动阶段初始化或编码失败后改用 CPU；没有设备时直接使用 CPU。软件编码和滤镜限制为单线程；已核验杜比视频的软件输入解码最多使用 4 个线程，其余输入解码保持单线程。Linux 上 FFmpeg 使用 nice 19 降低竞争优先级；实际 CPU 消耗仍取决于输入编码、分辨率和倍速，高码率或高分辨率输入可能无法实时处理。arm64 镜像提供软件模式，未安装 x86 Intel 驱动。`compose.gpu.yaml` 现在强制 `vaapi`，设备缺失、权限不足或硬件编码失败时直接提示失败。
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
@@ -277,9 +277,13 @@ HLS 优先使用支持 MSE 的 HLS.js，浏览器不支持时再尝试原生 HLS
 
 评分优先使用影视源明确提供的 `vod_douban_score`，标注“影视源提供，未独立验证”，不会将通用 `vod_score` 当成豆瓣评分，也不会显示 0.0 为有效评分。源提供豆瓣条目 ID 时，可校验豆瓣公开条目的 JSON-LD；条目暂不可达时，尝试按该 ID 与标题匹配 [豆瓣公开电影列表](https://movie.douban.com/j/search_subjects?type=movie&tag=%E7%83%AD%E9%97%A8&sort=recommend&page_limit=50&page_start=0) 或电视剧列表。不会只凭片名猜测同名影片。未匹配、限流或无数据时显示暂无评分。成功结果缓存 24 小时，失败结果 5 分钟后可重试。按本次选择，仅接入无需凭证的评分，没有使用 TMDB 官方凭证接口；无法保证所有影片都有评分。
 
-家庭弹幕按影片与剧集保存到 SQLite，其他设备在播放中每 20 秒同步，暂停后停止轮询。文字最多 200 字，每集最多保存 5000 条，同屏最多显示 12 条；关闭弹幕后隐藏发送入口与覆盖层。
+家庭弹幕按影片与剧集保存到 SQLite，其他设备在播放中每 20 秒同步，暂停后停止轮询。文字最多 200 字，每集最多保存 5000 条，同屏最多显示 12 条；默认打开“显示弹幕”，关闭后立即清空覆盖层、停止读取并保存开关，不需要再点保存播放偏好。
 
-外部弹幕支持 B 站官方公开 CID XML 与 BV 视频链接。在播放器“绑定本集外部弹幕”中填写对应同一影片、同一集的视频链接；多分 P 链接明确加 `?p=编号`，并可设置 -600 到 600 秒偏移。绑定按集保存，也可清除。外部读取失败时仍保留家庭弹幕，家庭发送内容不会上传到 B 站。公开弹幕缓存 5 分钟；不绕过登录或验证码，不自动猜测全站影片对应关系。Dandanplay 官方服务需要应用凭证，本次未使用第三方借用密钥接入。
+外部弹幕默认按片名、别名、年份和集数自动匹配，通过本地 [danmu-api](https://github.com/huangxd-/danmu_api) 助手读取腾讯视频、爱奇艺、优酷、芒果 TV、B 站的官方视频弹幕；只接受能匹配的正片和剧集，排除预告、花絮、剪辑，不把 B 站全站关键词结果当作正片。最多合并 5000 条，按实际保留条数显示来源；成功缓存 5 分钟，未匹配或失败 30 秒后可重试。找不到匹配项时继续保留家庭弹幕。B 站番剧 / 影视公开目录提供受限备用查询，不使用账号 Cookie 或借用的 Dandanplay 密钥。
+
+助手固定镜像版本，仅容器网络可访问，不映射宿主机端口，限制为 0.5 CPU / 512 MiB；首次拉取镜像约 670 MB。它只处理公开影片信息和弹幕，不接收夸克凭证。默认只启用上述五个平台，关闭外部解析服务兜底；平台限流、版权区域和版本差异仍可能导致某部影片无弹幕。
+
+在播放器“绑定本集外部弹幕”也可手动填写同一影片、同一集的 B 站官方 CID XML 或 BV 视频链接；多分 P 链接明确加 `?p=编号`，并可设置 -600 到 600 秒偏移。手动绑定优先于自动匹配，按集保存，也可清除后恢复自动匹配。家庭发送内容只保存在此播放器，不上传任何外部平台。
 
 第三方解析页可能禁止 iframe、要求自行登录，或只能在外部打开。这类网页无法读取其内部视频时间，不支持精确续播；第三方源本身的可用性、编解码器和浏览器支持也会影响播放。
 
@@ -289,7 +293,7 @@ HLS 优先使用支持 MSE 的 HLS.js，浏览器不支持时再尝试原生 HLS
 
 更新前先备份并记录当前镜像。NAS 镜像部署更新：
 
-本次首次启用动态网页提取时，先使用上面的保留配置更新脚本新增 `quark-browser`；之后继续下面的正常更新步骤。仅更新镜像不能把新服务加到旧 Compose 中。
+本次首次启用多平台自动弹幕时，先使用上面的保留配置更新脚本加 `--danmaku` 新增助手；它也会检查 `quark-browser`。之后继续下面的正常更新步骤。仅更新镜像不能把新服务加到旧 Compose 中。
 
 ```sh
 docker compose -f docker-compose.yml pull && \

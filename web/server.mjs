@@ -85,7 +85,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: searchPool.request, defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
   const cloudCatalog = quarkCatalog ?? createQuarkCatalog({ store });
   const cloudPosters = quarkPosters ?? createQuarkPosters({ catalog: cloudCatalog });
-  const cloudMedia = quarkMedia ?? createQuarkMedia({ quark: quarkService, visible: category => ensureVisible(category) });
+  const cloudMedia = quarkMedia ?? createQuarkMedia({ quark: quarkService, visible: category => ensureVisible(category), probeColor: input => transcodeService.inspectColor(input) });
   const salt = store.meta('password-salt') ?? randomBytes(16).toString('hex');
   const passwordHash = scryptSync(password, salt, 32);
   if (store.meta('password-hash') !== passwordHash.toString('hex')) store.clearSessions();
@@ -431,7 +431,8 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         }
         if (['/api/danmaku', '/api/danmaku/binding'].includes(path) && method === 'GET') {
           const episode = url.searchParams.get('episode') ?? '0';
-          const value = { key: url.searchParams.get('key'), episode: /^-?\d+(?:\.\d+)?$/.test(episode) ? Number(episode) : episode };
+          const value = { key: url.searchParams.get('key'), episode: /^-?\d+(?:\.\d+)?$/.test(episode) ? Number(episode) : episode,
+            ...Object.fromEntries(['title', 'year', 'type', 'episodeName', 'aliases'].filter(name => url.searchParams.has(name)).map(name => [name, url.searchParams.get(name)])) };
           return json(res, 200, path.endsWith('/binding') ? danmakuService.binding(value) : await danmakuService.list(value));
         }
         if (path === '/api/danmaku' && method === 'POST') return json(res, 200, danmakuService.send(await readBody(req)));

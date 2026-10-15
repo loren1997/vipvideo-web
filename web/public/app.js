@@ -534,7 +534,7 @@ async function renderQuarkLibrary(params, stamp) {
   const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺' };
   const category = Object.hasOwn(categories, params.get('category')) ? params.get('category') : 'movie';
   const filters = { genre: params.get('genre') || '', year: params.get('year') || '', sort: ['release', 'score', 'release-score'].includes(params.get('sort')) ? params.get('sort') : 'release-score' };
-  const page = section('夸克影院', '发现影片，选择分享与视频文件后手动转存播放');
+  const page = section('夸克影院', '发现影片，自动准备当前影片或剧集，选择版本后播放');
   const tabs = node('div', undefined, 'category-tabs');
   for (const [id, title] of Object.entries(categories)) { const tab = button(title, () => goto('quark', { category: id, ...filters, genre: '' }), `button${category === id ? ' selected' : ''}`); tab.setAttribute('aria-pressed', String(category === id)); tabs.append(tab); }
   const controls = node('div', undefined, 'browse-controls'); controls.append(tabs); page.append(controls);
@@ -744,6 +744,7 @@ async function startCompatibility(current, position = playPosition(current), aut
       const request = current.request, stamp = current.stamp;
       const valid = () => player === current && current.request === request && playVersion === request && routeVersion === stamp;
       current.position = requested; current.transcodeLoading = true; current.recovering = true; current.failed = false; current.compatibilityErrorCode = null;
+      current.updateClock?.();
       clearTimeout(current.loadTimer); clearInterval(current.danmakuTimer); current.danmakuTimer = null;
       if (current.video) current.video.pause();
       current.note.textContent = '正在准备兼容播放，首次启动可能需要约 20 秒…'; current.note.className = 'player-note';
@@ -760,7 +761,7 @@ async function startCompatibility(current, position = playPosition(current), aut
         if (current.pendingTranscodePosition !== undefined) continue;
         if (current.video) { resetDanmaku(current); loadMedia(current, `正在连接${compatibilityLabel(current)}…`); }
         else mountPlayer(current);
-        if (current.proxyButton) current.proxyButton.disabled = true;
+  if (current.proxyButton) current.proxyButton.disabled = true;
         if (current.compatibilityButton) current.compatibilityButton.textContent = '重新兼容播放';
       } catch (error) {
         if (!valid()) { console.warn('离开播放器后兼容任务启动失败', error.message); return; }
@@ -773,6 +774,7 @@ async function startCompatibility(current, position = playPosition(current), aut
         if (current.catalog) { renderSources(current.detail, current.detail.candidates || []); renderEpisodes(current.detail); }
       } finally {
         current.transcodeLoading = false;
+        if (player === current) current.updateClock?.();
         if (player === current && current.compatibilityButton) current.compatibilityButton.disabled = false;
       }
     }
@@ -926,9 +928,9 @@ async function openQuarkDetail(id, stamp) {
 
 function mountQuarkStub(data, state = { resources: [], files: [], version: 0 }, episode = 0) {
   const request = ++playVersion; void stopPlayer(false);
-  const host = $('#player-host'), note = node('p', '手动选择视频文件并转存，准备完成后点击夸克播放。', 'player-note'); host.replaceChildren(note);
+  const host = $('#player-host'), note = node('p', '匹配当前影片或剧集后自动转存并整理名称；匹配不明确时请选择视频文件，准备完成后点击夸克播放。', 'player-note'); host.replaceChildren(note);
   data.selectedEpisode = episode; const select = $('[aria-label="夸克当前集数"]'); if (select) select.value = String(episode);
-  player = { detail: data, line: 0, episode, episodeName: data.lines[0]?.episodes[episode]?.name || '选择文件', position: 0, started: false, catalog: true, quarkOnly: true, mode: 'direct', flow: { tried: new Set(), quarkAutomatic: false }, stamp: routeVersion, request, quarkState: state, note };
+  player = { detail: data, line: 0, episode, episodeName: data.lines[0]?.episodes[episode]?.name || '选择文件', position: 0, started: false, catalog: true, quarkOnly: true, mode: 'direct', flow: { tried: new Set() }, stamp: routeVersion, request, quarkState: state, note };
   mountQuark(player);
 }
 
@@ -1409,8 +1411,11 @@ function mountSubtitles(current, host, assetId = current.quarkAsset) {
   select.style.maxWidth = '100%'; select.style.minWidth = '0';
   const input = node('input'); input.type = 'file'; input.accept = '.srt,.vtt,.ass'; input.setAttribute('aria-label', '添加字幕文件');
   input.style.maxWidth = '100%';
+  const refresh = button('刷新夸克目录字幕', () => void loadAssociatedSubtitles(), 'button small'); refresh.hidden = !assetId;
+  input.title = '添加这台设备上的字幕文件；夸克目录字幕请使用左侧列表或刷新按钮。';
   const status = node('p', undefined, 'muted'); current.subtitleStatus = status;
-  controls.append(select, input); panel.append(controls, node('small', '可选择随视频转存的字幕，或添加本机 SRT / VTT / ASS；ASS 以文字显示。', 'muted'), status); host.append(panel);
+  status.setAttribute('aria-live', 'polite');
+  controls.append(select, refresh, input); panel.append(controls, node('small', '夸克目录字幕在列表中选择；找不到时可刷新，或添加本机 SRT / VTT / ASS。ASS 以文字显示。', 'muted'), status); host.append(panel);
   const draw = () => {
     select.replaceChildren(); const off = node('option', '关闭外挂字幕'); off.value = ''; select.append(off);
     for (const item of [...state.items, ...(state.documents.has('manual') ? [{ id: 'manual', name: state.documents.get('manual').name }] : [])]) { const option = node('option', item.name); option.value = item.id; select.append(option); }
@@ -1459,13 +1464,24 @@ function mountSubtitles(current, host, assetId = current.quarkAsset) {
     } catch (error) { if (player === current) status.textContent = error.message; }
     finally { input.value = ''; }
   });
+  async function loadAssociatedSubtitles() {
+    if (!assetId || refresh.disabled || player !== current || current.subtitleState !== state) return;
+    refresh.disabled = true; status.textContent = '正在检查夸克视频目录中的字幕…';
+    try {
+      const data = await request(`/api/quark/subtitles?${new URLSearchParams({ assetId })}`, true);
+      if (player !== current || current.subtitleState !== state) return;
+      state.items = (Array.isArray(data.subtitles) ? data.subtitles : []).slice(0, 60).filter(item => {
+        try { const url = new URL(item.url, location.origin); return typeof item.id === 'string' && item.id !== 'manual' && item.id && typeof item.name === 'string' && ['srt', 'vtt', 'ass'].includes(item.type) && url.origin === location.origin && !url.username && !url.password && url.pathname === '/api/quark/subtitle' && url.searchParams.get('assetId') === assetId && url.searchParams.get('subtitleId') === item.id; } catch { return false; }
+      });
+      if (state.selected && state.selected !== 'manual' && !state.items.some(item => item.id === state.selected)) { state.selected = ''; clearSubtitleTrack(current); }
+      state.loaded = true; draw();
+      status.textContent = state.items.length ? `找到 ${state.items.length} 个夸克目录字幕，请从列表选择。` : '当前视频目录未找到匹配字幕，可添加本机字幕文件。';
+      if (typeof data.reason === 'string' && data.reason) status.textContent += ` ${data.reason}`;
+    } catch (error) { if (player === current && current.subtitleState === state) status.textContent = `${error.name === 'AbortError' ? '夸克目录字幕读取超时。' : '夸克目录字幕暂时无法读取。'} 可点击刷新重试，或添加本机字幕。`; }
+    finally { if (player === current && current.subtitleState === state) refresh.disabled = false; }
+  }
   draw(); applySubtitleTrack(current);
-  if (assetId && !state.loaded) void request(`/api/quark/subtitles?${new URLSearchParams({ assetId })}`, true).then(data => {
-    if (player !== current || current.subtitleState !== state) return;
-    state.items = (Array.isArray(data.subtitles) ? data.subtitles : []).slice(0, 60).filter(item => {
-      try { const url = new URL(item.url, location.origin); return typeof item.id === 'string' && item.id !== 'manual' && item.id && typeof item.name === 'string' && ['srt', 'vtt', 'ass'].includes(item.type) && url.origin === location.origin && !url.username && !url.password && url.pathname === '/api/quark/subtitle' && url.searchParams.get('assetId') === assetId && url.searchParams.get('subtitleId') === item.id; } catch { return false; }
-    }); state.loaded = true; draw();
-  }).catch(error => { if (player === current && current.subtitleState === state) status.textContent = `${error.name === 'AbortError' ? '关联字幕读取超时。' : '关联字幕暂时无法读取。'} 可手动添加字幕。`; });
+  if (assetId && !state.loaded) void loadAssociatedSubtitles();
 }
 
 function returnFromQuark(current) {
@@ -1519,7 +1535,7 @@ function mountQuark(current) {
   }
   showUnverified(state.unverified);
   const valid = () => player === current && current.stamp === routeVersion && host.contains(panel);
-  let searchVersion = 0, loading = false, canTransfer = false;
+  let searchVersion = 0, loading = false, canTransfer = false, autoTransfer = false;
   const retry = button('重试搜索', () => void load(false, false), 'button small'); retry.hidden = true;
   const more = button('查找更多公开资源', () => void load(true), 'button small'); more.disabled = true;
   current.cancelQuarkSearch = () => { clearTimeout(current.quarkSearchTimer); delete current.quarkSearchTimer; searchVersion++; loading = false; more.disabled = retry.disabled = false; };
@@ -1529,6 +1545,7 @@ function mountQuark(current) {
   const accountNote = node('p', '公开分享可继续查找；转存和播放个人文件需要连接并启用夸克账号。', 'muted'); accountNote.hidden = true; panel.append(accountNote);
   function ready(data) {
     state.ready = data; result.replaceChildren(node('p', `${data.name || '当前集'}：${data.status === 'ready' ? '已准备好' : data.status === 'pending' ? '正在准备' : '准备未完成'}${data.saved ? ' · 已转存' : ''}`, 'muted'));
+    if (data.renameReason) result.append(node('p', data.renameReason, 'muted'));
     if (data.status === 'ready' && data.assetId) {
       if (!current.video) mountSubtitles(current, panel, data.assetId);
       const active = current.quarkAsset === data.assetId, failed = (active || current.quarkOnly && !current.quarkAsset) && current.quarkPlaybackStatus === 'error';
@@ -1557,7 +1574,6 @@ function mountQuark(current) {
   }
   async function prepare(resource, file, automatic = false, remaining = 11) {
     if (!valid() || !canTransfer) return;
-    if (current.quarkOnly) automatic = false;
     current.cancelQuarkSearch();
     clearTimeout(current.quarkTimer);
     const version = ++state.version; transfer.disabled = true; feedback.textContent = '正在为当前单集准备夸克版本…';
@@ -1626,12 +1642,12 @@ function mountQuark(current) {
       state.files = Array.isArray(data.files) ? data.files : [];
       if (!state.files.length) { filePlaceholder('此分享暂无匹配的视频文件'); feedback.textContent = data.reason || '此分享未找到当前集的视频文件，请选择其他分享资源。'; return; }
       const matching = state.files.filter(file => file.match === true);
-      renderFileOptions(!current.quarkOnly && !data.ambiguous && matching.length === 1 ? matching[0].id : '');
-      feedback.textContent = current.quarkOnly ? '请手动选择要播放的视频文件，再点击转存所选单集。' : fileSelect.value ? '已核对当前集。转存完成后自动切换夸克播放。' : '请核对文件名，只选择当前要看的单集；匹配不明确时不会自动转存。';
-      if (automatic && state.resources.length === 1 && !data.ambiguous && matching.length === 1) void prepare(resource, matching[0], true);
+      renderFileOptions(autoTransfer && !data.ambiguous && matching.length === 1 ? matching[0].id : '');
+      feedback.textContent = fileSelect.value ? autoTransfer ? '已核对当前影片或剧集，自动转存后可点击夸克播放。' : '已核对当前影片或剧集，请点击转存所选单集。' : '请核对文件名，只选择当前要看的单集；匹配不明确时不会自动转存。';
+      if (automatic && autoTransfer && !data.ambiguous && matching.length === 1) void prepare(resource, matching[0], true);
     } catch (error) { if (valid() && version === state.version) { filePlaceholder('文件读取失败，请重试或切换分享'); feedback.textContent = `网盘文件暂时不可用：${error.message}`; result.replaceChildren(button('重试读取文件', () => { current.cancelQuarkSearch(); void loadFiles(); }, 'button small')); } }
   }
-  shareSelect.addEventListener('change', () => { current.cancelQuarkSearch(); delete state.selectionRequired; void loadFiles(); }); fileSelect.addEventListener('change', () => { current.cancelQuarkSearch(); clearTimeout(current.quarkTimer); state.version++; delete state.ready; delete state.selection; result.replaceChildren(); clearPreparedSubtitles(); const file = state.files.find(value => value.id === fileSelect.value); transfer.disabled = !canTransfer || !file; fileSelect.title = file?.name || '请选择当前集视频'; });
+  shareSelect.addEventListener('change', () => { current.cancelQuarkSearch(); delete state.selectionRequired; void loadFiles(autoTransfer); }); fileSelect.addEventListener('change', () => { current.cancelQuarkSearch(); clearTimeout(current.quarkTimer); state.version++; delete state.ready; delete state.selection; result.replaceChildren(); clearPreparedSubtitles(); const file = state.files.find(value => value.id === fileSelect.value); transfer.disabled = !canTransfer || !file; fileSelect.title = file?.name || '请选择当前集视频'; const resource = state.resources.find(value => value.id === shareSelect.value); if (autoTransfer && resource && file) void prepare(resource, file); });
   async function load(webSearch = false, automatic = true) {
     if (loading) return;
     current.cancelQuarkSearch(); loading = true;
@@ -1642,10 +1658,11 @@ function mountQuark(current) {
     try {
       const settings = await api('/api/quark/settings'); if (!currentSearch()) return;
       canTransfer = settings.configured === true && settings.enabled === true; account.hidden = accountNote.hidden = canTransfer; transfer.disabled = !canTransfer || !state.files.some(file => file.id === fileSelect.value);
+      autoTransfer = canTransfer && settings.autoSave === true;
       if (!canTransfer && !current.quarkOnly) { feedback.textContent = '连接并启用夸克后，可为当前单集准备网盘版本。'; choices.replaceChildren(button('设置夸克账号', () => goto('settings'), 'button small')); return; }
       configured = current.quarkOnly || canTransfer;
       if (state.ready && !webSearch) { if (shareSelect.options.length) choices.replaceChildren(shareField, fileField, actions); ready(state.ready); feedback.textContent = current.quarkAsset === state.ready.assetId ? quarkPlaybackMessage(current) : '当前文件已准备，可点击夸克播放。'; if (!state.ready.resume || current.quarkAsset) return; }
-      let autoSaveAvailable = !current.quarkOnly && automatic && !webSearch && settings.autoSave === true && current.flow.quarkAutomatic !== false;
+      let autoSaveAvailable = autoTransfer && automatic && !webSearch && !state.ready?.assetId && current.flow.quarkAutomatic !== false;
       async function update(poll = false) {
         if (!currentSearch()) return;
         if (poll && Date.now() - startedAt >= searchLimitMs) { feedback.textContent = '已暂停自动检查，可点击重试搜索继续查找公开资源。'; retry.hidden = false; return; }
@@ -1848,9 +1865,13 @@ function playerPreferences(current, host) {
     input.addEventListener('change', () => {
       prefs[key] = input.checked;
       if (key === 'danmakuEnabled') {
-        if (!input.checked) { clearDanmaku(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; }
+        if (!input.checked) { clearDanmaku(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; if (current.danmakuStatus) current.danmakuStatus.textContent = '弹幕已关闭。'; }
         else { void loadDanmaku(current); startDanmakuSync(current); }
         if (current.danmakuForm) current.danmakuForm.hidden = !input.checked;
+        const snapshot = { key: current.detail.key, ...prefs };
+        current.danmakuPreferenceQueue = (current.danmakuPreferenceQueue || Promise.resolve()).then(() => api('/api/player/preferences', { method: 'PUT', body: snapshot })).then(result => {
+          current.detail.preferencesPromise = Promise.resolve(result);
+        }).catch(error => { if (player === current) notify(`弹幕开关未保存：${error.message}`, true); });
       }
     });
   }
@@ -1908,12 +1929,17 @@ async function loadDanmaku(current) {
   if (current.danmaku.loading) return current.danmaku.loading;
   current.danmaku.loading = (async () => {
     try {
-      const result = await api(`/api/danmaku?${new URLSearchParams({ key: current.detail.key, episode: current.episodeName })}`);
+      const aliases = (Array.isArray(current.detail.aliases) ? current.detail.aliases : []).filter(value => typeof value === 'string').slice(0, 3);
+      const result = await api(`/api/danmaku?${new URLSearchParams({ key: current.detail.key, episode: current.episodeName, title: current.detail.title || '', year: String(current.detail.year || ''), type: current.detail.type || '', episodeName: current.episodeName || '', aliases: JSON.stringify(aliases) })}`);
       if (player !== current || !current.preferences.danmakuEnabled) return;
       current.danmaku.comments = (result.comments || []).filter(comment => typeof comment.text === 'string' && Number.isFinite(comment.time) && comment.time >= 0).map(comment => ({ ...comment, id: String(comment.id), text: comment.text.slice(0, 200) })).sort((first, second) => first.time - second.time);
       const index = current.danmaku.comments.findIndex(comment => comment.time >= playPosition(current) - 1);
       current.danmaku.cursor = index < 0 ? current.danmaku.comments.length : index;
-      current.danmakuStatus.textContent = (result.errors || []).map(error => typeof error === 'string' ? error : error.error || error.message || '弹幕来源暂不可用').join('；'); drawDanmaku(current);
+      const sources = (Array.isArray(result.sources) ? result.sources : []).filter(source => typeof source.platform === 'string' && Number.isSafeInteger(source.count) && source.count > 0);
+      const feedback = sources.length ? [`已加载弹幕：${sources.map(source => `${source.platform} ${source.count} 条`).join('、')}`] : [];
+      feedback.push(...(result.errors || []).map(error => typeof error === 'string' ? error : error.error || error.message || '弹幕来源暂不可用'));
+      if (!feedback.length) feedback.push('暂未取得本集外部弹幕，可展开下方绑定面板手动选择；家庭弹幕仍可使用。');
+      current.danmakuStatus.textContent = feedback.join('；'); drawDanmaku(current);
     } catch (error) { if (player === current) current.danmakuStatus.textContent = `弹幕暂时不可用：${error.message}`; }
     finally { current.danmaku.loading = null; }
   })();
@@ -1926,7 +1952,7 @@ function mountDanmaku(current, surface, host) {
   const form = node('form', undefined, 'danmaku-form'); current.danmakuForm = form; form.hidden = !current.preferences.danmakuEnabled;
   const input = node('input'); input.maxLength = 200; input.placeholder = '发一句家庭弹幕'; input.setAttribute('aria-label', '家庭弹幕'); input.autocomplete = 'off';
   const send = node('button', '发送弹幕', 'button small'); send.type = 'submit'; form.append(input, send);
-  current.danmakuStatus = node('small', undefined, 'danmaku-status muted'); host.insertBefore(form, current.note); host.insertBefore(current.danmakuStatus, current.note);
+  current.danmakuStatus = node('small', current.preferences.danmakuEnabled ? '正在自动匹配本集弹幕…' : '弹幕已关闭。', 'danmaku-status muted'); current.danmakuStatus.setAttribute('aria-live', 'polite'); host.insertBefore(form, current.note); host.insertBefore(current.danmakuStatus, current.note);
   form.addEventListener('submit', async event => {
     event.preventDefault(); const text = input.value.trim(); if (!text || player !== current || !current.preferences.danmakuEnabled) return;
     send.disabled = true;
@@ -1944,7 +1970,7 @@ function mountDanmaku(current, surface, host) {
 
 function mountDanmakuBinding(current, host) {
   const panel = node('details', undefined, 'danmaku-binding'); panel.append(node('summary', '绑定本集外部弹幕'));
-  panel.append(node('p', '请选择对应同一影片、同一集的版本；使用官方 B 站 XML 或明确分 P 的视频链接。家庭弹幕只保存在此播放器服务中。', 'muted'));
+  panel.append(node('p', '默认按片名和集数自动匹配多平台弹幕，可关闭“显示弹幕”。自动匹配不准确时，可绑定同一影片、同一集的官方 B 站 XML 或明确分 P 的视频链接；手动绑定优先。家庭弹幕只保存在此播放器服务中。', 'muted'));
   const form = node('form', undefined, 'binding-form');
   const url = node('input'); url.type = 'url'; url.placeholder = 'https://comment.bilibili.com/123.xml 或 B 站视频链接'; url.setAttribute('aria-label', '外部弹幕链接'); url.autocomplete = 'off';
   const label = node('label', '偏移（秒）'); const offset = node('input'); offset.type = 'number'; offset.min = '-600'; offset.max = '600'; offset.step = '0.1'; offset.value = '0'; offset.setAttribute('aria-label', '弹幕时间偏移（秒）'); label.append(offset);
@@ -1983,9 +2009,10 @@ function mountPlayer(current) {
   const host = $('#player-host'); if (!host) return;
   host.replaceChildren();
   const surface = node('div', undefined, 'player-surface');
+  const frame = node('div', undefined, 'player-frame'); frame.append(surface);
   const toolbar = node('div', undefined, 'player-toolbar');
   const note = node('p', undefined, 'player-note'); current.note = note;
-  host.append(surface, toolbar, note);
+  host.append(frame, toolbar, note);
   current.preferences ||= { ...defaultPreferences };
   if (current.type === 'page') {
     current.mode = 'parser';
@@ -2018,7 +2045,8 @@ function mountPlayer(current) {
     if (current.transcoded) void startCompatibility(current, position);
   });
   const full = button('全屏', async () => {
-    try { if (video.requestFullscreen) await video.requestFullscreen(); else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else notify('当前浏览器不支持全屏。'); }
+    const target = current.fullFilmControls ? frame : video;
+    try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) await target.requestFullscreen(); else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else notify('当前浏览器不支持全屏。'); }
     catch (error) { notify(error.message, true); }
   });
   toolbar.append(backward, forward, speed, full);
@@ -2046,13 +2074,32 @@ function mountPlayer(current) {
   toolbar.append(externalLink('原链接 ↗', current.quarkAsset ? current.quarkUrl : current.originalUrl || current.url));
   if (!current.live) mountSubtitles(current, host);
   const clock = node('div', undefined, 'player-clock');
-  const clockText = node('span'); const timeline = node('input'); timeline.type = 'range'; timeline.min = '0'; timeline.step = '1'; timeline.setAttribute('aria-label', '原片进度');
+  const clockText = node('span'); clockText.id = 'full-film-time'; const timeline = node('input'); timeline.id = 'full-film-progress'; timeline.type = 'range'; timeline.min = '0'; timeline.step = '1'; timeline.setAttribute('aria-label', '原片进度');
   clock.append(clockText, timeline); host.insertBefore(clock, current.note);
+  const filmControls = node('div', undefined, 'player-film-controls'); filmControls.id = 'full-film-controls'; filmControls.setAttribute('aria-label', '影片播放控制'); filmControls.hidden = true; frame.append(filmControls);
+  const transport = node('div', undefined, 'player-toolbar');
+  const play = button('播放', () => { if (player !== current) return; if (video.paused) void video.play().catch(error => notify(error.message, true)); else video.pause(); });
+  const mute = button('静音', () => { video.muted = !video.muted; });
+  const volumeLabel = node('label', '音量'); const volume = node('input'); volume.type = 'range'; volume.min = '0'; volume.max = '1'; volume.step = '0.05'; volume.value = String(video.volume); volume.setAttribute('aria-label', '音量'); volumeLabel.append(volume);
+  volume.addEventListener('input', () => { video.volume = Number(volume.value); if (video.volume > 0) video.muted = false; });
+  transport.append(play, mute, volumeLabel); filmControls.append(transport);
+  const updateTransport = () => {
+    play.textContent = video.paused ? '播放' : '暂停'; play.disabled = Boolean(current.transcodeLoading);
+    mute.textContent = video.muted ? '取消静音' : '静音'; volume.value = String(video.volume);
+  };
+  for (const event of ['play', 'pause', 'volumechange']) video.addEventListener(event, updateTransport);
+  frame.addEventListener('fullscreenchange', () => { full.textContent = document.fullscreenElement === frame ? '退出全屏' : '全屏'; });
   const updateClock = () => {
     const duration = playDuration(current), position = playPosition(current);
     clockText.textContent = `${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${formatTime(position)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
+    current.fullFilmControls = Boolean(current.transcoded && !current.live && duration > 0);
+    filmControls.hidden = !current.fullFilmControls; video.controls = !current.fullFilmControls;
+    if (current.fullFilmControls) { if (clock.parentNode !== filmControls) filmControls.prepend(clock); if (full.parentNode !== transport) transport.append(full); }
+    else { if (clock.parentNode !== host) host.insertBefore(clock, current.note); if (full.parentNode !== toolbar) toolbar.append(full); }
+    updateTransport();
     timeline.hidden = !current.transcoded || current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
-    timeline.max = String(Math.max(0, duration - 1)); if (document.activeElement !== timeline) timeline.value = String(position);
+    timeline.max = String(duration); if (document.activeElement !== timeline) timeline.value = String(position);
+    timeline.setAttribute('aria-valuetext', `${formatTime(position)} / ${formatTime(duration)}`);
   };
   timeline.addEventListener('change', () => { if (player === current && current.transcoded) void startCompatibility(current, Number(timeline.value)); });
   current.updateClock = updateClock;
@@ -2071,6 +2118,7 @@ function mountPlayer(current) {
     }
   });
   video.addEventListener('pause', () => { if (player === current) { if (current.transcoded && !current.transcodeLoading) current.pausedAt = Date.now(); void saveHistory(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
+  video.addEventListener('seeked', () => { if (player === current && current.quarkAsset) void saveHistory(current); });
   video.addEventListener('play', () => {
     if (player !== current || !current.transcoded || current.transcodeLoading) return;
     if (current.pausedAt && Date.now() - current.pausedAt >= 120000 && !current.expiryRecovered) {
@@ -2174,6 +2222,7 @@ async function loadMedia(current, message = '正在连接播放地址…') {
   current.note.className = 'player-note'; current.note.textContent = message;
   setQuarkPlaybackStatus(current, 'loading');
   const video = current.video;
+  current.updateClock?.();
   if (current.qualitySelect) { current.qualitySelect.hidden = true; current.qualitySelect.replaceChildren(new Option('自动画质', '-1')); }
   if (current.type === 'hls') {
     try { await ensureHls(); }
@@ -2335,26 +2384,27 @@ function maintenancePanel(stamp) {
 }
 
 function quarkSettingsPanel(stamp) {
-  const panel = settingsSection('夸克网盘', '账号连接、手动转存与到期清理', 'quark-settings'); panel.append(node('p', '在夸克影院选择影片、分享和视频文件，手动转存完成后点击播放。自动清理只处理本应用管理、已看完且达到保留期限的文件，保留天数可改或关闭；其他目录和未看完文件不会删除。', 'muted'));
+  const panel = settingsSection('夸克网盘', '账号连接、自动转存与到期清理', 'quark-settings'); panel.append(node('p', '在夸克影院匹配当前影片或剧集后自动转存并按片名、年份及季集整理名称；匹配不明确时请选择视频文件，准备完成后点击播放。可关闭自动转存，改为手动操作。自动清理只处理本应用管理、已看完且达到保留期限的文件，保留天数可改或关闭；其他目录和未看完文件不会删除。', 'muted'));
   const status = node('p', '正在读取账号状态…', 'muted'); status.setAttribute('aria-live', 'polite');
   const searchStatus = node('p', undefined, 'muted'); searchStatus.hidden = true; panel.append(status, searchStatus);
   const fields = node('div', undefined, 'quark-settings-fields'), inputs = {};
-  for (const [key, label] of [['enabled', '启用夸克'], ['cleanupEnabled', '定期清理已看完文件']]) {
+  for (const [key, label] of [['enabled', '启用夸克'], ['autoSave', '自动转存当前影片或剧集'], ['cleanupEnabled', '定期清理已看完文件']]) {
     const field = node('label', label, 'player-option'), input = node('input'); input.type = 'checkbox'; input.setAttribute('aria-label', label); field.prepend(input); fields.append(field); inputs[key] = input;
   }
-  const retentionLabel = node('label', '看完后保留天数'), retention = node('input'); retention.type = 'number'; retention.min = '1'; retention.step = '1'; retention.value = '7'; retention.setAttribute('aria-label', '夸克看完后保留天数'); retentionLabel.append(retention); fields.append(retentionLabel);
+  const retentionLabel = node('label', '看完后保留天数'), retention = node('input'); retention.type = 'number'; retention.min = '0'; retention.max = '365'; retention.step = '1'; retention.value = '7'; retention.setAttribute('aria-label', '夸克看完后保留天数'); retentionLabel.append(retention); fields.append(retentionLabel);
   const dailyLabel = node('label', '每日最多转存次数'), dailyTransfers = node('input'); dailyTransfers.type = 'number'; dailyTransfers.min = '1'; dailyTransfers.max = '100'; dailyTransfers.step = '1'; dailyTransfers.required = true; dailyTransfers.value = '100'; dailyTransfers.setAttribute('aria-label', '每日最多转存次数'); dailyLabel.append(dailyTransfers); fields.append(dailyLabel);
   const searchLabel = node('label', '资源搜索接口（可选）'), search = node('input'); search.type = 'url'; search.placeholder = 'https://…'; search.setAttribute('aria-label', '夸克资源搜索接口'); searchLabel.append(search); fields.append(searchLabel);
   const cookieLabel = node('label', '官方网页登录 Cookie'), cookie = node('input'); cookie.type = 'password'; cookie.autocomplete = 'off'; cookie.placeholder = '留空保留已连接账号'; cookie.setAttribute('aria-label', '夸克账号 Cookie'); cookieLabel.append(cookie); fields.append(cookieLabel);
   panel.append(fields, node('p', '首次连接时，复制夸克官方网页文件列表请求 Request Headers 的 Cookie 完整值，支持 Cookie: 前缀。保存后清空此输入，账号凭证不会回填或包含在配置导出中。', 'muted'));
   const actions = node('div', undefined, 'settings-actions'); panel.append(actions);
+  const cleanupStatus = node('p', undefined, 'muted'); cleanupStatus.setAttribute('aria-live', 'polite'); panel.append(cleanupStatus);
   for (const input of [...Object.values(inputs), retention, dailyTransfers, search, cookie]) input.disabled = true;
   let data = null, version = 0;
   const valid = request => stamp === routeVersion && panel.isConnected && request === version;
   function draw(next) {
     data = next; for (const [key, input] of Object.entries(inputs)) input.checked = next[key] === true;
     for (const input of [...Object.values(inputs), retention, dailyTransfers, search, cookie]) input.disabled = false; save.disabled = false;
-    retention.value = String(next.retentionDays || 7); dailyTransfers.value = String(next.maxDailyTransfers ?? 100); search.value = next.searchApi || '';
+    retention.value = String(next.retentionDays ?? 7); dailyTransfers.value = String(next.maxDailyTransfers ?? 100); search.value = next.searchApi || '';
     const count = Number.isFinite(next.managedFiles) ? next.managedFiles : Array.isArray(next.managedFiles) ? next.managedFiles.length : Number.isFinite(next.managedFiles?.total) ? next.managedFiles.total : null;
     status.textContent = `${next.account?.connected ? `已连接 · ${next.account.label || '夸克账号'}` : '尚未连接夸克账号'}${count !== null ? ` · 管理 ${count} 个文件` : ''} · 最近清理：${formatDate(next.lastCleanup)}${next.lastError ? ` · ${next.lastError}` : ''}`;
     searchStatus.hidden = !next.searchPool; searchStatus.textContent = next.searchPool ? `自动备用搜索接口：可用 ${next.searchPool.healthy} 个 / 待验证 ${next.searchPool.pending} 个 / 暂不可用 ${next.searchPool.suspended} 个` : '';
@@ -2385,7 +2435,22 @@ function quarkSettingsPanel(stamp) {
   }, 'button small');
   const cleanup = button('清理到期已看完文件', async () => {
     cleanup.disabled = true;
-    try { await api('/api/quark/cleanup', { method: 'POST', body: {}, timeoutMs: 60000 }); if (stamp !== routeVersion || !panel.isConnected) return; await load(); notify('已检查到期且已看完的管理文件'); }
+    try {
+      await quarkProgressQueue;
+      const result = await api('/api/quark/cleanup', { method: 'POST', body: {}, timeoutMs: 60000 });
+      if (stamp !== routeVersion || !panel.isConnected) return;
+      await load();
+      if (stamp !== routeVersion || !panel.isConnected) return;
+      const details = [`已清理 ${Number(result.deleted) || 0} 个管理文件`];
+      if (result.disabled) details.push('清理开关尚未启用');
+      if (result.notWatched > 0) details.push(`${result.notWatched} 个尚未标记看完`);
+      if (result.notDue > 0) details.push(`${result.notDue} 个仍在保留期内（${result.retentionDays ?? data?.retentionDays ?? 7} 天）`);
+      if (result.leased > 0) details.push(`${result.leased} 个正在播放或刚停止，约 ${Math.ceil((result.leaseRemainingMs || 0) / 1000)} 秒后重试`);
+      if (result.nextEligibleAt > 0) details.push(`下次最早可清理：${formatDate(result.nextEligibleAt)}`);
+      if (result.recycled > (result.deleted || 0)) details.push(`${result.recycled - (result.deleted || 0)} 个已送入回收站，将继续核验释放容量`);
+      if (result.errors > 0) details.push(`${result.errors} 个清理失败，请查看账号状态`);
+      cleanupStatus.textContent = details.join('；'); notify(cleanupStatus.textContent, result.errors > 0);
+    }
     catch (error) { if (stamp === routeVersion) status.textContent = `清理未完成：${error.message}`; }
     finally { if (stamp === routeVersion && panel.isConnected) cleanup.disabled = !data?.account?.connected; }
   }, 'button small');
@@ -2396,7 +2461,7 @@ function quarkSettingsPanel(stamp) {
     finally { if (stamp === routeVersion && panel.isConnected) repair.disabled = !data?.account?.connected || !data?.enabled; }
   }, 'button small'); repair.disabled = true;
   const limit = node('p', undefined, 'muted'); actions.append(save, disconnect, cleanup, repair, button('刷新夸克状态', () => void load(), 'button small'));
-  panel.append(node('p', '确认原专用目录缺失后，可恢复目录继续转存；旧文件与额度记录保留，旧目录不再自动清理。', 'muted'), limit); void load(); return panel;
+  panel.append(node('p', '保留天数设为 0 表示看完即可清理；默认 7 天。手动清理同样遵守保留期，正在播放或刚停止的文件会稍后再清理。', 'muted'), node('p', '确认原专用目录缺失后，可恢复目录继续转存；旧文件与额度记录保留，旧目录不再自动清理。', 'muted'), limit); void load(); return panel;
 }
 
 function renderSettings() {
@@ -2573,7 +2638,9 @@ window.addEventListener('keydown', event => {
     return;
   }
   if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || !current?.video || !(target instanceof Element) || !$('#player-host')?.contains(target) || target.matches('input,textarea,select') || target.closest('[contenteditable="true"]')) return;
-  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); seekVideo(current, event.key === 'ArrowRight' ? 10 : -10); }
+  if (current.fullFilmControls && target === current.video && [' ', 'Enter', 'MediaPlayPause', 'MediaPlay', 'MediaPause'].includes(event.key)) {
+    event.preventDefault(); if (event.key === 'MediaPause' || event.key !== 'MediaPlay' && !current.video.paused) current.video.pause(); else void current.video.play().catch(error => notify(error.message, true));
+  } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); seekVideo(current, event.key === 'ArrowRight' ? 10 : -10); }
   else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
     const controls = [...$('#player-host').querySelectorAll('button,a[href],video[controls],select,input')].filter(element => !element.disabled && element.getClientRects().length);
     const index = controls.indexOf(target), direction = event.key === 'ArrowDown' ? 1 : -1;

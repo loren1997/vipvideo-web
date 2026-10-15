@@ -407,6 +407,10 @@ test('danmaku endpoints use the agreed selection, comment and binding service co
   const binding = { ...selection, url:'https://comment.bilibili.com/12345.xml',offset:-2 };
   assert.deepEqual(await (await instance.call('/api/danmaku/binding', binding, cookie, 'PUT')).json(), { url:binding.url,offset:-2 });
   assert.deepEqual(received, [['list',selection],['send',comment],['binding',selection],['bind',binding]]);
+  const metadata = { ...selection, title: '海风来信', year: '2025', type: 'movie', episodeName: '正片', aliases: JSON.stringify(['海風來信']) };
+  const automaticQuery = new URLSearchParams(metadata);
+  assert.equal((await instance.call('/api/danmaku?'+automaticQuery, undefined, cookie)).status, 200);
+  assert.deepEqual(received.at(-1), ['list',metadata], '自动匹配元数据传给服务，原有集级绑定键不变');
 });
 
 test('real danmaku storage shares family comments and persists explicit episode binding across restart', async t => {

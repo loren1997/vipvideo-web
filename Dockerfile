@@ -15,7 +15,7 @@ RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates ffmpeg chromium xvfb xauth; \
     if [ "$(dpkg --print-architecture)" = amd64 ]; then \
-      apt-get install -y --no-install-recommends intel-media-va-driver-non-free; \
+      apt-get install -y --no-install-recommends intel-media-va-driver-non-free mesa-vulkan-drivers; \
     fi; \
     rm -rf /var/lib/apt/lists/*
 
