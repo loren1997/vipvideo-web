@@ -86,6 +86,53 @@ test('cloud routes protect account data, resolve trusted selections and proxy on
   assert.equal((await call(playback.url, undefined, cookie)).status, 403);
 });
 
+test('cloud subtitles expose only registered same-origin files after login', async t => {
+  const content = '1\n00:00:01,000 --> 00:00:02,000\n中文字幕\n', calls = [];
+  const quark = {
+    subtitles: async (id, options) => { options.valid(); options.visible('movie'); calls.push(['list', id]); return [{ id: 'sub-1', name: '影片.zh.srt', type: 'srt', fid: 'private-fid', url: 'https://drive.quark.cn/private?token=secret' }]; },
+    subtitle: async (id, subtitleId, options) => { options.valid(); options.visible('movie'); calls.push(['read', id, subtitleId]); return content; },
+  };
+  const { call, login } = await running(t, { quark }), path = '/api/quark/subtitles?assetId=asset';
+  assert.equal((await call(path)).status, 401);
+  assert.equal((await call('/api/quark/subtitle?assetId=asset&subtitleId=sub-1')).status, 401);
+  assert.equal(calls.length, 0);
+  const cookie = await login(), list = await (await call(path, undefined, cookie)).json();
+  assert.deepEqual(list, { subtitles: [{ id: 'sub-1', name: '影片.zh.srt', type: 'srt', url: '/api/quark/subtitle?assetId=asset&subtitleId=sub-1' }] });
+  const subtitle = await call(list.subtitles[0].url, undefined, cookie);
+  assert.equal(subtitle.status, 200); assert.equal(await subtitle.text(), content);
+  assert.equal(subtitle.headers.get('content-type'), 'text/plain; charset=utf-8');
+  assert.equal(subtitle.headers.get('content-length'), String(Buffer.byteLength(content)));
+  assert.equal(subtitle.headers.get('cache-control'), 'private, no-store');
+  assert.equal(subtitle.headers.get('x-content-type-options'), 'nosniff');
+  const before = calls.length;
+  for (const query of ['assetId=asset&url=http://127.0.0.1/private', 'assetId=asset&fid=arbitrary', 'assetId=asset&assetId=other', '']) assert.equal((await call('/api/quark/subtitles?' + query, undefined, cookie)).status, 400);
+  for (const query of ['assetId=asset', 'assetId=asset&subtitleId=sub-1&subtitleId=sub-2', 'assetId=asset&subtitleId=sub-1&url=https://evil.example']) assert.equal((await call('/api/quark/subtitle?' + query, undefined, cookie)).status, 400);
+  assert.equal(calls.length, before);
+});
+
+test('cloud subtitles obey hidden categories and bounded text responses', async t => {
+  const quark = {
+    subtitles: async (_id, { visible }) => { visible('adult'); return []; },
+    subtitle: async () => '字'.repeat(Math.ceil(2 * 1024 * 1024 / 3)),
+  };
+  const { call, login } = await running(t, { quark }), cookie = await login();
+  assert.equal((await call('/api/quark/subtitles?assetId=hidden', undefined, cookie)).status, 403);
+  const oversized = await call('/api/quark/subtitle?assetId=asset&subtitleId=large', undefined, cookie);
+  assert.equal(oversized.status, 400); assert.match((await oversized.json()).error, /2 MiB/);
+});
+
+test('cloud subtitle reads cannot finish after the household session is revoked', async t => {
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; }), paused = new Promise(resolve => { release = resolve; });
+  const quark = { subtitle: async () => { entered(); await paused; return 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nprivate\n'; } };
+  const { call, login } = await running(t, { quark }), cookie = await login();
+  t.after(release);
+  const response = call('/api/quark/subtitle?assetId=asset&subtitleId=sub-1', undefined, cookie);
+  await started;
+  try { assert.equal((await call('/api/auth/logout', {}, cookie)).status, 200); } finally { release(); }
+  assert.equal((await response).status, 401);
+});
+
 test('Quark resource searches use the maintained pool and expose its status only after login', async t => {
   let searches = 0;
   const poolStatus = { healthy: 1, pending: 1, lastDiscovery: 123 };

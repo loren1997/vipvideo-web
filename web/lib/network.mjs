@@ -122,7 +122,7 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
 
 export const request = createRequest();
 
-export async function readText(response, maxBytes = 4 * 1024 * 1024) {
+export async function readBuffer(response, maxBytes = 4 * 1024 * 1024) {
   const encoding = String(response.headers?.['content-encoding'] || 'identity').toLowerCase();
   const decompressors = { gzip: createGunzip, deflate: createInflate, br: createBrotliDecompress };
   if (encoding !== 'identity' && !decompressors[encoding]) {
@@ -141,7 +141,7 @@ export async function readText(response, maxBytes = 4 * 1024 * 1024) {
       if (size > maxBytes) throw failure('影视源响应过大');
       chunks.push(bytes);
     }
-    return Buffer.concat(chunks).toString('utf8');
+    return Buffer.concat(chunks);
   } catch (cause) {
     response.destroy();
     stream.destroy();
@@ -149,4 +149,8 @@ export async function readText(response, maxBytes = 4 * 1024 * 1024) {
   } finally {
     if (stream !== response) response.off('error', onError);
   }
+}
+
+export async function readText(response, maxBytes) {
+  return (await readBuffer(response, maxBytes)).toString('utf8');
 }

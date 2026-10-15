@@ -99,6 +99,12 @@ let quarkCookie = '', quarkMode = 'matched', holdQuarkResources = false, release
 let quarkResourceReply = null;
 let quarkAssetPosition = 0;
 let quarkChoicesFixture = false, quarkFilesFixture = 'matched';
+let quarkSubtitleFixture = false, releaseQuarkSubtitle = null;
+const subtitleFixtures = {
+  srt: '1\n00:00:00,000 --> 00:00:04,000\n开头字幕\n\n2\n00:00:05,000 --> 00:00:10,000\n续播字幕\n\n3\n00:00:20,000 --> 00:00:25,000\n末段字幕\n',
+  vtt: 'WEBVTT\n\nNOTE 备注不应显示\n00:00.000 --> 00:03.000\n这不是字幕\n\n00:00.000 --> 00:04.000\nVTT 第一行\n第二行\n',
+  ass: '[Script Info]\nTitle: 测试\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:04.00,Default,,0,0,0,,{\\b1}ASS 字幕,含逗号\\N第二行\n',
+};
 let holdQuarkPrepare = false, releaseQuarkPrepare, holdQuarkPlayback = false, releaseQuarkPlayback, quarkPendingChecks = 0;
 let quarkFolderRepairFails = false, holdQuarkFolderRepair = false, releaseQuarkFolderRepair;
 const heldQuarkFileReads = new Map();
@@ -188,6 +194,7 @@ try {
   const errors = [];
   const network = [];
   const media = silentMedia();
+  const videoMedia = readFileSync(new URL('./assets/player-h264-aac.mp4', import.meta.url));
   async function context(viewport, nativeMedia = true, realServices = false, initialHash = '', userAgent = '') {
     const value = await browser.newContext({ viewport, ...(userAgent ? { userAgent } : {}) });
     const contextId = ++nextContextId;
@@ -239,8 +246,8 @@ try {
         const id = `fixture-${transcodeStarts.length}`;
         return route.fulfill({ json: { id, url: `/api/transcode/${id}/index.m3u8`, type: 'hls', transcoded: true, startPosition: body.position, duration: transcodeDuration, acceleration: transcodeAcceleration } });
       }
-      // 原生静音WAV只验证转码契约与媒体事件；FFmpeg实际HLS由独立转码集成测试覆盖。
-      if (parsed.origin === base && /^\/api\/transcode\/fixture-\d+\/index\.(?:m3u8|mp4)$/.test(parsed.pathname)) return route.fulfill({ status: 200, contentType: 'audio/wav', body: media, headers: { 'Accept-Ranges': 'bytes' } });
+      // UI flows decode a real H.264/AAC sample; actual FFmpeg HLS has a separate integration test.
+      if (parsed.origin === base && /^\/api\/transcode\/fixture-\d+\/index\.(?:m3u8|mp4)$/.test(parsed.pathname)) return route.fulfill({ status: 200, contentType: 'video/mp4', body: videoMedia, headers: { 'Accept-Ranges': 'bytes' } });
       if (parsed.origin === base && parsed.pathname === '/api/ratings' && parsed.searchParams.get('source') === 'quark-library') return route.fulfill({ json: { douban: cloudFilm.douban, errors: [] } });
       if (parsed.origin === base && parsed.pathname.startsWith('/api/quark/')) {
         const method = route.request().method(), body = method === 'POST' || method === 'PUT' ? route.request().postDataJSON() : null;
@@ -316,11 +323,22 @@ try {
           const assetId = cloudAssetId(body.shareId, body.fileId);
           const seen = quarkAssets.has(assetId); quarkAssets.set(assetId, { body, name: `网盘样例第${body.episode + 1}集.mp4` }); quarkSettings.managedFiles = quarkAssets.size;
           const pending = quarkMode === 'pending-forever' || quarkMode === 'pending' && ++quarkPendingChecks === 1;
-          return route.fulfill({ json: { assetId, name: quarkAssets.get(assetId).name, position: quarkAssetPosition, duration: 1200, status: pending ? 'pending' : 'ready', saved: !pending, reused: seen } });
+          return route.fulfill({ json: { assetId, name: quarkAssets.get(assetId).name, position: quarkAssetPosition, duration: 1200, status: pending ? 'pending' : 'ready', saved: !pending, reused: seen, ...(quarkSubtitleFixture ? { subtitleReason: '字幕未全部就绪：固定字幕转存失败' } : {}) } });
+        }
+        if (parsed.pathname === '/api/quark/subtitles') {
+          const assetId = parsed.searchParams.get('assetId'); assert.ok(quarkAssets.has(assetId));
+          const subtitles = quarkSubtitleFixture ? ['srt', 'vtt', 'ass', 'bad', 'late'].map(type => ({ id: `sub-${type}`, name: `关联字幕.${type}`, type: ['bad', 'late'].includes(type) ? 'srt' : type, url: `/api/quark/subtitle?${new URLSearchParams({ assetId, subtitleId: `sub-${type}` })}` })) : [];
+          if (quarkSubtitleFixture) subtitles.push({ id: 'unsafe', name: '外站字幕', type: 'srt', url: 'https://example.invalid/a.srt' }, { id: 'other-asset', name: '别的影片字幕', type: 'srt', url: `/api/quark/subtitle?assetId=${'f'.repeat(32)}&subtitleId=other-asset` });
+          return route.fulfill({ json: { subtitles } });
+        }
+        if (parsed.pathname === '/api/quark/subtitle') {
+          assert.ok(quarkAssets.has(parsed.searchParams.get('assetId'))); const type = parsed.searchParams.get('subtitleId').slice(4);
+          if (type === 'late') await new Promise(ok => { releaseQuarkSubtitle = ok; });
+          return route.fulfill(type === 'bad' ? { status: 502, body: '固定字幕读取失败' } : { contentType: 'text/plain; charset=utf-8', body: subtitleFixtures[type] || subtitleFixtures.srt });
         }
         if (parsed.pathname === '/api/quark/playback') { if (holdQuarkPlayback) await new Promise(ok => { releaseQuarkPlayback = ok; }); if (quarkMode === 'playback-error') return route.fulfill({ status: 502, json: { error: '固定夸克播放链接错误' } }); assert.ok(quarkAssets.has(body.assetId)); const type = quarkMode === 'requires' ? 'mkv' : ['webm', 'avi', 'mpegts'].includes(quarkMode) ? quarkMode : 'hls'; return route.fulfill({ json: { assetId: body.assetId, name: quarkAssets.get(body.assetId).name, url: `/api/quark/media/${body.assetId}/index.${type === 'hls' ? 'm3u8' : type}`, type, size: 10485760, version: 'official-fixture-h264-v1', requiresCompatibility: ['requires', 'avi', 'mpegts'].includes(quarkMode), duration: 30 } }); }
         if (parsed.pathname === '/api/quark/progress') { assert.ok(quarkAssets.has(body.assetId), `未知测试资产 ${body.assetId} / ${[...quarkAssets.keys()].join(',')}`); assert.ok(Number.isFinite(body.position) && Number.isFinite(body.duration) && typeof body.ended === 'boolean'); assert.ok(body.position >= 0 && body.duration > 0 && body.duration <= 86400 && body.position <= body.duration + 2, '观看进度遵守服务端时长及范围校验'); quarkProgress.push(body); return route.fulfill({ json: { ok: true } }); }
-        if (parsed.pathname.startsWith('/api/quark/media/')) return route.fulfill({ contentType: 'audio/wav', body: media, headers: { 'Accept-Ranges': 'bytes' } });
+        if (parsed.pathname.startsWith('/api/quark/media/')) return route.fulfill({ contentType: quarkMode === 'audio-only' ? 'audio/wav' : 'video/mp4', body: quarkMode === 'audio-only' ? media : videoMedia, headers: { 'Accept-Ranges': 'bytes' } });
       }
       if (parsed.origin === base && parsed.pathname === '/api/playability/report') {
         const body = route.request().postDataJSON(); playabilityReports.push(body);
@@ -613,8 +631,9 @@ try {
       await p.evaluate(() => {
         window.Hls = class CloudFixtureHls {
           static Events = { ERROR: 'error', MANIFEST_PARSED: 'manifest' }; static isSupported() { return true; }
-          loadSource(url) { this.url = url; } attachMedia(video) { video.src = this.url.replace('.m3u8', '.mp4'); }
-          on(name, callback) { if (name === 'manifest') queueMicrotask(() => callback(name, { levels: [] })); } startLoad() {} destroy() {}
+          loadSource(url) { this.url = url; } attachMedia(video) { this.media = video; video.src = this.url.replace('.m3u8', '.mp4'); }
+          // Hls.js 清单重载会清空已有 TextTrack，应用须在 manifest 后重建外挂字幕。
+          on(name, callback) { if (name === 'manifest') queueMicrotask(() => { for (const track of this.media.textTracks) { for (const cue of [...(track.cues || [])]) track.removeCue(cue); track.mode = 'disabled'; } callback(name, { levels: [] }); }); } startLoad() {} destroy() {}
         };
       });
       if (hash !== '#quark') await p.evaluate(hash => { location.hash = hash; }, hash);
@@ -626,6 +645,7 @@ try {
       releaseQuarkResources?.(); releaseQuarkPrepare?.(); releaseQuarkPlayback?.(); releaseTranscode?.(); releaseQuarkFolderRepair?.();
       releaseQuarkResources = releaseQuarkPrepare = releaseQuarkPlayback = releaseTranscode = releaseQuarkFolderRepair = null;
       for (const release of heldQuarkFileReads.values()) release(); heldQuarkFileReads.clear();
+      releaseQuarkSubtitle?.(); releaseQuarkSubtitle = null; quarkSubtitleFixture = false;
       for (const c of contexts) await c.value.close();
       quarkResourceReply = null; quarkChoicesFixture = false; quarkFilesFixture = 'matched'; quarkFolderRepairFails = false; quarkAssetPosition = 0;
       Object.assign(quarkSettings, settings); quarkMode = mode; transcodeDuration = duration; transcodeMode = transcode; app.store.setConfig(configBefore);
@@ -646,6 +666,87 @@ try {
     await p.locator('#quark-resources').getByRole('button', { name: '夸克播放', exact: true }).click();
     await until(() => p.locator('video').evaluate(video => video.readyState >= 2 && !video.paused && video.currentSrc.includes('/api/')).catch(() => false), '手动播放后真实playing');
     await p.locator('#quark-resources').getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
+    await assertVideoFrames(p.locator('video'), '所选夸克文件');
+  }
+
+  async function assertVideoFrames(video, label) {
+    const first = await video.evaluate(video => ({ width: video.videoWidth, height: video.videoHeight, frames: video.getVideoPlaybackQuality().totalVideoFrames, time: video.currentTime }));
+    assert.ok(first.width > 0 && first.height > 0 && first.frames > 0, `${label}必须有实际视频画面`);
+    await until(() => video.evaluate(video => ({ frames: video.getVideoPlaybackQuality().totalVideoFrames, time: video.currentTime })).then(next => next.frames > first.frames && next.time > first.time), `${label}视频帧与时间递增`);
+  }
+
+  async function verifyQuarkSubtitles() {
+    await withCloudFixture(async open => {
+      quarkSubtitleFixture = true; transcodeMode = 'enabled'; transcodeDuration = 30;
+      const { page: p } = await open();
+      await p.evaluate(() => {
+        const create = URL.createObjectURL.bind(URL), revoke = URL.revokeObjectURL.bind(URL); window.subtitleBlobs = new Set();
+        URL.createObjectURL = value => { const url = create(value); if (value.type === 'text/vtt') window.subtitleBlobs.add(url); return url; };
+        URL.revokeObjectURL = url => { window.subtitleBlobs.delete(url); return revoke(url); };
+      });
+      await prepareCloudFile(p); await p.locator('#quark-resources .subtitle-warning').getByText('字幕未全部就绪：固定字幕转存失败', { exact: true }).waitFor();
+      let panel = p.locator('.player-subtitles'); await panel.locator('summary').click();
+      let select = p.getByLabel('播放字幕', { exact: true }); await select.locator('option[value="sub-srt"]').waitFor({ state: 'attached' });
+      assert.equal(await select.locator('option').count(), 6, '外站地址和其他资产字幕不展示');
+      await select.selectOption('sub-srt'); await panel.getByText('字幕已加载。', { exact: true }).waitFor();
+      assert.equal(await p.locator('video').count(), 0, '可先选关联字幕，不自动播放');
+      quarkMode = 'hls'; await playCloudFile(p); panel = p.locator('.player-subtitles'); await panel.locator('summary').click(); select = p.getByLabel('播放字幕', { exact: true });
+      assert.equal(await p.locator('#quark-resources .subtitle-warning').textContent(), '字幕未全部就绪：固定字幕转存失败', '字幕部分转存失败单独提示，不覆盖正在播放状态');
+      const cues = () => p.locator('video track').evaluate(track => [...(track.track.cues || [])].map(cue => ({ start: cue.startTime, end: cue.endTime, text: cue.text })));
+      await until(() => cues().then(rows => rows.length === 3), '关联SRT实际加载原生字幕轨道');
+      assert.equal(await p.locator('video track').evaluate(track => track.track.mode), 'showing', 'Hls清单清理后恢复外挂字幕显示');
+      assert.equal(await select.inputValue(), 'sub-srt'); assert.deepEqual((await cues())[0], { start: 0, end: 4, text: '开头字幕' });
+      await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 1; });
+      await until(() => p.locator('video track').evaluate(track => track.track.activeCues?.[0]?.text === '开头字幕'), '原生字幕在视频对应时间显示');
+
+      const source = await p.locator('video').evaluate(video => video.currentSrc), starts = playerRequests.length;
+      for (const type of ['vtt', 'ass', 'srt']) {
+        await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: `本机字幕.${type}`, mimeType: 'text/plain', buffer: Buffer.from(subtitleFixtures[type]) });
+        await panel.getByText('本机字幕已添加。', { exact: true }).waitFor();
+        await until(() => cues().then(rows => rows.length === (type === 'srt' ? 3 : 1)), `本机${type}实际字幕轨道`);
+        const row = (await cues())[0]; assert.equal(row.start, 0); assert.equal(row.end, 4);
+        assert.equal(row.text, type === 'ass' ? 'ASS 字幕,含逗号\n第二行' : type === 'vtt' ? 'VTT 第一行\n第二行' : '开头字幕');
+      }
+      const gbk = Buffer.concat([Buffer.from('1\n00:00:00,000 --> 00:00:04,000\n'), Buffer.from([0xd6, 0xd0, 0xce, 0xc4, 0xd7, 0xd6, 0xc4, 0xbb]), Buffer.from('\n')]);
+      await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: 'GBK中文字幕.srt', mimeType: 'text/plain', buffer: gbk });
+      await until(() => cues().then(rows => rows[0]?.text === '中文字幕'), 'GBK按GB18030正确解码中文');
+      await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: 'UTF16字幕.srt', mimeType: 'text/plain', buffer: Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(subtitleFixtures.srt, 'utf16le')]) });
+      await until(() => cues().then(rows => rows.length === 3 && rows[0].text === '开头字幕'), 'UTF16带BOM正确解码中文');
+      await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: `${'中英文长字幕名称'.repeat(15)}.srt`, mimeType: 'text/plain', buffer: Buffer.from(subtitleFixtures.srt) });
+      await p.setViewportSize({ width: 390, height: 844 }); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '长字幕名在手机不撑破页面');
+      await p.setViewportSize({ width: 1440, height: 1000 });
+      assert.equal(await p.locator('video').evaluate(video => video.currentSrc), source, '添加字幕不重启当前视频'); assert.equal(playerRequests.length, starts);
+      await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: '损坏.srt', mimeType: 'text/plain', buffer: Buffer.from('这不是字幕') });
+      await panel.getByText(/没有读取到有效字幕/).waitFor(); assert.equal((await cues()).length, 3, '坏字幕不覆盖已有有效字幕');
+      await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: '过大.srt', mimeType: 'text/plain', buffer: Buffer.alloc(2 * 1024 * 1024 + 1) });
+      await panel.getByText('字幕文件不能超过 2 MiB。', { exact: true }).waitFor();
+
+      await select.selectOption('sub-bad'); await panel.getByText(/字幕读取失败（502）。.*视频可继续播放/).waitFor();
+      assert.equal(await p.locator('video').evaluate(video => video.currentSrc), source, '字幕接口错误不触发播放回退');
+      await select.selectOption('sub-late'); await until(() => Boolean(releaseQuarkSubtitle), '旧字幕请求等待中');
+      await select.selectOption('sub-vtt'); await until(() => cues().then(rows => rows[0]?.text === 'VTT 第一行\n第二行'), '后选字幕立即生效');
+      releaseQuarkSubtitle(); releaseQuarkSubtitle = null; await p.waitForTimeout(100);
+      assert.equal((await cues())[0].text, 'VTT 第一行\n第二行', '迟到旧字幕不覆盖新选择');
+      await select.selectOption('sub-srt'); await until(() => cues().then(rows => rows.length === 3), '恢复关联SRT');
+      await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 5; });
+      await p.locator('.player-toolbar').getByRole('button', { name: '兼容播放', exact: true }).click();
+      await until(() => transcodeStarts.at(-1)?.position >= 5, '兼容播放保留原片位置');
+      await until(() => cues().then(rows => rows.length === 2 && rows[0].start === 0 && rows[0].text === '续播字幕'), '兼容字幕减去起播offset，已结束字幕消失');
+      assert.ok(Math.abs((await cues())[0].end - 5) < 0.2);
+      await assertVideoFrames(p.locator('video'), '字幕加载后的兼容视频');
+      const playingSource = await p.locator('video').evaluate(video => video.currentSrc);
+      await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-2'); assert.equal(await p.locator('video track').count(), 1); assert.equal(await p.locator('video').evaluate(video => video.currentSrc), playingSource, '播放旧资产时重选文件不清除正确字幕或重启视频');
+      await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-1'); await p.getByRole('button', { name: '转存所选单集', exact: true }).click(); await p.locator('#quark-resources').getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
+      await select.selectOption(''); assert.equal(await p.locator('video track').count(), 0); assert.equal(await p.evaluate(() => window.subtitleBlobs.size), 0, '关闭字幕撤销blob');
+      await select.selectOption('sub-srt'); await until(() => p.evaluate(() => window.subtitleBlobs.size === 1), '重新启用字幕仅保留一个blob');
+      await p.getByRole('button', { name: '返回夸克资源', exact: true }).click(); assert.equal(await p.locator('video').count(), 0); assert.equal(await p.evaluate(() => window.subtitleBlobs.size), 0, '停止播放撤销字幕blob');
+      await p.getByLabel('夸克分享资源', { exact: true }).selectOption('share-fixture'); assert.equal(await p.locator('.player-subtitles').count(), 0, '未播放时重选分享立即清除旧资产字幕菜单');
+      await prepareCloudFile(p);
+      await p.getByLabel('夸克视频文件', { exact: true }).selectOption('file-2'); assert.equal(await p.locator('.player-subtitles').count(), 0, '未播放时重选文件立即清除旧资产字幕菜单');
+      await p.getByLabel('夸克当前集数', { exact: true }).selectOption('1'); await prepareCloudFile(p, 'file-2');
+      assert.equal(await p.getByLabel('播放字幕', { exact: true }).inputValue(), '', '换集的新视频不继承旧字幕');
+      console.log('PASS 关联字幕与本机SRT/VTT/ASS实际TextTrack显示、同资产先选后播、兼容offset校准、坏文件/2MiB/502不影响视频、迟到响应和外站/其他资产隔离、关闭停止换集撤销blob');
+    });
   }
 
   async function verifyQuarkPublicSearch() {
@@ -824,6 +925,40 @@ try {
     });
   }
 
+  async function verifyQuarkPictureReadiness() {
+    for (const mode of ['audio-only', 'zero-frame']) await withCloudFixture(async open => {
+      quarkMode = mode;
+      const { page: p } = await open({ clock: true });
+      if (mode === 'zero-frame') await p.evaluate(() => { HTMLVideoElement.prototype.getVideoPlaybackQuality = () => ({ totalVideoFrames: 0 }); });
+      await prepareCloudFile(p); const progress = quarkProgress.length, panel = p.locator('#quark-resources');
+      await panel.getByRole('button', { name: '夸克播放', exact: true }).click();
+      await until(() => p.locator('video').evaluate(video => video.readyState >= 2 && !video.paused).catch(() => false), '音频事件已触发但尚无可验证视频帧');
+      assert.equal(await panel.getByRole('button', { name: '正在夸克播放', exact: true }).count(), 0);
+      await p.clock.fastForward(15000);
+      await panel.getByText('播放源没有可解码的视频画面，请尝试兼容播放或选择其他官方在线版本。', { exact: true }).waitFor();
+      assert.equal(await panel.getByRole('button', { name: '重试夸克播放', exact: true }).isEnabled(), true);
+      assert.equal(quarkProgress.length, progress, '无视频帧不能写入观看进度');
+    });
+    await withCloudFixture(async open => {
+      const { page: p } = await open({ clock: true });
+      await p.evaluate(() => { window.__actualVideoQuality = HTMLVideoElement.prototype.getVideoPlaybackQuality; HTMLVideoElement.prototype.getVideoPlaybackQuality = () => ({ totalVideoFrames: 0 }); });
+      await prepareCloudFile(p); const panel = p.locator('#quark-resources'); await panel.getByRole('button', { name: '夸克播放', exact: true }).click();
+      await until(() => p.locator('video').evaluate(video => video.readyState >= 2 && !video.paused).catch(() => false), '首轮媒体事件先于画面计数');
+      assert.equal(await panel.getByRole('button', { name: '正在夸克播放', exact: true }).count(), 0);
+      await p.evaluate(() => { HTMLVideoElement.prototype.getVideoPlaybackQuality = window.__actualVideoQuality; delete window.__actualVideoQuality; document.querySelector('video').dispatchEvent(new Event('timeupdate')); });
+      await panel.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
+      await assertVideoFrames(p.locator('video'), '延迟确认的视频画面');
+    });
+    await withCloudFixture(async open => {
+      quarkMode = 'playback-error'; const { page: p } = await open(); await prepareCloudFile(p);
+      const panel = p.locator('#quark-resources'); await panel.getByRole('button', { name: '夸克播放', exact: true }).click();
+      await panel.getByText('夸克播放未启动：固定夸克播放链接错误', { exact: true }).waitFor();
+      assert.equal(await panel.getByRole('button', { name: '重试夸克播放', exact: true }).isEnabled(), true);
+      assert.equal(await p.locator('video').count(), 0);
+    });
+    console.log('PASS 音频only与零视频帧不冒充夸克画面、不提前清除启动检查、不同步观看，具体错误显示在播放器上方');
+  }
+
   async function verifyQuarkStartupFailure() {
     await withCloudFixture(async open => {
       quarkMode = 'requires'; quarkAssetPosition = 281; transcodeMode = 'enabled'; transcodeDuration = 1200; holdTranscode = true;
@@ -831,11 +966,14 @@ try {
       const { page: p } = await open(); await prepareCloudFile(p); const panel = p.locator('#quark-resources'); await panel.getByRole('button', { name: '夸克播放', exact: true }).click();
       await until(() => typeof releaseTranscode === 'function', '所选文件281秒兼容启动在途'); assert.equal(transcodeStarts.at(-1).position, 281); assert.equal(await panel.getByRole('button', { name: '正在夸克播放', exact: true }).count(), 0);
       transcodeMode = 'timeout'; holdTranscode = false; releaseTranscode(); releaseTranscode = null; await p.locator('.player-note').getByText(/兼容播放启动超时/).waitFor(); await panel.getByRole('button', { name: '重试夸克播放', exact: true }).waitFor();
+      await panel.getByText('兼容播放未启动：兼容播放启动超时', { exact: true }).waitFor();
       assert.equal(await panel.getByRole('button', { name: '返回夸克资源', exact: true }).isEnabled(), true); assert.equal(quarkProgress.length, progress);
       transcodeMode = 'enabled'; await panel.getByRole('button', { name: '重试夸克播放', exact: true }).click(); const video = p.locator('video'); await until(() => video.evaluate(video => video.readyState >= 2 && !video.paused).catch(() => false), '重试仅一任务且真实playing'); await panel.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor(); assert.equal(transcodeStarts.length, jobs + 2);
+      await assertVideoFrames(video, '夸克兼容重试');
       await video.evaluate(video => { video.pause(); video.currentTime = 2; video.dispatchEvent(new Event('pause')); }); await until(() => quarkProgress.slice(progress).some(body => body.position === 283 && body.duration === 1200), '281秒续播本地2秒只加一次偏移');
       await video.evaluate(video => { video.currentTime = 0; }); await p.locator('.player-toolbar').getByRole('button', { name: '返回夸克资源', exact: true }).click(); assert.equal(await p.locator('video').count(), 0); await panel.getByRole('button', { name: '夸克播放', exact: true }).waitFor();
       transcodeMode = 'not-seekable'; await panel.getByRole('button', { name: '夸克播放', exact: true }).click(); const fromBeginning = panel.getByRole('button', { name: '从头兼容播放', exact: true }); await fromBeginning.waitFor(); assert.equal(transcodeStarts.at(-1).position, 281); assert.doesNotMatch(await p.locator('.player-note').textContent(), /另一台设备/);
+      await panel.getByText('兼容播放未启动：原文件暂不支持定位续播，请从头播放或换官方在线线路', { exact: true }).waitFor();
       const beforeReset = quarkProgress.length; transcodeMode = 'enabled'; holdTranscode = true; await fromBeginning.click(); await until(() => typeof releaseTranscode === 'function', '显式从头启动挂起'); assert.equal(transcodeStarts.at(-1).position, 0);
       await video.evaluate(video => video.dispatchEvent(new Event('pause'))); assert.equal(quarkProgress.slice(beforeReset).some(body => body.position < 281), false); assert.ok(app.store.get('history', cloudFilm.key).position >= 281, 'playing前不清零历史');
       holdTranscode = false; releaseTranscode(); releaseTranscode = null; await until(() => video.evaluate(video => video.readyState >= 2 && !video.paused).catch(() => false), '显式从头后实际playing'); await video.evaluate(video => { video.pause(); video.currentTime = 1; video.dispatchEvent(new Event('pause')); }); await until(() => quarkProgress.slice(beforeReset).some(body => body.position === 1), 'playing后才存从头进度');
@@ -884,7 +1022,7 @@ try {
       await video.focus(); await p.keyboard.press('Escape'); await poster.waitFor(); await until(() => poster.evaluate(element => element === document.activeElement), '返回保留原海报焦点');
       await p.locator('nav a[href="#home"]').focus(); await p.keyboard.press('Enter'); await p.locator('.poster-link').first().waitFor();
       await p.locator('.category-tabs button').first().focus(); await p.keyboard.press('ArrowRight'); assert.equal(await p.evaluate(() => document.activeElement.textContent), '电视剧'); await p.keyboard.press('Enter');
-      await p.getByRole('button', { name: '播放 星海旅途', exact: true }).waitFor(); await p.screenshot({ path: join(tvOutput, 'tv-home.png') });
+      await p.locator('#browse-results').getByRole('button', { name: '播放 星海旅途', exact: true }).waitFor(); await p.screenshot({ path: join(tvOutput, 'tv-home.png') });
       await p.locator('nav a[href="#home"]').focus(); for (let index = 0; index < 5; index++) await p.keyboard.press('ArrowDown'); await p.keyboard.press('Enter');
       await p.getByLabel('本机界面模式', { exact: true }).waitFor(); const summary = p.locator('details.settings-section > summary').first(); await summary.focus(); await p.keyboard.press('Enter');
       assert.equal(await summary.evaluate(element => element.parentElement.open), true); await p.keyboard.press('ArrowDown'); assert.equal(await p.evaluate(() => document.activeElement.tagName), 'INPUT');
@@ -921,14 +1059,15 @@ try {
   }
 
   if (process.argv.includes('--quark-library-only')) await verifyQuarkPublicSearch();
-  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkPendingSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkStartupFailure]) await verify(); }
-  else if (process.argv.includes('--quark-playback-only')) { for (const verify of [verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkStartupFailure]) await verify(); }
+  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkPendingSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
+  else if (process.argv.includes('--quark-playback-only')) { for (const verify of [verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure]) await verify(); }
   else if (process.argv.includes('--quark-progress-only')) await verifyQuarkProgressReadiness();
   else if (process.argv.includes('--quark-search-only')) {
     app.store.setConfig({ ...app.store.config(), sources: ['first', 'second'].map((id, index) => ({ id, name: ['第一源', '第二源'][index], api: `https://api.example.com/${id}`, enabled: true })) });
     for (const verify of [verifyQuarkPublicSearch, verifyQuarkPendingSearch, verifyQuarkAutoplay]) { app.store.remove('history', cloudFilm.key); await verify(); }
   }
   else if (process.argv.includes('--quark-startup-only')) await verifyQuarkStartupFailure();
+  else if (process.argv.includes('--quark-subtitles-only')) await verifyQuarkSubtitles();
   else if (process.argv.includes('--tv-only')) await verifyTvRemote();
   else {
   const { page } = await context({ width: 1440, height: 1000 });
@@ -1527,12 +1666,13 @@ try {
     await cp.locator('nav a[href="#search"]').click(); await cp.getByLabel('影片名称', { exact: true }).fill(title);
     await cp.getByRole('button', { name: '搜索', exact: true }).click(); await cp.getByRole('button', { name: `播放 ${title}`, exact: true }).click();
   };
-  const decodedCompat = async () => !await cp.locator('.player-note').textContent().then(value => value.includes('正在准备兼容播放')).catch(() => true) && cp.locator('video').evaluate((video, id) => video.readyState >= 2 && video.currentSrc.includes(`/api/transcode/${id}/`), `fixture-${transcodeStarts.length}`).catch(() => false);
+  const decodedCompat = async () => !await cp.locator('.player-note').textContent().then(value => value.includes('正在准备兼容播放')).catch(() => true) && cp.locator('video').evaluate((video, id) => video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0 && video.getVideoPlaybackQuality().totalVideoFrames > 0 && video.currentSrc.includes(`/api/transcode/${id}/`), `fixture-${transcodeStarts.length}`).catch(() => false);
   const compatStart = transcodeStarts.length;
   await searchCompat(compatibilityFilm.title);
   try { await until(decodedCompat, '直连/代理失败后自动兼容播放', 20000); }
   catch (error) { console.error('COMPAT_DEBUG', JSON.stringify({ starts: transcodeStarts.slice(compatStart), stops: transcodeStops, note: await cp.locator('.player-note').textContent(), video: await cp.locator('video').evaluate(video => ({ src: video.currentSrc, ready: video.readyState, error: video.error?.message, time: video.currentTime })).catch(() => null) })); throw error; }
   assert.equal(transcodeStarts.length, compatStart + 1, '自动转码仅一次');
+  await assertVideoFrames(cp.locator('video'), '普通影片兼容播放');
   assert.equal(transcodeStarts.at(-1).position, 60, '首个兼容任务直接跳过片头');
   assert.equal(transcodeStarts.at(-1).speed, 1);
   assert.ok(playabilityReports.some(value => value.id === 'compatibility' && value.status === 'error'), '原流全部失败仍允许受限转码');
@@ -1629,6 +1769,7 @@ try {
   await until(async () => liveReports.length > beforeLiveDecode && await cp.locator('video').evaluate(video => video.readyState >= 2).catch(() => false), '直播手动兼容前');
   const liveRecordCount = app.store.list('history').length, liveReportCount = liveReports.length;
   await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await until(decodedCompat, '直播手动兼容播放');
+  await assertVideoFrames(cp.locator('video'), '直播兼容播放');
   assert.deepEqual(transcodeStarts.at(-1), { liveId: 'test-tv-one', line: 1, position: 0, speed: 1 });
   assert.equal(await cp.getByLabel('播放速度', { exact: true }).isDisabled(), true);
   assert.equal(await cp.getByRole('button', { name: '快进 10 秒', exact: true }).isDisabled(), true);
@@ -1877,6 +2018,7 @@ try {
   await verifyQuarkAutoplay();
   await verifyQuarkFlow();
   await verifyQuarkProgressReadiness();
+  await verifyQuarkPictureReadiness();
   await verifyQuarkPublicSearch();
   await verifyQuarkSearchRetry();
   await verifyQuarkPendingSearch();
@@ -1921,6 +2063,7 @@ try {
   console.log('PASS 退出登录；浏览器验收完成');
   await verifyTvRemote();
   await verifyQuarkStartupFailure();
+  await verifyQuarkSubtitles();
   }
   // 显式启用联网验收；固定样例保持可离线重复，不把清单200等同于实际解码。
   if (process.env.VIPVIDEO_REAL_LIVE === '1') {

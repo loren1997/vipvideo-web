@@ -47,6 +47,44 @@ test('invalid identities never call the adapter', async t => {
   assert.throws(() => createQuarkShareValidator({ read: async () => {} }), /predicates/);
 });
 
+test('selected folders validate directly and keep their cache and invalidation separate from root and other folders', async t => {
+  const a = 'a'.repeat(32), b = 'b'.repeat(32), scoped = folder => ({ ...resource(), folder, url: resource().url + '#/list/share/' + folder });
+  const f = fixture(t, input => input.query.pdir_fid === a ? list([video('a-video')]) : list([]));
+  const [root, first, second] = [resource(), scoped(a), scoped(b)].map(row => f.validator.inspect(row));
+  await Promise.all([root.promise, first.promise, second.promise]);
+  assert.equal(root.status, 'empty'); assert.equal(first.status, 'valid'); assert.equal(second.status, 'empty');
+  assert.deepEqual(f.calls.filter(call => call.path.endsWith('/detail')).map(call => call.input.query.pdir_fid), ['0', a, b]);
+  assert.equal(f.validator.inspect(scoped(a)), first); assert.equal(f.validator.inspect({ ...resource(), url: resource().url + '#/list/share/0' }), root);
+  f.validator.invalidate(scoped(b)); assert.equal(first.status, 'valid'); assert.equal(root.status, 'empty'); assert.equal(second.status, 'unavailable');
+});
+
+test('selected folder identities reject malformed, conflicting and foreign share routes without any adapter call', async t => {
+  const f = fixture(t), a = 'a'.repeat(32), b = 'b'.repeat(32);
+  for (const row of [
+    { ...resource(), folder: null }, { ...resource(), folder: 'bad/fid' }, { ...resource(), folder: a },
+    { ...resource(), url: resource().url + '#/list/share/../' }, { ...resource(), url: resource().url + '#/list/share/' + a + '/child' },
+    { ...resource(), folder: a, url: resource().url + '#/list/share/' + b }, { ...resource(), url: 'https://pan.quark.cn/s/othershare#/list/share/' + a },
+  ]) assert.equal(f.validator.inspect(row).status, 'unavailable');
+  assert.equal(f.calls.length, 0);
+});
+
+test('missing or canceled selected folders never fall back to a different root directory', async t => {
+  const a = 'a'.repeat(32), scoped = { ...resource(), folder: a, url: resource().url + '#/list/share/' + a };
+  const f = fixture(t, input => { assert.equal(input.query.pdir_fid, a); throw Object.assign(new Error('not part of this share'), { status: 404 }); });
+  const entry = f.validator.inspect(scoped); await entry.promise; assert.equal(entry.status, 'unavailable'); assert.equal(f.calls.length, 2);
+  const pending = fixture(t, input => new Promise((resolve, reject) => input.signal.addEventListener('abort', () => reject(input.signal.reason), { once: true })));
+  const check = pending.validator.inspect(scoped), settled = check.promise; await turn(); pending.validator.invalidate(scoped); await settled;
+  assert.equal(check.status, 'unavailable'); assert.deepEqual(pending.calls.filter(call => call.path.endsWith('/detail')).map(call => call.input.query.pdir_fid), [a]);
+});
+
+test('a selected-folder response cannot substitute root files or navigate back through a root directory entry', async t => {
+  const a = 'a'.repeat(32), scoped = { ...resource(), folder: a, url: resource().url + '#/list/share/' + a };
+  for (const rows of [[{ ...video(), pdir_fid: '0' }], [{ ...folder('0'), pdir_fid: a }]]) {
+    const f = fixture(t, () => list(rows)), entry = f.validator.inspect(scoped); await entry.promise;
+    assert.equal(entry.status, 'unavailable'); assert.deepEqual(f.calls.filter(call => call.path.endsWith('/detail')).map(call => call.input.query.pdir_fid), [a]);
+  }
+});
+
 test('canceled, protected, denied and unknown shares stay unavailable without leaking upstream messages or retrying', async t => {
   for (const result of [
     Object.assign(new Error('synthetic-upstream-secret'), { quarkUpstreamCode: 41017 }),

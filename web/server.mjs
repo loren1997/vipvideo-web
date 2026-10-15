@@ -264,6 +264,28 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           requireSession(owner);
           return json(res, 200, lease.response);
         }
+        if (['/api/quark/subtitles', '/api/quark/subtitle'].includes(path) && method === 'GET') {
+          const keys = path.endsWith('/subtitles') ? ['assetId'] : ['assetId', 'subtitleId'];
+          if ([...url.searchParams.keys()].some(key => !keys.includes(key)) || keys.some(key => url.searchParams.getAll(key).length !== 1)) throw badRequest('字幕查询参数无效');
+          const assetId = text(url.searchParams.get('assetId'), '夸克影片标识', 200), owner = hashToken(token);
+          const valid = () => { requireSession(owner); return true; };
+          valid();
+          if (path.endsWith('/subtitles')) {
+            const subtitles = await quarkService.subtitles(assetId, { valid, visible: ensureVisible });
+            valid();
+            return json(res, 200, { subtitles: subtitles.map(({ id, name, type }) => ({ id, name, type,
+              url: '/api/quark/subtitle?' + new URLSearchParams({ assetId, subtitleId: id }) })) });
+          }
+          const content = await quarkService.subtitle(assetId, text(url.searchParams.get('subtitleId'), '字幕标识', 200), { valid, visible: ensureVisible });
+          valid();
+          const body = Buffer.from(content, 'utf8');
+          if (body.length > 2 * 1024 * 1024) throw badRequest('字幕文件超过 2 MiB');
+          res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+          res.setHeader('Cache-Control', 'private, no-store');
+          res.setHeader('Content-Length', body.length);
+          res.end(body);
+          return;
+        }
         if (path === '/api/quark/progress' && method === 'POST') {
           const input = await readBody(req);
           return json(res, 200, await quarkService.progress(text(input?.assetId, '夸克影片标识', 200), {

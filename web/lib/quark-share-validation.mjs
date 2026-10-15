@@ -2,7 +2,19 @@ const fid = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(
 const unavailable = reason => ({ status: 'unavailable', reason });
 function identity(resource) {
   const pwdId = resource?.pwdId, password = resource?.password ?? '';
-  return typeof pwdId === 'string' && /^[a-z0-9]{6,32}$/i.test(pwdId) && typeof password === 'string' && /^[a-z0-9]{0,16}$/i.test(password) ? { pwdId, password, key: pwdId + ':' + password } : null;
+  let folder = resource?.folder === undefined ? '0' : resource.folder;
+  if (typeof folder !== 'string' || !/^(?:0|[a-f0-9]{32})$/i.test(folder)) return null;
+  folder = folder.toLowerCase();
+  if (resource?.url !== undefined) {
+    try {
+      const url = new URL(resource.url), scoped = url.hash ? /^#\/list\/share\/(0|[a-f0-9]{32})\/?$/i.exec(url.hash) : undefined;
+      if (url.protocol !== 'https:' || url.hostname !== 'pan.quark.cn' || url.port || url.username || url.password || url.pathname.replace(/\/$/, '') !== '/s/' + pwdId || url.hash && !scoped) return null;
+      const fromUrl = scoped ? scoped[1].toLowerCase() : '0';
+      if (resource.folder !== undefined && folder !== fromUrl) return null;
+      folder = fromUrl;
+    } catch { return null; }
+  }
+  return typeof pwdId === 'string' && /^[a-z0-9]{6,32}$/i.test(pwdId) && typeof password === 'string' && /^[a-z0-9]{0,16}$/i.test(password) ? { pwdId, password, folder, key: pwdId + ':' + password + (folder === '0' ? '' : ':' + folder) } : null;
 }
 
 export function createQuarkShareValidator({ read, now = Date.now, isVideo, isDirectory } = {}) {
@@ -44,7 +56,7 @@ export function createQuarkShareValidator({ read, now = Date.now, isVideo, isDir
     try {
       const token = await call('/share/sharepage/token', { method: 'POST', body: { pwd_id: work.pwdId, passcode: work.password } });
       if (typeof token?.data?.stoken !== 'string' || !token.data.stoken || token.data.stoken.length > 4096) return unavailable('分享暂时无法核验，可能已取消、需要提取码或受访问限制');
-      const folders = [{ fid: '0', depth: 0, page: 1, count: 0 }], seen = new Set();
+      const folders = [{ fid: work.folder, depth: 0, page: 1, count: 0 }], seen = new Set();
       let requests = 0, incomplete = false;
       while (folders.length && requests++ < 5) {
         const folder = folders.shift();
@@ -53,6 +65,7 @@ export function createQuarkShareValidator({ read, now = Date.now, isVideo, isDir
         if (!Array.isArray(list) || list.length > 100) return unavailable('分享目录格式异常，暂时无法核验');
         for (const row of list) {
           if (!row || !fid(row.fid) || typeof row.file_name !== 'string' || !row.file_name.trim() || /[\u0000-\u001f\u007f]/.test(row.file_name)) { incomplete = true; continue; }
+          if (work.folder !== '0' && (row.pdir_fid !== undefined && row.pdir_fid !== folder.fid || isDirectory(row) && row.fid === '0')) return unavailable('所选分享目录的文件归属无法核验');
           if (seen.has(row.fid)) return unavailable('分享目录存在重复记录，暂时无法完整核验');
           seen.add(row.fid);
           if (isDirectory(row)) {
@@ -102,10 +115,10 @@ export function createQuarkShareValidator({ read, now = Date.now, isVideo, isDir
     if (stopped) return { ...unavailable('分享校验服务已停止'), pending: false };
     const parsed = identity(resource);
     if (!parsed) return { ...unavailable('夸克分享地址或提取码无效'), pending: false };
-    const { pwdId, password, key } = parsed, previous = cache.get(key);
+    const { pwdId, password, folder, key } = parsed, previous = cache.get(key);
     if (previous?.entry.pending || previous?.expires > now() && !force) return previous.entry;
     const entry = { status: previous?.entry.status === 'valid' ? 'valid' : 'checking', pending: true };
-    const work = { entry, pwdId, password, expires: Infinity, controller: new AbortController(), queuedUntil: now() + 30_000 };
+    const work = { entry, pwdId, password, folder, expires: Infinity, controller: new AbortController(), queuedUntil: now() + 30_000 };
     remember(key, work);
     if (active.size >= 2 && queue.length >= 64) { finish(work, unavailable('分享校验繁忙，请稍后重试')); return entry; }
     entry.promise = new Promise(resolve => { work.resolve = resolve; });

@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { gzipSync } from 'node:zlib';
 import http from 'node:http';
-import { createRequest, isPublicAddress, readText, validateUrl } from '../lib/network.mjs';
+import { createRequest, isPublicAddress, readBuffer, readText, validateUrl } from '../lib/network.mjs';
 
 function response(body = '', statusCode = 200, headers = {}) {
   return Object.assign(Readable.from([Buffer.from(body)]), { statusCode, headers });
@@ -140,6 +140,15 @@ test('limits redirect loops and reports DNS timeout', async () => {
   assert.equal(calls.length, 4);
   const hanging = createRequest({ lookup: () => new Promise(() => {}) });
   await assert.rejects(hanging('https://source.example/', { timeout: 10 }), /超时/);
+});
+
+test('bounded byte reads preserve non-UTF8 subtitle encodings through compression', async () => {
+  const bytes = Buffer.from([0xff, 0xfe, 0x2d, 0x4e]);
+  const encoded = Object.assign(Readable.from([gzipSync(bytes)]), { headers: { 'content-encoding': 'gzip' } });
+  assert.deepEqual(await readBuffer(encoded), bytes);
+  const tooLarge = Object.assign(Readable.from([gzipSync(bytes)]), { headers: { 'content-encoding': 'gzip' } });
+  await assert.rejects(readBuffer(tooLarge, bytes.length - 1), /响应过大/);
+  assert.equal(tooLarge.destroyed, true);
 });
 
 test('limits decoded response size and reads gzip JSON', async () => {

@@ -1327,12 +1327,145 @@ function queueQuarkProgress(current, ended = false, keepalive = false, completed
 }
 
 function setQuarkPlaybackStatus(current, status) {
-  if (player !== current || !current.quarkAsset || current.quarkPlaybackStatus === status) return;
+  if (player !== current || !(current.quarkAsset || current.quarkOnly) || current.quarkPlaybackStatus === status) return;
   current.quarkPlaybackStatus = status; current.refreshQuarkPlayback?.();
 }
 
 function quarkPlaybackMessage(current) {
-  return current.quarkPlaybackStatus === 'playing' ? '正在夸克播放。转存保留源文件画质。' : current.quarkPlaybackStatus === 'error' ? '夸克播放未成功，可重试夸克播放或返回原线路。' : '正在准备夸克播放，请稍候…';
+  if (current.quarkPlaybackStatus === 'error') return current.note?.className.includes('error-message') && current.note.textContent || `夸克播放未成功，可重试夸克播放或${current.quarkOnly ? '返回夸克资源' : '返回原线路'}。`;
+  return current.quarkPlaybackStatus === 'playing' ? '正在夸克播放。转存保留源文件画质。' : '正在准备夸克播放，请稍候…';
+}
+
+function hasVideoFrame(video) {
+  const frames = video.getVideoPlaybackQuality?.().totalVideoFrames ?? video.webkitDecodedFrameCount;
+  return video.videoWidth > 0 && video.videoHeight > 0 && (frames === undefined || frames > 0);
+}
+
+function subtitleCues(text, type) {
+  if (typeof text !== 'string' || new TextEncoder().encode(text).length > 2 * 1024 * 1024) throw new Error('字幕文件不能超过 2 MiB。');
+  const lines = text.replace(/^\uFEFF/, '').replace(/\r/g, '').split('\n'), cues = [];
+  const seconds = value => {
+    const match = /^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})[.,](\d{1,3})$/.exec(value.trim());
+    return match && Number(match[2]) < 60 && Number(match[3]) < 60 ? Number(match[1] || 0) * 3600 + Number(match[2]) * 60 + Number(match[3]) + Number(match[4].padEnd(3, '0')) / 1000 : NaN;
+  };
+  const add = (start, end, value) => {
+    const plain = value.replace(/<[^>]*>/g, '').trim();
+    if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end > start && end <= 86400 && plain) cues.push({ start, end, text: plain });
+    if (cues.length > 50000) throw new Error('字幕条目过多。');
+  };
+  if (type === 'ass') {
+    let events = false, fields = [];
+    for (const line of lines) {
+      if (/^\[/.test(line)) { events = /^\[Events\]\s*$/i.test(line); continue; }
+      if (!events) continue;
+      if (/^Format:/i.test(line)) fields = line.slice(line.indexOf(':') + 1).split(',').map(field => field.trim().toLowerCase());
+      else if (/^Dialogue:/i.test(line) && fields.at(-1) === 'text' && fields.includes('start') && fields.includes('end')) {
+        const parts = line.slice(line.indexOf(':') + 1).split(','), value = parts.slice(fields.length - 1).join(',');
+        add(seconds(parts[fields.indexOf('start')] || ''), seconds(parts[fields.indexOf('end')] || ''), value.replace(/\{[^}]*\}/g, '').replace(/\\[Nn]/g, '\n').replace(/\\h/g, ' '));
+      }
+    }
+  } else {
+    for (let index = 0; index < lines.length; index++) {
+      if (type === 'vtt' && /^(?:NOTE(?:\s|$)|STYLE\s*$|REGION\s*$)/.test(lines[index])) { while (++index < lines.length && lines[index].trim()) {} continue; }
+      const timing = /^\s*(\S+)\s+-->\s+(\S+)/.exec(lines[index]);
+      if (!timing) continue;
+      const body = []; while (++index < lines.length && lines[index].trim()) body.push(lines[index]);
+      add(seconds(timing[1]), seconds(timing[2]), body.join('\n'));
+    }
+  }
+  if (!cues.length) throw new Error('没有读取到有效字幕，请选择 SRT、VTT 或 ASS 文件。');
+  return cues;
+}
+
+function clearSubtitleTrack(current) {
+  current.subtitleTrack?.remove(); delete current.subtitleTrack;
+  if (current.subtitleBlob) URL.revokeObjectURL(current.subtitleBlob); delete current.subtitleBlob;
+}
+
+function applySubtitleTrack(current) {
+  clearSubtitleTrack(current);
+  const state = current.subtitleState, entry = state?.documents.get(state.selected);
+  if (player !== current || !current.video || !entry) return;
+  if (hls) hls.subtitleTrack = -1;
+  const offset = current.transcoded ? current.startPosition || 0 : 0;
+  const timestamp = value => { const ms = Math.round(value * 1000); return `${String(Math.floor(ms / 3600000)).padStart(2, '0')}:${String(Math.floor(ms / 60000) % 60).padStart(2, '0')}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}.${String(ms % 1000).padStart(3, '0')}`; };
+  const rows = entry.cues.filter(cue => cue.end > offset).map(cue => `${timestamp(Math.max(0, cue.start - offset))} --> ${timestamp(cue.end - offset)}\n${cue.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}`);
+  current.subtitleBlob = URL.createObjectURL(new Blob([`WEBVTT\n\n${rows.join('\n\n')}\n`], { type: 'text/vtt' }));
+  const track = node('track'); track.kind = 'subtitles'; track.label = entry.name; track.srclang = 'und'; track.default = true; track.src = current.subtitleBlob;
+  current.subtitleTrack = track; current.video.append(track); track.track.mode = 'showing';
+  track.addEventListener('error', () => { if (player === current && current.subtitleTrack === track) current.subtitleStatus.textContent = '字幕暂时无法显示，视频可继续播放。'; });
+}
+
+function mountSubtitles(current, host, assetId = current.quarkAsset) {
+  if (current.subtitlePanel?.isConnected && current.subtitleState?.assetId === assetId) return;
+  for (const request of current.subtitleRequests || []) request.abort();
+  current.subtitlePanel?.remove(); clearSubtitleTrack(current);
+  const saved = current.quarkState?.subtitle || current.subtitleState;
+  const state = saved && saved.assetId === assetId ? saved : { assetId, items: [], selected: '', documents: new Map(), loaded: !assetId };
+  current.subtitleState = state; if (current.quarkState && assetId) current.quarkState.subtitle = state;
+  const panel = node('details', undefined, 'player-subtitles'); current.subtitlePanel = panel;
+  panel.append(node('summary', '字幕'));
+  const controls = node('div', undefined, 'player-toolbar'), select = node('select'); select.setAttribute('aria-label', '播放字幕');
+  select.style.maxWidth = '100%'; select.style.minWidth = '0';
+  const input = node('input'); input.type = 'file'; input.accept = '.srt,.vtt,.ass'; input.setAttribute('aria-label', '添加字幕文件');
+  input.style.maxWidth = '100%';
+  const status = node('p', undefined, 'muted'); current.subtitleStatus = status;
+  controls.append(select, input); panel.append(controls, node('small', '可选择随视频转存的字幕，或添加本机 SRT / VTT / ASS；ASS 以文字显示。', 'muted'), status); host.append(panel);
+  const draw = () => {
+    select.replaceChildren(); const off = node('option', '关闭外挂字幕'); off.value = ''; select.append(off);
+    for (const item of [...state.items, ...(state.documents.has('manual') ? [{ id: 'manual', name: state.documents.get('manual').name }] : [])]) { const option = node('option', item.name); option.value = item.id; select.append(option); }
+    select.value = state.selected;
+  };
+  const request = async (url, json = false) => {
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 15000);
+    if (!json) { current.subtitleRead?.abort(); current.subtitleRead = controller; }
+    (current.subtitleRequests ||= new Set()).add(controller);
+    try {
+      const response = await fetch(url, { credentials: 'same-origin', signal: controller.signal });
+      if (!response.ok) throw new Error(`字幕读取失败（${response.status}）。`);
+      if (Number(response.headers.get('content-length')) > 2 * 1024 * 1024) throw new Error('字幕文件不能超过 2 MiB。');
+      const text = await response.text(); if (new TextEncoder().encode(text).length > 2 * 1024 * 1024) throw new Error('字幕文件不能超过 2 MiB。');
+      return json ? JSON.parse(text) : text;
+    } finally { clearTimeout(timer); current.subtitleRequests.delete(controller); if (current.subtitleRead === controller) delete current.subtitleRead; }
+  };
+  const selectSubtitle = async () => {
+    state.selected = select.value; current.subtitleRead?.abort(); clearSubtitleTrack(current); status.textContent = '';
+    const selected = state.selected;
+    try {
+      if (selected && !state.documents.has(selected)) {
+        const item = state.items.find(value => value.id === selected); status.textContent = '正在读取字幕…';
+        const cues = subtitleCues(await request(item.url), item.type);
+        if (player !== current || current.subtitleState !== state || state.selected !== selected) return;
+        state.documents.set(selected, { name: item.name, cues });
+      }
+      if (player === current && current.subtitleState === state && state.selected === selected) { status.textContent = selected ? '字幕已加载。' : ''; applySubtitleTrack(current); }
+    } catch (error) { if (player === current && current.subtitleState === state && state.selected === selected) status.textContent = `${error.name === 'AbortError' ? '字幕读取超时或已取消。' : error.message} 视频可继续播放。`; }
+  };
+  select.addEventListener('change', () => void selectSubtitle());
+  input.addEventListener('change', async () => {
+    const file = input.files[0]; if (!file) return;
+    current.subtitleRead?.abort();
+    try {
+      const type = /\.(srt|vtt|ass)$/i.exec(file.name)?.[1]?.toLowerCase(); if (!type) throw new Error('请选择 SRT、VTT 或 ASS 字幕。');
+      if (file.size > 2 * 1024 * 1024) throw new Error('字幕文件不能超过 2 MiB。');
+      const bytes = new Uint8Array(await file.arrayBuffer()); let text;
+      try {
+        const bom = bytes[0] === 0xff && bytes[1] === 0xfe ? 'utf-16le' : bytes[0] === 0xfe && bytes[1] === 0xff ? 'utf-16be' : '';
+        if (bom) text = new TextDecoder(bom, { fatal: true }).decode(bytes);
+        else { try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { text = new TextDecoder('gb18030', { fatal: true }).decode(bytes); } }
+      } catch { throw new Error('无法识别字幕编码，请另存为 UTF-8 后重试。'); }
+      const cues = subtitleCues(text, type); if (player !== current || current.subtitleState !== state) return;
+      state.documents.set('manual', { name: file.name, cues }); state.selected = 'manual'; draw(); status.textContent = '本机字幕已添加。'; applySubtitleTrack(current);
+    } catch (error) { if (player === current) status.textContent = error.message; }
+    finally { input.value = ''; }
+  });
+  draw(); applySubtitleTrack(current);
+  if (assetId && !state.loaded) void request(`/api/quark/subtitles?${new URLSearchParams({ assetId })}`, true).then(data => {
+    if (player !== current || current.subtitleState !== state) return;
+    state.items = (Array.isArray(data.subtitles) ? data.subtitles : []).slice(0, 60).filter(item => {
+      try { const url = new URL(item.url, location.origin); return typeof item.id === 'string' && item.id !== 'manual' && item.id && typeof item.name === 'string' && ['srt', 'vtt', 'ass'].includes(item.type) && url.origin === location.origin && !url.username && !url.password && url.pathname === '/api/quark/subtitle' && url.searchParams.get('assetId') === assetId && url.searchParams.get('subtitleId') === item.id; } catch { return false; }
+    }); state.loaded = true; draw();
+  }).catch(error => { if (player === current && current.subtitleState === state) status.textContent = `${error.name === 'AbortError' ? '关联字幕读取超时。' : '关联字幕暂时无法读取。'} 可手动添加字幕。`; });
 }
 
 function returnFromQuark(current) {
@@ -1350,7 +1483,7 @@ function restartQuarkFromBeginning(current) {
 async function playQuark(current, assetId, valid = () => true) {
   if (player !== current || !current.catalog || !valid()) return;
   const stamp = routeVersion, scope = adScope(current);
-  if (current.quarkAsset === assetId) setQuarkPlaybackStatus(current, 'loading');
+  if (current.quarkOnly || current.quarkAsset === assetId) setQuarkPlaybackStatus(current, 'loading');
   try {
     const [data, preferences] = await Promise.all([api('/api/quark/playback', { method: 'POST', body: { assetId }, timeoutMs: 35000 }), current.preferences ? Promise.resolve(current.preferences) : (current.detail.preferencesPromise ||= api(`/api/player/preferences?${new URLSearchParams({ key: current.detail.key })}`).catch(error => { console.warn('网盘播放偏好读取失败', error.message); return defaultPreferences; }))]);
     if (player !== current || stamp !== routeVersion || scope !== adScope(current) || !valid()) return;
@@ -1360,7 +1493,7 @@ async function playQuark(current, assetId, valid = () => true) {
     const position = current.quarkOnly && current.quarkAsset !== assetId ? ready?.assetId === assetId && Number.isFinite(ready.position) ? ready.position : Number.isFinite(saved?.position) ? saved.position : 0 : playPosition(current), request = ++playVersion; void stopPlayer(false);
     player = { detail: current.detail, line: current.line, episode: current.episode, episodeName: current.quarkOnly ? ready?.name || current.episodeName : current.episodeName, position, started: true, catalog: true, quarkOnly: current.quarkOnly === true, flow: { tried: new Set() }, request, stamp, mode: 'direct', preferences: normalizePreferences(preferences), quarkAsset: assetId, quarkPlaybackStatus: 'loading', quarkVersion: typeof data.version === 'string' ? data.version : JSON.stringify(data.quality ?? 'default'), requiresCompatibility: data.requiresCompatibility === true, quarkState: current.quarkState, quarkUrl: url.href, originalUrl: current.originalUrl || current.url, url: url.href, type: data.type, introHandled: current.introHandled };
     mountPlayer(player);
-  } catch (error) { if (player === current && stamp === routeVersion && valid()) { setQuarkPlaybackStatus(current, 'error'); notify(`夸克播放未启动：${error.message}`, true); } }
+  } catch (error) { if (player === current && stamp === routeVersion && valid()) { current.note.textContent = `夸克播放未启动：${error.message}`; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); notify(current.note.textContent, true); } }
 }
 
 function mountQuark(current) {
@@ -1397,12 +1530,14 @@ function mountQuark(current) {
   function ready(data) {
     state.ready = data; result.replaceChildren(node('p', `${data.name || '当前集'}：${data.status === 'ready' ? '已准备好' : data.status === 'pending' ? '正在准备' : '准备未完成'}${data.saved ? ' · 已转存' : ''}`, 'muted'));
     if (data.status === 'ready' && data.assetId) {
-      const active = current.quarkAsset === data.assetId, failed = active && current.quarkPlaybackStatus === 'error';
-      const play = button(active ? failed ? '重试夸克播放' : current.quarkPlaybackStatus === 'playing' ? '正在夸克播放' : '正在准备夸克播放' : data.resume ? '继续播放已转存文件' : '夸克播放', () => { current.cancelQuarkSearch(); void playQuark(current, data.assetId); }, 'button primary small'); play.disabled = !canTransfer || active && !failed; result.append(play);
+      if (!current.video) mountSubtitles(current, panel, data.assetId);
+      const active = current.quarkAsset === data.assetId, failed = (active || current.quarkOnly && !current.quarkAsset) && current.quarkPlaybackStatus === 'error';
+      const play = button(failed ? '重试夸克播放' : active ? current.quarkPlaybackStatus === 'playing' ? '正在夸克播放' : '正在准备夸克播放' : data.resume ? '继续播放已转存文件' : '夸克播放', () => { current.cancelQuarkSearch(); void playQuark(current, data.assetId); }, 'button primary small'); play.disabled = !canTransfer || active && !failed; result.append(play);
       if (failed && current.compatibilityErrorCode === 'TRANSCODE_INPUT_NOT_SEEKABLE') result.append(button('从头兼容播放', () => { current.cancelQuarkSearch(); restartQuarkFromBeginning(current); }, 'button small'));
       if (failed) result.append(button(current.quarkOnly ? '返回夸克资源' : '返回原线路', () => returnFromQuark(current), 'button small'));
     }
     if (data.reason) result.append(node('p', data.reason, 'muted'));
+    if (data.status === 'ready' && typeof data.subtitleReason === 'string' && data.subtitleReason) result.append(node('p', data.subtitleReason, 'muted subtitle-warning'));
     if (data.code === 'QUARK_FOLDER_MISSING' && state.selection) {
       result.append(node('p', '恢复会新建专用目录，保留旧文件与转存记录；旧目录中的文件不再自动清理。', 'muted'));
       const repair = button('恢复专用目录并重试', async () => {
@@ -1475,9 +1610,15 @@ function mountQuark(current) {
   } else if (state.selection && state.resources.some(resource => resource.id === state.selection.resource.id) && state.files.some(file => file.id === state.selection.file.id)) {
     renderShareOptions(state.selection.resource.id); renderFileOptions(state.selection.file.id);
   } else filePlaceholder('请先选择分享资源');
+  function clearPreparedSubtitles() {
+    if (current.video) return;
+    for (const request of current.subtitleRequests || []) request.abort();
+    current.subtitlePanel?.remove(); clearSubtitleTrack(current);
+    delete current.subtitlePanel; delete current.subtitleState; delete state.subtitle;
+  }
   async function loadFiles(automatic = false, resetReady = true) {
     const resource = state.resources.find(value => value.id === shareSelect.value); if (!resource || !valid()) return;
-    clearTimeout(current.quarkTimer); const version = ++state.version; if (resetReady) { delete state.ready; result.replaceChildren(); } delete state.selection; filePlaceholder('正在读取视频文件…'); shareSelect.title = resource.name || resource.id; feedback.textContent = '正在核对当前集的视频文件…';
+    clearTimeout(current.quarkTimer); const version = ++state.version; if (resetReady) { delete state.ready; result.replaceChildren(); clearPreparedSubtitles(); } delete state.selection; filePlaceholder('正在读取视频文件…'); shareSelect.title = resource.name || resource.id; feedback.textContent = '正在核对当前集的视频文件…';
     const safe = httpUrl(resource.url); if (safe) { publicLink.href = safe; publicLink.removeAttribute('aria-disabled'); } else publicLink.removeAttribute('href');
     try {
       const data = await api(`/api/quark/files?${new URLSearchParams({ ...playbackSelection(current.detail, current.line, current.episode), shareId: resource.id })}`, { timeoutMs: 35000 });
@@ -1490,7 +1631,7 @@ function mountQuark(current) {
       if (automatic && state.resources.length === 1 && !data.ambiguous && matching.length === 1) void prepare(resource, matching[0], true);
     } catch (error) { if (valid() && version === state.version) { filePlaceholder('文件读取失败，请重试或切换分享'); feedback.textContent = `网盘文件暂时不可用：${error.message}`; result.replaceChildren(button('重试读取文件', () => { current.cancelQuarkSearch(); void loadFiles(); }, 'button small')); } }
   }
-  shareSelect.addEventListener('change', () => { current.cancelQuarkSearch(); delete state.selectionRequired; void loadFiles(); }); fileSelect.addEventListener('change', () => { current.cancelQuarkSearch(); clearTimeout(current.quarkTimer); state.version++; delete state.ready; delete state.selection; result.replaceChildren(); const file = state.files.find(value => value.id === fileSelect.value); transfer.disabled = !canTransfer || !file; fileSelect.title = file?.name || '请选择当前集视频'; });
+  shareSelect.addEventListener('change', () => { current.cancelQuarkSearch(); delete state.selectionRequired; void loadFiles(); }); fileSelect.addEventListener('change', () => { current.cancelQuarkSearch(); clearTimeout(current.quarkTimer); state.version++; delete state.ready; delete state.selection; result.replaceChildren(); clearPreparedSubtitles(); const file = state.files.find(value => value.id === fileSelect.value); transfer.disabled = !canTransfer || !file; fileSelect.title = file?.name || '请选择当前集视频'; });
   async function load(webSearch = false, automatic = true) {
     if (loading) return;
     current.cancelQuarkSearch(); loading = true;
@@ -1553,7 +1694,7 @@ function mountQuark(current) {
     } catch (error) { if (currentSearch()) { feedback.textContent = `夸克资源暂时不可用：${error.message}`; retry.hidden = false; } }
     finally { if (currentSearch()) { loading = false; more.disabled = retry.disabled = !configured; } }
   }
-  current.refreshQuarkPlayback = () => { if (valid() && state.ready?.assetId === current.quarkAsset) { ready(state.ready); feedback.textContent = quarkPlaybackMessage(current); } };
+  current.refreshQuarkPlayback = () => { if (valid() && state.ready && (state.ready.assetId === current.quarkAsset || current.quarkOnly && !current.quarkAsset)) { ready(state.ready); feedback.textContent = quarkPlaybackMessage(current); } };
   void load();
 }
 
@@ -1903,6 +2044,7 @@ function mountPlayer(current) {
     }); proxy.title = '跨域或直连失败时，尝试服务器受限转发'; current.proxyButton = proxy; toolbar.append(proxy);
   }
   toolbar.append(externalLink('原链接 ↗', current.quarkAsset ? current.quarkUrl : current.originalUrl || current.url));
+  if (!current.live) mountSubtitles(current, host);
   const clock = node('div', undefined, 'player-clock');
   const clockText = node('span'); const timeline = node('input'); timeline.type = 'range'; timeline.min = '0'; timeline.step = '1'; timeline.setAttribute('aria-label', '原片进度');
   clock.append(clockText, timeline); host.insertBefore(clock, current.note);
@@ -1937,10 +2079,17 @@ function mountPlayer(current) {
     current.pausedAt = 0;
   });
   video.addEventListener('ended', () => { if (player === current) { void saveHistory(current, true); if (current.catalog && !current.quarkOnly && current.preferences.autoNext && !current.nextPending) { current.nextPending = true; void nextEpisode(current); } } });
-  video.addEventListener('loadeddata', () => { if (player === current) { clearTimeout(current.loadTimer); if (current.transcoded) current.transcodeReady = true; if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); updateClock(); resetDanmaku(current); } });
-  video.addEventListener('playing', () => { if (player === current && !current.transcodeLoading && (!current.transcoded || current.transcodeReady)) { delete current.quarkRestartPosition; clearTimeout(current.loadTimer); note.textContent = `${current.quarkAsset ? '夸克播放 · ' : ''}${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${current.live ? `正在直播 · ${current.detail.title}` : `${current.episodeName || current.detail.title} · 进度每 10 秒自动保存`}`; note.className = 'player-note'; setQuarkPlaybackStatus(current, 'playing'); current.overlay?.classList.remove('paused'); if (current.catalog) { startDanmakuSync(current); drawDanmaku(current); } } });
+  video.addEventListener('loadeddata', () => { if (player === current) { if (!current.quarkAsset || hasVideoFrame(video)) { clearTimeout(current.loadTimer); if (current.transcoded) current.transcodeReady = true; if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); } updateClock(); resetDanmaku(current); } });
+  const markPlaying = () => {
+    if (player !== current || current.transcodeLoading || current.quarkAsset && (video.paused || !hasVideoFrame(video))) return;
+    if (current.quarkAsset && current.transcoded) current.transcodeReady = true;
+    if (current.transcoded && !current.transcodeReady) return;
+    delete current.quarkRestartPosition; clearTimeout(current.loadTimer); note.textContent = `${current.quarkAsset ? '夸克播放 · ' : ''}${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${current.live ? `正在直播 · ${current.detail.title}` : `${current.episodeName || current.detail.title} · 进度每 10 秒自动保存`}`; note.className = 'player-note'; setQuarkPlaybackStatus(current, 'playing'); current.overlay?.classList.remove('paused'); if (current.catalog) { startDanmakuSync(current); drawDanmaku(current); }
+  };
+  video.addEventListener('playing', markPlaying);
   video.addEventListener('timeupdate', () => {
     if (player !== current) return;
+    if (current.quarkAsset && current.quarkPlaybackStatus === 'loading') markPlaying();
     updateClock();
     if (!current.catalog) return;
     if (skipMarkedAd(current)) return;
@@ -1979,7 +2128,7 @@ function playbackError(current, hlsError) {
       ? hlsError.type === 'mediaError' && ['manifestIncompatibleCodecsError', 'bufferAddCodecError', 'bufferIncompatibleCodecsError', 'bufferAppendError', 'bufferAppendingError'].includes(hlsError.details) && !(hlsError.response?.code >= 400)
       : [3, 4].includes(current.video?.error?.code);
     if (decodeError && !current.requiresCompatibility && !current.flow.transcodeTried) { void startCompatibility(current, playPosition(current), true); return; }
-    current.failed = true; current.note.textContent = '夸克播放中断。可重试夸克播放，或返回原线路；原影视源不会因此停用。'; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); return;
+    current.failed = true; current.note.textContent = current.video?.readyState >= 2 && !hasVideoFrame(current.video) ? '播放源没有可解码的视频画面，请尝试兼容播放或选择其他官方在线版本。' : `夸克播放中断。可重试夸克播放，或${current.quarkOnly ? '返回夸克资源' : '返回原线路；原影视源不会因此停用'}。`; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); return;
   }
   if (current.catalog) void recoverPlayback(current);
   else if (current.live) void recoverLive(current);
@@ -2019,6 +2168,7 @@ async function loadMedia(current, message = '正在连接播放地址…') {
   if (hls) { hls.destroy(); hls = null; }
   clearTimeout(current.loadTimer);
   const generation = (current.mediaVersion || 0) + 1; current.mediaVersion = generation;
+  applySubtitleTrack(current);
   const url = mediaUrl(current.usedProxy ? current.proxyUrl : current.url);
   if (!url) return playbackError(current);
   current.note.className = 'player-note'; current.note.textContent = message;
@@ -2033,7 +2183,7 @@ async function loadMedia(current, message = '正在连接播放地址…') {
     }
     if (player !== current || generation !== current.mediaVersion) return;
   }
-  current.loadTimer = setTimeout(() => { if (player === current && generation === current.mediaVersion && video.readyState < 2) playbackError(current); }, 15000);
+  current.loadTimer = setTimeout(() => { if (player === current && generation === current.mediaVersion && (video.readyState < 2 || current.quarkAsset && !hasVideoFrame(video))) playbackError(current); }, 15000);
   if (current.type === 'hls' && window.Hls?.isSupported()) {
     const quality = current.live && !current.transcoded ? liveQuality(current.channel.streams[current.line]) : null;
     const selectLevel = Boolean(quality) || !current.live;
@@ -2058,7 +2208,7 @@ async function loadMedia(current, message = '正在连接播放地址…') {
         if (index >= 0) instance.startLevel = index;
         instance.startLoad?.(current.transcoded ? 0 : -1);
       }
-      attemptPlay(current, generation);
+      applySubtitleTrack(current); attemptPlay(current, generation);
     });
   } else if (current.type === 'hls' && !video.canPlayType('application/vnd.apple.mpegurl')) {
     clearTimeout(current.loadTimer); playbackError(current);
@@ -2092,6 +2242,8 @@ function stopPlayer(invalidate = true) {
   clearTimeout(current.loadTimer);
   clearTimeout(current.quarkTimer);
   current.cancelQuarkSearch?.();
+  for (const request of current.subtitleRequests || []) request.abort();
+  clearSubtitleTrack(current);
   if (hls) { hls.destroy(); hls = null; }
   if (current.video) { current.video.pause(); current.video.removeAttribute('src'); current.video.load(); }
   if (current.frame) current.frame.src = 'about:blank';
