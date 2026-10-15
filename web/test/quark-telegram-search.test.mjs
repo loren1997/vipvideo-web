@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createQuarkTelegramSearch, extractQuarkTelegramResults, searchTelegramQuark } from '../lib/quark-telegram-search.mjs';
+import { createQuarkTelegramSearch as createTelegramSearch, DEFAULT_QUARK_TELEGRAM_CHANNELS, extractQuarkTelegramResults, inspectQuarkTelegramChannel } from '../lib/quark-telegram-search.mjs';
 import { quarkPasswordDate } from '../lib/quark-google-search.mjs';
 
 const now = Date.parse('2026-10-15T00:00:00Z'), pageUrl = 'https://t.me/s/Quark_Movies?q=%E5%B8%8C%E6%9C%9B';
 const post = (id, heading, body, date = '2026-10-14T00:00:00Z') => `<div class="tgme_widget_message_wrap js-widget_message_wrap"><div data-post="Quark_Movies/${id}" class="js-widget_message tgme_widget_message"><div class="tgme_widget_message_text js-message_text">名称：<b>${heading}</b><br/><br/>${body}</div><div class="tgme_widget_message_footer"><a href="https://t.me/Quark_Movies/${id}"><time datetime="${date}"></time></a></div></div></div>`;
 const extract = (html, options = {}) => extractQuarkTelegramResults(html, { url: pageUrl, title: '希望', aliases: ['Hope'], year: 2026, now, ...options });
 const link = 'https://pan.quark.cn/s/abc123456789';
+const createQuarkTelegramSearch = () => createTelegramSearch({ channels: ['Quark_Movies'] });
+const searchTelegramQuark = createQuarkTelegramSearch();
 
 test('extracts same-post Quark links at different positions and sorts real publication dates', () => {
   const old = post(10, '希望 Hope (2026) 1080p', `<div>介绍</div>链接：<a href="${link}">夸克</a><br/>提取码：A1b2`, '2026-10-10T00:00:00Z');
@@ -230,7 +232,181 @@ test('honors expired deadlines and cancellation without making extra requests', 
 
 test('does not accept redirects outside the public channel and preserves bounded errors', async () => {
   const rows = await searchTelegramQuark('希望', { now: () => now, read: async () => ({ html: post(10, '希望 (2026)', link), url: 'https://example.com/article' }) });
-  assert.deepEqual(rows, []);
+  assert.deepEqual([...rows], []);
   const failed = await searchTelegramQuark('希望', { now: () => now, read: async () => { throw new Error('request timeout'); } });
   assert.equal(failed.reason, '公开频道搜索超时');
+});
+
+const channelPost = (channel, ...args) => post(...args).replaceAll('Quark_Movies', channel);
+
+test('default catalog covers verified film, series and animation channels without duplicate usernames', () => {
+  assert.equal(DEFAULT_QUARK_TELEGRAM_CHANNELS.length, 27);
+  assert.equal(new Set(DEFAULT_QUARK_TELEGRAM_CHANNELS.map(value => value.toLowerCase())).size, 27);
+  for (const channel of ['Quark_Movies', 'Netdisk_Movies', 'kuakedongman', 'guoman4K', 'yunpanx']) assert.ok(DEFAULT_QUARK_TELEGRAM_CHANNELS.includes(channel));
+  assert.ok(Object.isFrozen(DEFAULT_QUARK_TELEGRAM_CHANNELS));
+});
+
+test('channel admission inspects only same-channel post text and actual public Quark links', () => {
+  const options = { url: 'https://t.me/s/Other_Channel', channel: 'Other_Channel' };
+  const html = channelPost('Other_Channel', 10, '希望 (2026)', `<a href="${link}">夸克</a>`);
+  assert.deepEqual(inspectQuarkTelegramChannel(html, options), { readable: true, hasQuarkLinks: true });
+  const unrelated = `<header>${link}</header>` + channelPost('Other_Channel', 10, '希望 (2026)', `<script>${link}</script><!--${link}--><img data-link="${link}">暂无链接`) + post(20, '希望 (2026)', link);
+  assert.deepEqual(inspectQuarkTelegramChannel(unrelated, options), { readable: true, hasQuarkLinks: false });
+  for (const url of ['http://t.me/s/Other_Channel', 'https://t.me.evil/s/Other_Channel', 'https://t.me/s/Another_Channel', 'https://user:secret@t.me/s/Other_Channel', 'https://t.me/Other_Channel/10']) assert.equal(inspectQuarkTelegramChannel(html, { ...options, url }).readable, false);
+  assert.equal(inspectQuarkTelegramChannel(post(10, '希望 (2026)', link), options).readable, false);
+  assert.equal(inspectQuarkTelegramChannel('x'.repeat(512 * 1024 + 1), options).readable, false);
+});
+
+test('extraction binds each allowed channel to its own posts, film identity and dated footer', () => {
+  const html = channelPost('ucquark', 10, '希望 Hope (2026)', link, '2026-10-12T00:00:00Z') + post(9, '希望 (2026)', link.replace('abc123456789', 'bbb123456789')) + channelPost('ucquark', 8, '另一个电影 (2026)', link.replace('abc123456789', 'ccc123456789'));
+  const result = extract(html, { url: 'https://t.me/s/ucquark' });
+  assert.equal(result.rows.length, 1);
+  assert.equal(result.rows[0].url, link);
+  assert.equal(result.rows[0].publishedAt, Date.parse('2026-10-12T00:00:00Z'));
+  assert.equal(result.nextBefore, '8');
+  assert.deepEqual(extract(html, { url: 'https://t.me/s/Unknown_Channel' }).rows, []);
+  assert.equal(extractQuarkTelegramResults(channelPost('Fixture_Channel', 10, '希望 (2026)', link), { url: 'https://t.me/s/Fixture_Channel', title: '希望', year: 2026, now, channels: ['Fixture_Channel'] }).rows.length, 1);
+});
+
+test('accepts the observed bracketed title label without borrowing a later differently titled section', () => {
+  const html = channelPost('gokuapan', 10, '希望 (2026)', link).replace('名称：', '【标题】：');
+  assert.equal(extract(html, { url: 'https://t.me/s/gokuapan' }).rows.length, 1);
+  const mixed = channelPost('gokuapan', 10, '希望 (2026)', `暂无资源<br/>【标题】：另一个电影 (2026)<br/>${link}`).replace('名称：', '【标题】：');
+  assert.deepEqual(extract(mixed, { url: 'https://t.me/s/gokuapan' }).rows, []);
+});
+
+test('more searches untouched channels before aliases or older pages even after useful results', async () => {
+  const search = createTelegramSearch(), calls = []; let active = 0, maximumActive = 0;
+  const options = { aliases: ['Hope'], year: 2026, now: () => now, read: async (url, duration, maxBytes, end, signal) => {
+    const address = new URL(url), channel = address.pathname.split('/').at(-1);
+    calls.push({ channel, q: address.searchParams.get('q'), before: address.searchParams.get('before') });
+    assert.ok(duration <= 3000 && maxBytes === 512 * 1024 && end === now + 35000 && signal instanceof AbortSignal);
+    maximumActive = Math.max(maximumActive, ++active); await new Promise(resolve => setImmediate(resolve)); active--;
+    return channelPost(channel, 30, '希望 Hope (2026)', link.replace('abc123456789', String(DEFAULT_QUARK_TELEGRAM_CHANNELS.indexOf(channel) + 100).padEnd(12, '0')));
+  } };
+  const first = await search('希望', options);
+  assert.equal(first.length, 8); assert.equal(first.pending, true);
+  assert.equal(first.progress.attemptedChannels, 8);
+  for (let batch = 1; batch < 4; batch++) await search('希望', { ...options, page: 1 });
+  assert.equal(calls.length, 32); assert.equal(maximumActive, 2);
+  assert.deepEqual(calls.slice(0, 27).map(call => call.channel), [...DEFAULT_QUARK_TELEGRAM_CHANNELS]);
+  assert.ok(calls.slice(0, 27).every(call => call.q === '希望' && call.before === null));
+  assert.ok(calls.slice(27).every(call => call.q === 'Hope' && call.before === null));
+});
+
+test('publishes partial results while another channel is still being read and deduplicates cross-channel dates and codes', async () => {
+  const search = createTelegramSearch({ channels: ['Alpha_Channel', 'Bravo_Channel'] });
+  let release, notified;
+  const partial = new Promise(resolve => { notified = resolve; });
+  const pending = search('希望', { year: 2026, now: () => now, onResults: rows => notified(rows), read: async url => {
+    const address = new URL(url), channel = address.pathname.split('/').at(-1);
+    if (address.searchParams.has('before')) return '';
+    if (channel === 'Bravo_Channel') await new Promise(resolve => { release = resolve; });
+    return channelPost(channel, 30, '希望 (2026)', link + (channel === 'Alpha_Channel' ? '?pwd=AB12' : ''), channel === 'Alpha_Channel' ? '2026-10-10T00:00:00Z' : '2026-10-14T00:00:00Z');
+  } });
+  assert.equal((await partial)[0].url, link + '?pwd=AB12');
+  release();
+  const result = await pending;
+  assert.equal(result.length, 1); assert.equal(result[0].url, link + '?pwd=AB12');
+  assert.equal(result[0].publishedAt, Date.parse('2026-10-14T00:00:00Z'));
+  assert.equal(result[0][quarkPasswordDate], Date.parse('2026-10-10T00:00:00Z'));
+});
+
+test('failed channels are isolated while normal empty searches retain their alias and other sources finish', async () => {
+  const search = createTelegramSearch({ channels: ['Alpha_Channel', 'Bravo_Channel', 'Charlie_Channel'] }), calls = [];
+  const result = await search('希望', { aliases: ['Hope'], year: 2026, now: () => now, read: async url => {
+    const address = new URL(url), channel = address.pathname.split('/').at(-1), q = address.searchParams.get('q'); calls.push({ channel, q });
+    if (channel === 'Alpha_Channel') throw new Error('request timeout');
+    return channel === 'Bravo_Channel' ? '' : channelPost(channel, 30, '希望 Hope (2026)', link);
+  } });
+  assert.equal(result.length, 1); assert.equal(result.pending, false); assert.equal(result.progress.failedChannels, 1);
+  assert.equal(calls.filter(call => call.channel === 'Alpha_Channel').length, 1);
+  assert.deepEqual(calls.filter(call => call.channel === 'Bravo_Channel').map(call => call.q), ['希望', 'Hope']);
+  assert.ok(calls.filter(call => call.channel === 'Charlie_Channel').length > 1);
+  const more = await search('希望', { aliases: ['Hope'], year: 2026, page: 1, now: () => now, read: async () => assert.fail('finished and failed sources must not restart') });
+  assert.equal(more.pending, false);
+});
+
+test('read timeout aborts only the slow channel and preserves already found results for more', async () => {
+  const search = createTelegramSearch({ channels: ['Alpha_Channel', 'Bravo_Channel'] }); let readSignal;
+  const started = Date.now();
+  const result = await search('希望', { year: 2026, deadline: started + 50, read: async (url, duration, bytes, end, signal) => {
+    const channel = new URL(url).pathname.split('/').at(-1);
+    if (channel === 'Alpha_Channel') { readSignal = signal; return new Promise(() => {}); }
+    return channelPost(channel, 30, '希望 (2026)', link);
+  } });
+  assert.equal(result.length, 1); assert.equal(readSignal.aborted, true); assert.equal(result.pending, true);
+  assert.equal(result.reason, '公开频道搜索超时'); assert.ok(Date.now() - started < 1000);
+});
+
+test('redirects to another allowed channel never lend its posts or pagination to the requested channel', async () => {
+  const search = createTelegramSearch({ channels: ['Alpha_Channel', 'Bravo_Channel'] }), calls = [];
+  const result = await search('希望', { year: 2026, now: () => now, read: async url => {
+    const channel = new URL(url).pathname.split('/').at(-1); calls.push(channel);
+    return channel === 'Alpha_Channel' ? { url: 'https://t.me/s/Bravo_Channel', html: channelPost('Bravo_Channel', 10, '希望 (2026)', link) } : '';
+  } });
+  assert.equal(result.length, 0); assert.equal(result.progress.failedChannels, 1);
+  assert.deepEqual(calls, ['Alpha_Channel', 'Bravo_Channel']);
+});
+
+test('trusted channel updates preserve cursors, prioritize the new primary task and reject invalid usernames', async () => {
+  let refresh = 0;
+  const search = createTelegramSearch({ channels: ['Alpha_Channel'], resolveChannels: async ({ read, deadline, signal }) => {
+    assert.equal(typeof read, 'function'); assert.equal(deadline, now + 35000); assert.equal(signal, undefined);
+    return ++refresh === 1 ? ['Alpha_Channel'] : ['alpha_channel', 'Bravo_Channel', '../Other', 'https://evil.example', 'x', 'Bravo_Channel'];
+  } }), calls = [];
+  const options = { year: 2026, now: () => now, read: async url => {
+    const address = new URL(url), channel = address.pathname.split('/').at(-1), before = address.searchParams.get('before'); calls.push({ channel, before });
+    return before ? '' : channelPost(channel, 30, '希望 (2026)', link);
+  } };
+  await search('希望', options);
+  const result = await search('希望', { ...options, page: 1 });
+  assert.equal(result.progress.totalChannels, 2);
+  assert.deepEqual(calls.slice(0, 3), [{ channel: 'Alpha_Channel', before: null }, { channel: 'Bravo_Channel', before: null }, { channel: 'Alpha_Channel', before: '30' }]);
+  assert.equal(calls.filter(call => call.channel.toLowerCase() === 'alpha_channel' && call.before === null).length, 1);
+});
+
+test('failed catalog refresh retains static channels and a successful empty result does not import body channels', async () => {
+  const calls = [], search = createTelegramSearch({ channels: ['Alpha_Channel'], resolveChannels: async () => { throw new Error('private upstream detail'); } });
+  const result = await search('希望', { year: 2026, now: () => now, read: async url => {
+    calls.push(new URL(url).pathname);
+    return channelPost('Other_Channel', 30, '希望 (2026)', link) + '<a href="https://t.me/s/Injected_Channel">频道</a>';
+  } });
+  assert.equal(result.length, 0); assert.equal(result.pending, false);
+  assert.equal(result.reason, '公开频道目录暂时无法更新');
+  assert.deepEqual(calls, ['/s/Alpha_Channel']);
+});
+
+test('authoritative channel health disables a source and restoration resumes its original cursor', async () => {
+  const revisions = [['Alpha_Channel', 'Bravo_Channel'], ['Bravo_Channel'], ['Alpha_Channel', 'Bravo_Channel']], calls = [];
+  const search = createTelegramSearch({ channels: revisions[0], resolveChannels: async () => revisions.shift() });
+  const options = { year: 2026, now: () => now, read: async url => {
+    const address = new URL(url), channel = address.pathname.split('/').at(-1), before = address.searchParams.get('before');
+    calls.push({ channel, before });
+    return channelPost(channel, before ? Number(before) - 10 : 1000, '希望 (2026)', link);
+  } };
+  await search('希望', options);
+  const disabledAt = calls.length, inactive = await search('希望', { ...options, page: 1 }), restoredAt = calls.length;
+  assert.equal(inactive.progress.totalChannels, 1);
+  assert.ok(calls.slice(disabledAt).every(call => call.channel === 'Bravo_Channel'));
+  const restored = await search('希望', { ...options, page: 1 });
+  assert.equal(restored.progress.totalChannels, 2);
+  assert.deepEqual(calls[restoredAt], { channel: 'Alpha_Channel', before: '970' });
+  assert.equal(calls.filter(call => call.channel === 'Alpha_Channel' && call.before === null).length, 1);
+});
+
+test('an empty active catalog dispatches nothing and refresh failure never revives inactive defaults', async () => {
+  let refresh = 0, calls = 0;
+  const search = createTelegramSearch({ channels: ['Alpha_Channel', 'Bravo_Channel'], resolveChannels: async () => {
+    if (++refresh === 2) throw new Error('catalog refresh unavailable');
+    return [];
+  } });
+  const options = { now: () => now, read: async () => { calls++; assert.fail('inactive channels must not be read'); } };
+  for (let index = 0; index < 3; index++) {
+    const rows = await search('希望', { ...options, page: index });
+    assert.equal(rows.length, 0); assert.equal(rows.pending, false);
+    assert.equal(rows.progress.totalChannels, 0);
+    if (index === 1) assert.equal(rows.reason, '公开频道目录暂时无法更新');
+  }
+  assert.equal(calls, 0);
 });

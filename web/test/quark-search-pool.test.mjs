@@ -16,12 +16,165 @@ const response = (body, statusCode = 200) => Object.assign(Readable.from([body])
 const rss = (url, title = '电影') => `<rss><channel><item><title>${title}</title><link>${url || 'https://example.org'}</link></item></channel></rss>`;
 const flush = async () => { for (let index = 0; index < 5; index++) await new Promise(done => setImmediate(done)); };
 
+test('known registered shares reveal older buffered channel results without changing shared searches', async () => {
+  const clock = Date.parse('2026-10-15T00:00:00Z'), address = 'https://manual.example/api/search?kw=%E5%B8%8C%E6%9C%9B';
+  const rows = Array.from({ length: 40 }, (_, index) => ({ name: '希望 (2026)', url: 'https://pan.quark.cn/s/buffer' + String(index).padStart(4, '0'), publishedAt: clock - index * 1000 }));
+  let release, channelCalls = 0;
+  const f = fixture({ now: () => clock, request: async () => response(JSON.stringify({ results: rows.slice(0, 30) })),
+    telegramSearch: async () => { channelCalls++; await new Promise(resolve => { release = resolve; }); return rows.slice(30); } });
+  try {
+    const initial = JSON.parse(await readText(await f.pool.request(address, { year: '2026' })));
+    assert.deepEqual(initial.results.map(row => row.url), rows.slice(0, 30).map(row => row.url));
+    assert.equal(initial.pending, true);
+    const knownShares = initial.results.map(row => row.url), options = { year: '2026', knownShares };
+    const waiting = JSON.parse(await readText(await f.pool.request(address, { ...options, poll: true })));
+    assert.equal(waiting.results.length, 0); assert.equal(waiting.pending, true);
+    await readText(await f.pool.request(address, options));
+    assert.equal(channelCalls, 1); assert.equal(f.calls.length, 1);
+    release(); await flush();
+    const later = JSON.parse(await readText(await f.pool.request(address, { ...options, poll: true })));
+    assert.deepEqual(later.results.map(row => row.url), rows.slice(30).map(row => row.url));
+    assert.equal(later.pending, undefined);
+    const original = JSON.parse(await readText(await f.pool.request(address, { year: '2026', poll: true })));
+    assert.deepEqual(original.results.map(row => row.url), initial.results.map(row => row.url));
+    assert.equal(channelCalls, 1); assert.equal(f.calls.length, 1);
+  } finally { release?.(); await f.pool.stop(); }
+});
+
+test('known-share hints accept only bounded canonical Quark paths and never become request or cache keys', async () => {
+  const clock = Date.parse('2026-10-15T00:00:00Z'), address = 'https://manual.example/api/search?kw=%E5%B8%8C%E6%9C%9B';
+  const rows = Array.from({ length: 40 }, (_, index) => ({ name: '希望 (2026)', url: 'https://pan.quark.cn/s/buffer' + String(index).padStart(4, '0'), publishedAt: clock - index * 1000 }));
+  const f = fixture({ now: () => clock, request: async () => response(JSON.stringify({ results: rows })) });
+  const poll = async knownShares => JSON.parse(await readText(await f.pool.request(address, { year: '2026', poll: true, knownShares })));
+  try {
+    await readText(await f.pool.request(address, { year: '2026' }));
+    const malformed = ['http://pan.quark.cn/s/buffer0000', 'https://pan.quark.cn.evil/s/buffer0000', 'https://evil@pan.quark.cn/s/buffer0000',
+      'https://pan.quark.cn:444/s/buffer0000', 'file:///buffer0000', rows[0].url + '?pwd=invalid!', rows[0].url + '?extra=' + 'x'.repeat(2048), {}, null];
+    assert.equal((await poll(malformed)).results[0].url, rows[0].url);
+    assert.equal((await poll(rows[0].url)).results[0].url, rows[0].url);
+    const duplicate = await poll([rows[0].url, rows[0].url + '/', rows[0].url + '?pwd=1234']);
+    assert.equal(duplicate.results.length, 30); assert.equal(duplicate.results[0].url, rows[1].url);
+    const oversized = await poll([...Array(128).fill(rows[0].url), rows[1].url]);
+    assert.equal(oversized.results[0].url, rows[1].url, 'entries beyond the 128-item hint limit are not inspected');
+    assert.equal((await poll(rows.slice(0, 30).map(row => row.url))).results.length, 10);
+    assert.equal((await poll()).results.length, 30, 'one caller cannot hide shares from another consumer');
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls[0].options.knownShares, undefined);
+    assert.ok(!f.calls[0].url.includes('knownShares'));
+  } finally { await f.pool.stop(); }
+});
+
+test('candidate buffering remains bounded at 128 while each consumer receives at most thirty', async () => {
+  const clock = Date.parse('2026-10-15T00:00:00Z'), address = 'https://manual.example/api/search?kw=%E5%B8%8C%E6%9C%9B';
+  const rows = Array.from({ length: 220 }, (_, index) => ({ name: '希望 (2026)', url: 'https://pan.quark.cn/s/bounded' + String(index).padStart(4, '0'), publishedAt: clock - index * 1000 }));
+  const f = fixture({ now: () => clock, request: async () => response(JSON.stringify({ results: rows })) });
+  try {
+    const first = JSON.parse(await readText(await f.pool.request(address, { year: '2026' }))), knownShares = first.results.map(row => row.url), counts = [first.results.length];
+    for (let page = 0; page < 5; page++) {
+      const result = JSON.parse(await readText(await f.pool.request(address, { year: '2026', poll: true, knownShares })));
+      assert.ok(result.results.length <= 30);
+      counts.push(result.results.length); knownShares.push(...result.results.map(row => row.url));
+    }
+    assert.deepEqual(counts, [30, 30, 30, 30, 8, 0]);
+    assert.equal(new Set(knownShares).size, 128);
+    assert.equal(f.calls.length, 1);
+  } finally { await f.pool.stop(); }
+});
+
+test('a registered folder hint never hides a root candidate or a candidate from another folder', async t => {
+  const address = 'https://manual.example/api/search?kw=%E5%B8%8C%E6%9C%9B', folderA = 'a'.repeat(32), folderB = 'b'.repeat(32);
+  for (const source of [quarkUrl, quarkUrl + '#/list/share/' + folderB]) await t.test(source === quarkUrl ? 'root' : 'other folder', async () => {
+    const f = fixture({ request: async () => response(json(source, '希望 (2026)')) });
+    try {
+      await readText(await f.pool.request(address, { year: '2026' }));
+      for (const folder of [folderA, folderA.toUpperCase()]) {
+        const result = JSON.parse(await readText(await f.pool.request(address, { year: '2026', poll: true, knownShares: [quarkUrl + '#/list/share/' + folder] })));
+        assert.deepEqual(result.results.map(row => row.url.split('?')[0]), [quarkUrl]);
+      }
+      assert.equal(f.calls.length, 1);
+    } finally { await f.pool.stop(); }
+  });
+});
+
+test('an explicit root-folder hint is equivalent to the root and does not remove it from shared storage', async () => {
+  const address = 'https://manual.example/api/search?kw=%E5%B8%8C%E6%9C%9B', f = fixture({ request: async () => response(json(quarkUrl, '希望 (2026)')) });
+  try {
+    await readText(await f.pool.request(address, { year: '2026' }));
+    for (const suffix of ['', '#', '#/list/share/0', '#/list/share/0/']) {
+      const result = JSON.parse(await readText(await f.pool.request(address, { year: '2026', poll: true, knownShares: [quarkUrl + suffix] })));
+      assert.equal(result.results.length, 0);
+    }
+    const original = JSON.parse(await readText(await f.pool.request(address, { year: '2026', poll: true })));
+    assert.equal(original.results.length, 1); assert.equal(f.calls.length, 1);
+  } finally { await f.pool.stop(); }
+});
+
+test('malformed folder hints are ignored rather than being downgraded into a known root share', async () => {
+  const address = 'https://manual.example/api/search?kw=%E5%B8%8C%E6%9C%9B', f = fixture({ request: async () => response(json(quarkUrl, '希望 (2026)')) });
+  try {
+    await readText(await f.pool.request(address, { year: '2026' }));
+    for (const suffix of ['#junk', '#list/share/0', '#/list/share/00', '#/list/share/' + 'a'.repeat(31), '#/list/share/' + 'g'.repeat(32), '#/list/share/0/child', '#/list/share/' + 'a'.repeat(32) + '/child']) {
+      const result = JSON.parse(await readText(await f.pool.request(address, { year: '2026', poll: true, knownShares: [quarkUrl + suffix] })));
+      assert.equal(result.results.length, 1, suffix);
+    }
+    assert.equal(f.calls.length, 1);
+  } finally { await f.pool.stop(); }
+});
+
+test('the first explicit web search preserves older normal-search candidates without asking providers to resend them', async () => {
+  const clock = Date.parse('2026-10-15T00:00:00Z'), address = 'https://manual.example/api/search?kw=%E5%B8%8C%E6%9C%9B';
+  const rows = Array.from({ length: 40 }, (_, index) => ({ name: '希望 (2026)', url: 'https://pan.quark.cn/s/carried' + String(index).padStart(4, '0'), publishedAt: clock - index * 1000 }));
+  let apiCalls = 0, channelCalls = 0;
+  const f = fixture({ now: () => clock, googleSearch: async () => [], request: async url => {
+    const provider = new URL(url).hostname === 'manual.example';
+    return response(JSON.stringify({ results: provider && ++apiCalls === 1 ? rows.slice(0, 30) : [] }));
+  }, telegramSearch: async () => ++channelCalls === 1 ? rows.slice(30) : [] });
+  try {
+    const initial = JSON.parse(await readText(await f.pool.request(address, { year: '2026' })));
+    await flush();
+    const completed = JSON.parse(await readText(await f.pool.request(address, { year: '2026', poll: true })));
+    assert.equal(completed.pending, undefined);
+    assert.deepEqual(completed.results.map(row => row.url), rows.slice(0, 30).map(row => row.url));
+    const buffered = JSON.parse(await readText(await f.pool.request(address, { year: '2026', poll: true, knownShares: initial.results.map(row => row.url) })));
+    assert.deepEqual(buffered.results.map(row => row.url), rows.slice(30).map(row => row.url));
+    const more = JSON.parse(await readText(await f.pool.request(address, { year: '2026', webSearch: true, forceRefresh: true, knownShares: initial.results.map(row => row.url) })));
+    assert.deepEqual(more.results.map(row => row.url), rows.slice(30).map(row => row.url));
+    await flush();
+    const normal = JSON.parse(await readText(await f.pool.request(address, { year: '2026', poll: true })));
+    assert.deepEqual(normal.results.map(row => row.url), completed.results.map(row => row.url));
+    assert.equal(apiCalls, 3, 'the empty refresh tries the original title and its existing year variant'); assert.equal(channelCalls, 2);
+  } finally { await f.pool.stop(); }
+});
+
+test('cross-mode candidate carryover requires the exact work, aliases, year and endpoint and an unexpired entry', async t => {
+  const address = 'https://manual.example/api/search?kw=%E5%B8%8C%E6%9C%9B';
+  for (const variation of ['work', 'aliases', 'year', 'endpoint', 'expired']) await t.test(variation, async () => {
+    let clock = Date.parse('2026-10-15T00:00:00Z'), emitted = false;
+    const f = fixture({ now: () => clock, googleSearch: async () => [], request: async url => {
+      const provider = new URL(url).hostname.endsWith('.example');
+      const results = provider && !emitted ? [{ name: '希望', url: quarkUrl }] : [];
+      if (provider) emitted = true;
+      return response(JSON.stringify({ results }));
+    } });
+    try {
+      const initial = JSON.parse(await readText(await f.pool.request(address, { year: '2026' })));
+      assert.equal(initial.results.length, 1);
+      await flush();
+      if (variation === 'expired') clock += 120001;
+      const target = variation === 'endpoint' ? address.replace('manual.example', 'other.example') : variation === 'work' ? address.replace('%E5%B8%8C%E6%9C%9B', '%E7%9B%BC%E6%9C%9B') : address;
+      const options = { year: variation === 'year' ? '2025' : '2026', ...(variation === 'work' ? { aliases: ['希望'] } : variation === 'aliases' ? { aliases: ['Hope'] } : {}), webSearch: true, forceRefresh: true };
+      const more = JSON.parse(await readText(await f.pool.request(target, options)));
+      assert.deepEqual(more.results, [], variation);
+    } finally { await f.pool.stop(); }
+  });
+});
+
 test('public channel results merge after a fast API response, polls reuse work and more advances its page', async () => {
   const channelCalls = []; let release;
   const f = fixture({ request: async () => response(json(quarkUrl, '希望 (2026)')),
     telegramSearch: async (title, options) => {
       channelCalls.push({ title, page: options.page });
-      assert.equal(options.year, '2026'); assert.ok(options.deadline <= Date.now() + 10000);
+      assert.equal(options.year, '2026'); assert.ok(options.deadline <= Date.now() + 35000);
       await options.read('https://t.me/s/Quark_Movies?q=希望', 1000, 512 * 1024, options.deadline);
       if (channelCalls.length === 1) await new Promise(resolve => { release = resolve; });
       return [{ name: '希望 (2026)', url: 'https://pan.quark.cn/s/channel2026' }];
@@ -52,8 +205,73 @@ test('stopping public channel search cancels its request and late results cannot
   await f.pool.stop(); assert.equal(sawAbort, true); assert.equal(channelSignal.aborted, true);
 });
 
+test('public channel batches publish partial results while polls reuse the running search', async () => {
+  let release;
+  const pages = [];
+  const f = fixture({ request: value => response(value.includes('bing.com') ? '<rss><channel></channel></rss>' : '{"results":[]}'),
+    telegramSearch: async (_title, options) => {
+      pages.push(options.page);
+      if (pages.length === 1) {
+        options.onResults([{ name: '希望 (2026)', url: 'https://pan.quark.cn/s/channelpartial' }]);
+        await new Promise(resolve => { release = resolve; });
+        return Object.assign([], { pending: true });
+      }
+      return [{ name: '希望 (2026)', url: 'https://pan.quark.cn/s/channelcontinued' }];
+    },
+  });
+  const url = 'https://manual.example/api/search?kw=' + encodeURIComponent('希望');
+  const read = options => f.pool.request(url, { year: '2026', ...options }).then(readText).then(JSON.parse);
+  try {
+    const early = await read({});
+    assert.equal(early.pending, true);
+    assert.equal(early.results.length, 1);
+    await read({ poll: true });
+    assert.deepEqual(pages, [0]);
+    release();
+    await flush();
+    const done = await read({ poll: true });
+    assert.deepEqual(pages, [0, 1]);
+    assert.equal(done.pending, undefined);
+    assert.equal(done.results.length, 2);
+  } finally { release?.(); await f.pool.stop(); }
+});
+
+test('one public channel read can time out without cancelling the shared search', async () => {
+  let entrySignal;
+  const f = fixture({ request: value => response(value.includes('bing.com') ? '<rss><channel></channel></rss>' : '{"results":[]}'),
+    telegramSearch: async (_title, options) => {
+      entrySignal = options.signal;
+      const local = new AbortController();
+      local.abort(new DOMException('Single channel deadline', 'TimeoutError'));
+      await assert.rejects(options.read('https://t.me/s/Quark_Movies?q=test', 1000, 512 * 1024, options.deadline, local.signal), /搜索请求超时/);
+      assert.equal(entrySignal.aborted, false);
+      return [{ name: '希望 (2026)', url: 'https://pan.quark.cn/s/channelhealthy' }];
+    },
+  });
+  const url = 'https://manual.example/api/search?kw=' + encodeURIComponent('希望');
+  try {
+    await f.pool.request(url, { year: '2026' });
+    await flush();
+    const done = JSON.parse(await readText(await f.pool.request(url, { year: '2026', poll: true })));
+    assert.equal(entrySignal.aborted, false);
+    assert.ok(done.results.length, JSON.stringify(done));
+    assert.equal(done.results[0].url, 'https://pan.quark.cn/s/channelhealthy');
+    assert.equal(f.calls.some(call => new URL(call.url).hostname === 't.me'), false);
+  } finally { await f.pool.stop(); }
+});
+
+test('a public channel adapter that stays pending cannot run an unbounded number of batches', async () => {
+  let batches = 0;
+  const f = fixture({ telegramSearch: async () => { batches++; return Object.assign([], { pending: true }); } });
+  try {
+    await f.pool.request('https://manual.example/api/search?kw=' + encodeURIComponent('电影'));
+    await flush();
+    assert.equal(batches, 6);
+  } finally { await f.pool.stop(); }
+});
+
 test('channel cursors continue past the fourth page while Google page numbers wrap and polls do not restart work', async () => {
-  const channelCalls = [], renderedPages = [], channel = createQuarkTelegramSearch();
+  const channelCalls = [], renderedPages = [], channel = createQuarkTelegramSearch({ channels: ['Quark_Movies'] });
   const fourth = 'https://pan.quark.cn/s/abc000000070';
   const f = fixture({ telegramSearch: channel,
     request: value => {
@@ -71,15 +289,15 @@ test('channel cursors continue past the fourth page while Google page numbers wr
   try {
     let completed;
     for (let index = 0; index < 4; index++) {
-      const options = index ? { webSearch: true, forceRefresh: true } : {};
+      const options = { webSearch: true, ...(index ? { forceRefresh: true } : {}) };
       await read(options); await flush();
       const requests = channelCalls.length, renders = renderedPages.length;
       completed = await read({ ...options, poll: true });
       assert.equal(channelCalls.length, requests); assert.equal(renderedPages.length, renders);
       assert.equal(completed.pending, undefined);
     }
-    for (const q of ['希望', 'Hope']) assert.deepEqual(channelCalls.filter(call => call.q === q).map(call => call.before), [null, '100', '90', '80']);
-    assert.deepEqual(renderedPages, [0, 1, 2, 0]);
+    for (const q of ['希望', 'Hope']) assert.deepEqual(channelCalls.filter(call => call.q === q).map(call => call.before), [null, '100', '90', '80', '70', '60', '50', '40', '30', '20', '10']);
+    assert.deepEqual(renderedPages, [0, 1, 2, 0], JSON.stringify({ completed, requests: channelCalls.length }));
     assert.ok(completed.results.some(row => row.url === fourth));
   } finally { await f.pool.stop(); }
 });
@@ -1154,7 +1372,7 @@ test('an explicit fresh web search bypasses completed result and render caches w
       releases[0]([{ name: '电影', url: quarkUrl }]); await flush();
       assert.equal((await read({ webSearch: initialWeb })).results.length, 1);
       assert.equal(renders, 1); assert.equal(googleCalls, 0);
-      const previousRows = initialWeb ? [quarkUrl] : [];
+      const previousRows = [quarkUrl];
       const refreshed = await read({ webSearch: true, forceRefresh: true });
       assert.equal(refreshed.pending, true); assert.deepEqual(refreshed.results.map(row => row.url), previousRows);
       assert.equal(renders, 2); assert.equal(googleCalls, 0);

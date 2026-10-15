@@ -1,10 +1,19 @@
 import { validateUrl } from './network.mjs';
 import { extractQuarkArticle, quarkPasswordDate } from './quark-google-search.mjs';
 
-const CHANNEL = 'Quark_Movies', MAX_BODY = 512 * 1024;
+// PanSou's official channel catalog; each default has a readable, same-channel public post containing Quark links.
+export const DEFAULT_QUARK_TELEGRAM_CHANNELS = Object.freeze([
+  'Quark_Movies', 'ucquark', 'QuarkFree', 'kuakedongman', 'guoman4K', 'PanjClub', 'SharePanFilms',
+  'Netdisk_Movies', 'yunpanquark', 'quark_res', 'baicaoZY', 'tgsearchers7', 'yunpanx', 'yydf_hzl',
+  'Aliyun_4K_Movies', 'shareAliyun', 'dianying4k', 'WPpindao', 'Panzi88com', 'zh_vip', 'rbzhwpzy',
+  'gokuapan', 'jxwpzy', 'TG654TG', 'yoyokuakeduanju', 'Q66Share', 'leoziyuan'
+]);
+export const QUARK_TELEGRAM_CHANNELS = DEFAULT_QUARK_TELEGRAM_CHANNELS;
+const MAX_BODY = 512 * 1024;
+const channelNames = values => [...new Map((Array.isArray(values) ? values : []).slice(0, 128).filter(value => typeof value === 'string' && /^[a-z][a-z0-9_]{4,31}$/i.test(value)).map(value => [value.toLowerCase(), value])).values()];
 const attribute = (value, name) => new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i').exec(value)?.slice(1).find(value => value !== undefined) || '';
 const hasClass = (value, name) => attribute(value, 'class').split(/\s+/).includes(name);
-const titlePrefix = /^(?:\s|<[^>]+>)*(?:名称|标题)(?:\s|<[^>]+>)*[:：](?:\s|<[^>]+>)*/i;
+const titlePrefix = /^(?:\s|<[^>]+>)*(?:【|\[)?(?:名称|标题)(?:】|\])?(?:\s|<[^>]+>)*[:：](?:\s|<[^>]+>)*/i;
 
 function mergeRow(rows, row) {
   const url = new URL(row.url), previous = rows.get(url.pathname);
@@ -30,26 +39,45 @@ function divs(html, name, limit = 100) {
   return found;
 }
 
-function publicPage(value) {
+function publicPage(value, channels = DEFAULT_QUARK_TELEGRAM_CHANNELS) {
   try {
     const url = validateUrl(value);
-    return url.protocol === 'https:' && url.hostname === 't.me' && !url.port && new RegExp(`^/(?:s/)?${CHANNEL}(?:/[1-9]\\d{0,12})?/?$`, 'i').test(url.pathname) ? url : null;
+    const match = /^\/(?:s\/)?([a-z][a-z0-9_]{4,31})(?:\/[1-9]\d{0,12})?\/?$/i.exec(url.pathname);
+    const channel = match && channels.find(value => value.toLowerCase() === match[1].toLowerCase());
+    return url.protocol === 'https:' && url.hostname === 't.me' && !url.port && channel ? { url, channel } : null;
   } catch { return null; }
 }
 
-export function extractQuarkTelegramResults(html, { url, title, aliases = [], year, now = Date.now() } = {}) {
-  const rows = new Map(), page = publicPage(url); let nextBefore;
+export function inspectQuarkTelegramChannel(html, { url, channel } = {}) {
+  const page = publicPage(url, channelNames([channel]));
+  if (!page || !new RegExp(`^/s/${page.channel}/?$`, 'i').test(page.url.pathname) || typeof html !== 'string' || Buffer.byteLength(html) > MAX_BODY) return { readable: false, hasQuarkLinks: false };
+  let readable = false, hasQuarkLinks = false;
+  for (const post of divs(html, 'tgme_widget_message_wrap')) {
+    const message = divs(post.html, 'tgme_widget_message', 1)[0];
+    if (!new RegExp(`^${page.channel}/[1-9]\\d{0,12}$`, 'i').test(attribute(message?.attributes || '', 'data-post'))) continue;
+    const body = divs(message.html, 'tgme_widget_message_text', 1)[0]?.html;
+    if (!body?.trim()) continue;
+    readable = true;
+    const visible = body.replace(/<!--[\s\S]*?-->|<(?:script|style|template)\b[^>]*>[\s\S]*?<\/(?:script|style|template)\s*>/gi, '');
+    const links = [...visible.matchAll(/<a\b([^>]*)>/gi)].map(match => attribute(match[1], 'href')).concat(visible.replace(/<[^>]*>/g, ' ').match(/https:\/\/pan\.quark\.cn\/s\/[^\s<>"'，。]+/gi) || []);
+    if (links.some(link => { try { const target = validateUrl(link); return target.protocol === 'https:' && target.hostname === 'pan.quark.cn' && !target.port && /^\/s\/[a-z0-9]{6,32}\/?$/i.test(target.pathname); } catch { return false; } })) hasQuarkLinks = true;
+  }
+  return { readable, hasQuarkLinks };
+}
+
+export function extractQuarkTelegramResults(html, { url, title, aliases = [], year, now = Date.now(), channels = DEFAULT_QUARK_TELEGRAM_CHANNELS } = {}) {
+  const rows = new Map(), page = publicPage(url, channelNames(channels)); let nextBefore;
   if (!page || typeof html !== 'string' || Buffer.byteLength(html) > MAX_BODY) return { rows: [], nextBefore };
   for (const post of divs(html, 'tgme_widget_message_wrap')) {
     const message = divs(post.html, 'tgme_widget_message', 1)[0];
-    const id = new RegExp(`^${CHANNEL}/([1-9]\\d{0,12})$`, 'i').exec(attribute(message?.attributes || '', 'data-post'))?.[1];
+    const id = new RegExp(`^${page.channel}/([1-9]\\d{0,12})$`, 'i').exec(attribute(message?.attributes || '', 'data-post'))?.[1];
     if (!id) continue;
     if (!nextBefore || Number(id) < Number(nextBefore)) nextBefore = id;
     const body = divs(message.html, 'tgme_widget_message_text', 1)[0]?.html;
     if (!body) continue;
     const lines = body.split(/<br\b[^>]*>|\r?\n/i), heading = lines[0].replace(titlePrefix, '');
-    const postUrl = `https://t.me/${CHANNEL}/${id}`;
-    const dateAnchor = [...message.html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)].find(match => attribute(match[1], 'href') === postUrl && /<time\b/i.test(match[2]));
+    const postUrl = `https://t.me/${page.channel}/${id}`;
+    const dateAnchor = [...message.html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)].find(match => attribute(match[1], 'href').toLowerCase() === postUrl.toLowerCase() && /<time\b/i.test(match[2]));
     const date = dateAnchor && /<time\b[^>]*>/i.exec(dateAnchor[2])?.[0] || '';
     const sections = lines.map((line, index) => index && titlePrefix.test(line) ? `<h2>${line.replace(titlePrefix, '')}</h2>` : line).join('<br/>');
     const links = sections.replace(/<a\b[^>]*>[\s\S]*?<\/a\s*>|<[^>]*>|https?:\/\/pan\.quark\.cn\/s\/[a-z0-9]{6,32}(?:\?[^\s<>"'，。]*)?/gi, value => value.startsWith('<') ? value : `<a href="${value}">夸克链接</a>`);
@@ -59,10 +87,11 @@ export function extractQuarkTelegramResults(html, { url, title, aliases = [], ye
   return { rows: [...rows.values()].sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0)), nextBefore };
 }
 
-export function createQuarkTelegramSearch() {
-  const cache = new Map();
-  return async function searchTelegramQuark(keyword, { aliases = [], year, page = 0, read, deadline, now = Date.now, signal } = {}) {
-    const rows = new Map(), end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, now() + 10_000);
+export function createQuarkTelegramSearch({ channels = DEFAULT_QUARK_TELEGRAM_CHANNELS, resolveChannels } = {}) {
+  const cache = new Map(), allowed = new Map(channelNames(channels).map(channel => [channel.toLowerCase(), channel]));
+  let activeChannels = [...allowed.values()];
+  return async function searchTelegramQuark(keyword, { aliases = [], year, page = 0, read, deadline, now = Date.now, signal, onResults } = {}) {
+    const rows = new Map(), end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, now() + 35_000);
     if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 1000 || typeof read !== 'function' || now() >= end) return [];
     signal?.throwIfAborted();
     const title = keyword.trim(), names = [...new Set([title, ...(Array.isArray(aliases) ? aliases.slice(0, 10) : []).filter(value => typeof value === 'string' && value.trim() && value.length <= 300).map(value => value.trim())])].slice(0, 2);
@@ -75,47 +104,87 @@ export function createQuarkTelegramSearch() {
         if (!idle) return Object.assign([], { reason: '公开频道搜索繁忙，请稍后重试' });
         cache.delete(idle[0]);
       }
-      entry = { queries: [], next: 0, expires: now() + 120_000, users: 0, tail: Promise.resolve() };
+      entry = { queries: [], failed: [], active: [], expires: now() + 120_000, users: 0, tail: Promise.resolve() };
       cache.set(key, entry);
     }
-    const previous = entry.tail; let release, timer, onAbort, reason = '';
+    const previous = entry.tail; let release, timer, onAbort, reason = '', pending = false, progress, interrupted;
     const gate = new Promise(resolve => { release = resolve; });
     entry.tail = previous.then(() => gate); entry.users++;
     try {
-      await Promise.race([previous, new Promise((_, reject) => {
+      interrupted = new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('公开频道搜索超时')), Math.max(1, end - now()));
         onAbort = () => reject(signal.reason); signal?.addEventListener('abort', onAbort, { once: true });
-      })]);
+      });
+      await Promise.race([previous, interrupted]);
       signal?.throwIfAborted();
       if (now() >= end) return Object.assign([], { reason: '公开频道搜索超时' });
-      const reset = !(Number(page) > 0) || entry.expires <= now() || !entry.queries.length;
-      const queries = reset ? names.map(name => ({ name, before: undefined, exhausted: false })) : entry.queries.map(value => ({ ...value }));
-      const failed = new Set(), maximum = Number(page) > 0 && reset ? 3 : names.length;
-      let next = reset ? 0 : entry.next;
-      for (let requests = 0; requests < maximum && now() < end; requests++) {
-        signal?.throwIfAborted();
-        let query;
-        for (let count = 0; count < queries.length; count++) {
-          const candidate = queries[next]; next = (next + 1) % queries.length;
-          if (!candidate.exhausted && !failed.has(candidate.name)) { query = candidate; break; }
-        }
-        if (!query) break;
-        const address = `https://t.me/s/${CHANNEL}?` + new URLSearchParams({ q: query.name, ...(query.before ? { before: query.before } : {}) });
+      let channels = activeChannels;
+      if (typeof resolveChannels === 'function') {
         try {
-          const result = await read(address, Math.min(5000, end - now()), MAX_BODY, end);
+          const discovered = await Promise.race([resolveChannels({ read, deadline: end, signal }), interrupted]);
           signal?.throwIfAborted();
-          if (now() >= end) { reason = '公开频道搜索超时'; break; }
-          const parsed = extractQuarkTelegramResults(typeof result === 'string' ? result : result?.html, { url: typeof result === 'string' ? address : result?.url || address, title, aliases, year, now: now() });
+          if (!Array.isArray(discovered)) throw new Error('公开频道目录格式不兼容');
+          for (const channel of channelNames(discovered)) if (allowed.size < 128 && !allowed.has(channel.toLowerCase())) allowed.set(channel.toLowerCase(), channel);
+          channels = activeChannels = channelNames(discovered).map(channel => allowed.get(channel.toLowerCase())).filter(Boolean);
+        } catch (error) { signal?.throwIfAborted(); reason = '公开频道目录暂时无法更新'; }
+      }
+      const active = new Set(channels);
+      const reset = !(Number(page) > 0) || entry.expires <= now() || !entry.queries.length;
+      const queries = reset ? [] : entry.queries.map(value => ({ ...value })), failed = new Set(reset ? [] : entry.failed);
+      for (const channel of active) if (!entry.active.includes(channel)) failed.delete(channel);
+      for (const [index, name] of names.entries()) for (const channel of active) {
+        if (!queries.some(query => query.channel === channel && query.name === name)) queries.push({ channel, name, index, depth: 0, before: undefined, exhausted: false, attempted: false });
+      }
+      const maximum = Math.min(8, active.size === 1 ? Number(page) > 0 && reset ? 3 : names.length : 8);
+      const available = () => queries.filter(query => active.has(query.channel) && !query.exhausted && !failed.has(query.channel));
+      const snapshot = () => [...rows.values()].sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
+      const fetchQuery = async query => {
+        const duration = Math.max(1, Math.min(3000, end - now())), controller = new AbortController();
+        const abort = () => controller.abort(signal.reason), timeout = setTimeout(() => controller.abort(new Error('公开频道搜索超时')), duration);
+        let onReadAbort;
+        signal?.addEventListener('abort', abort, { once: true });
+        const address = `https://t.me/s/${query.channel}?` + new URLSearchParams({ q: query.name, ...(query.before ? { before: query.before } : {}) });
+        try {
+          const result = await Promise.race([Promise.resolve().then(() => {
+            signal?.throwIfAborted();
+            return read(address, duration, MAX_BODY, end, controller.signal);
+          }), new Promise((_, reject) => {
+            onReadAbort = () => reject(controller.signal.reason);
+            controller.signal.addEventListener('abort', onReadAbort, { once: true });
+          })]);
+          signal?.throwIfAborted();
+          if (now() >= end) throw new Error('公开频道搜索超时');
+          const resultUrl = typeof result === 'string' ? address : result?.url || address, final = publicPage(resultUrl, [query.channel]);
+          if (!final) throw new Error('公开频道跳转不可用');
+          const html = typeof result === 'string' ? result : result?.html;
+          if (typeof html !== 'string' || Buffer.byteLength(html) > MAX_BODY) throw new Error('公开频道响应不可用');
+          const parsed = extractQuarkTelegramResults(html, { url: resultUrl, title, aliases, year, now: now(), channels: [query.channel] });
           for (const row of parsed.rows) mergeRow(rows, row);
+          query.attempted = true; query.depth++;
           query.exhausted = !parsed.nextBefore || query.before !== undefined && Number(parsed.nextBefore) >= Number(query.before);
           if (!query.exhausted) query.before = parsed.nextBefore;
+          if (parsed.rows.length && typeof onResults === 'function') onResults(snapshot());
         } catch (error) {
-          signal?.throwIfAborted(); failed.add(query.name);
+          signal?.throwIfAborted(); query.attempted = true; failed.add(query.channel);
           reason = /超时|timeout|timed out/i.test(error?.message || '') ? '公开频道搜索超时' : '公开频道暂时无法读取';
+        } finally {
+          clearTimeout(timeout); signal?.removeEventListener('abort', abort);
+          controller.signal.removeEventListener('abort', onReadAbort);
         }
+      };
+      for (let requests = 0; requests < maximum && now() < end;) {
+        signal?.throwIfAborted();
+        const remaining = available(), rank = query => query.depth * names.length + query.index;
+        const first = Math.min(...remaining.map(rank)), wave = remaining.filter(query => rank(query) === first).slice(0, Math.min(2, maximum - requests));
+        if (!wave.length) break;
+        requests += wave.length;
+        await Promise.all(wave.map(fetchQuery));
       }
       signal?.throwIfAborted();
-      entry.queries = queries; entry.next = next; entry.expires = now() + 120_000;
+      pending = available().length > 0;
+      const current = queries.filter(query => active.has(query.channel));
+      progress = { totalChannels: active.size, attemptedChannels: new Set(current.filter(query => query.attempted).map(query => query.channel)).size, totalQueries: current.length, attemptedQueries: current.filter(query => query.attempted).length, failedChannels: [...failed].filter(channel => active.has(channel)).length };
+      entry.queries = queries; entry.failed = [...failed]; entry.active = channels; entry.expires = now() + 120_000;
     } catch (error) {
       signal?.throwIfAborted();
       reason = '公开频道搜索超时';
@@ -124,6 +193,7 @@ export function createQuarkTelegramSearch() {
     }
     const results = [...rows.values()].sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
     if (reason) results.reason = reason;
+    if (progress) { results.pending = pending; results.progress = progress; }
     return results;
   };
 }

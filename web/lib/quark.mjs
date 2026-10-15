@@ -336,14 +336,20 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
   }
   async function lookupResources(detail, options = {}) {
     const info = detailInfo(detail, options), rows = new Map(), unverified = new Map(), generation = epoch, cacheKey = info.key + ':' + providedScope(detail);
+    const cached = searches.get(cacheKey), force = options.webSearch === true && options.poll !== true;
+    const roundPaths = new Set(cached?.expires > now() && !force ? cached.roundPaths || [] : []);
+    if (force && cached?.expires > now()) cached.roundPaths = [];
     const provided = detail.quarkShares || detail.meta?.quarkShares || [];
     for (const link of (Array.isArray(provided) ? provided : [provided]).slice(0, 20)) {
       const label = name(link?.work_title || link?.name || link?.title);
       if (label && classifyQuarkCandidate(label, { title: info.searchTitle, aliases: info.aliases, year: info.year }) === 'unrelated') continue;
-      const row = addShare(info, link, label); if (row) rows.set(row.id, row);
+      const parsed = share(link?.url || link, link?.password || link?.pwd || ''); if (!parsed) continue;
+      const target = new URL(parsed.url), path = target.pathname + target.hash;
+      const historical = cached?.expires > now() && cached.rows.some(row => { const saved = new URL(row.url); return saved.pathname + saved.hash === path; });
+      if (!historical && !roundPaths.has(path) && roundPaths.size >= 30) continue;
+      const row = addShare(info, link, label); if (row) { rows.set(row.id, row); if (!historical) roundPaths.add(path); }
     }
     let reason, pending = false, retryAfterMs;
-    const cached = searches.get(cacheKey);
     if (cached && cached.expires > now()) reason = cached.reason;
     if (cached && cached.expires > now() && cached.pending === true) { pending = true; retryAfterMs = cached.retryAfterMs; }
     if (cached && cached.expires > now()) for (const row of cached.rows) { const existing = shares.get(row.id); if (existing) { const fresh = addShare(info, existing, existing.name); rows.set(fresh.id, fresh); } }
@@ -356,7 +362,8 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         const target = configured ? new URL(searchUrl(configured)) : new URL('https://www.bing.com/search');
         if (configured) { target.searchParams.set('kw', info.searchTitle); target.searchParams.set('cloud_types', 'quark'); target.searchParams.set('res', 'results'); target.searchParams.set('conc', '2'); }
         else { target.searchParams.set('q', info.searchTitle + ' site:pan.quark.cn/s'); target.searchParams.set('format', 'rss'); }
-        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, year: info.year, aliases: info.aliases, webSearch: options.webSearch === true, forceRefresh: options.webSearch === true && options.poll !== true, ...(options.poll === true ? { poll: true } : {}), headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
+        const knownShares = [...rows.values()].map(row => shares.get(row.id)).filter(row => row?.detail === info.key).slice(0, 128).map(row => { const url = new URL(row.url); url.search = ''; return url.href; });
+        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, year: info.year, aliases: info.aliases, knownShares, webSearch: options.webSearch === true, forceRefresh: options.webSearch === true && options.poll !== true, ...(options.poll === true ? { poll: true } : {}), headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
         const body = await Promise.race([fetch, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('公开夸克搜索超时', 504)); }, 8000); })]);
         let visited = 0;
         const collect = (link, forceUnverified = false) => {
@@ -364,7 +371,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
           const target = new URL(parsed.url), path = target.pathname + target.hash, existing = [...rows.values()].some(row => { const saved = new URL(row.url); return saved.pathname + saved.hash === path; });
           let match = classifyQuarkCandidate(link.name, { title: info.searchTitle, aliases: info.aliases, year: info.year });
           if (forceUnverified && match === 'matched') match = 'unknown';
-          if (match === 'matched' && (existing || rows.size < 30)) { const row = addShare(info, link, link.name); if (row) { rows.set(row.id, row); unverified.delete(path); } }
+          if (match === 'matched' && (existing || roundPaths.has(path) || roundPaths.size < 30)) { const row = addShare(info, link, link.name); if (row) { rows.set(row.id, row); unverified.delete(path); if (!existing) roundPaths.add(path); } }
           else if (match === 'unknown' && !existing && (unverified.has(path) || unverified.size < 10)) unverified.set(path, { name: link.name || '未标注片名的分享', url: parsed.url });
         };
         const visit = (value, label = '', depth = 0, forceUnverified = false) => {
@@ -378,15 +385,16 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
           }
         };
         try { const result = JSON.parse(body); visit(result); if (typeof result?.reason === 'string') reason = name(result.reason); if (result?.pending === true) { pending = true; retryAfterMs = Number.isFinite(result.retryAfterMs) ? Math.min(5000, Math.max(500, result.retryAfterMs)) : 1500; } } catch { visit(body); }
-        if (pending || rows.size || unverified.size || !reason) searches.set(cacheKey, { rows: [...rows.values()], unverified: [...unverified.values()], ...(reason ? { reason } : {}), ...(pending ? { pending: true, retryAfterMs } : {}), expires: now() + (pending ? retryAfterMs : 60000) });
+        for (const key of rows.keys()) if (!shares.has(key)) rows.delete(key);
+        if (pending || rows.size || unverified.size || !reason) searches.set(cacheKey, { rows: [...rows.values()], unverified: [...unverified.values()], roundPaths: [...roundPaths], ...(reason ? { reason } : {}), ...(pending ? { pending: true, retryAfterMs } : {}), expires: now() + 60000 });
         else searches.delete(cacheKey);
         while (searches.size > 64) searches.delete(searches.keys().next().value);
       } catch (cause) { reason = publicReason(cause); }
       finally { expired = true; clearTimeout(timeout); response?.destroy(); }
     }
-    const force = options.webSearch === true && options.poll !== true;
-    const checked = [...rows.values()].map(row => ({ row, entry: shareValidator.inspect(shares.get(row.id), { force }) }));
-    const unknown = [...unverified.values()].map(row => ({ row, entry: shareValidator.inspect(share(row.url), { force }) }));
+    const inspect = resource => { const entry = shareValidator.inspect(resource); return force && entry.status === 'valid' && !entry.pending ? shareValidator.inspect(resource, { force: true }) : entry; };
+    const checked = [...rows.values()].map(row => ({ row, entry: inspect(shares.get(row.id)) }));
+    const unknown = [...unverified.values()].map(row => ({ row, entry: inspect(share(row.url)) }));
     const checking = [...checked, ...unknown].filter(value => value.entry.pending);
     if (checking.length) {
       let wait;

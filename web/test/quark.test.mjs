@@ -1267,7 +1267,7 @@ test('web and normal callers subscribe to their pool snapshots while sharing one
   assert.deepEqual(state.calls.map(call => call.path), ['/share/sharepage/token', '/share/sharepage/detail'], 'only the new candidate is checked at the official read-only endpoints');
 });
 
-test('pending cache expires at its bounded retry interval and never remains pending for a minute', async t => {
+test('pending snapshots refresh independently of their bounded poll interval', async t => {
   const { service, state } = await fixture(t), film = { ...detail, quarkShares: [] };
   state.searchBody = JSON.stringify({ results: [], pending: true, retryAfterMs: 'unsafe' });
   assert.equal((await service.resources(film)).retryAfterMs, 1500); state.clock += 1501;
@@ -1278,6 +1278,123 @@ test('pending cache expires at its bounded retry interval and never remains pend
     state.searchBody = JSON.stringify({ results: [], pending: true, retryAfterMs: delay });
     assert.equal((await service.resources({ ...film, id: 'delay-' + delay })).retryAfterMs, expected);
   }
+});
+
+test('polling at and after retry preserves verified resources while merging new ones with a bounded snapshot lifetime', async t => {
+  const { service, state } = await fixture(t), film = { ...detail, quarkShares: [] };
+  const old = 'https://pan.quark.cn/s/original123', recent = 'https://pan.quark.cn/s/recent123', later = 'https://pan.quark.cn/s/later123', invalid = 'https://pan.quark.cn/s/canceled123';
+  state.beforeRequest = call => call.path.endsWith('/token') && call.body.pwd_id === 'canceled123' ? reply(null, { status: 404, code: 41001 }) : undefined;
+  state.searchBody = JSON.stringify({ results: [{ name: '影片 2026 原分享', url: old }, { name: '影片 2026 已取消', url: invalid }] });
+  const initial = await service.resources(film), originalId = initial.resources[0].id;
+  assert.deepEqual(initial.resources.map(row => row.url), [old]);
+  state.searchBody = JSON.stringify({ results: [{ name: '影片 2026 新分享', url: recent }], pending: true, retryAfterMs: 1500 });
+  const more = await service.resources(film, { webSearch: true });
+  assert.deepEqual(more.resources.map(row => row.url), [old, recent]);
+  assert.equal(more.pending, true);
+  state.clock += more.retryAfterMs;
+  const exact = await service.resources(film, { webSearch: true, poll: true });
+  assert.deepEqual(exact.resources.map(row => row.url), [old, recent]);
+  assert.equal(exact.resources[0].id, originalId);
+  state.clock += 45000;
+  state.searchBody = JSON.stringify({ results: [{ name: '影片 2026 更晚分享', url: later }, { name: '另一影片 2026', url: 'https://pan.quark.cn/s/another123' }, { name: '影片 2025', url: 'https://pan.quark.cn/s/wrongyear123' }], pending: true, retryAfterMs: 1500 });
+  const delayed = await service.resources(film, { webSearch: true, poll: true });
+  assert.deepEqual(delayed.resources.map(row => row.url), [old, recent, later]);
+  assert.equal(delayed.resources[0].id, originalId);
+  assert.match(delayed.reason, /已隐藏 1 条/);
+  assert.equal(state.searchCalls.at(-1).options.poll, true);
+  state.searchBody = JSON.stringify({ results: [] });
+  const unrelated = await service.resources({ ...film, id: 'isolated-pending-film', title: '另一影片' }, { poll: true });
+  assert.deepEqual(unrelated.resources, []);
+  assert.deepEqual(state.searchCalls.at(-1).options.knownShares, []);
+  state.clock += 60000;
+  const expired = await service.resources(film, { poll: true });
+  assert.deepEqual(expired.resources, []);
+  assert.equal(expired.pending, undefined);
+  assert.equal(state.saved, 0);
+});
+
+test('more admits fresh candidates after thirty historical rows without repeating negative probes and expired negatives recover', async t => {
+  const { service, state } = await fixture(t), film = { ...detail, quarkShares: [] };
+  const rows = (prefix, count) => Array.from({ length: count }, (_, index) => ({ name: '影片 2026', url: `https://pan.quark.cn/s/${prefix}${String(index).padStart(6, '0')}` + (prefix === 'oldshare' && !index ? '?pwd=AB12' : '') }));
+  let recovered = false;
+  state.beforeRequest = call => {
+    if (call.path.endsWith('/token') && call.body.pwd_id.startsWith('oldshare') && Number(call.body.pwd_id.slice(8)) >= 11 && !(recovered && call.body.pwd_id === 'oldshare000011')) return reply(null, { status: 404, code: 41001 });
+  };
+  state.searchBody = JSON.stringify({ results: rows('oldshare', 30) });
+  const initial = await service.resources(film), originalIds = initial.resources.map(row => row.id);
+  assert.equal(initial.resources.length, 11);
+  const before = state.calls.length;
+  state.searchBody = JSON.stringify({ results: [...rows('oldshare', 30), ...rows('newshare', 10)] });
+  const more = await service.resources(film, { webSearch: true });
+  assert.equal(more.resources.length, 21);
+  assert.deepEqual(more.resources.slice(0, 11).map(row => row.id), originalIds);
+  const known = state.searchCalls.at(-1).options.knownShares;
+  assert.equal(known.length, 30);
+  assert.ok(known.includes('https://pan.quark.cn/s/oldshare000011'), 'the negative candidate is also known to the pool');
+  assert.ok(known.includes('https://pan.quark.cn/s/oldshare000000'));
+  assert.ok(known.every(url => new URL(url).search === ''), 'known-share hints contain identities without extraction passwords');
+  const newCalls = state.calls.slice(before).filter(call => call.path.endsWith('/token'));
+  assert.equal(newCalls.filter(call => call.body.pwd_id.startsWith('newshare')).length, 10);
+  assert.equal(newCalls.filter(call => call.body.pwd_id.startsWith('oldshare') && Number(call.body.pwd_id.slice(8)) >= 11).length, 0);
+  assert.equal(newCalls.filter(call => call.body.pwd_id.startsWith('oldshare')).length, 11, 'previously valid shares are still freshly checked');
+  recovered = true; state.clock += 30001;
+  const recovery = await service.resources(film, { poll: true });
+  assert.equal(recovery.resources.length, 22);
+  assert.ok(recovery.resources.some(row => row.url.endsWith('/oldshare000011')));
+  assert.equal(state.saved, 0);
+});
+
+test('the thirty fresh candidate budget spans pending polls and an explicit more starts the next bounded round', async t => {
+  const { service, state } = await fixture(t), film = { ...detail, quarkShares: [] };
+  const rows = (prefix, count) => Array.from({ length: count }, (_, index) => ({ name: '影片 2026', url: `https://pan.quark.cn/s/${prefix}${String(index).padStart(6, '0')}` }));
+  let active = 0, maximumActive = 0;
+  state.beforeRequest = async call => { if (call.path.startsWith('/share/sharepage/')) { maximumActive = Math.max(maximumActive, ++active); await turn(); active--; } };
+  state.searchBody = JSON.stringify({ results: rows('original', 1) });
+  const original = (await service.resources(film)).resources[0];
+  const pending = prefix => JSON.stringify({ results: rows(prefix, 20), pending: true, retryAfterMs: 1500 });
+  state.searchBody = pending('batcha');
+  assert.equal((await service.resources(film, { webSearch: true })).resources.length, 21);
+  state.clock += 1500; state.searchBody = pending('batchb');
+  assert.equal((await service.resources(film, { webSearch: true, poll: true })).resources.length, 31);
+  state.clock += 1500; state.searchBody = pending('batchc');
+  const before = state.calls.length, capped = await service.resources(film, { webSearch: true, poll: true });
+  assert.equal(capped.resources.length, 31); assert.equal(capped.resources[0].id, original.id);
+  assert.equal(state.searchCalls.at(-1).options.knownShares.length, 31);
+  assert.equal(state.searchCalls.at(-1).options.knownShares.some(url => url.includes('/batchc')), false, 'budget-rejected candidates are not marked known');
+  assert.equal(state.calls.slice(before).filter(call => call.path.endsWith('/token')).length, 0);
+  assert.equal(state.calls.filter(call => call.path.endsWith('/token') && /^batch[abc]/.test(call.body.pwd_id)).length, 30);
+  const next = await service.resources(film, { webSearch: true });
+  assert.equal(next.resources.length, 51); assert.equal(next.resources[0].id, original.id);
+  assert.ok(maximumActive <= 2); assert.equal(state.saved, 0);
+});
+
+test('retained search history still uses the existing global one-hundred-twenty-eight share registration bound', async t => {
+  const { service, state } = await fixture(t), firstFilm = { ...detail, id: 'registry-film-0' };
+  let first;
+  for (let movie = 0; movie < 7; movie++) {
+    const film = { ...detail, id: 'registry-film-' + movie, quarkShares: Array.from({ length: 20 }, (_, index) => `https://pan.quark.cn/s/registered${String(movie * 20 + index).padStart(6, '0')}`) };
+    const result = await service.resources(film); assert.equal(result.resources.length, 20);
+    if (!movie) first = result.resources;
+  }
+  await assert.rejects(service.files(firstFilm, { shareId: first[11].id }), /过期/);
+  assert.equal((await service.files(firstFilm, { shareId: first[12].id })).files.length, 1);
+  assert.equal(state.saved, 0);
+});
+
+test('cold catalog-provided shares and search candidates share the same thirty fresh candidate budget', async t => {
+  const { service, state } = await fixture(t);
+  const urls = (prefix, count) => Array.from({ length: count }, (_, index) => `https://pan.quark.cn/s/${prefix}${String(index).padStart(6, '0')}`);
+  const film = { ...detail, quarkShares: urls('provided', 20) };
+  state.searchBody = JSON.stringify({ results: urls('searched', 30).map(url => ({ name: '影片 2026', url })), pending: true });
+  const initial = await service.resources(film);
+  assert.equal(initial.resources.length, 30);
+  assert.equal(state.calls.filter(call => call.path.endsWith('/token') && call.body.pwd_id.startsWith('provided')).length, 20);
+  assert.equal(state.calls.filter(call => call.path.endsWith('/token') && call.body.pwd_id.startsWith('searched')).length, 10);
+  const before = state.calls.length;
+  state.searchBody = JSON.stringify({ results: urls('laterpage', 30).map(url => ({ name: '影片 2026', url })), pending: true });
+  assert.equal((await service.resources(film, { poll: true })).resources.length, 30);
+  assert.equal(state.calls.slice(before).filter(call => call.path.endsWith('/token')).length, 0);
+  assert.equal(state.saved, 0);
 });
 
 test('explicit web polling passes the existing query scope without another transfer or normal-search substitution', async t => {

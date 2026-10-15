@@ -24,7 +24,8 @@ import { createQuarkCatalog } from './lib/quark-catalog.mjs';
 import { createQuarkPosters } from './lib/quark-posters.mjs';
 import { createQuarkSearchPool } from './lib/quark-search-pool.mjs';
 import { createQuarkBrowserSearch } from './lib/quark-browser-client.mjs';
-import { searchTelegramQuark } from './lib/quark-telegram-search.mjs';
+import { createQuarkTelegramSearch } from './lib/quark-telegram-search.mjs';
+import { createQuarkChannelCatalog } from './lib/quark-channel-catalog.mjs';
 import { createQuarkMedia } from './lib/quark-media.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -80,7 +81,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const ratingService = ratings ?? createRatings({ store });
   const danmakuService = danmaku ?? createDanmaku({ store });
   const transcodeService = transcoder ?? createTranscoder({ media, logger });
-  const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store, telegramSearch: searchTelegramQuark, ...(process.env.QUARK_BROWSER_URL === 'http://quark-browser:3020' ? { renderSearch: createQuarkBrowserSearch() } : {}) });
+  const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store, telegramSearch: createQuarkTelegramSearch({ resolveChannels: createQuarkChannelCatalog({ store }).resolve }), ...(process.env.QUARK_BROWSER_URL === 'http://quark-browser:3020' ? { renderSearch: createQuarkBrowserSearch() } : {}) });
   const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: searchPool.request, defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
   const cloudCatalog = quarkCatalog ?? createQuarkCatalog({ store });
   const cloudPosters = quarkPosters ?? createQuarkPosters({ catalog: cloudCatalog });
