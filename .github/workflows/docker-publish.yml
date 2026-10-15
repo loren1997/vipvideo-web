@@ -158,7 +158,7 @@ jobs:
           const password = 'ci-compose-fixture-password';
           let config = readFileSync('docker-compose.yml', 'utf8');
           for (const [pattern, replacement] of [
-            [/^    image: [^\r\n]+/gm, `    image: ${process.env.CI_IMAGE}`],
+            [/^(  web:\r?\n    image: )[^\r\n]+/gm, `$1${process.env.CI_IMAGE}`],
             [/^      APP_PASSWORD: ""(?=\r?$)/gm, `      APP_PASSWORD: "${password}"`],
             [/^      - "3000:3000"(?=\r?$)/gm, '      - "127.0.0.1:3000:3000"']
           ]) {

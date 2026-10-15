@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 import test from 'node:test';
 
 const updater = new URL('../../scripts/enable-quark-browser.py', import.meta.url);
@@ -163,4 +164,29 @@ test('every supplied Compose deploys an isolated browser from the same candidate
     assert.equal((source.match(/^\s+QUARK_SEARCH_PROXY:/gm) || []).length, 2);
   }
   assert.ok(existsSync(updater));
+});
+
+test('the CI Compose fixture changes only the web image and preserves strict unique replacements with companions present', { skip: !existsSync(new URL('../../.github/workflows/docker-publish.yml', import.meta.url)) && 'CI workflow is outside the runtime image' }, () => {
+  const workflow = readFileSync(new URL('../../.github/workflows/docker-publish.yml', import.meta.url), 'utf8');
+  const step = workflow.split('- name: Check Compose health and backup restore')[1]?.split(/^      - name:/m)[0];
+  const conversion = step?.match(/          const password = [\s\S]*?(?=          const directory =)/)?.[0];
+  assert.ok(conversion, 'Exercise the actual workflow replacement sequence');
+  const source = readFileSync(new URL('../../docker-compose.yml', import.meta.url), 'utf8');
+  const image = 'vipvideo-ci-fixture@sha256:' + 'a'.repeat(64);
+  const convert = input => runInNewContext(conversion + '\nconfig;', {
+    assert, process: { env: { CI_IMAGE: image } },
+    readFileSync: (file, encoding) => { assert.equal(file, 'docker-compose.yml'); assert.equal(encoding, 'utf8'); return input; },
+  }, { timeout: 1000 });
+  for (const newline of ['\n', '\r\n']) {
+    const input = source.replace(/\r?\n/g, newline), converted = convert(input);
+    assert.ok(converted.includes(`  web:${newline}    image: ${image}`));
+    assert.match(converted, /APP_PASSWORD: "ci-compose-fixture-password"/);
+    assert.match(converted, /"127\.0\.0\.1:3000:3000"/);
+    const browser = input.indexOf('  quark-browser:');
+    assert.equal(converted.slice(converted.indexOf('  quark-browser:')), input.slice(browser), 'Browser, danmaku and volumes remain unchanged');
+    assert.equal(converted.slice(0, converted.indexOf('  web:')), input.slice(0, input.indexOf('  web:')), 'Candidate image anchor remains unchanged');
+    assert.equal(converted.split(image).length - 1, 1);
+  }
+  assert.throws(() => convert(source.replace('  web:', '  renamed-web:')), /Expected one Compose replacement/);
+  assert.throws(() => convert(source.replace('  web:', '  web:\n    image: duplicate:fixture\n  web:')), /Expected one Compose replacement/);
 });
