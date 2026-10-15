@@ -28,7 +28,7 @@ services:
       QUARK_BROWSER_URL: http://quark-browser:3020
       QUARK_SEARCH_PROXY: ""
       DANMAKU_API_URL: http://danmaku:9321
-      DANMAKU_API_TOKEN: "${DANMAKU_API_TOKEN:-vipvideo-local-danmaku}"
+      DANMAKU_API_TOKEN: vipvideo-local-danmaku
     devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -119,7 +119,7 @@ services:
     restart: unless-stopped
     init: true
     environment:
-      TOKEN: "${DANMAKU_API_TOKEN:-vipvideo-local-danmaku}"
+      TOKEN: vipvideo-local-danmaku
       SOURCE_ORDER: tencent,iqiyi,youku,imgo,bilibili
       RATE_LIMIT_MAX_REQUESTS: "0"
       YOUKU_CONCURRENCY: "2"
