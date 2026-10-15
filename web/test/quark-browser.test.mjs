@@ -8,7 +8,7 @@ import { chromium } from 'playwright-core';
 import { createRequest } from '../lib/network.mjs';
 import { createQuarkBrowser } from '../lib/quark-browser.mjs';
 
-const executablePath = [process.env.CHROMIUM_PATH, process.env.BROWSER_EXECUTABLE, '/usr/bin/chromium', chromium.executablePath(),
+const executablePath = [process.env.CHROMIUM_PATH, process.env.BROWSER_EXECUTABLE, '/opt/google/chrome/chrome', '/usr/bin/google-chrome', '/usr/bin/chromium', chromium.executablePath(),
   'C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'].find(value => value && existsSync(value));
 const response = (body, statusCode = 200, headers = { 'content-type': 'text/html; charset=utf-8' }) => Object.assign(typeof body === 'string' ? Readable.from([Buffer.from(body)]) : body, { statusCode, headers });
 
