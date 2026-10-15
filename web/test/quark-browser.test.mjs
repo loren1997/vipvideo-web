@@ -12,7 +12,7 @@ const executablePath = [process.env.CHROMIUM_PATH, process.env.BROWSER_EXECUTABL
   'C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'].find(value => value && existsSync(value));
 const response = (body, statusCode = 200, headers = { 'content-type': 'text/html; charset=utf-8' }) => Object.assign(typeof body === 'string' ? Readable.from([Buffer.from(body)]) : body, { statusCode, headers });
 
-function fixture(routes, { lookup } = {}) {
+function fixture(routes, { lookup, trace } = {}) {
   const calls = [], lookups = [], browsers = [], launchOptions = [];
   let active = 0, maximum = 0;
   const transport = (url, options, callback) => {
@@ -23,6 +23,7 @@ function fixture(routes, { lookup } = {}) {
     outgoing.end = () => queueMicrotask(() => {
       options.lookup(url.hostname, { all: true }, (error, addresses) => {
         if (error) return outgoing.destroy(error);
+        trace?.({ event: 'route', ordinal: calls.length + 1, publicReload: /(?:^|;\s*)public_reload=ready(?:;|$)/.test(options.headers.cookie || '') });
         calls.push({ url: url.href, headers: options.headers, addresses });
         const route = routes[url.pathname];
         incoming = route ? route(url, options) : response('', 404);
@@ -40,7 +41,9 @@ function fixture(routes, { lookup } = {}) {
   }, httpRequest: transport, httpsRequest: transport });
   const renderer = createQuarkBrowser({ safeRequest, executablePath, launch: async options => {
     launchOptions.push(options);
+    trace?.({ event: 'launch-start' });
     const browser = await chromium.launch(options);
+    trace?.({ event: 'launch-ready', version: browser.version() });
     browsers.push(browser);
     maximum = Math.max(maximum, ++active);
     browser.once('disconnected', () => active--);
@@ -93,20 +96,29 @@ test('a context timeout reports its phase and releases the launched browser', as
 });
 
 test('headless Chromium renders through the validated transport', { skip: executablePath ? false : 'No local Chromium; set CHROMIUM_PATH to run rendering and SSRF fixtures.' }, async t => {
-  await t.test('waits for a script-only page to reload into a visible article using temporary public cookies', async () => {
+  await t.test('waits for a script-only page to reload into a visible article using temporary public cookies', async t => {
+    const started = performance.now(), events = [];
+    const trace = entry => { if (events.length < 16) events.push({ elapsedMs: Math.round((performance.now() - started) * 100) / 100, ...entry }); };
+    let failed;
     const value = fixture({
       '/delayed-article': (_url, options) => /public_reload=ready/.test(options.headers.cookie || '')
         ? response('<title>希望 (2026)</title><article><h1>希望 (2026)</h1><a href="https://pan.quark.cn/s/reload26">夸克网盘分享</a></article>')
         : response('<script>document.cookie="public_reload=ready; Secure; SameSite=Lax";setTimeout(()=>location.reload(),1200)</script>'),
-    });
+    }, { trace });
     try {
+      trace({ event: 'render-start' });
       const result = await value.renderer.render('https://page.example/delayed-article');
+      trace({ event: 'render-ready' });
       assert.equal(result.title, '希望 (2026)');
       assert.match(result.html, /https:\/\/pan\.quark\.cn\/s\/reload26/);
       assert.equal(value.calls.length, 2);
       assert.match(value.calls[1].headers.cookie, /public_reload=ready/);
       assert.ok(value.calls.every(call => call.addresses.every(record => record.address === '8.8.8.8')));
-    } finally { await value.renderer.close(); }
+    } catch (error) { failed = error; throw error; }
+    finally {
+      try { await value.renderer.close(); }
+      finally { t.diagnostic(JSON.stringify({ executablePath, events, ...(failed ? { reason: failed.quarkPoolReason || failed.name, phase: failed.quarkBrowserPhase } : { completed: true }) })); }
+    }
     assert.equal(value.active(), 0);
   });
 
