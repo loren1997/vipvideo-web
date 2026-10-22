@@ -1068,7 +1068,12 @@ try {
       await p.getByRole('button', { name: '退出全屏', exact: true }).click();
       await until(() => p.evaluate(() => !document.fullscreenElement), '完整播放器退出全屏');
       const before = transcodeStarts.length, progress = quarkProgress.length;
-      holdTranscode = true; await timeline.fill('6000'); await timeline.dispatchEvent('change');
+      holdTranscode = true;
+      await timeline.evaluate(input => { input.focus(); input.value = '6000'; input.dispatchEvent(new Event('input', { bubbles: true })); input.blur(); });
+      await video.evaluate(v => v.dispatchEvent(new Event('timeupdate')));
+      assert.equal(await timeline.inputValue(), '6000', '失焦和播放进度更新不能覆盖尚未提交的定位');
+      assert.equal(await timeline.getAttribute('max'), '7116.05', '拖动期间保留原时间轴范围');
+      await timeline.dispatchEvent('change');
       await until(() => transcodeStarts.length === before + 1, '超出当前HLS窗口的完整影片定位');
       assert.equal(transcodeStarts.at(-1).position, 6000); assert.ok(transcodeStarts.at(-1).quarkAsset);
       assert.equal(await timeline.isDisabled(), true, '定位在途不能反复拖动');
@@ -1080,11 +1085,36 @@ try {
       await until(() => quarkProgress.slice(progress).some(row => row.position === 6001 && row.duration === 7116.05), '完整影片定位后只加一次offset并同步原始时长');
       assert.match(await p.locator('#full-film-time').textContent(), /1:40:01 \/ 1:58:36/);
       if (!tv) await until(() => video.evaluate(v => [...v.textTracks].some(t => [...(t.activeCues || [])].some(c => c.text === '全片定位字幕'))), '完整时间轴定位保持字幕原片时间');
-      else {
+      {
         const keys = transcodeStarts.length; await timeline.focus(); await p.keyboard.press('ArrowRight');
-        await until(() => transcodeStarts.length === keys + 1, 'TV方向键调整完整影片进度');
-        assert.equal(transcodeStarts.at(-1).position, 6002, 'TV按原片秒数定位而非片段时间');
-        await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused).catch(() => false), 'TV定位后继续播放');
+        await until(() => transcodeStarts.length === keys + 1, '键盘与TV方向键调整完整影片进度');
+        assert.equal(transcodeStarts.at(-1).position, 6002, '方向键按原片秒数定位而非片段时间');
+        await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused).catch(() => false), '方向键定位后继续播放');
+      }
+      if (!tv) for (const drag of [false, true]) {
+        await p.getByRole('button', { name: '暂停', exact: true }).click();
+        await timeline.scrollIntoViewIfNeeded(); const box = await timeline.boundingBox(); assert.ok(box);
+        const count = transcodeStarts.length, duration = Number(await timeline.getAttribute('max'));
+        holdTranscode = true; let selected;
+        if (drag) {
+          const position = Number(await timeline.inputValue());
+          await p.mouse.move(box.x + box.width * position / duration, box.y + box.height / 2); await p.mouse.down();
+          await p.mouse.move(box.x + box.width * .65, box.y + box.height / 2, { steps: 8 });
+          selected = Number(await timeline.inputValue());
+          await timeline.evaluate(input => input.blur()); await video.evaluate(v => v.dispatchEvent(new Event('timeupdate')));
+          assert.equal(Number(await timeline.inputValue()), selected, '真实拖动后的失焦进度更新保留所选时间');
+          await p.mouse.up();
+        } else {
+          await timeline.evaluate(input => input.addEventListener('input', () => { input.blur(); document.querySelector('video').dispatchEvent(new Event('timeupdate')); }, { once: true }));
+          await p.mouse.click(box.x + box.width * .35, box.y + box.height / 2);
+        }
+        await until(() => transcodeStarts.length === count + 1, drag ? '真实鼠标拖动提交一次定位' : '真实鼠标点击提交一次定位');
+        const requested = transcodeStarts.at(-1).position;
+        assert.ok(Math.abs(requested / duration - (drag ? .65 : .35)) < .03, '点击或拖动保留原片绝对时间而非回到0');
+        if (drag) assert.equal(requested, selected, '拖动提交捕获的时间');
+        assert.equal(await timeline.isDisabled(), true);
+        holdTranscode = false; releaseTranscode(); releaseTranscode = null;
+        await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused && v.currentSrc.includes('/api/transcode/')).catch(() => false), '鼠标定位后继续解码播放');
       }
       await p.setViewportSize({ width: 390, height: 844 }); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '完整控件手机无横向溢出');
       await p.screenshot({ path: join(output, `full-film-timeline-${tv ? 'tv' : 'mobile'}.png`), fullPage: true });
@@ -1095,7 +1125,7 @@ try {
       await until(() => p.locator('video').evaluate(v => v.readyState >= 2 && v.currentSrc.includes('/api/quark/media/')).catch(() => false), '切回直接播放');
       assert.equal(await p.locator('video').evaluate(v => v.controls), true, '普通直放保留原生控件'); assert.equal(await p.locator('#full-film-controls').isHidden(), true);
     });
-    console.log('PASS 完整7116.05秒/5375偏移替代两秒HLS短条、播放音量全屏与键盘TV、跨生成窗口绝对定位/进度/字幕、手机与未知时长/直放回退');
+    console.log('PASS 完整7116.05秒/5375偏移、失焦进度更新与鼠标点击拖动不覆盖定位、键盘TV/进度/字幕、手机与未知时长/直放回退');
   }
 
   async function verifyQuarkPictureReadiness() {

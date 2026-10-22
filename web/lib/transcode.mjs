@@ -279,7 +279,8 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     }
   }
   async function checkColor(task, deadline) {
-    if (!task.inspectOnly && (!task.colorSpace || ['sdr', 'browser-default'].includes(task.colorSpace))) return;
+    if (!task.inspectOnly && (task.colorSpace === 'sdr' || task.colorSpace !== 'dolby-vision' && task.sourceColorSpace !== 'dolby-vision')) return;
+    const sourceRisk = ['pq', 'hlg', 'hdr', 'dolby-vision'].some(value => [task.sourceColorSpace, task.colorSpace].includes(value));
     let attempt, timer;
     const scope = task.type !== 'hls' && (task.colorSpace === 'dolby-vision' || task.sourceColorSpace === 'dolby-vision')
       ? task.probeReads = { bytes: 0, reserved: 0, requests: 0, responses: new Set(), promise: undefined } : undefined;
@@ -290,7 +291,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         ...(task.type === 'hls' ? ['-allowed_extensions', 'ALL'] : []), '-read_intervals', '%+#1', '-i', task.input,
         '-select_streams', 'v:0', '-show_streams', '-show_frames', '-show_entries',
         'stream=codec_name,codec_tag_string,pix_fmt,bits_per_raw_sample,color_space,color_transfer,color_primaries:stream_side_data:frame=pix_fmt,color_space,color_transfer,color_primaries:frame_side_data', '-of', 'json'], undefined, { command: probeExecutable, capture: true });
-      const colorBudget = task.colorSpace === 'dolby-vision' || task.sourceColorSpace === 'dolby-vision' ? 6000 : 3000;
+      const colorBudget = sourceRisk ? 6000 : 3000;
       await Promise.race([attempt.promise, ...(scope ? [scope.promise] : []), new Promise(done => { timer = setTimeout(done, Math.max(1, Math.min(probeTimeout, colorBudget, deadline - now()))); })]);
       assertValid(task);
       if (scope?.error) throw scope.error;
@@ -304,7 +305,6 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
       const consistent = ['color_transfer', 'color_primaries', 'color_space'].every(key => new Set([stream[key], frame[key]].filter(value => !unspecified(value))).size <= 1);
       const sdrPrimaries = new Set(['bt709', 'bt470bg', 'smpte170m', 'smpte240m']), sdrMatrices = new Set(['bt709', 'bt470bg', 'smpte170m', 'smpte240m', 'fcc', 'gbr']);
       const hdrMetadata = sideData.some(row => /hdr|mastering display|content light|smpte.?2094/i.test(row?.side_data_type || ''));
-      const sourceRisk = ['pq', 'hlg', 'hdr', 'dolby-vision'].some(value => [task.sourceColorSpace, task.colorSpace].includes(value));
       const dolby = /^(?:dvhe|dvh1|dvav|dva1)$/i.test(stream.codec_tag_string || '') || sideData.some(row => row && (/dovi|dolby.?vision/i.test(row.side_data_type || '') || row.dv_profile !== undefined));
       const config = sideData.find(row => Number.isSafeInteger(row?.dv_profile) && row.dv_profile >= 0 && row.dv_profile <= 255), profile = config?.dv_profile;
       const field = value => typeof value === 'string' && /^[a-z0-9_.-]{1,40}$/i.test(value) ? value : '';
@@ -345,7 +345,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
   function argumentsFor(task, acceleration) {
     const scale = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
     const dolby = task.colorSpace === 'dolby-vision', hardware = acceleration === 'vaapi';
-    const toneMapped = dolby || ['pq', 'hlg'].includes(task.colorSpace);
+    const toneMapped = dolby || task.sourceColorSpace === 'dolby-vision' && ['pq', 'hlg'].includes(task.colorSpace);
     const toneMap = `${scale},zscale=transfer=linear:npl=100,format=gbrpf32le,zscale=primaries=bt709,tonemap=tonemap=hable:desat=2,zscale=transfer=bt709:matrix=bt709:range=limited,format=yuv420p,sidedata=mode=delete:type=MASTERING_DISPLAY_METADATA,sidedata=mode=delete:type=CONTENT_LIGHT_LEVEL`;
     // The original HEVC RPU must reach libplacebo; an already miscoloured AVC stream cannot be repaired here.
     const dolbyMap = `${hardware ? 'hwmap=derive_device=vulkan,format=vulkan' : 'hwupload'},libplacebo=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:format=yuv420p:apply_dolbyvision=1:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:tonemapping=hable:peak_detect=false:upscaler=none:downscaler=none,hwdownload,format=yuv420p${hardware ? ',format=nv12,hwupload' : ''}`;
@@ -400,7 +400,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         signal?.addEventListener('abort', abort, { once: true });
         assertValid(task); task.playback = selectedMedia.playback({ lines: [{ episodes: [{ url, type: task.type }] }] }, 0, 0);
         task.input = await bridge(task); assertValid(task);
-        await checkColor(task, now() + Math.min(episode.colorSpace === 'dolby-vision' || sourceColorSpace === 'dolby-vision' ? 6000 : 3000, timeout)); assertValid(task);
+        await checkColor(task, now() + timeout); assertValid(task);
         return { ...task.colorProbe };
       } finally { signal?.removeEventListener('abort', abort); await cleanup(task); }
     },
@@ -410,9 +410,10 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
       if (!selectedMedia?.playback || !selectedMedia?.serve) throw failure('兼容播放需要签名媒体转发模块', 503);
       if (typeof owner !== 'string' || !owner || owner.length > 256 || typeof isValid !== 'function' || !Number.isFinite(position) || position < 0 || position > 604800 || !speeds.has(speed) || !Object.hasOwn(inputFormats, episode?.type) || typeof episode.url !== 'string' || episode.url.length > 8192 || !/^\/api\/[a-z0-9/_-]{1,120}$/.test(proxyPath)) throw failure('兼容播放参数无效', 400);
       if (episode.colorSpace !== undefined && !colorSpaces.has(episode.colorSpace)) throw failure('兼容播放色彩参数无效', 400);
+      if (episode.sourceColorSpace !== undefined && (!colorSpaces.has(episode.sourceColorSpace) || episode.sourceColorSpace === 'browser-default')) throw failure('原文件色彩参数无效', 400);
       const url = validateUrl(episode.url).href;
       if (current && !current.stopped && current.owner !== owner) throw failure('另一台设备正在使用兼容播放，请稍后再试', 409);
-      const previous = current, task = { id: randomBytes(16).toString('hex'), owner, valid: isValid, position, speed, type: episode.type, colorSpace: episode.colorSpace, duration: null, stopped: false, media: selectedMedia, proxyPath };
+      const previous = current, task = { id: randomBytes(16).toString('hex'), owner, valid: isValid, position, speed, type: episode.type, colorSpace: episode.colorSpace, sourceColorSpace: episode.sourceColorSpace ?? 'unknown', duration: null, stopped: false, media: selectedMedia, proxyPath };
       current = task;
       try {
         if (previous) await cleanup(previous);
@@ -429,7 +430,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         const deadline = now() + startupTimeout;
         await checkResumeRange(task, deadline); assertValid(task);
         await checkColor(task, deadline); assertValid(task);
-        if (['pq', 'hlg'].includes(task.colorSpace)) {
+        if (task.sourceColorSpace === 'dolby-vision' && ['pq', 'hlg'].includes(task.colorSpace)) {
           if (preference === 'vaapi' || !allowSoftware) throw failure('HDR 转为普通色彩需要软件色调映射，当前设置不允许，请改用夸克官方 SDR 线路', 503);
           acceleration = 'software';
         }

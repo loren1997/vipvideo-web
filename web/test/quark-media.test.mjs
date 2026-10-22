@@ -71,26 +71,53 @@ test('publishes an adaptive master without disclosing upstream links or account 
   assert.equal((await fetch(base + children[0])).status, 403);
 });
 
-test('HDR playback carries a bounded color hint to compatibility while ordinary SDR remains direct', async t => {
-  for (const colorSpace of ['sdr', 'pq', 'hlg']) {
-    const { cloud, calls } = await fixture(t, { quark: { playback: async () => descriptor({ episode: { type: 'mp4', url: 'https://video.quark.cn/movie.mp4', colorSpace } }) } });
+test('ordinary SDR, unknown and HDR Vivid HLS, MP4 and WebM play directly without color inspection', async t => {
+  for (const type of ['hls', 'mp4', 'webm']) for (const colorSpace of [undefined, 'unknown', 'sdr', 'pq', 'hlg', 'hdr', 'browser-default']) {
+    const { cloud, calls } = await fixture(t, { quark: { playback: async () => descriptor({ episode: { type, url: `https://video.quark.cn/movie.${type}`, colorSpace }, metadata: { sourceColorSpace: colorSpace === 'browser-default' ? 'unknown' : colorSpace, name: '2026.2160p.WEB-DL.AAC.HDR.Vivid.60FPS.H.265-FGTWeb.mp4' } }) },
+      probeColor: async () => assert.fail('non-Dolby playback must not inspect or calibrate colors') });
     const lease = await cloud.playback('asset');
     assert.equal(lease.episode.colorSpace, colorSpace);
     assert.equal(lease.response.colorSpace, colorSpace);
-    assert.equal(lease.response.requiresCompatibility, colorSpace !== 'sdr');
-    assert.equal(calls.length, 0, 'color hints must not probe or transcode during ordinary lease creation');
+    assert.equal(lease.response.requiresCompatibility, false);
+    assert.equal(lease.colorProbe, undefined);
+    assert.equal(lease.episode.sourceColorSpace, colorSpace === 'browser-default' || colorSpace === undefined ? 'unknown' : colorSpace);
+    assert.equal(Object.hasOwn(lease.response, 'sourceColorSpace'), false);
+    assert.equal(calls.length, 0);
     assert.ok(!JSON.stringify(lease.response).includes('account-secret'));
   }
+  const vivid = await fixture(t, { quark: { playback: async () => descriptor({ episode: { type: 'mp4', colorSpace: 'unknown' }, metadata: { sourceColorSpace: 'hdr' } }) }, probeColor: async () => assert.fail('an HDR Vivid filename is not Dolby evidence') });
+  const vividLease = await vivid.cloud.playback('vivid');
+  assert.equal(vividLease.response.colorSpace, 'unknown'); assert.equal(vividLease.response.requiresCompatibility, false);
   const cloud = createQuarkMedia({ quark: { playback: async () => descriptor({ episode: { type: 'mp4', url: 'https://video.quark.cn/movie.mp4', colorSpace: 'untrusted color hint' } }) } });
   await assert.rejects(cloud.playback('asset'), /色彩信息无效/);
 });
 
-test('unmarked official playback is decoded-color checked before direct playback and cached by actual source identity', async t => {
+test('non-Dolby unsupported containers request compatibility for their format without probing color', async t => {
+  for (const type of ['mkv', 'avi', 'mpegts']) {
+    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: { type, colorSpace: 'hdr' }, metadata: { sourceColorSpace: 'hdr' } }) }, probeColor: async () => assert.fail('container compatibility does not require Dolby inspection') });
+    const lease = await cloud.playback('asset');
+    assert.equal(lease.response.requiresCompatibility, true); assert.equal(lease.response.colorSpace, 'hdr'); assert.equal(lease.colorProbe, undefined);
+    assert.equal(lease.episode.sourceColorSpace, 'hdr'); assert.equal(Object.hasOwn(lease.response, 'sourceColorSpace'), false);
+  }
+});
+
+test('non-Dolby playback preserves its selected source even when an SDR alternative uses an unsupported container', async t => {
+  for (const colorSpace of ['unknown', 'hdr', 'pq']) {
+    const primary = { type: 'mp4', url: 'https://video.quark.cn/selected.mp4', colorSpace };
+    const alternative = { type: 'mkv', url: 'https://video.quark.cn/alternative.mkv', colorSpace: 'sdr' };
+    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: primary, candidates: [alternative], metadata: { sourceColorSpace: colorSpace } }) }, probeColor: async () => assert.fail('ordinary playback must preserve the selected stream') });
+    const lease = await cloud.playback('asset');
+    assert.equal(lease.episode.url, primary.url); assert.equal(lease.response.type, 'mp4'); assert.equal(lease.response.colorSpace, colorSpace);
+    assert.equal(lease.response.requiresCompatibility, false); assert.equal(lease.colorProbe, undefined);
+  }
+});
+
+test('known Dolby source alternatives are decoded-color checked and cached by actual source identity', async t => {
   let probes = 0, clock = 100, revision = 'one';
   const { cloud, calls } = await fixture(t, { now: () => clock,
-    quark: { playback: async () => descriptor({ episode: { colorSpace: undefined }, metadata: { version: revision, requiresCompatibility: true } }) },
+    quark: { playback: async () => descriptor({ episode: { colorSpace: undefined }, metadata: { sourceColorSpace: 'dolby-vision', version: revision, requiresCompatibility: true } }) },
     probeColor: async input => {
-      probes++; assert.ok(input.timeout > 0 && input.timeout <= 3000); assert.equal(input.valid(), true);
+      probes++; assert.ok(input.timeout > 0 && input.timeout <= 6000); assert.equal(input.valid(), true);
       assert.match(input.proxyPath, /^\/api\/quark\/media\/[a-f0-9]{32}$/); assert.equal(typeof input.mediaOverride.serve, 'function');
       return { colorSpace: 'sdr', codec: 'h264', transfer: 'bt709', primaries: 'bt709', matrix: 'bt709' };
     } });
@@ -110,7 +137,7 @@ test('actual SDR alternatives beat unmarked DV/PQ and unknown variants cannot le
   const third = { ...first, url: 'https://video.quark.cn/other.m3u8' };
   for (const detected of ['dolby-vision', 'pq']) {
     const seen = [];
-    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: first, candidates: [first, second, third], variants: [first, second, third] }) },
+    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: first, candidates: [first, second, third], variants: [first, second, third], metadata: { sourceColorSpace: 'dolby-vision' } }) },
       probeColor: async input => { seen.push(input.episode.url); return { colorSpace: input.episode.url === first.url ? detected : 'sdr', transfer: input.episode.url === first.url ? 'smpte2084' : 'bt709' }; } });
     const lease = await cloud.playback('asset');
     assert.deepEqual(seen, [first.url, second.url]); assert.equal(lease.episode.url, second.url);
@@ -119,11 +146,11 @@ test('actual SDR alternatives beat unmarked DV/PQ and unknown variants cannot le
     assert.ok(!JSON.stringify(lease.response).includes('video.quark.cn'));
   }
   let probes = 0;
-  const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: first, candidates: [first, { ...second, colorSpace: 'sdr' }] }) }, probeColor: async () => { probes++; throw Error('should not probe explicit SDR'); } });
+  const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: first, candidates: [first, { ...second, colorSpace: 'sdr' }], metadata: { sourceColorSpace: 'dolby-vision' } }) }, probeColor: async () => { probes++; throw Error('should not probe explicit SDR'); } });
   assert.equal((await cloud.playback('asset')).episode.url, second.url); assert.equal(probes, 0);
 });
 
-test('browser-default proof stays a single stream and cannot survive a source risk change or enter SDR adaptive playback', async t => {
+test('non-Dolby source hints stay unmodified while a new Dolby declaration requires real proof', async t => {
   const first = { type: 'hls', url: 'https://video.quark.cn/high.m3u8', colorSpace: 'unknown', width: 1920, height: 1080, bandwidth: 6000000 };
   const second = { ...first, url: 'https://video.quark.cn/low.m3u8', width: 1280, height: 720 };
   let sourceColorSpace = 'unknown', probes = 0;
@@ -131,26 +158,46 @@ test('browser-default proof stays a single stream and cannot survive a source ri
   const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: first, candidates: [first, second], variants: [first, second], metadata: { version: 'same-stream', sourceColorSpace } }) },
     probeColor: async input => { probes++; assert.equal(input.sourceColorSpace, sourceColorSpace); return proof; } });
   const lease = await cloud.playback('asset');
-  assert.equal(lease.episode.colorSpace, 'browser-default'); assert.equal(lease.response.requiresCompatibility, false); assert.equal(lease.response.colorSpace, 'browser-default');
-  assert.equal(lease.colorProbe.bitDepth, 8); assert.equal(lease.master, undefined); assert.equal(probes, 2);
-  await cloud.playback('asset'); assert.equal(probes, 2, 'safe source can reuse its bounded default proof');
-  for (const risk of ['dolby-vision', 'hdr', 'pq', 'hlg']) {
+  assert.equal(lease.episode.colorSpace, 'unknown'); assert.equal(lease.response.requiresCompatibility, false); assert.equal(lease.response.colorSpace, 'unknown');
+  assert.equal(lease.colorProbe, undefined); assert.equal(lease.master, undefined); assert.equal(probes, 0);
+  for (const risk of ['sdr', 'hdr', 'pq', 'hlg']) {
     sourceColorSpace = risk;
-    await assert.rejects(cloud.playback('asset'), error => error.status === 409 && /避免偏色|杜比视界/.test(error.message));
+    const direct = await cloud.playback('asset'); assert.equal(direct.response.colorSpace, 'unknown'); assert.equal(direct.response.requiresCompatibility, false);
   }
-  assert.equal(probes, 10, 'every source risk identity is independently checked, even with an unchanged descriptor version');
+  assert.equal(probes, 0, 'ordinary source changes do not add a color probe');
+  sourceColorSpace = 'dolby-vision';
+  await assert.rejects(cloud.playback('asset'), error => error.status === 409 && error.code === 'QUARK_DOLBY_UNSUPPORTED');
+  assert.equal(probes, 2, 'browser defaults cannot prove a known Dolby source is safe');
 });
 
 test('verified SDR still beats a browser default and invalid source color declarations fail before a probe', async t => {
   const first = { type: 'hls', url: 'https://video.quark.cn/high.m3u8', colorSpace: 'unknown' }, second = { ...first, url: 'https://video.quark.cn/low.m3u8' };
   const seen = [];
-  const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: first, candidates: [first, second] }) }, probeColor: async input => {
+  const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: first, candidates: [first, second], metadata: { sourceColorSpace: 'dolby-vision' } }) }, probeColor: async input => {
     seen.push(input.episode.url); return input.episode.url === first.url ? { colorSpace: 'browser-default', codec: 'h264', pixFmt: 'yuv420p', bitDepth: 8 } : { colorSpace: 'sdr', transfer: 'bt709' };
   } });
   const lease = await cloud.playback('asset'); assert.equal(lease.episode.url, second.url); assert.equal(lease.response.colorSpace, 'sdr'); assert.equal(seen.length, 2);
   for (const sourceColorSpace of ['browser-default', 'not-a-color']) {
     const f = await fixture(t, { quark: { playback: async () => descriptor({ metadata: { sourceColorSpace } }) }, probeColor: async () => assert.fail('invalid source must not be probed') });
     await assert.rejects(f.cloud.playback('asset'), { status: 502 });
+  }
+});
+
+test('Dolby evidence on a candidate or variant triggers inspection but an already converted SDR stream plays directly', async t => {
+  const first = { type: 'hls', url: 'https://video.quark.cn/main.m3u8', colorSpace: 'unknown' };
+  const dolby = { ...first, url: 'https://video.quark.cn/dolby.m3u8', colorSpace: 'dolby-vision', width: 1920, height: 1080, bandwidth: 6000000 };
+  for (const location of ['candidates', 'variants']) for (const detected of ['sdr', 'browser-default']) {
+    let probes = 0;
+    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: first, [location]: [dolby] }) }, probeColor: async input => {
+      probes++; assert.equal(input.sourceColorSpace, 'dolby-vision'); assert.equal(input.timeout, 6000);
+      return { colorSpace: detected, codec: 'h264' };
+    } });
+    if (detected === 'sdr') {
+      const lease = await cloud.playback('asset');
+      assert.equal(lease.episode.url, first.url); assert.equal(lease.response.colorSpace, 'sdr'); assert.equal(lease.response.requiresCompatibility, false);
+      assert.equal(lease.episode.sourceColorSpace, 'dolby-vision'); assert.equal(Object.hasOwn(lease.response, 'sourceColorSpace'), false);
+    } else await assert.rejects(cloud.playback('asset'), { status: 409, code: 'QUARK_DOLBY_UNSUPPORTED' });
+    assert.equal(probes, 1);
   }
 });
 
@@ -205,17 +252,18 @@ test('invalidation during original Dolby inspection cannot publish a compatible 
   const pending = cloud.playback('asset'); await ready; cloud.invalidate(); release(); await assert.rejects(pending, { status: 409 });
 });
 
-test('PQ and HLG remain compatibility sources when no safe SDR candidate exists, while DV and unverifiable sources never play direct', async t => {
+test('checked PQ and HLG alternatives remain compatibility sources for known Dolby, while unverifiable Dolby never plays direct', async t => {
   for (const colorSpace of ['pq', 'hlg']) {
-    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: { colorSpace: 'unknown' } }) }, probeColor: async () => ({ colorSpace }) });
+    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: { colorSpace: 'unknown' }, metadata: { sourceColorSpace: 'dolby-vision' } }) }, probeColor: async () => ({ colorSpace }) });
     const lease = await cloud.playback('asset'); assert.equal(lease.episode.colorSpace, colorSpace); assert.equal(lease.response.requiresCompatibility, true);
+    assert.equal(lease.episode.sourceColorSpace, 'dolby-vision'); assert.equal(Object.hasOwn(lease.response, 'sourceColorSpace'), false);
   }
   for (const proof of [{ colorSpace: 'dolby-vision', dolbyVisionProfile: 5 }, null]) {
     let probes = 0;
     const candidates = Array.from({ length: 8 }, (_, index) => ({ type: 'hls', url: `https://video.quark.cn/${index}.m3u8`, colorSpace: 'unknown' }));
-    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: candidates[0], candidates }) }, probeColor: async () => { probes++; return proof; } });
+    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: candidates[0], candidates, metadata: { sourceColorSpace: 'dolby-vision' } }) }, probeColor: async () => { probes++; return proof; } });
     await assert.rejects(cloud.playback('asset'), error => {
-      assert.equal(error.code, proof ? 'QUARK_DOLBY_UNSUPPORTED' : 'QUARK_COLOR_UNCONFIRMED');
+      assert.equal(error.code, 'QUARK_DOLBY_UNSUPPORTED');
       assert.equal(error.colorProbe.colorSpace, proof ? 'dolby-vision' : 'unknown');
       assert.ok(!JSON.stringify(error.colorProbe).includes('video.quark.cn'));
       return error.status === 409 && /避免偏色|杜比视界/.test(error.message);
@@ -227,12 +275,12 @@ test('PQ and HLG remain compatibility sources when no safe SDR candidate exists,
 test('color inspection uses one queue, an overall deadline and existing account cancellation', async t => {
   let clock = 0, probes = 0;
   const candidates = [0, 1, 2].map(value => ({ type: 'hls', url: `https://video.quark.cn/${value}.m3u8`, colorSpace: 'unknown' }));
-  const { cloud } = await fixture(t, { now: () => clock, quark: { playback: async () => descriptor({ episode: candidates[0], candidates }) },
-    probeColor: async input => { probes++; assert.equal(input.timeout, probes === 1 ? 3000 : 1000); clock += probes === 1 ? 5000 : 1000; throw Error('metadata unavailable'); } });
-  await assert.rejects(cloud.playback('asset'), { status: 409 }); assert.equal(probes, 2, 'remaining candidates cannot each restart a six-second deadline');
+  const { cloud } = await fixture(t, { now: () => clock, quark: { playback: async () => descriptor({ episode: candidates[0], candidates, metadata: { sourceColorSpace: 'dolby-vision' } }) },
+    probeColor: async input => { probes++; assert.equal(input.timeout, probes === 1 ? 6000 : 1000); clock += probes === 1 ? 14000 : 1000; throw Error('metadata unavailable'); } });
+  await assert.rejects(cloud.playback('asset'), { status: 409 }); assert.equal(probes, 2, 'remaining candidates cannot each restart the overall deadline');
   let active = 0, maximum = 0, release, entered;
   const ready = new Promise(done => { entered = done; });
-  const f = await fixture(t, { quark: { playback: async () => descriptor({ episode: { colorSpace: 'unknown' } }) }, probeColor: async input => {
+  const f = await fixture(t, { quark: { playback: async () => descriptor({ episode: { colorSpace: 'unknown' }, metadata: { sourceColorSpace: 'dolby-vision' } }) }, probeColor: async input => {
     active++; maximum = Math.max(maximum, active); entered();
     try { await new Promise((done, reject) => { release = done; input.signal.addEventListener('abort', () => reject(Error('cancelled')), { once: true }); }); return { colorSpace: 'sdr' }; }
     finally { active--; }
@@ -240,6 +288,64 @@ test('color inspection uses one queue, an overall deadline and existing account 
   const first = f.cloud.playback('asset', { owner: 'one' }); await ready;
   const second = f.cloud.playback('other', { owner: 'two' }); f.cloud.invalidate(); release();
   await assert.rejects(first); await assert.rejects(second); assert.equal(maximum, 1); assert.equal(active, 0);
+});
+
+test('an exhausted color deadline retains verified HDR playback and drains the probe before retrying', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let probes = 0, active = 0, maximum = 0, finishCleanup, entered, signal;
+  const ready = new Promise(done => { entered = done; });
+  const candidates = [0, 1, 2].map(value => ({ type: 'hls', url: `https://video.quark.cn/${value}.m3u8`, colorSpace: 'unknown' }));
+  const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: candidates[0], candidates, metadata: { version: 'dolby-alternatives', sourceColorSpace: 'dolby-vision' } }) },
+    probeColor: async input => {
+      probes++; active++; maximum = Math.max(maximum, active);
+      try {
+        assert.equal(input.timeout, 6000);
+        if (probes === 1) return { colorSpace: 'pq', transfer: 'smpte2084' };
+        if (probes === 2) {
+          signal = input.signal;
+          await new Promise(done => { signal.addEventListener('abort', done, { once: true }); entered(); });
+          await new Promise(done => { finishCleanup = done; });
+        }
+        return { colorSpace: 'sdr' };
+      } finally { active--; }
+    } });
+  const pending = cloud.playback('asset'); await ready;
+  t.mock.timers.tick(15000);
+  const lease = await pending;
+  assert.equal(signal.aborted, true); assert.equal(lease.valid(), true);
+  assert.equal(lease.response.colorSpace, 'pq'); assert.equal(lease.response.requiresCompatibility, true);
+  assert.equal(probes, 2, 'the deadline cancels remaining candidates');
+  const retry = cloud.playback('asset'); await Promise.resolve();
+  assert.equal(probes, 2, 'a retry must wait for the cancelled inspector to finish cleaning up');
+  finishCleanup();
+  assert.equal((await retry).response.colorSpace, 'sdr');
+  assert.equal(probes, 3, 'a late aborted SDR result must not enter the proof cache');
+  assert.equal(maximum, 1); assert.equal(active, 0);
+});
+
+test('an exhausted color deadline without proof cancels inspection and keeps a retryable timeout', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let entered, signal;
+  const ready = new Promise(done => { entered = done; });
+  const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: { colorSpace: 'unknown' }, metadata: { sourceColorSpace: 'dolby-vision' } }) },
+    probeColor: async input => { signal = input.signal; await new Promise(done => { signal.addEventListener('abort', done, { once: true }); entered(); }); return { colorSpace: 'sdr' }; } });
+  const pending = cloud.playback('asset'); await ready;
+  t.mock.timers.tick(15000);
+  await assert.rejects(pending, error => error.status === 504 && error.code === 'QUARK_COLOR_PROBE_TIMEOUT');
+  assert.equal(signal.aborted, true);
+});
+
+test('a failed official color probe preserves its retryable cause and can try a lower SDR candidate', async t => {
+  const candidates = [0, 1].map(value => ({ type: 'hls', url: `https://video.quark.cn/${value}.m3u8`, colorSpace: 'unknown' }));
+  for (const code of ['QUARK_COLOR_PROBE_TIMEOUT', 'QUARK_COLOR_PROBE_READ_FAILED']) {
+    const error = Object.assign(Error('metadata unavailable'), { status: code.endsWith('TIMEOUT') ? 504 : 502, code, colorProbe: { colorSpace: 'unknown' } });
+    let sdr = false;
+    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: candidates[0], candidates, metadata: { sourceColorSpace: 'dolby-vision' } }) },
+      probeColor: async input => { if (sdr && input.episode.url === candidates[1].url) return { colorSpace: 'sdr' }; throw error; } });
+    await assert.rejects(cloud.playback('asset'), failure => failure === error);
+    sdr = true;
+    assert.equal((await cloud.playback('asset')).response.colorSpace, 'sdr');
+  }
 });
 
 test('adaptive master rejects invalid qualities and refuses the master token without variants', async t => {

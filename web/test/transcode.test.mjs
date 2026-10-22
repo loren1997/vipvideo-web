@@ -322,7 +322,7 @@ test('missing tags never erase source HDR risk, 10-bit or HEVC uncertainty, cont
     } finally { await f.close(); }
   }
   const f = await fixture({ colorProbe: { streams: [plain], frames: [plain] } });
-  try { await assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'hdr' } }), /无法确认.*色彩/); }
+  try { await assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'hdr', sourceColorSpace: 'dolby-vision' } }), /无法确认.*色彩/); }
   finally { await f.close(); }
 });
 
@@ -385,12 +385,12 @@ test('ordinary SDR playback keeps the existing path without a color probe or ton
   } finally { await f.close(); }
 });
 
-test('confirmed PQ, HLG and HDR Vivid base signals tone-map in linear light to bounded BT709 SDR', async () => {
+test('confirmed PQ and HLG alternatives from a known Dolby source tone-map in linear light to BT709 SDR', async () => {
   for (const [hint, transfer, sideData] of [['pq', 'smpte2084'], ['hlg', 'arib-std-b67'], ['unknown', 'smpte2084'], ['hdr', 'smpte2084', [{ side_data_type: 'HDR Vivid Dynamic Metadata' }]]]) {
     const color = { color_transfer: transfer, color_primaries: 'bt2020', color_space: 'bt2020nc' };
     const f = await fixture({ colorProbe: { streams: [color], frames: [{ ...color, side_data_list: sideData || [] }] } });
     try {
-      const result = await start(f.service, { episode: { ...episode, colorSpace: hint } });
+      const result = await start(f.service, { episode: { ...episode, colorSpace: hint, sourceColorSpace: 'dolby-vision' } });
       assert.equal(result.acceleration, 'software');
       const probe = f.calls.find(call => call.args.includes('-show_entries')), encoder = f.calls.find(call => call.args.includes('-c:v'));
       assert.equal(probe.command, 'ffprobe'); assert.equal(probe.options.stdio[1], 'pipe');
@@ -409,13 +409,26 @@ test('confirmed PQ, HLG and HDR Vivid base signals tone-map in linear light to b
   }
 });
 
-test('a filename HDR hint does not force tone mapping when decoded metadata proves SDR', async () => {
-  const color = { color_transfer: 'bt709', color_primaries: 'bt709', color_space: 'bt709' };
-  const f = await fixture({ colorProbe: { streams: [color], frames: [color] } });
+test('ordinary HDR Vivid, PQ, HLG and unknown MP4 or MKV compatibility never probes or calibrates color', async () => {
+  for (const type of ['mp4', 'mkv']) for (const colorSpace of [undefined, 'unknown', 'hdr', 'pq', 'hlg']) {
+    const f = await fixture({ hungColorProbe: true });
+    try {
+      await start(f.service, { episode: { url: `https://movies.example/2026.HDR.Vivid.${type}`, type, colorSpace, sourceColorSpace: colorSpace ?? 'unknown' } });
+      assert.equal(f.calls.filter(call => call.args.includes('-show_entries')).length, 0);
+      const args = f.calls.find(call => call.args.includes('-c:v')).args;
+      assert.doesNotMatch(args.join(' '), /tonemap|zscale|libplacebo|-color_trc|-color_primaries|-colorspace|sidedata=/);
+      assert.equal(args[args.indexOf('-f') + 1], type === 'mp4' ? 'mov' : 'matroska');
+      assert.equal(args[args.indexOf('-c:v') + 1], 'libx264');
+    } finally { await f.close(); }
+  }
+});
+
+test('an explicitly converted SDR stream from a Dolby source keeps ordinary codec compatibility without calibration', async () => {
+  const f = await fixture({ hungColorProbe: true });
   try {
-    await start(f.service, { episode: { ...episode, colorSpace: 'hdr' } });
-    assert.equal(f.calls.filter(call => call.args.includes('-show_entries')).length, 1);
-    assert.doesNotMatch(f.calls.find(call => call.args.includes('-c:v')).args.join(' '), /tonemap|zscale/);
+    await start(f.service, { episode: { ...episode, colorSpace: 'sdr', sourceColorSpace: 'dolby-vision' } });
+    assert.equal(f.calls.some(call => call.args.includes('-show_entries')), false);
+    assert.doesNotMatch(f.calls.find(call => call.args.includes('-c:v')).args.join(' '), /tonemap|zscale|libplacebo|-color_trc|-color_primaries|-colorspace/);
   } finally { await f.close(); }
 });
 
@@ -430,7 +443,7 @@ test('a Dolby hint without original RPU cannot fall through to ordinary PQ conve
     const metadata = [{ side_data_type: location === 'stream' ? 'DOVI configuration record' : 'Dolby Vision RPU Data', dv_profile: 5, dv_bl_signal_compatibility_id: 0 }];
     const f = await fixture({ colorProbe: { streams: [{ ...color, ...(location === 'stream' ? { side_data_list: metadata } : {}) }], frames: [{ ...color, ...(location === 'frame' ? { side_data_list: metadata } : {}) }] } });
     try {
-      await assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'hdr' } }), /杜比视界.*SDR/);
+      await assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'hdr', sourceColorSpace: 'dolby-vision' } }), /杜比视界.*SDR/);
       assert.equal(f.calls.filter(call => call.args.includes('-c:v')).length, 0);
       assert.deepEqual(await readdir(f.root), []);
     } finally { await f.close(); }
@@ -544,13 +557,22 @@ test('Dolby Vulkan failure in strict hardware mode reports capability failure wi
   } finally { await f.close(); }
 });
 
-test('a bounded original Dolby probe can finish after three seconds while ordinary probes keep their shorter deadline', async () => {
+test('bounded Dolby and HDR probes can finish after three seconds while ordinary probes keep their shorter deadline', async () => {
   const dolby = await fixture({ colorProbe: dolbyProbe(), colorProbeDelay: 3150, di: { probeTimeout: 6000 } });
   try {
     const proof = await dolby.service.inspectColor({ episode: { ...episode, colorSpace: 'dolby-vision' }, sourceColorSpace: 'dolby-vision', owner: 'probe', valid: () => true, timeout: 5500 });
     assert.equal(supportsDolbyMapping(proof), true);
     assert.equal(dolby.calls.some(call => call.args.includes('-c:v')), false);
   } finally { await dolby.close(); }
+  for (const sourceColorSpace of ['hdr', 'pq', 'hlg']) {
+    const color = { codec_name: 'hevc', pix_fmt: 'yuv420p10le', color_transfer: sourceColorSpace === 'hlg' ? 'arib-std-b67' : 'smpte2084', color_primaries: 'bt2020', color_space: 'bt2020nc' };
+    const hdr = await fixture({ colorProbe: { streams: [color], frames: [color] }, colorProbeDelay: 3150, di: { probeTimeout: 6000 } });
+    try {
+      const proof = await hdr.service.inspectColor({ episode: { ...episode, colorSpace: 'unknown' }, sourceColorSpace, owner: 'probe', valid: () => true, timeout: 6000 });
+      assert.equal(proof.colorSpace, sourceColorSpace === 'hlg' ? 'hlg' : 'pq');
+      assert.ok(hdr.children.every(child => child.finished));
+    } finally { await hdr.close(); }
+  }
   const ordinary = await fixture({ colorProbeDelay: 3150, di: { probeTimeout: 6000 } });
   try {
     await assert.rejects(ordinary.service.inspectColor({ episode, owner: 'probe', valid: () => true, timeout: 5500 }), error => error.status === 504 && error.code === 'QUARK_COLOR_PROBE_TIMEOUT');
@@ -563,7 +585,7 @@ test('unknown, malformed, oversized and timed-out color probes stop safely befor
   for (const option of [{ colorProbe: { streams: [{}], frames: [{}] } }, { colorProbe: { streams: [{ color_transfer: 'smpte2084' }], frames: [] } }, { colorProbeBody: '{malformed' }, { colorProbeBody: 'x'.repeat(65537) }, { hungColorProbe: true }]) {
     const f = await fixture(option);
     try {
-      await assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'hdr' } }), error => error.status === (option.hungColorProbe ? 504 : 409) && (option.hungColorProbe ? error.code === 'QUARK_COLOR_PROBE_TIMEOUT' : /无法确认.*色彩/.test(error.message)) && !error.message.includes('movies.example'));
+      await assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'hdr', sourceColorSpace: 'dolby-vision' } }), error => error.status === (option.hungColorProbe ? 504 : 409) && (option.hungColorProbe ? error.code === 'QUARK_COLOR_PROBE_TIMEOUT' : /无法确认.*色彩/.test(error.message)) && !error.message.includes('movies.example'));
       assert.equal(f.calls.filter(call => call.args.includes('-c:v')).length, 0);
       assert.deepEqual(await readdir(f.root), []);
       assert.ok(f.children.every(child => child.finished));
@@ -571,12 +593,25 @@ test('unknown, malformed, oversized and timed-out color probes stop safely befor
   }
 });
 
-test('HDR mapping honors explicit GPU-only and disabled-software settings instead of adding CPU encoding', async () => {
+test('HDR alternatives from Dolby sources honor GPU-only and disabled-software settings', async () => {
   for (const env of [{ TRANSCODE_ACCEL: 'vaapi' }, { TRANSCODE_ACCEL: 'auto', TRANSCODE_ALLOW_SOFTWARE: 'false' }]) {
     const f = await fixture({ gpu: true, env });
     try {
-      await assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'pq' } }), error => error.status === 503 && /软件色调映射/.test(error.message));
+      await assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'pq', sourceColorSpace: 'dolby-vision' } }), error => error.status === 503 && /软件色调映射/.test(error.message));
       assert.equal(f.calls.filter(call => call.args.includes('-c:v')).length, 0);
+    } finally { await f.close(); }
+  }
+});
+
+test('ordinary HDR compatibility keeps hardware encoding instead of forcing software color mapping', async () => {
+  for (const env of [{ TRANSCODE_ACCEL: 'vaapi' }, { TRANSCODE_ACCEL: 'auto', TRANSCODE_ALLOW_SOFTWARE: 'false' }]) {
+    const f = await fixture({ gpu: true, env, hungColorProbe: true });
+    try {
+      const result = await start(f.service, { episode: { ...episode, colorSpace: 'pq', sourceColorSpace: 'hdr' } });
+      assert.equal(result.acceleration, 'vaapi'); assert.equal(f.calls.some(call => call.args.includes('-show_entries')), false);
+      const args = f.calls.find(call => call.args.includes('-c:v')).args;
+      assert.equal(args[args.indexOf('-c:v') + 1], 'h264_vaapi');
+      assert.doesNotMatch(args.join(' '), /tonemap|zscale|libplacebo|-color_trc|-color_primaries|-colorspace/);
     } finally { await f.close(); }
   }
 });
@@ -584,7 +619,7 @@ test('HDR mapping honors explicit GPU-only and disabled-software settings instea
 test('a build without HDR filters reports the missing capability instead of claiming converted playback', async () => {
   const f = await fixture({ run: async ({ child }) => { child.stderr.write("No such filter: 'zscale'\n"); child.exit(1); } });
   try {
-    await assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'pq' } }), error => error.status === 503 && /缺少 HDR 色调映射支持/.test(error.message));
+    await assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'pq', sourceColorSpace: 'dolby-vision' } }), error => error.status === 503 && /缺少 HDR 色调映射支持/.test(error.message));
     assert.deepEqual(await readdir(f.root), []);
   } finally { await f.close(); }
 });
@@ -592,7 +627,7 @@ test('a build without HDR filters reports the missing capability instead of clai
 test('closing during a color probe kills its owned process and leaves no bridge or output directory', async () => {
   const f = await fixture({ hungColorProbe: true, di: { probeTimeout: 1000 } });
   try {
-    const pending = assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'hdr' } }), statusError(409));
+    const pending = assert.rejects(start(f.service, { episode: { ...episode, colorSpace: 'hdr', sourceColorSpace: 'dolby-vision' } }), statusError(409));
     for (let index = 0; index < 30 && !f.calls.some(call => call.args.includes('-show_entries')); index++) await new Promise(done => setTimeout(done, 2));
     assert.ok(f.calls.some(call => call.args.includes('-show_entries')));
     await f.service.close(); await pending;
@@ -844,7 +879,7 @@ test('unsafe or unquoted manifest links and upstream Location headers cannot esc
 test('private inputs, unsupported formats, invalid speed/position/owner and stale validity never spawn FFmpeg', async () => {
   const f = await fixture();
   try {
-    for (const overrides of [{ episode: { url: 'http://127.0.0.1/a.mp4', type: 'mp4' } }, { episode: { url: 'file:///tmp/a.mp4', type: 'mp4' } }, { episode: { url, type: 'page' } }, { speed: 4 }, { position: -1 }, { position: Infinity }, { owner: '' }, { valid: null }]) await assert.rejects(start(f.service, overrides));
+    for (const overrides of [{ episode: { url: 'http://127.0.0.1/a.mp4', type: 'mp4' } }, { episode: { url: 'file:///tmp/a.mp4', type: 'mp4' } }, { episode: { url, type: 'page' } }, { episode: { ...episode, sourceColorSpace: 'invalid' } }, { episode: { ...episode, sourceColorSpace: 'browser-default' } }, { episode: { ...episode, sourceColorSpace: {} } }, { speed: 4 }, { position: -1 }, { position: Infinity }, { owner: '' }, { valid: null }]) await assert.rejects(start(f.service, overrides));
     await assert.rejects(start(f.service, { valid: () => false }), statusError(409)); assert.equal(f.calls.length, 0);
   } finally { await f.close(); }
 });

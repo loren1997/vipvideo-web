@@ -2089,6 +2089,7 @@ function mountPlayer(current) {
   };
   for (const event of ['play', 'pause', 'volumechange']) video.addEventListener(event, updateTransport);
   frame.addEventListener('fullscreenchange', () => { full.textContent = document.fullscreenElement === frame ? '退出全屏' : '全屏'; });
+  let pendingTimelinePosition;
   const updateClock = () => {
     const duration = playDuration(current), position = playPosition(current);
     clockText.textContent = `${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${formatTime(position)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
@@ -2098,10 +2099,15 @@ function mountPlayer(current) {
     else { if (clock.parentNode !== host) host.insertBefore(clock, current.note); if (full.parentNode !== toolbar) toolbar.append(full); }
     updateTransport();
     timeline.hidden = !current.transcoded || current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
-    timeline.max = String(duration); if (document.activeElement !== timeline) timeline.value = String(position);
+    if (pendingTimelinePosition === undefined) { timeline.max = String(duration); timeline.value = String(position); }
     timeline.setAttribute('aria-valuetext', `${formatTime(position)} / ${formatTime(duration)}`);
   };
-  timeline.addEventListener('change', () => { if (player === current && current.transcoded) void startCompatibility(current, Number(timeline.value)); });
+  timeline.addEventListener('input', () => { pendingTimelinePosition = Number(timeline.value); });
+  timeline.addEventListener('change', () => {
+    const position = pendingTimelinePosition ?? Number(timeline.value); pendingTimelinePosition = undefined;
+    if (player === current && current.transcoded) void startCompatibility(current, position);
+  });
+  timeline.addEventListener('pointercancel', () => { pendingTimelinePosition = undefined; updateClock(); });
   current.updateClock = updateClock;
   video.addEventListener('loadedmetadata', () => {
     if (player !== current) return;

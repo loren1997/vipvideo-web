@@ -26,14 +26,20 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
     return proof;
   }
   async function selectColor(lease, candidates, version) {
+    if (!lease.dolbyRisk) return { episode: candidates[0] };
     const sdr = !lease.originalDolby && candidates.find(row => row.colorSpace === 'sdr');
     if (sdr) return { episode: sdr };
     if (queued >= 8) throw failure('官方流色彩检查繁忙，请稍后重试', 429);
-    const deadline = now() + 6000; queued++; let timer;
+    const deadline = now() + 15000, controller = new AbortController();
+    const abort = () => controller.abort();
+    lease.controller.signal.addEventListener('abort', abort, { once: true });
+    queued++; let timer, fallback, lastError;
+    const timeoutError = () => lastError || Object.assign(failure('官方流色彩检查超时，已停止播放以避免偏色，请稍后重试', 504), { code: 'QUARK_COLOR_PROBE_TIMEOUT', colorProbe: { colorSpace: 'unknown' } });
     const job = colorTail.then(async () => {
-      let fallback, lastProbe, dolby = lease.sourceColorSpace === 'dolby-vision', probes = 0;
+      let lastProbe, dolby = lease.dolbyRisk, probes = 0;
       for (const row of candidates) {
         if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409);
+        if (controller.signal.aborted) break;
         const originalDolby = lease.originalDolby && row.url === lease.episode.url;
         if (!originalDolby && (row.colorSpace === 'pq' || row.colorSpace === 'hlg')) { fallback ||= { episode: row }; continue; }
         if (row.colorSpace === 'dolby-vision' && !originalDolby) { dolby = true; continue; }
@@ -41,13 +47,17 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
         if (!proof && probes < 3 && now() < deadline) {
           probes++;
           try {
-            proof = colorProof(await probeColor({ episode: row, sourceColorSpace: lease.sourceColorSpace, owner: lease.owner || lease.id, valid: () => valid(lease), signal: lease.controller.signal, mediaOverride: lease.media, proxyPath: lease.proxyPath, timeout: Math.min(originalDolby ? 5500 : 3000, deadline - now()) }));
+            const budget = originalDolby ? 5500 : 6000;
+            proof = colorProof(await probeColor({ episode: row, sourceColorSpace: 'dolby-vision', owner: lease.owner || lease.id, valid: () => valid(lease), signal: controller.signal, mediaOverride: lease.media, proxyPath: lease.proxyPath, timeout: Math.min(budget, deadline - now()) }));
             if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409);
+            if (controller.signal.aborted) break;
             const key = colorKey(lease, row, version); colorCache.delete(key); colorCache.set(key, { proof, expires: now() + 10 * 60_000 });
             while (colorCache.size > 64) colorCache.delete(colorCache.keys().next().value);
           } catch (error) {
             if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409);
+            if (controller.signal.aborted) break;
             if (originalDolby && ['QUARK_COLOR_PROBE_TIMEOUT', 'QUARK_COLOR_PROBE_READ_FAILED'].includes(error.code)) throw error;
+            if (['QUARK_COLOR_PROBE_TIMEOUT', 'QUARK_COLOR_PROBE_READ_FAILED'].includes(error.code)) lastError = error;
             lastProbe = colorProof(error.colorProbe || { colorSpace: 'unknown' }, true); continue;
           }
         }
@@ -57,15 +67,20 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
           continue;
         }
         if (proof?.colorSpace === 'sdr') return { episode: { ...row, colorSpace: 'sdr' }, proof };
-        if (proof?.colorSpace === 'browser-default' && ['unknown', 'sdr'].includes(lease.sourceColorSpace)) fallback ||= { episode: { ...row, colorSpace: 'browser-default' }, proof };
         if (proof?.colorSpace === 'pq' || proof?.colorSpace === 'hlg') fallback ||= { episode: { ...row, colorSpace: proof.colorSpace }, proof };
         if (proof?.colorSpace === 'dolby-vision') dolby = true;
       }
       if (fallback) return fallback;
+      if (lastError || controller.signal.aborted) throw timeoutError();
       throw Object.assign(failure(dolby ? lease.originalDolby ? '此杜比视界原片未确认可支持的单层 RPU 信息，请选择其他 SDR 版本' : '官方候选均未提供可确认的 SDR 线路，此杜比视界视频暂不能保证正确转换，请选择其他 SDR 版本' : '无法确认官方流的色彩信息，已停止播放以避免偏色，请稍后重试或选择其他 SDR 版本', 409), { code: dolby ? 'QUARK_DOLBY_UNSUPPORTED' : 'QUARK_COLOR_UNCONFIRMED', colorProbe: lastProbe || { colorSpace: dolby ? 'dolby-vision' : 'unknown' } });
-    }).finally(() => { queued--; });
+    }).finally(() => { queued--; lease.controller.signal.removeEventListener('abort', abort); });
     colorTail = job.catch(() => {});
-    try { return await Promise.race([job, new Promise((_, reject) => { timer = setTimeout(() => reject(failure('官方流色彩检查超时，已停止播放以避免偏色，请稍后重试', 504)), 6000); })]); }
+    try { return await Promise.race([job, new Promise((resolve, reject) => { timer = setTimeout(() => {
+      controller.abort();
+      if (!valid(lease)) reject(failure('夸克账号或播放会话已变更', 409));
+      else if (fallback) resolve(fallback);
+      else reject(timeoutError());
+    }, 15000); })]); }
     finally { clearTimeout(timer); }
   }
   return {
@@ -118,7 +133,8 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
       const id = randomBytes(16).toString('hex'), proxyPath = `/api/quark/media/${id}`;
       const metadata = descriptor.metadata || {}, version = String(metadata.version || assetId).slice(0, 300), sourceColorSpace = metadata.sourceColorSpace ?? 'unknown';
       if (!colors.has(sourceColorSpace) || sourceColorSpace === 'browser-default') throw failure('夸克原文件色彩信息无效', 502);
-      const lease = { id, assetId, episode, sourceColorSpace, originalDolby: metadata.mode === 'download' && sourceColorSpace === 'dolby-vision', proxyPath, category: metadata.category, generation, authorized, owner, expires: now() + 2 * 60 * 60_000, streams: new Set(), controller: new AbortController() };
+      const dolbyRisk = sourceColorSpace === 'dolby-vision' || [...candidates.values(), ...variants.values()].some(row => row.colorSpace === 'dolby-vision');
+      const lease = { id, assetId, episode, sourceColorSpace, dolbyRisk, originalDolby: metadata.mode === 'download' && sourceColorSpace === 'dolby-vision', proxyPath, category: metadata.category, generation, authorized, owner, expires: now() + 2 * 60 * 60_000, streams: new Set(), controller: new AbortController() };
       lease.media = createMedia({ proxyPath, request: async (target, options = {}) => {
         if (!valid(lease)) throw failure('夸克播放会话已过期，请重新播放');
         const url = validateUrl(target), headers = {};
@@ -151,7 +167,7 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
       let selected;
       try { selected = await selectColor(lease, [...candidates.values()], version); if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409); visible(lease.category); }
       catch (error) { close(lease); leases.delete(id); throw error; }
-      episode = lease.episode = selected.episode; lease.colorProbe = selected.proof;
+      episode = lease.episode = { ...selected.episode, sourceColorSpace: lease.dolbyRisk ? 'dolby-vision' : lease.sourceColorSpace }; lease.colorProbe = selected.proof;
       const result = lease.media.playback({ lines: [{ episodes: [episode] }] }, 0, 0);
       const sdrVariants = episode.colorSpace === 'sdr' ? [...variants.values()].filter(row => row.colorSpace === 'sdr' || cachedColor(lease, row, version)?.colorSpace === 'sdr') : [];
       if (sdrVariants.length > 1) {
@@ -163,7 +179,7 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
       }
       lease.response = { assetId, url: result.proxyUrl, type: episode.type,
         name: String(metadata.name || '').slice(0, 300), size: Number(metadata.size) || 0,
-        version, requiresCompatibility: !['sdr', 'browser-default'].includes(episode.colorSpace) || !['hls', 'mp4', 'webm'].includes(episode.type),
+        version, requiresCompatibility: lease.dolbyRisk && !['sdr', 'browser-default'].includes(episode.colorSpace) || !['hls', 'mp4', 'webm'].includes(episode.type),
         ...(episode.colorSpace ? { colorSpace: episode.colorSpace } : {}),
         ...(lease.master ? { quality: '自动画质' } : Number.isSafeInteger(episode.width) && Number.isSafeInteger(episode.height) ? { quality: `${episode.width}×${episode.height}` } : metadata.quality ? { quality: Number.isSafeInteger(metadata.quality.width) && Number.isSafeInteger(metadata.quality.height)
           ? `${metadata.quality.width}×${metadata.quality.height}` : String(metadata.quality).slice(0, 100) } : {}) };
