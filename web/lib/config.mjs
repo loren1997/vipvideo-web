@@ -63,6 +63,8 @@ export function validatePlayerPreferences(input) {
     if (typeof value !== 'boolean') throw badRequest('播放开关必须是布尔值');
     row[field] = value;
   }
+  row.danmakuRows = input.danmakuRows === undefined ? 1 : input.danmakuRows;
+  if (!Number.isInteger(row.danmakuRows) || row.danmakuRows < 1 || row.danmakuRows > 10) throw badRequest('弹幕行数必须为 1–10 的整数');
   row.skipAds = input.skipAds === undefined ? false : input.skipAds;
   if (typeof row.skipAds !== 'boolean') throw badRequest('广告跳过开关必须是布尔值');
   const ranges = input.adRanges === undefined ? [] : input.adRanges;

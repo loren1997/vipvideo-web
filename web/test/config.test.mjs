@@ -61,10 +61,18 @@ test('subscriptions and live sources validate separately and survive a source-on
 });
 
 test('player preferences enforce meaningful durations, speeds and boolean switches', () => {
-  assert.deepEqual(validatePlayerPreferences({ key: 'film' }), { key: 'film', introSeconds: 0, outroSeconds: 0, autoNext: true, danmakuEnabled: true, skipAds: false, adRanges: [], speed: 1 });
+  assert.deepEqual(validatePlayerPreferences({ key: 'film' }), { key: 'film', introSeconds: 0, outroSeconds: 0, autoNext: true, danmakuEnabled: true, danmakuRows: 1, skipAds: false, adRanges: [], speed: 1 });
   assert.equal(validatePlayerPreferences({ key: 'film', speed: 3, introSeconds: 90, outroSeconds: 120 }).speed, 3);
   for (const input of [{ introSeconds: -1 }, { outroSeconds: 601 }, { introSeconds: 1.5 }, { outroSeconds: '30' }, { autoNext: 'false' }, { danmakuEnabled: null }, { speed: 9 }, { speed: '2' }]) {
     assert.throws(() => validatePlayerPreferences({ key: 'film', ...input }), { status: 400 });
+  }
+});
+
+test('danmaku rows default to one and accept only integer counts from one to ten', () => {
+  assert.equal(validatePlayerPreferences({ key: 'film' }).danmakuRows, 1);
+  for (const danmakuRows of [1, 4, 10]) assert.equal(validatePlayerPreferences({ key: 'film', danmakuRows }).danmakuRows, danmakuRows);
+  for (const danmakuRows of [0, -1, 11, 1.5, NaN, Infinity, null, true, '1', [], {}]) {
+    assert.throws(() => validatePlayerPreferences({ key: 'film', danmakuRows }), { status: 400 });
   }
 });
 

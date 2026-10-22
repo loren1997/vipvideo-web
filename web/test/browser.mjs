@@ -92,6 +92,7 @@ let probeActive = 0, probeMax = 0, holdVerifiedProbe = false, releaseVerifiedPro
 let holdDoomedProbe = false, holdDoomedMedia = false, releaseDoomedMedia;
 const releaseDoomedProbes = [];
 const preferences = new Map(), bindings = new Map(), comments = new Map();
+let holdPreferences = false, releasePreferences;
 const adRequests = [];
 let adMetadataMode = 'none', holdAdMetadata = false, releaseAdMetadata, maintenanceHealth = false;
 const quarkRequests = [], quarkProgress = [], quarkAssets = new Map();
@@ -385,9 +386,12 @@ try {
         if (body) {
           assert.equal(typeof body.skipAds, 'boolean'); assert.ok(Array.isArray(body.adRanges) && body.adRanges.length <= 20);
           assert.ok(body.adRanges.every(range => typeof range.scope === 'string' && range.scope.length <= 4096 && Number.isFinite(range.start) && Number.isFinite(range.end) && range.start >= 0 && range.end <= 86400 && range.end > range.start && range.end - range.start <= 600));
-          preferences.set(body.key, { introSeconds: body.introSeconds, outroSeconds: body.outroSeconds, speed: body.speed, autoNext: body.autoNext, danmakuEnabled: body.danmakuEnabled, skipAds: body.skipAds, adRanges: body.adRanges });
+          if (holdPreferences) await new Promise(ok => { releasePreferences = ok; });
+          const danmakuRows = body.danmakuRows ?? preferences.get(body.key)?.danmakuRows ?? 1;
+          assert.ok(Number.isInteger(danmakuRows) && danmakuRows >= 1 && danmakuRows <= 10);
+          preferences.set(body.key, { introSeconds: body.introSeconds, outroSeconds: body.outroSeconds, speed: body.speed, autoNext: body.autoNext, danmakuEnabled: body.danmakuEnabled, danmakuRows, skipAds: body.skipAds, adRanges: body.adRanges });
         }
-        return route.fulfill({ json: preferences.get(body?.key || parsed.searchParams.get('key')) || { introSeconds: 0, outroSeconds: 0, speed: 1, autoNext: true, danmakuEnabled: true, skipAds: false, adRanges: [] } });
+        return route.fulfill({ json: preferences.get(body?.key || parsed.searchParams.get('key')) || { introSeconds: 0, outroSeconds: 0, speed: 1, autoNext: true, danmakuEnabled: true, danmakuRows: 1, skipAds: false, adRanges: [] } });
       }
       if (parsed.origin === base && parsed.pathname === '/api/ads') {
         const selection = Object.fromEntries(parsed.searchParams); selection.line = Number(selection.line); selection.episode = Number(selection.episode); adRequests.push(selection);
@@ -414,7 +418,7 @@ try {
         if (body) { const comment = { id: `family-${danmakuRequests.length}`, time: body.time, text: body.text, color: '#fff', origin: 'family' }; comments.set(key, [...list, comment]); return route.fulfill({ json: comment }); }
         const binding = bindings.get(key);
         if (automaticDanmakuFixture && !binding?.url) return route.fulfill({ json: {
-          comments: [...list, { id: 'auto-bili', time: 2, text: '自动匹配B站弹幕', color: '#ffffff', origin: 'bilibili' }, { id: 'auto-tencent', time: 2, text: '自动匹配腾讯弹幕', color: '#ffffff', origin: 'tencent' }],
+          comments: [...list, { id: 'auto-bili', time: 2, text: '自动匹配B站弹幕', color: '#ffffff', origin: 'bilibili' }, { id: 'auto-tencent', time: 2, text: '自动匹配腾讯弹幕', color: '#ffffff', origin: 'tencent' }, { id: 'row-third', time: 2, text: '第三行家庭弹幕', color: '#ffffff', origin: 'family' }],
           updated: Date.now(), errors: [], sources: [{ platform: 'B站', count: 1, mode: 'auto' }, { platform: '腾讯视频', count: 1, mode: 'auto' }],
         } });
         return route.fulfill({ json: { comments: [...list, ...(binding?.url ? [{ id: 'bilibili-seed', time: Math.max(0, 6 + binding.offset), text: '外部样例 <img src=x onerror=alert(1)>', color: '#fff', origin: 'bilibili' }] : [])], updated: Date.now(), errors: [] } });
@@ -629,7 +633,7 @@ try {
     const contexts = [];
     Object.assign(quarkSettings, { enabled: true, configured: true, autoSave: false, account: { connected: true, label: '测试账号' } });
     quarkMode = 'webm'; quarkResourceReply = null; quarkAssetPosition = 0; app.store.remove('history', cloudFilm.key);
-    preferences.set(cloudFilm.key, { introSeconds: 0, outroSeconds: 0, autoNext: true, speed: 1, danmakuEnabled: false });
+    preferences.set(cloudFilm.key, { introSeconds: 0, outroSeconds: 0, autoNext: true, speed: 1, danmakuEnabled: false, danmakuRows: 1 });
     async function open({ viewport = { width: 1440, height: 1000 }, clock = false, hash = cloudPath, tv = false } = {}) {
       const c = await context(viewport, true, false, '#quark', tv ? 'Mozilla/5.0 (Linux; Android 12) VIPVideoWebTV/1.0' : ''); contexts.push(c); const p = c.page;
       if (clock) { await p.clock.install(); await p.clock.pauseAt(new Date()); }
@@ -651,6 +655,7 @@ try {
       releaseQuarkResources = releaseQuarkPrepare = releaseQuarkPlayback = releaseTranscode = releaseQuarkFolderRepair = null;
       for (const release of heldQuarkFileReads.values()) release(); heldQuarkFileReads.clear();
       releaseQuarkSubtitle?.(); releaseQuarkSubtitle = null; quarkSubtitleFixture = false;
+      holdPreferences = false; releasePreferences?.(); releasePreferences = null;
       quarkCleanupReply = null; automaticDanmakuFixture = false;
       for (const c of contexts) await c.value.close();
       quarkResourceReply = null; quarkChoicesFixture = false; quarkFilesFixture = 'matched'; quarkFolderRepairFails = false; quarkAssetPosition = 0;
@@ -840,20 +845,44 @@ try {
 
   async function verifyAutomaticDanmaku() {
     await withCloudFixture(async open => {
-      automaticDanmakuFixture = true; preferences.delete(cloudFilm.key);
+      automaticDanmakuFixture = true;
+      preferences.set(cloudFilm.key, { introSeconds: 0, outroSeconds: 0, speed: 1, autoNext: true, danmakuEnabled: true, skipAds: false, adRanges: [] });
       const { page: p } = await open(); await prepareCloudFile(p); await playCloudFile(p);
+      const video = p.locator('video'), rows = p.getByLabel('弹幕行数', { exact: true }), active = p.locator('.danmaku-comment');
       assert.equal(await p.getByLabel('显示弹幕', { exact: true }).isChecked(), true, '默认启用弹幕');
+      assert.equal(await rows.inputValue(), '1', '旧偏好未存行数时默认一行');
+      assert.deepEqual(await rows.locator('option').evaluateAll(options => options.map(option => option.value)), Array.from({ length: 10 }, (_value, index) => String(index + 1)));
       await p.locator('.danmaku-status').getByText('已加载弹幕：B站 1 条、腾讯视频 1 条', { exact: true }).waitFor();
       const automatic = danmakuRequests.filter(row => row.method === 'GET' && row.query?.title === cloudFilm.title).at(-1);
       assert.ok(automatic); assert.equal(automatic.query.year, cloudFilm.year); assert.equal(automatic.query.type, cloudFilm.type); assert.ok(automatic.query.episodeName); assert.ok(Array.isArray(JSON.parse(automatic.query.aliases)));
-      await p.locator('video').evaluate(async video => { video.pause(); video.currentTime = 2.1; await video.play(); });
+      await video.evaluate(async video => { video.pause(); video.currentTime = 2.1; await video.play(); });
+      await until(() => active.count().then(count => count === 1), '默认密集弹幕只有一行');
+      const firstTop = await active.evaluate(element => element.getBoundingClientRect().top - element.parentElement.getBoundingClientRect().top);
+      assert.ok(firstTop >= 0 && firstTop < 24, '默认行固定在视频顶部');
+      await video.evaluate(video => video.pause());
+      await rows.selectOption('3'); await until(() => preferences.get(cloudFilm.key)?.danmakuRows === 3, '行数改变立即保存');
+      await video.evaluate(async video => { video.currentTime = 2.1; await video.play(); });
+      await until(() => active.count().then(count => count === 3), '选择三行同时显示三条弹幕');
+      const offsets = await active.evaluateAll(elements => elements.map(element => element.getBoundingClientRect().top - element.parentElement.getBoundingClientRect().top));
+      assert.equal(new Set(offsets).size, 3); assert.ok(offsets.every(top => top >= 0 && top < 80), '三行位于不同顶部位置');
       await p.locator('.danmaku-overlay').getByText('自动匹配B站弹幕', { exact: true }).waitFor(); await p.locator('.danmaku-overlay').getByText('自动匹配腾讯弹幕', { exact: true }).waitFor();
+      await video.evaluate(video => video.pause()); await rows.selectOption('1');
+      assert.ok(await active.count() <= 1, '减少行数立即清除超出范围的弹幕');
+      await until(() => preferences.get(cloudFilm.key)?.danmakuRows === 1, '减少行数持久化');
+      holdPreferences = true; await rows.selectOption('3'); await until(() => typeof releasePreferences === 'function', '行数保存请求在途');
+      await p.getByLabel('跳过片头（秒）', { exact: true }).fill('1');
+      await p.getByRole('button', { name: '保存播放偏好', exact: true }).click(); await rows.selectOption('2');
+      holdPreferences = false; releasePreferences(); releasePreferences = null;
+      await until(() => preferences.get(cloudFilm.key)?.danmakuRows === 2 && preferences.get(cloudFilm.key)?.introSeconds === 1 && p.getByRole('button', { name: '保存播放偏好', exact: true }).isEnabled(), '旧保存响应与手动保存不能覆盖最新行数或片头设置');
+      assert.equal(await rows.inputValue(), '2');
+      await p.getByRole('button', { name: '返回夸克资源', exact: true }).click(); await playCloudFile(p);
+      assert.equal(await p.getByLabel('弹幕行数', { exact: true }).inputValue(), '2', '重新打开影片保留已保存行数');
       await p.getByLabel('显示弹幕', { exact: true }).uncheck(); await until(() => preferences.get(cloudFilm.key)?.danmakuEnabled === false, '关闭开关立即保存，不依赖另点保存');
       assert.equal(await p.locator('.danmaku-comment').count(), 0); assert.equal(await p.getByLabel('家庭弹幕', { exact: true }).isVisible(), false);
       const reads = danmakuRequests.filter(row => row.method === 'GET').length; await p.clock.install(); await p.clock.fastForward(20000); assert.equal(danmakuRequests.filter(row => row.method === 'GET').length, reads, '关闭时停止自动请求');
       await p.getByLabel('显示弹幕', { exact: true }).check(); await until(() => preferences.get(cloudFilm.key)?.danmakuEnabled === true, '重新启用开关持久化');
       await p.locator('.danmaku-status').getByText('已加载弹幕：B站 1 条、腾讯视频 1 条', { exact: true }).waitFor();
-      console.log('PASS 夸克播放默认自动查询片名/年份/集名、多来源弹幕实际显示、关闭清屏/停止请求并立即保存、重新启用');
+      console.log('PASS 弹幕默认顶部一行、1至10行选择/三行多来源/减少即清屏、自动保存与旧响应竞争/重新打开保留、关闭停止请求并重新启用');
     });
   }
 
@@ -1267,6 +1296,7 @@ try {
   else if (process.argv.includes('--quark-playback-only')) { for (const verify of [verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure]) await verify(); }
   else if (process.argv.includes('--quark-progress-only')) await verifyQuarkProgressReadiness();
   else if (process.argv.includes('--full-film-timeline-only')) await verifyFullFilmTimeline();
+  else if (process.argv.includes('--danmaku-rows-only')) await verifyAutomaticDanmaku();
   else if (process.argv.includes('--quark-search-only')) {
     app.store.setConfig({ ...app.store.config(), sources: ['first', 'second'].map((id, index) => ({ id, name: ['第一源', '第二源'][index], api: `https://api.example.com/${id}`, enabled: true })) });
     for (const verify of [verifyQuarkPublicSearch, verifyQuarkPendingSearch, verifyQuarkAutoplay]) { app.store.remove('history', cloudFilm.key); await verify(); }

@@ -15,7 +15,7 @@ const ratingResult = { douban: { score: 8, url: 'https://movie.douban.com/subjec
 const catalog = { async detail() { return movie; }, async search() { return { groups: [], failedSources: [] }; } };
 const maintenance = { status() { return { sources: [] }; }, async probe() { return { sources: [] }; }, async update() { return { sources: [] }; } };
 const live = { async list() { return { channels }; }, status() { return []; } };
-const preferences = { key: movie.key, introSeconds: 0, outroSeconds: 0, autoNext: true, danmakuEnabled: true, skipAds: false, adRanges: [], speed: 1 };
+const preferences = { key: movie.key, introSeconds: 0, outroSeconds: 0, autoNext: true, danmakuEnabled: true, danmakuRows: 1, skipAds: false, adRanges: [], speed: 1 };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 
 async function running(t, options = {}) {

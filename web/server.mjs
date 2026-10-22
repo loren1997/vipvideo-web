@@ -406,12 +406,13 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         }
         if (path === '/api/player/preferences' && method === 'GET') {
           const key = text(url.searchParams.get('key'), '影片标识', 8192);
-          return json(res, 200, store.get('player-preferences', key) ?? validatePlayerPreferences({ key }));
+          return json(res, 200, { danmakuRows: 1, ...(store.get('player-preferences', key) ?? validatePlayerPreferences({ key })) });
         }
         if (path === '/api/player/preferences' && method === 'PUT') {
           const input = await readBody(req);
           const old = store.get('player-preferences', text(input?.key, '影片标识', 8192));
           return json(res, 200, store.save('player-preferences', validatePlayerPreferences({ ...input,
+            danmakuRows: input.danmakuRows === undefined ? old?.danmakuRows : input.danmakuRows,
             skipAds: input.skipAds === undefined ? old?.skipAds : input.skipAds,
             adRanges: input.adRanges === undefined ? old?.adRanges : input.adRanges })));
         }

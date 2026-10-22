@@ -17,7 +17,7 @@ let historyQueue = Promise.resolve();
 let quarkProgressQueue = Promise.resolve();
 let importWarnings = [];
 const openSettingsSections = new Set();
-const defaultPreferences = { introSeconds: 0, outroSeconds: 0, autoNext: true, speed: 1, danmakuEnabled: true, skipAds: false, adRanges: [] };
+const defaultPreferences = { introSeconds: 0, outroSeconds: 0, autoNext: true, speed: 1, danmakuEnabled: true, danmakuRows: 1, skipAds: false, adRanges: [] };
 const sourceSuccess = new Map();
 const playabilityCache = new Map();
 let verificationActive = 0;
@@ -1759,7 +1759,23 @@ async function startEpisode(data, line, episode, position = 0, flow = { tried: n
 
 function normalizePreferences(value = {}) {
   const adRanges = (Array.isArray(value.adRanges) ? value.adRanges : []).filter(range => range && typeof range.scope === 'string' && range.scope.length <= 4096 && Number.isFinite(range.start) && Number.isFinite(range.end) && range.start >= 0 && range.end <= 86400 && range.end > range.start && range.end - range.start <= 600).slice(0, 20).map(range => ({ scope: range.scope, start: range.start, end: range.end }));
-  return { introSeconds: Math.max(0, Math.min(600, Number(value.introSeconds) || 0)), outroSeconds: Math.max(0, Math.min(600, Number(value.outroSeconds) || 0)), autoNext: value.autoNext !== false, speed: Number.isFinite(value.speed) && value.speed >= 0.5 && value.speed <= 3 ? value.speed : 1, danmakuEnabled: value.danmakuEnabled !== false, skipAds: value.skipAds === true, adRanges };
+  return { introSeconds: Math.max(0, Math.min(600, Number(value.introSeconds) || 0)), outroSeconds: Math.max(0, Math.min(600, Number(value.outroSeconds) || 0)), autoNext: value.autoNext !== false, speed: Number.isFinite(value.speed) && value.speed >= 0.5 && value.speed <= 3 ? value.speed : 1, danmakuEnabled: value.danmakuEnabled !== false, danmakuRows: Number.isInteger(value.danmakuRows) && value.danmakuRows >= 1 && value.danmakuRows <= 10 ? value.danmakuRows : 1, skipAds: value.skipAds === true, adRanges };
+}
+
+function savePlayerPreferences(current, preferences) {
+  const before = { ...current.preferences };
+  if (preferences) Object.assign(current.preferences, normalizePreferences(preferences));
+  const snapshot = { ...current.preferences };
+  const pending = (current.preferencesQueue || Promise.resolve()).catch(() => {}).then(() => api('/api/player/preferences', {
+    method: 'PUT', body: { key: current.detail.key, ...snapshot },
+  })).catch(error => {
+    if (preferences && current.preferencesQueue === pending) {
+      for (const key of Object.keys(snapshot)) if (current.preferences[key] === snapshot[key]) current.preferences[key] = before[key];
+    }
+    throw error;
+  });
+  current.preferencesQueue = pending; current.detail.preferencesPromise = pending.then(() => ({ ...current.preferences }), () => ({ ...current.preferences }));
+  return pending;
 }
 
 function adScope(current) { return current.quarkAsset ? JSON.stringify(['quark', current.quarkAsset, current.quarkVersion, current.episodeName]) : JSON.stringify([current.detail.source, String(current.detail.id), current.detail.lines[current.line]?.name || '', current.episodeName]); }
@@ -1820,9 +1836,9 @@ function playerAds(current, host) {
     const version = current.adSaveVersion = (current.adSaveVersion || 0) + 1;
     save.disabled = true;
     try {
-      const data = await api('/api/player/preferences', { method: 'PUT', body: { key: current.detail.key, ...next } });
+      await savePlayerPreferences(current, next);
       if (player !== current || version !== current.adSaveVersion) return;
-      Object.assign(prefs, normalizePreferences(data)); current.detail.preferencesPromise = Promise.resolve({ ...prefs }); toggle.checked = prefs.skipAds; draw(); void loadAdMarkers(current); notify('本影片广告设置已保存');
+      toggle.checked = prefs.skipAds; draw(); void loadAdMarkers(current); notify('本影片广告设置已保存');
     } catch (error) { if (player === current && version === current.adSaveVersion) notify(`广告设置未保存：${error.message}`, true); }
     finally { if (player === current && version === current.adSaveVersion) save.disabled = false; }
   }
@@ -1855,6 +1871,9 @@ function seekVideo(current, seconds) {
 function playerPreferences(current, host) {
   const prefs = current.preferences;
   const panel = node('div', undefined, 'player-preferences');
+  const saveDanmaku = () => {
+    void savePlayerPreferences(current).catch(error => { if (player === current) notify(`弹幕设置未保存：${error.message}`, true); });
+  };
   const numbers = {};
   for (const [key, title] of [['introSeconds', '跳过片头（秒）'], ['outroSeconds', '跳过片尾（秒）']]) {
     const label = node('label', title); const input = node('input'); input.type = 'number'; input.min = '0'; input.max = '600'; input.step = '1'; input.value = prefs[key]; input.setAttribute('aria-label', title); label.append(input); panel.append(label); numbers[key] = input;
@@ -1868,21 +1887,22 @@ function playerPreferences(current, host) {
         if (!input.checked) { clearDanmaku(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; if (current.danmakuStatus) current.danmakuStatus.textContent = '弹幕已关闭。'; }
         else { void loadDanmaku(current); startDanmakuSync(current); }
         if (current.danmakuForm) current.danmakuForm.hidden = !input.checked;
-        const snapshot = { key: current.detail.key, ...prefs };
-        current.danmakuPreferenceQueue = (current.danmakuPreferenceQueue || Promise.resolve()).then(() => api('/api/player/preferences', { method: 'PUT', body: snapshot })).then(result => {
-          current.detail.preferencesPromise = Promise.resolve(result);
-        }).catch(error => { if (player === current) notify(`弹幕开关未保存：${error.message}`, true); });
+        saveDanmaku();
       }
     });
   }
+  const rowsLabel = node('label', '弹幕行数'), rows = node('select'); rows.setAttribute('aria-label', '弹幕行数');
+  for (let count = 1; count <= 10; count++) { const option = node('option', `${count} 行`); option.value = String(count); rows.append(option); }
+  rows.value = String(prefs.danmakuRows); rowsLabel.append(rows); panel.append(rowsLabel);
+  rows.addEventListener('change', () => { prefs.danmakuRows = Number(rows.value); clearDanmaku(current); saveDanmaku(); });
   const save = button('保存播放偏好', async () => {
     if (player !== current) return;
     for (const input of Object.values(numbers)) if (!input.reportValidity() || input.value === '') return;
     save.disabled = true;
     try {
-      const result = await api('/api/player/preferences', { method: 'PUT', body: { key: current.detail.key, ...prefs } });
+      await savePlayerPreferences(current);
       if (player !== current) return;
-      Object.assign(prefs, normalizePreferences(result)); current.detail.preferencesPromise = Promise.resolve({ ...prefs }); notify('本影片播放偏好已保存');
+      notify('本影片播放偏好已保存');
     } catch (error) { if (player === current) notify(`偏好未保存：${error.message}`, true); }
     finally { if (player === current) save.disabled = false; }
   }, 'button small');
@@ -1907,7 +1927,7 @@ function drawDanmaku(current) {
   while (state.cursor < state.comments.length && state.comments[state.cursor].time <= time) {
     const comment = state.comments[state.cursor++];
     if (comment.time < time - 1 || state.shown.has(comment.id) || state.active.size >= 12) continue;
-    const lanes = Math.max(1, Math.min(12, Math.floor((current.overlay.clientHeight - 48) / 24)));
+    const lanes = Math.max(1, Math.min(current.preferences.danmakuRows, Math.floor((current.overlay.clientHeight - 48) / 24)));
     const lane = Array.from({ length: lanes }, (_value, index) => index).find(index => ![...state.active.values()].includes(index));
     if (lane === undefined) continue;
     const text = node('span', comment.text, 'danmaku-comment'); text.style.top = `${8 + lane * 24}px`;

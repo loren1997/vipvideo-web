@@ -59,6 +59,31 @@ test('ad inspection resolves configured episodes and preserves ranges for older 
   assert.equal((await call('/api/player/preferences', { key: 'film', skipAds: null }, cookie, 'PUT')).status, 400);
 });
 
+test('danmaku rows roundtrip per film, default for old records and survive older preference updates', async t => {
+  const { app, call, login } = await running(t), cookie = await login();
+  const read = async key => (await call('/api/player/preferences?key=' + key, undefined, cookie)).json();
+  assert.equal((await read('new-film')).danmakuRows, 1);
+  app.store.save('player-preferences', { key: 'legacy-film', introSeconds: 15, danmakuEnabled: false, speed: 1.5 });
+  const legacy = await read('legacy-film');
+  assert.equal(legacy.danmakuRows, 1); assert.equal(legacy.introSeconds, 15); assert.equal(legacy.danmakuEnabled, false);
+  assert.equal(app.store.get('player-preferences', 'legacy-film').danmakuRows, undefined, 'reading an old record does not need a storage rewrite');
+  for (const danmakuRows of [1, 10, 4]) {
+    const response = await call('/api/player/preferences', { key: 'film', danmakuRows }, cookie, 'PUT');
+    assert.equal(response.status, 200); assert.equal((await response.json()).danmakuRows, danmakuRows);
+    assert.equal((await read('film')).danmakuRows, danmakuRows);
+  }
+  assert.equal((await read('other-film')).danmakuRows, 1);
+  const oldClient = await call('/api/player/preferences', { key: 'film', speed: 2 }, cookie, 'PUT');
+  assert.equal(oldClient.status, 200); assert.equal((await oldClient.json()).danmakuRows, 4);
+  assert.equal(app.store.get('player-preferences', 'film').danmakuRows, 4);
+  const migrated = await call('/api/player/preferences', { key: 'legacy-film', speed: 2 }, cookie, 'PUT');
+  assert.equal((await migrated.json()).danmakuRows, 1);
+  for (const danmakuRows of [0, -1, 11, 1.5, null, true, '1', [], {}]) {
+    assert.equal((await call('/api/player/preferences', { key: 'film', danmakuRows }, cookie, 'PUT')).status, 400);
+  }
+  assert.equal((await read('film')).danmakuRows, 4, 'invalid values never replace the saved preference');
+});
+
 test('cloud routes protect account data, resolve trusted selections and proxy only server-created assets', async t => {
   const calls = [], source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
   const settings = () => ({ configured: true, enabled: true, account: { connected: true, label: '已连接账号' } });
