@@ -2114,7 +2114,9 @@ function mountPlayer(current) {
     const duration = playDuration(current), position = playPosition(current);
     clockText.textContent = `${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${formatTime(position)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
     current.fullFilmControls = Boolean(current.transcoded && !current.live && duration > 0);
-    filmControls.hidden = !current.fullFilmControls; video.controls = !current.fullFilmControls;
+    filmControls.hidden = !current.fullFilmControls;
+    // Rewriting controls on every progress update resets the browser's auto-hide timer.
+    if (video.controls !== !current.fullFilmControls) video.controls = !current.fullFilmControls;
     if (current.fullFilmControls) { if (clock.parentNode !== filmControls) filmControls.prepend(clock); if (full.parentNode !== transport) transport.append(full); }
     else { if (clock.parentNode !== host) host.insertBefore(clock, current.note); if (full.parentNode !== toolbar) toolbar.append(full); }
     updateTransport();

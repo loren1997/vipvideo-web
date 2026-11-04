@@ -735,6 +735,74 @@ try {
     await until(() => video.evaluate(video => ({ frames: video.getVideoPlaybackQuality().totalVideoFrames, time: video.currentTime })).then(next => next.frames > first.frames && next.time > first.time), `${label}视频帧与时间递增`);
   }
 
+  async function verifyNativeFullscreenControls() {
+    const before = app.store.config(), savedPreference = preferences.get(controlsFilm.key);
+    let isolated, cdp;
+    try {
+      app.store.setConfig({ ...before, sources: ['first', 'second'].map((id, index) => ({ id, name: ['第一源', '第二源'][index], api: `https://api.example.com/${id}`, enabled: true })) });
+      preferences.set(controlsFilm.key, { introSeconds: 0, outroSeconds: 0, autoNext: false, speed: 1, danmakuEnabled: false });
+      app.store.remove('history', controlsFilm.key);
+      isolated = await context({ width: 1280, height: 800 }); const p = isolated.page;
+      await p.route(/^https:\/\/fixtures\.example\/controls-.*\.mp4\?/, route => route.fulfill({ status: 200, contentType: 'video/mp4', body: videoMedia, headers: { 'Access-Control-Allow-Origin': '*', 'Accept-Ranges': 'bytes' } }));
+      await p.evaluate(() => { location.hash = '#detail?source=first&id=controls'; });
+      const video = p.locator('video');
+      await until(() => video.evaluate(v => v.readyState >= 2 && v.videoWidth > 0 && !v.paused).catch(() => false), '全屏原生控件真实视频');
+      await assertVideoFrames(video, '全屏原生控件样例');
+      assert.equal(await video.evaluate(v => v.controls), true, '普通直放保留原生控件');
+      assert.equal(await p.locator('#full-film-controls').isVisible(), false);
+      await video.evaluate(v => {
+        v.loop = true;
+        window.nativeControlsProbe = { mutations: 0, trustedTimeUpdates: 0 };
+        const observer = new MutationObserver(records => { window.nativeControlsProbe.mutations += records.length; });
+        observer.observe(v, { attributes: true, attributeFilter: ['controls'] });
+        v.addEventListener('timeupdate', event => { if (event.isTrusted) window.nativeControlsProbe.trustedTimeUpdates++; });
+        window.nativeControlsObserver = observer;
+      });
+      await p.getByRole('button', { name: '全屏', exact: true }).click();
+      await until(() => video.evaluate(v => document.fullscreenElement === v), '普通直放进入原生视频全屏');
+      cdp = await isolated.value.newCDPSession(p);
+      const tree = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+      const findPanel = node => {
+        const attrs = node.attributes || [];
+        if (attrs.some((value, index) => value === 'pseudo' && attrs[index + 1] === '-webkit-media-controls-panel')) return node;
+        for (const child of [...(node.children || []), ...(node.shadowRoots || [])]) { const found = findPanel(child); if (found) return found; }
+      };
+      const panel = findPanel(tree.root); assert.ok(panel, 'CDP必须找到Chromium实际UA原生控制面板');
+      const { object } = await cdp.send('DOM.resolveNode', { backendNodeId: panel.backendNodeId });
+      let panelState;
+      const panelVisible = async () => {
+        const result = await cdp.send('Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: 'function() { const style = getComputedStyle(this), box = this.getBoundingClientRect(); return { connected: this.isConnected, opacity: Number(style.opacity), display: style.display, visibility: style.visibility, width: box.width, height: box.height }; }', returnByValue: true });
+        panelState = result.result.value;
+        assert.ok(panelState?.connected, '原生控制面板在播放中保持连接');
+        return panelState.display !== 'none' && panelState.visibility === 'visible' && panelState.opacity > .01 && panelState.width > 0 && panelState.height > 0;
+      };
+      const waitPanel = async (visible, label) => {
+        try { await until(async () => await panelVisible() === visible, label, 8000); }
+        catch (error) { error.message += ` ${JSON.stringify(panelState)}`; throw error; }
+      };
+      await p.mouse.move(640, 300); await waitPanel(true, '鼠标操作显示原生全屏控制条');
+      await waitPanel(false, '持续真实timeupdate时原生全屏控制条闲置隐藏');
+      await p.screenshot({ path: join(output, 'native-fullscreen-controls-idle.png') });
+      await p.mouse.move(690, 320); await waitPanel(true, '鼠标移动唤醒原生全屏控制条');
+      await waitPanel(false, '鼠标停止后原生控制条再次隐藏');
+      await video.focus(); await p.keyboard.press('Space');
+      await until(() => video.evaluate(v => v.paused), '原生全屏键盘暂停');
+      await waitPanel(true, '键盘暂停显示原生控制条');
+      await p.waitForTimeout(3500); assert.equal(await panelVisible(), true, '暂停或键盘焦点时原生控制条保持可见');
+      await p.keyboard.press('Space'); await until(() => video.evaluate(v => !v.paused), '原生全屏键盘恢复播放');
+      const probe = await p.evaluate(() => window.nativeControlsProbe);
+      assert.ok(probe.trustedTimeUpdates >= 8, `必须收到多次真实timeupdate，实际${probe.trustedTimeUpdates}`);
+      assert.equal(probe.mutations, 0, '普通直放的媒体事件不能重复写入controls属性并重置原生隐藏计时');
+      assert.equal(await video.evaluate(v => v.controls), true, '闲置隐藏保留原生controls属性');
+      await p.evaluate(() => { window.nativeControlsObserver.disconnect(); return document.exitFullscreen(); });
+      await until(() => p.evaluate(() => !document.fullscreenElement), '原生全屏退出');
+      console.log('PASS 原生全屏真实timeupdate不重复写controls、Chromium UA控制条闲置隐藏/鼠标唤醒/键盘暂停恢复、暂停和焦点保持可见');
+    } finally {
+      await cdp?.detach(); await isolated?.value.close(); app.store.setConfig(before);
+      if (savedPreference === undefined) preferences.delete(controlsFilm.key); else preferences.set(controlsFilm.key, savedPreference);
+    }
+  }
+
   async function verifyQuarkSubtitles() {
     await withCloudFixture(async open => {
       quarkSubtitleFixture = true; transcodeMode = 'enabled'; transcodeDuration = 30;
@@ -1296,6 +1364,7 @@ try {
   else if (process.argv.includes('--quark-playback-only')) { for (const verify of [verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure]) await verify(); }
   else if (process.argv.includes('--quark-progress-only')) await verifyQuarkProgressReadiness();
   else if (process.argv.includes('--full-film-timeline-only')) await verifyFullFilmTimeline();
+  else if (process.argv.includes('--fullscreen-controls-only')) await verifyNativeFullscreenControls();
   else if (process.argv.includes('--danmaku-rows-only')) await verifyAutomaticDanmaku();
   else if (process.argv.includes('--quark-search-only')) {
     app.store.setConfig({ ...app.store.config(), sources: ['first', 'second'].map((id, index) => ({ id, name: ['第一源', '第二源'][index], api: `https://api.example.com/${id}`, enabled: true })) });
@@ -1920,6 +1989,7 @@ try {
   await cp.locator('video').evaluate(video => video.pause());
   await until(() => app.store.list('history').some(value => value.key === compatibilityFilm.key && value.position >= 62 && value.duration === 1200), '兼容保存原片进度和总时长');
   assert.match(await cp.locator('.player-clock').textContent(), /软件兼容播放/);
+  assert.equal(await cp.locator('video').evaluate(video => video.controls), false, '完整原片时间轴关闭原生短窗口控件');
   assert.equal(playabilityReports.length, originalReports, '转码成功不报告原始URL可播');
   await cp.screenshot({ path: join(output, 'desktop-compatible-player.png'), fullPage: true });
   await cp.setViewportSize({ width: 390, height: 844 });
@@ -1961,6 +2031,7 @@ try {
   assert.equal(playabilityReports.length, manualReports, '手动兼容不更新原流可播状态');
   await cp.locator('#source-row').getByRole('button', { name: '第二源', exact: true }).click();
   await until(() => cp.locator('video').evaluate(video => video.readyState >= 1 && video.currentSrc.includes('controls-second')).catch(() => false), '兼容后仍可按集名手动换源');
+  assert.equal(await cp.locator('video').evaluate(video => video.controls), true, '兼容播放切回普通直放恢复原生控件');
   assert.ok(app.store.list('history').some(value => value.key === controlsFilm.key && value.source === 'second'), '换源恢复正常线路记录');
   console.log('PASS 手动硬件兼容、未知时长不跳片尾/不误保存HLS窗口、按集名换源与任务清理');
 
@@ -2302,6 +2373,7 @@ try {
   await verifyQuarkStartupFailure();
   await verifyQuarkSubtitles();
   await verifyFullFilmTimeline();
+  await verifyNativeFullscreenControls();
   await verifyQuarkCleanupFeedback();
   await verifyAutomaticDanmaku();
   }
