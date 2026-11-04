@@ -291,7 +291,7 @@ html[data-tv="true"] .brand { display:flex; margin-bottom:30px; font-size:28px; 
 html[data-tv="true"] .topbar { min-height:110px; margin-bottom:28px; }
 html[data-tv="true"] h1 { font-size:32px; }
 html[data-tv="true"] h2 { font-size:26px; }
-html[data-tv="true"] .button,html[data-tv="true"] .button.small,html[data-tv="true"] .player-toolbar .button,html[data-tv="true"] .episode-grid .button { min-height:48px; font-size:18px; padding:10px 16px; }
+html[data-tv="true"] .button,html[data-tv="true"] .button.small,html[data-tv="true"] .player-toolbar .button,html[data-tv="true"] .episode-grid .button,html[data-tv="true"] summary { min-height:48px; font-size:18px; padding:10px 16px; }
 html[data-tv="true"] input,html[data-tv="true"] select,html[data-tv="true"] textarea,html[data-tv="true"] .browse-filter select,html[data-tv="true"] .player-toolbar select { min-height:48px; font-size:18px; padding:10px 14px; }
 html[data-tv="true"] label,html[data-tv="true"] .muted,html[data-tv="true"] .card-meta,html[data-tv="true"] .player-note,html[data-tv="true"] .filter-note,html[data-tv="true"] .settings-note { font-size:17px; }
 html[data-tv="true"] .poster-grid { grid-template-columns:repeat(5,minmax(0,1fr)); gap:30px 24px; padding:9px; margin:-9px; }

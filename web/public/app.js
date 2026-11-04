@@ -39,7 +39,7 @@ function applyTvMode() {
 applyTvMode();
 
 function tvControls(root = document) {
-  return [...root.querySelectorAll('a[href],button,input,select,textarea,summary,video[controls],[tabindex]')].filter(element => element.tabIndex >= 0 && !element.disabled && !element.closest('[hidden],[inert],[aria-hidden="true"]') && element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden');
+  return [...root.querySelectorAll('a[href],button,input,select,textarea,summary,video[controls],[tabindex]')].filter(element => (!document.fullscreenElement || document.fullscreenElement.contains(element)) && element.tabIndex >= 0 && !element.disabled && !element.closest('[hidden],[inert],[aria-hidden="true"],details:not([open]) > :not(summary)') && element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden');
 }
 function tvFocusKey(element) {
   return `${element.tagName}:${element.getAttribute('aria-label') || element.id || element.getAttribute('href') || element.textContent.trim().slice(0, 120)}`;
@@ -49,14 +49,15 @@ function tvFocusRoute(final = false) {
   const controls = tvControls(content), saved = tvFocusHistory.get(location.hash);
   if (!controls.length && !final) return;
   let target = saved && controls.find(element => tvFocusKey(element) === saved.key);
-  if (saved && !target && !final) return;
+  if (saved && !target && !final && !document.fullscreenElement) return;
   const home = !location.hash || location.hash.split('?')[0] === '#home';
-  target ||= saved && controls[saved.index] || home && $('.category-tabs .selected', content) || controls.find(element => element.matches('video,.poster-link,.channel-card')) || controls[0] || $('nav a[aria-current="page"]');
+  target ||= saved && controls[saved.index] || home && controls.find(element => element.matches('.category-tabs .selected')) || controls.find(element => element.matches('video,.poster-link,.channel-card')) || controls[0] || tvControls().find(element => element.matches('nav a[aria-current="page"]'));
   if (target) { target.focus({ preventScroll: true }); target.scrollIntoView({ block: 'nearest', inline: 'nearest' }); tvRoutePending = false; }
 }
 document.addEventListener('focusin', event => {
   if (!tvMode || !content.contains(event.target)) return;
-  const controls = tvControls(content); tvFocusHistory.set(location.hash, { key: tvFocusKey(event.target), index: controls.indexOf(event.target) });
+  const controls = tvControls(content); if (!controls.includes(event.target)) return;
+  tvFocusHistory.set(location.hash, { key: tvFocusKey(event.target), index: controls.indexOf(event.target) });
   if (tvFocusHistory.size > 24) tvFocusHistory.delete(tvFocusHistory.keys().next().value);
 });
 new MutationObserver(() => { if (tvRoutePending) tvFocusRoute(); else if (tvMode && document.activeElement === document.body) tvFocusRoute(true); }).observe(content, { childList: true, subtree: true });
@@ -2583,7 +2584,7 @@ function updateSourceStatus() {
 
 async function renderRoute() {
   if ($('#app-view').hidden) return;
-  if (tvMode && !tvFocusHistory.has(location.hash)) {
+  if (tvMode && (!tvFocusHistory.has(location.hash) || document.activeElement?.closest('.browse-filters,.browse-controls'))) {
     const active = document.activeElement;
     if (content.contains(active) && active.matches('select,input,textarea')) tvFocusHistory.set(location.hash, { key: tvFocusKey(active), index: tvControls(content).indexOf(active) });
     else window.scrollTo(0, 0);

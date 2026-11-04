@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { Readable } from 'node:stream';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { createApp } from '../server.mjs';
+import { createSourceMaintenance } from '../lib/source-maintenance.mjs';
 
 const empty = { showAdult: false, sources: [], platforms: [], parsers: [], subscriptions: [], liveSources: [] };
 const movie = { key: '普通影片|2025|movie', source: 'demo', id: '1', title: '普通影片', year: '2025', type: 'movie', category: 'movie',
@@ -48,6 +50,25 @@ async function running(t, options = {}) {
   return { get app() { return app; }, get base() { return base; }, call, login, dataDir,
     async restart() { await app.close(); await open(); } };
 }
+
+test('server resolves the configured Quark API only when background health checks start', { timeout: 5000 }, async t => {
+  let calls = 0, instance;
+  const read = deferred();
+  instance = await running(t, { quark: { async settings() {
+    calls++;
+    void instance.app.quarkSearch.stop();
+    read.resolve();
+    return { searchApi: 'https://configured.example/api/search' };
+  } } });
+  assert.equal(calls, 0);
+  instance.app.store.setMeta('quark-search-pool-v1', JSON.stringify({ lastDiscovery: Date.now() }));
+  await instance.restart();
+  assert.equal(calls, 0);
+  instance.app.quarkSearch.start();
+  await read.promise;
+  await instance.app.quarkSearch.stop();
+  assert.equal(calls, 1);
+});
 
 test('new service endpoints require authentication before reading request JSON or calling providers', async t => {
   let calls = 0;
@@ -223,6 +244,50 @@ test('discovery and live probe endpoints operate on the latest stored configurat
   assert.deepEqual((await discovered.json()).discovery, discoveryStatus);
   assert.deepEqual(await (await instance.call('/api/live/probe', {}, cookie)).json(), { channels });
   assert.deepEqual(events, ['discover', ['probe','https://tv.example/new.m3u'], ['probe','https://tv.example/new.m3u'], ['list','https://tv.example/new.m3u']]);
+});
+
+test('background source quarantine, discovery and recovery take effect in HTTP routes without restarting', async t => {
+  let service, clock = 1_000_000, unavailable = true;
+  const seen = [], source = { id: 'demo', name: '原有源', api: 'https://api.example/vod', enabled: true };
+  const instance = await running(t, {
+    initialConfig: { ...empty, sources: [source] },
+    maintenance: {
+      availableConfig: snapshot => service.availableConfig(snapshot), status: () => service.status(),
+      stop: () => service?.stop(),
+    },
+    catalog: {
+      async search(config) { seen.push(config.sources.map(item => item.id)); return { groups: [], failedSources: [] }; },
+      async browse(config) { seen.push(config.sources.map(item => item.id)); return { items: [] }; },
+      async detail(config, id) {
+        seen.push(config.sources.map(item => item.id));
+        if (!config.sources.some(item => item.id === id && item.enabled !== false)) throw Object.assign(new Error('源不可用'), { status: 404 });
+        return { ...movie, source: id };
+      },
+    },
+  });
+  service = createSourceMaintenance({ store: instance.app.store, now: () => clock, backgroundMode: 'normal', request: async () =>
+    Object.assign(Readable.from([JSON.stringify(unavailable ? { error: 'offline' } : { list: [{ vod_id: 1, vod_name: '样例' }] })]), { statusCode: unavailable ? 503 : 200, headers: {} }) });
+  const cookie = await instance.login();
+  for (let attempt = 0; attempt < 3; attempt++) { await service.probe(); clock += 30 * 60_000; }
+  assert.equal(service.status().sources[0].status, 'quarantined');
+  for (const path of ['/api/search?q=sample', '/api/browse?category=movie']) {
+    assert.equal((await instance.call(path, undefined, cookie)).status, 200);
+    assert.deepEqual(seen.at(-1), [], path);
+  }
+  for (const path of ['/api/detail', '/api/playback', '/api/ratings']) {
+    assert.equal((await instance.call(path + '?source=demo&id=1', undefined, cookie)).status, 404, path);
+    assert.deepEqual(seen.at(-1), [], path);
+  }
+  const added = { id: 'new', name: '新发现源', api: 'https://new.example/vod', enabled: true };
+  instance.app.store.setConfig({ ...instance.app.store.config(), sources: [source, added] });
+  assert.equal((await instance.call('/api/search?q=sample', undefined, cookie)).status, 200);
+  assert.deepEqual(seen.at(-1), ['new'], '后台加入的源立即参与搜索，旧隔离源仍排除');
+  assert.equal((await instance.call('/api/detail?source=new&id=1', undefined, cookie)).status, 200);
+  unavailable = false; await service.probe({ force: false });
+  assert.equal((await instance.call('/api/search?q=sample', undefined, cookie)).status, 200);
+  assert.deepEqual(seen.at(-1), ['demo', 'new'], '定期复查恢复后立即重新参与搜索');
+  assert.equal((await instance.call('/api/playback?source=demo&id=1', undefined, cookie)).status, 200);
+  assert.equal(instance.app.store.config().sources[0].enabled, true, '自动隔离保留用户配置');
 });
 
 test('playability checks and feedback accept only episodes returned by a configured source', async t => {

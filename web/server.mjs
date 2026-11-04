@@ -81,7 +81,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const ratingService = ratings ?? createRatings({ store });
   const danmakuService = danmaku ?? createDanmaku({ store });
   const transcodeService = transcoder ?? createTranscoder({ media, logger });
-  const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store, telegramSearch: createQuarkTelegramSearch({ resolveChannels: createQuarkChannelCatalog({ store }).resolve }), ...(process.env.QUARK_BROWSER_URL === 'http://quark-browser:3020' ? { renderSearch: createQuarkBrowserSearch() } : {}) });
+  const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store, getSearchApi: async () => (await quarkService.settings()).searchApi, telegramSearch: createQuarkTelegramSearch({ resolveChannels: createQuarkChannelCatalog({ store }).resolve }), ...(process.env.QUARK_BROWSER_URL === 'http://quark-browser:3020' ? { renderSearch: createQuarkBrowserSearch() } : {}) });
   const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: searchPool.request, defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
   const cloudCatalog = quarkCatalog ?? createQuarkCatalog({ store });
   const cloudPosters = quarkPosters ?? createQuarkPosters({ catalog: cloudCatalog });

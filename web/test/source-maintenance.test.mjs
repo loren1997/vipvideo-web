@@ -48,6 +48,36 @@ test('quarantines only persistent failures, preserves configuration and recovers
   await service.stop();
 });
 
+test('persisted quarantine respects retry deadlines, manual disable and explicit API changes after restart', async () => {
+  let clock = 1_000_000, calls = 0;
+  const store = memoryStore(config({ sources: [source('a')] }));
+  const failed = createSourceMaintenance({ store, now: () => clock, request: async () => { calls++; return response('unavailable', 503); } });
+  for (let index = 0; index < 3; index++) {
+    await failed.probe({ force: false });
+    if (index < 2) clock += 30 * 60_000;
+  }
+  const retryAt = failed.status().sources[0].retryAt;
+  assert.ok(retryAt > clock); await failed.stop();
+  const recovered = createSourceMaintenance({ store, now: () => clock, request: async () => { calls++; return response({ list: [] }); } });
+  assert.equal(recovered.status().sources[0].status, 'quarantined');
+  assert.equal(recovered.status().sources[0].failures, 3);
+  assert.equal(recovered.availableConfig().sources.length, 0);
+  await recovered.probe({ force: false }); assert.equal(calls, 3, 'restart does not bypass the persisted retry deadline');
+  store.setConfig(config({ sources: [source('a', { enabled: false })] }));
+  clock = retryAt; await recovered.probe({ force: false }); await recovered.probe();
+  assert.equal(calls, 3, 'neither automatic nor manual checks probe a manually disabled source');
+  assert.equal(recovered.status().sources[0].status, 'disabled');
+  assert.equal(store.config().sources[0].enabled, false);
+  const replacement = source('a', { api: 'https://replacement.example/api.php' });
+  store.setConfig(config({ sources: [replacement] }));
+  assert.equal(recovered.status().sources[0].status, 'unknown');
+  assert.deepEqual(recovered.availableConfig().sources, [replacement], 'old endpoint quarantine does not hide the replacement');
+  await recovered.probe({ force: false });
+  assert.equal(calls, 4); assert.equal(recovered.status().sources[0].status, 'ok');
+  assert.equal(recovered.status().sources[0].failures, 0);
+  await recovered.stop();
+});
+
 test('new subscription sources must pass actual media validation and large feeds continue in stable windows', async () => {
   const store = memoryStore(config({ subscriptions: [subscription()] }));
   const remote = feed(...Array.from({ length: 205 }, (_, i) => source(`s${i}`)));

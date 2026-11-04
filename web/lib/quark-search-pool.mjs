@@ -140,7 +140,7 @@ const result = (rows, query, reason, pending = false, known = new Set()) => {
   return Object.assign(Readable.from([body]), { statusCode: 200, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } });
 };
 
-export function createQuarkSearchPool({ store, request = createQuarkSearchRequest(), discoveryRequest = createQuarkPublicRequest(), webRequest = createQuarkPublicRequest(), googleSearch = searchGoogleQuark, renderSearch, telegramSearch, now = Date.now } = {}) {
+export function createQuarkSearchPool({ store, request = createQuarkSearchRequest(), discoveryRequest = createQuarkPublicRequest(), webRequest = createQuarkPublicRequest(), googleSearch = searchGoogleQuark, renderSearch, telegramSearch, getSearchApi, now = Date.now } = {}) {
   if (!store?.meta || !store?.setMeta) throw new TypeError('Search pool requires store metadata');
   let state = { candidates: [], retired: [], lastDiscovery: 0, lastHealth: 0, healthCursor: 0, discoveryCursor: 0, discoveryError: '' };
   let active = 0, timer, started = false, stopping = false, discoveryJob, currentPrimary;
@@ -253,16 +253,48 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
     return url.href;
   }
+  async function configuredEndpoint() {
+    const value = await getSearchApi();
+    if (typeof value !== 'string') throw failure('搜索接口配置无效', 400, true);
+    return endpoint(value || SIDECAR, true);
+  }
+  async function stillConfigured(row) {
+    if (stopping) return false;
+    if (row.automatic || typeof getSearchApi !== 'function') return true;
+    try { return await configuredEndpoint() === row.url && !stopping; }
+    catch { return false; }
+  }
   async function verifyCandidates() {
     if (stopping) return;
-    if (prune()) persist();
-    const rows = state.candidates.filter(row => row.automatic && row.retryAt <= now() && (row.status !== 'healthy' || now() - row.checkedAt >= HEALTH_INTERVAL));
-    for (let count = 0; count < Math.min(2, rows.length) && !stopping; count++) {
-      const row = rows[(state.healthCursor + count) % rows.length];
-      try { const links = compatible(await text(apiUrl(row.url, '星际穿越'), 4000), now()); if (stopping) break; if (links === undefined) throw failure('搜索接口格式不兼容'); checked(row, links); }
-      catch (cause) { if (stopping) break; failed(row, cause); }
+    let primary;
+    if (typeof getSearchApi === 'function') {
+      try {
+        const url = await configuredEndpoint(); if (stopping) return;
+        currentPrimary = url; primary = add(url, url === SIDECAR ? '内置搜索助手' : '手动配置', false);
+      } catch { if (stopping) return; state.discoveryError = '当前搜索接口配置暂不可读取，保留现有接口'; }
     }
-    if (!stopping) { state.healthCursor += Math.min(2, rows.length); state.lastHealth = now(); persist(); }
+    if (prune()) persist();
+    const due = row => row.retryAt <= now() && (row.status !== 'healthy' || now() - row.checkedAt >= HEALTH_INTERVAL);
+    const rows = state.candidates.filter(row => row.automatic && due(row)), selected = primary && due(primary) ? [primary] : [];
+    const count = Math.min(2 - selected.length, rows.length);
+    for (let index = 0; index < count; index++) selected.push(rows[(state.healthCursor + index) % rows.length]);
+    for (const row of selected) {
+      if (stopping) break;
+      try {
+        const probe = row.automatic ? request : async (url, options) => {
+          if (!await stillConfigured(row)) throw failure('搜索接口配置已改变', 503, true);
+          return request(url, options);
+        };
+        const links = compatible(await text(apiUrl(row.url, '星际穿越'), 4000, probe), now());
+        if (stopping) break; if (!await stillConfigured(row)) continue;
+        if (links === undefined) throw failure('搜索接口格式不兼容'); checked(row, links);
+      } catch (cause) {
+        if (stopping) break;
+        // Local queuing must leave enough of the four-second probe to judge the API.
+        if (await stillConfigured(row) && (cause?.searchBudgetMs ?? 4000) >= 3000) failed(row, cause);
+      }
+    }
+    if (!stopping) { state.healthCursor += count; state.lastHealth = now(); persist(); }
   }
   function status() {
     const automatic = state.candidates.filter(row => row.automatic && row.url !== currentPrimary);

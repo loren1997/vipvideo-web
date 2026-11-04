@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1162,7 +1162,33 @@ try {
       await p.getByRole('button', { name: '全屏', exact: true }).click();
       await until(() => p.evaluate(() => document.fullscreenElement?.classList.contains('player-frame')), '完整时间轴与基本控件共同进入全屏');
       assert.equal(await controls.evaluate(el => document.fullscreenElement.contains(el)), true);
-      await p.getByRole('button', { name: '退出全屏', exact: true }).click();
+      if (tv) {
+        const tvOutput = resolve(process.env.TV_TEST_OUTPUT || '.test-output'); await mkdir(tvOutput, { recursive: true });
+        const fullscreenLayouts = [];
+        for (const viewport of [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }]) {
+          await p.setViewportSize(viewport);
+          for (const button of await controls.locator('button').all()) for (const key of ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) {
+            await button.focus(); await p.keyboard.press(key);
+            assert.equal(await p.evaluate(() => document.fullscreenElement.contains(document.activeElement)), true, `TV全屏${key}不把焦点移到屏外控件`);
+          }
+          await video.focus(); await p.keyboard.press('ArrowDown');
+          assert.equal(await controls.evaluate(el => el.contains(document.activeElement)), true, 'TV全屏下键进入完整播放控件');
+          assert.equal(await video.evaluate(v => { v.focus(); v.blur(); return document.activeElement === document.body; }), true, '模拟全屏原生焦点丢失到body');
+          await p.keyboard.press('ArrowDown');
+          await until(() => p.evaluate(() => document.fullscreenElement.contains(document.activeElement)), 'TV全屏body焦点由方向键恢复到屏内');
+          await p.evaluate(() => {
+            const control = document.createElement('button'); control.textContent = '临时全屏控件';
+            document.fullscreenElement.append(control); control.focus(); control.remove();
+          });
+          await until(() => p.evaluate(() => document.fullscreenElement.contains(document.activeElement)), 'TV全屏移除当前末端控件后MutationObserver恢复屏内焦点');
+          const layout = await controls.evaluate(el => ({ width: innerWidth, height: innerHeight, overflow: document.documentElement.scrollWidth - innerWidth, controls: el.getBoundingClientRect().toJSON() }));
+          assert.ok(layout.overflow <= 1 && layout.controls.top >= 0 && layout.controls.bottom <= layout.height, 'TV全屏完整控制条在视口内且不溢出');
+          fullscreenLayouts.push(layout); await p.screenshot({ path: join(tvOutput, `tv-${viewport.width}-fullscreen.png`) });
+        }
+        await writeFile(join(tvOutput, 'tv-fullscreen-layouts.json'), JSON.stringify(fullscreenLayouts, null, 2));
+        await p.getByRole('button', { name: '退出全屏', exact: true }).focus();
+        await p.keyboard.press('Enter');
+      } else await p.getByRole('button', { name: '退出全屏', exact: true }).click();
       await until(() => p.evaluate(() => !document.fullscreenElement), '完整播放器退出全屏');
       const before = transcodeStarts.length, progress = quarkProgress.length;
       holdTranscode = true;
@@ -1287,7 +1313,8 @@ try {
     const before = app.store.config(), savedQuark = structuredClone(quarkSettings); let isolated;
     const tvChannel = { id: 'tv-remote-fixture', name: '遥控直播样例', group: '测试频道', streams: [{ name: '测试直连', type: 'mp4', status: 'ok', url: 'https://fixtures.example/tv-remote.mp4?token=fixture' }] };
     channels.push(tvChannel);
-    const tvOutput = resolve('.test-output'); await mkdir(tvOutput, { recursive: true });
+    const tvOutput = resolve(process.env.TV_TEST_OUTPUT || '.test-output'); await mkdir(tvOutput, { recursive: true });
+    const layouts = [];
     app.store.setConfig({ ...before, sources: ['first', 'second'].map(id => ({ id, name: id, api: `https://api.example.com/${id}`, enabled: true })), liveSources: [{ id: 'fixture-live', name: '测试直播源', url: 'https://live.example/test.m3u', enabled: true }] });
     Object.assign(quarkSettings, { enabled: true, configured: true, autoSave: false, account: { connected: true, label: '测试账号' } });
     try {
@@ -1351,10 +1378,64 @@ try {
       await p.evaluate(() => { delete window.Hls; location.hash = '#live'; }); const channel = p.locator('.channel-card[data-channel="tv-remote-fixture"]'); await channel.waitFor(); await channel.focus(); await p.keyboard.press('Enter');
       await until(() => p.locator('video').evaluate(video => video.readyState >= 2 && !video.paused && video.currentSrc.includes('/tv-remote.mp4')).catch(() => false), 'TV频道海报确定后直接播放');
       assert.equal(await channel.locator('.channel-caption strong').evaluate(element => getComputedStyle(element).fontSize), '18px');
+      const captureLayout = async name => {
+        const layout = await p.evaluate(() => {
+          const active = document.activeElement, focus = active.getBoundingClientRect(), style = getComputedStyle(active);
+          const controls = [...document.querySelectorAll('button,select,summary')].filter(el => !el.disabled && el.getClientRects().length);
+          return { width: innerWidth, height: innerHeight, overflow: document.documentElement.scrollWidth - innerWidth, scrollY, focus: { label: active.getAttribute('aria-label') || active.textContent.trim().slice(0, 80), top: focus.top, bottom: focus.bottom, outline: style.outlineStyle, outlineWidth: parseFloat(style.outlineWidth) }, smallTargets: controls.filter(el => el.getBoundingClientRect().height < 47).map(el => ({ label: el.getAttribute('aria-label') || el.textContent.trim().slice(0, 80), height: el.getBoundingClientRect().height })), clippedButtons: controls.filter(el => el.matches('button') && el.scrollWidth > el.clientWidth + 1 && getComputedStyle(el).overflowX === 'visible').map(el => el.textContent.trim().slice(0, 80)) };
+        });
+        assert.ok(layout.overflow <= 1, `${name}无横向溢出`);
+        assert.deepEqual(layout.smallTargets, [], `${name}遥控按钮和选择器高度至少48px`);
+        assert.deepEqual(layout.clippedButtons, [], `${name}按钮文字不溢出`);
+        assert.ok(layout.focus.top >= 0 && layout.focus.bottom <= layout.height, `${name}焦点滚动到可见区域`);
+        assert.notEqual(layout.focus.outline, 'none', `${name}焦点清晰可见`); assert.ok(layout.focus.outlineWidth >= 3);
+        layouts.push({ name, ...layout }); await p.screenshot({ path: join(tvOutput, `${name}.png`) });
+      };
+      for (const viewport of [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }]) {
+        await p.setViewportSize(viewport);
+        await p.locator('nav a[href="#home"]').focus(); await p.keyboard.press('Enter');
+        const genre = p.getByLabel('影片类型', { exact: true }); await genre.waitFor(); await genre.focus();
+        const previousGenre = await genre.elementHandle(); await p.keyboard.press('ArrowDown');
+        await until(() => previousGenre.evaluate(el => !el.isConnected), 'TV筛选路由完成重绘'); await previousGenre.dispose();
+        await until(() => genre.inputValue().then(value => value !== ''), 'TV遥控类型筛选');
+        try { await until(() => genre.evaluate(el => el === document.activeElement), '筛选刷新保留原控件焦点'); }
+        catch (error) { console.error('TV_FILTER_FOCUS', JSON.stringify(await p.evaluate(() => ({ width: innerWidth, hash: location.hash, active: document.activeElement.outerHTML.slice(0, 500) })))); throw error; }
+        await p.keyboard.press('ArrowRight'); assert.equal(await p.evaluate(() => document.activeElement.getAttribute('aria-label')), '上映年份', '选择器可用左右键离开，不困在选项里');
+        await captureLayout(`tv-${viewport.width}-home-filters`);
+        await p.locator('nav a[href="#settings"]').focus(); await p.keyboard.press('Enter');
+        const summaries = p.locator('details.settings-section > summary'); await summaries.first().waitFor();
+        await summaries.first().focus();
+        const settingsTrace = [];
+        for (let index = 0; index < 25 && !await summaries.last().evaluate(el => document.activeElement.getBoundingClientRect().top >= el.getBoundingClientRect().top - 1); index++) {
+          settingsTrace.push(await p.evaluate(() => ({ label: document.activeElement.getAttribute('aria-label') || document.activeElement.textContent.trim().slice(0, 60), tag: document.activeElement.tagName, top: document.activeElement.getBoundingClientRect().top })));
+          await p.keyboard.press('ArrowDown');
+        }
+        if (!await summaries.last().evaluate(el => el === document.activeElement)) await p.keyboard.press(await summaries.last().evaluate(el => el.getBoundingClientRect().left > document.activeElement.getBoundingClientRect().left ? 'ArrowRight' : 'ArrowLeft'));
+        if (!await summaries.last().evaluate(el => el === document.activeElement)) {
+          console.error('TV_SETTINGS_FOCUS', JSON.stringify({ trace: settingsTrace, ...await p.evaluate(() => ({ active: { tag: document.activeElement.tagName, label: document.activeElement.textContent.trim().slice(0, 80), box: document.activeElement.getBoundingClientRect().toJSON() }, summaries: [...document.querySelectorAll('details.settings-section > summary')].map(el => ({ label: el.textContent.trim().slice(0, 80), open: el.parentElement.open, box: el.getBoundingClientRect().toJSON() })) })) }));
+          await p.screenshot({ path: join(tvOutput, 'settings-navigation-failure.png') });
+        }
+        assert.equal(await summaries.last().evaluate(el => el === document.activeElement), true, 'TV可用方向键滚动到设置目录末尾');
+        if (!await summaries.last().evaluate(el => el.parentElement.open)) await p.keyboard.press('Enter');
+        await until(() => summaries.last().evaluate(el => el.parentElement.open), '末尾设置确定展开'); await p.keyboard.press('ArrowDown');
+        assert.equal(await p.evaluate(() => Boolean(document.activeElement.closest('details.settings-section[open]'))), true, `末尾设置展开后控件可达 ${await p.evaluate(() => JSON.stringify({ width: innerWidth, active: document.activeElement.outerHTML.slice(0, 300) }))}`);
+        await captureLayout(`tv-${viewport.width}-settings-scroll`);
+        await p.locator('nav a[href="#quark"]').focus(); await p.keyboard.press('Enter');
+        const cloudPoster = p.getByRole('button', { name: `查看 ${cloudMovie.title}`, exact: true }); await cloudPoster.waitFor();
+        await p.locator('.category-tabs button').first().focus(); await p.keyboard.press('ArrowDown');
+        assert.equal(await p.evaluate(() => Boolean(document.activeElement.closest('.browse-filters'))), true, 'TV影院分类下键进入筛选');
+        await cloudPoster.focus(); await captureLayout(`tv-${viewport.width}-cinema`); await p.keyboard.press('Enter');
+        await p.locator('#quark-resources').waitFor();
+        const moreResources = p.getByRole('button', { name: '查找更多公开资源', exact: true });
+        await until(() => moreResources.isEnabled(), 'TV影院资源面板就绪'); await moreResources.focus();
+        await captureLayout(`tv-${viewport.width}-cinema-detail`);
+        await p.goBack(); await cloudPoster.waitFor(); await until(() => cloudPoster.evaluate(el => el === document.activeElement), 'TV影院返回保留原海报焦点');
+      }
       for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
         const ordinary = await context(viewport); try { assert.equal(await ordinary.page.locator('html').getAttribute('data-tv'), 'false'); assert.ok(await ordinary.page.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1); } finally { await ordinary.value.close(); }
       }
-      console.log('PASS 既有Android TV UA自动适配、侧栏/搜索/分类/海报/剧集/夸克/设置Dpad、输入caret、播放器确定与seek/按钮导航、返回焦点、本机切换与手机桌面；HLS有限缓冲/1080起播ABR/实际清晰度切换与释放');
+      await writeFile(join(tvOutput, 'tv-layouts.json'), JSON.stringify(layouts, null, 2));
+      console.log('PASS 既有Android TV UA自动适配、1080p/720p筛选/影院/设置目录遥控和滚动、48px控件/焦点/文字溢出、搜索/选集/播放器/返回焦点、本机切换与手机桌面；HLS有限缓冲/1080起播ABR/实际清晰度切换与释放');
     } finally { await isolated?.value.close(); app.store.setConfig(before); Object.assign(quarkSettings, savedQuark); channels.splice(channels.indexOf(tvChannel), 1); }
   }
 
@@ -1373,7 +1454,7 @@ try {
   else if (process.argv.includes('--quark-startup-only')) await verifyQuarkStartupFailure();
   else if (process.argv.includes('--quark-subtitles-only')) await verifyQuarkSubtitles();
   else if (process.argv.includes('--playback-fixes-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyFullFilmTimeline, verifyQuarkSubtitles, verifyQuarkCleanupFeedback, verifyAutomaticDanmaku]) await verify(); }
-  else if (process.argv.includes('--tv-only')) await verifyTvRemote();
+  else if (process.argv.includes('--tv-only')) { await verifyTvRemote(); await verifyFullFilmTimeline(); }
   else {
   const { page } = await context({ width: 1440, height: 1000 });
   await page.locator('.notice').filter({ hasText: '还没有影视源' }).waitFor();

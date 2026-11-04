@@ -302,11 +302,11 @@ test('channel cursors continue past the fourth page while Google page numbers wr
   } finally { await f.pool.stop(); }
 });
 
-function fixture({ request, discoveryRequest, webRequest, renderSearch, telegramSearch, googleSearch = async () => { throw new Error('Fixture Google search unavailable'); }, saved, now = Date.now } = {}) {
+function fixture({ request, discoveryRequest, webRequest, renderSearch, telegramSearch, getSearchApi, googleSearch = async () => { throw new Error('Fixture Google search unavailable'); }, saved, now = Date.now } = {}) {
   const metadata = new Map(saved ? [[KEY, JSON.stringify(saved)]] : []), calls = [], discoveryCalls = [];
   const store = { meta: key => metadata.get(key), setMeta: (key, value) => metadata.set(key, value) };
   const transport = async (url, options) => { calls.push({ url, options }); return request ? request(url, options) : response(json(undefined, new URL(url).searchParams.get('kw') || '电影')); };
-  const pool = createQuarkSearchPool({ store, now, googleSearch, renderSearch, telegramSearch, webRequest: webRequest || transport,
+  const pool = createQuarkSearchPool({ store, now, googleSearch, renderSearch, telegramSearch, getSearchApi, webRequest: webRequest || transport,
     request: transport,
     discoveryRequest: async (url, options) => {
       discoveryCalls.push({ url, options });
@@ -470,6 +470,23 @@ test('public metadata, README and RSS add bounded candidates and only compatible
   } finally { await f.pool.stop(); }
 });
 
+test('an automatically discovered and verified API becomes a real foreground backup after restart', async () => {
+  const published = 'https://published.example/api/search';
+  const answer = url => response(new URL(url).hostname === 'published.example' ? json() : '{"results":[]}');
+  const f = fixture({ request: answer }), calls = [];
+  let restarted;
+  try {
+    await f.pool.discover();
+    assert.equal(f.pool.status().candidates.find(row => row.apiUrl === published).status, 'healthy');
+    await f.pool.stop();
+    restarted = createQuarkSearchPool({ store: f.store, request: async (url, options) => { calls.push({ url, options }); return answer(url); } });
+    const data = await lookup(restarted);
+    assert.equal(data.results[0].url, quarkUrl + '?pwd=1234');
+    assert.ok(calls.some(call => call.url.startsWith(published + '?') && new URL(call.url).searchParams.get('kw') === '电影'));
+    assert.ok(calls.every(call => !/cookie|authorization|user-token|user-cookie/i.test(JSON.stringify(call.options))));
+  } finally { await restarted?.stop(); await f.pool.stop(); }
+});
+
 test('empty search JSON stays pending and HTML with a share cannot become a healthy API', async () => {
   const f = fixture({ request: url => response(new URL(url).hostname === 'so.252035.xyz' ? '{"results":[]}' : `<html>${quarkUrl}</html>`) });
   try {
@@ -562,6 +579,99 @@ test('six-hour background health verification restores a paused automatic backup
     assert.equal(f.pool.status().candidates.find(row => row.apiUrl === backup).status, 'healthy');
     assert.equal(f.discoveryCalls.length, 0);
     assert.equal(JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === backup).failures, 0);
+  } finally { await f.pool.stop(); }
+});
+
+test('starting the pool verifies the current configured API before any foreground search', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const configured = 'https://configured.example/api/search';
+  let reads = 0;
+  const f = fixture({ saved: { lastDiscovery: Date.now() }, getSearchApi: async () => { reads++; return configured; } });
+  try {
+    assert.equal(reads, 0, 'the resolver must not run before the server finishes constructing services');
+    f.pool.start(); t.mock.timers.tick(0); await flush();
+    const probe = f.calls.find(call => call.url.startsWith(configured + '?'));
+    assert.ok(probe); assert.equal(new URL(probe.url).searchParams.get('kw'), '星际穿越');
+    assert.equal(f.pool.status().candidates.find(row => row.apiUrl === configured).status, 'healthy');
+    assert.equal(JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === configured).automatic, false);
+    assert.equal(f.discoveryCalls.length, 0);
+  } finally { await f.pool.stop(); }
+});
+
+test('a paused configured API survives restart and recovers through the six-hour health check without a search', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const configured = 'https://configured.example/api/search';
+  const f = fixture({ getSearchApi: () => configured, saved: { lastDiscovery: Date.now(), candidates: [
+    { url: configured, automatic: false, status: 'paused', failures: 2, addedAt: 1, checkedAt: Date.now(), retryAt: Date.now() + 15 * 60_000 },
+  ] } });
+  let restarted;
+  try {
+    await f.pool.stop();
+    restarted = createQuarkSearchPool({ store: f.store, getSearchApi: () => configured, request: async (url, options) => { f.calls.push({ url, options }); return response(json()); } });
+    restarted.start(); t.mock.timers.tick(0); await flush();
+    assert.ok(f.calls.every(call => !call.url.startsWith(configured + '?')), 'restart retains the current cooldown');
+    t.mock.timers.tick(6 * 60 * 60_000); await flush();
+    const row = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === configured);
+    assert.equal(row.status, 'healthy'); assert.equal(row.failures, 0); assert.equal(row.retryAt, 0);
+    assert.ok(f.calls.some(call => call.url.startsWith(configured + '?')));
+  } finally { await restarted?.stop(); await f.pool.stop(); }
+});
+
+test('changing the configured API while its probe is queued prevents the old dispatch and future checks', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const previous = 'https://previous.example/api/search', replacement = 'https://replacement.example/api/search';
+  let configured = previous;
+  const f = fixture({ saved: { lastDiscovery: Date.now() }, getSearchApi: () => configured, request: async url => {
+    if (new URL(url).hostname.startsWith('busy')) await new Promise(done => setTimeout(done, 3500));
+    return response(json());
+  } });
+  try {
+    const busy = Promise.all(['busy1', 'busy2'].map(name => lookup(f.pool, `https://${name}.example/api/search?kw=电影`)));
+    await flush(); f.pool.start(); t.mock.timers.tick(0); await flush();
+    configured = replacement; t.mock.timers.tick(3500); await flush(); await busy;
+    assert.ok(f.calls.every(call => !call.url.startsWith(previous + '?')));
+    const old = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === previous);
+    assert.equal(old.status, 'pending'); assert.equal(old.failures, 0);
+    t.mock.timers.tick(6 * 60 * 60_000); await flush();
+    assert.equal(f.pool.status().candidates.find(row => row.apiUrl === replacement).status, 'healthy');
+    assert.ok(f.calls.every(call => !call.url.startsWith(previous + '?')));
+  } finally { await f.pool.stop(); }
+});
+
+test('a configured probe completing after a configuration change cannot publish the old health result', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const previous = 'https://previous.example/api/search';
+  let configured = previous, complete;
+  const f = fixture({ saved: { lastDiscovery: Date.now() }, getSearchApi: () => configured,
+    request: url => url.startsWith(previous + '?') ? new Promise(done => { complete = done; }) : response(json()) });
+  try {
+    f.pool.start(); t.mock.timers.tick(0); await flush(); assert.equal(typeof complete, 'function');
+    configured = 'https://replacement.example/api/search'; complete(response(json())); await flush();
+    const old = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === previous);
+    assert.equal(old.status, 'pending'); assert.equal(old.checkedAt, 0); assert.equal(old.failures, 0);
+  } finally { complete?.(response(json())); await f.pool.stop(); }
+});
+
+test('a background probe shortened by foreground queuing cannot suspend a healthy API', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 6 * 60 * 60_000 + 1000 });
+  const saved = savedBackup(Date.now()); saved.lastDiscovery = Date.now(); saved.candidates[0].checkedAt = 1;
+  let backupCalls = 0;
+  const f = fixture({ saved, request: async url => {
+    const host = new URL(url).hostname;
+    if (host === 'manual.example' || host === 'backup.example' && ++backupCalls === 1) await new Promise(done => setTimeout(done, 3500));
+    else if (host === 'backup.example') await new Promise(done => setTimeout(done, 600));
+    return response(json());
+  } });
+  try {
+    const pending = lookup(f.pool); await flush();
+    f.pool.start(); t.mock.timers.tick(0); await flush();
+    t.mock.timers.tick(3500); await flush(); await pending;
+    const short = f.calls.filter(call => new URL(call.url).hostname === 'backup.example').at(-1);
+    assert.equal(short.options.timeout, 500);
+    t.mock.timers.tick(500); await flush();
+    const row = JSON.parse(f.metadata.get(KEY)).candidates.find(row => row.url === backup);
+    assert.equal(row.status, 'healthy'); assert.equal(row.failures, 0); assert.equal(row.retryAt, 0);
+    t.mock.timers.tick(100); await flush();
   } finally { await f.pool.stop(); }
 });
 
