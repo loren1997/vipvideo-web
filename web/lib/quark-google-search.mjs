@@ -15,6 +15,9 @@ const text = html => entities(html.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' '
 const attribute = (html, name) => entities(new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i').exec(html)?.slice(1).find(value => value !== undefined) || '');
 const blocked = html => /g-recaptcha|h-captcha|cf-chl-|our systems have detected|unusual traffic|<title[^>]*>[^<]*(?:验证码|安全验证|登录|sign\s?in|log\s?in)|<title[^>]*>\s*人机验证\s*<\/title\s*>/i.test(html);
 const resourceWords = /^(?:(?:电影|影视|电视剧|剧集|动漫|动画|国漫|日漫|韩剧|美剧|日剧|国产|韩国|日本|美国|中国|综艺|纪录片|科幻|动作|剧情|喜剧|惊悚|恐怖|悬疑|爱情|犯罪|战争|片|最新|新片|网盘|夸克|资源|链接|地址|下载|分享|转存|保存|查看|点击|立即|前往|访问|获取|提取|这里|此处|打开|视频|高清|超清|蓝光|原盘|国语|粤语|中字|中英字幕|完结|全集|4k|8k|hd|hdr|movie|tv|anime|未提供资源标题|未知标题)|(?:480|720|1080|2160)p|(?:19|20)\d{2})*$/i;
+const resourceCue = /夸克|网盘|资源|下载|分享/i;
+
+export const hasQuarkResourceCue = value => typeof value === 'string' && resourceCue.test(value);
 
 export function classifyQuarkCandidate(value, { title, aliases = [], year = '', requireYear = false } = {}) {
   const label = typeof value === 'string' ? value.normalize('NFKC').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 1000) : '';
@@ -135,11 +138,18 @@ function articleBody(html) {
 export const googleQueryUrl = (q, page = 0) => 'https://www.google.com/search?' + new URLSearchParams({ q: q.replace(/^"([^"]+)"/, '$1'), hl: 'zh-CN', tbs: 'sbd:1', ...(page ? { start: String(Math.min(2, Math.max(0, page)) * 10) } : {}) });
 export const bingQueryUrl = (q, page = 0, rss = false) => (rss ? 'https://www.bing.com/search?' : 'https://cn.bing.com/search?') + new URLSearchParams({ q, ...(rss ? { format: 'rss' } : { setlang: 'zh-hans', ensearch: '0' }), ...(page ? { first: String(Math.min(2, Math.max(0, page)) * 10 + 1) } : {}) });
 
+export function quarkSearchTitleVariants(title) {
+  if (typeof title !== 'string' || !title.trim()) return [];
+  const exact = title.trim(), plain = exact.replace(/[!！?？。…]+$/u, '').trimEnd();
+  return [...new Set([exact, ...(plain.length >= 2 ? [plain] : [])])];
+}
+
 export function quarkSearchQueries({ title, aliases = [], year = '' } = {}) {
   if (typeof title !== 'string' || !title.trim()) return [];
   const compact = /^([\p{Script=Han}]{2,})((?:19|20)\d{2})$/u.exec(title.trim());
   const split = compact && (!year || String(year) === compact[2]);
-  const names = [...new Set([split ? compact[1] : title.trim(), ...(Array.isArray(aliases) ? aliases : [])].filter(value => typeof value === 'string' && value.trim() && value.length <= 300).map(value => value.trim().replace(/["“”\u0000-\u001f\u007f]/g, ' ')))].slice(0, 3);
+  const variants = quarkSearchTitleVariants(split ? compact[1] : title);
+  const names = [...new Set([...variants, ...(Array.isArray(aliases) ? aliases : [])].filter(value => typeof value === 'string' && value.trim() && value.length <= 300).map(value => value.trim().replace(/["“”\u0000-\u001f\u007f]/g, ' ')))].slice(0, variants.length + 2);
   const stamp = /^(?:19|20)\d{2}$/.test(String(year)) ? String(year) : split ? compact[2] : '';
   const exact = name => `"${name}"${stamp ? ' ' + stamp : ''}`;
   return [...names.map(name => exact(name) + ' 夸克 网盘'), `"${names[0]}" 夸克`];
@@ -181,7 +191,7 @@ export function extractQuarkSearchResults(raw, { engine = 'Google', url = engine
       if (anchor) add(attribute(anchor[1], 'href'), text(anchor[2]));
     }
   }
-  return results.sort((a, b) => Number(/夸克|网盘|资源|下载|分享/i.test(b.name)) - Number(/夸克|网盘|资源|下载|分享/i.test(a.name)));
+  return results.sort((a, b) => Number(hasQuarkResourceCue(b.name)) - Number(hasQuarkResourceCue(a.name)));
 }
 
 // shortcut: reads complete JSON Flight records, add bounded stream assembly when a resource spans chunks.
@@ -261,7 +271,7 @@ export function extractQuarkArticle(html, { url, title, aliases = [], year, requ
 async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now, aliases = [], year, titleOnly = false, page = 0 } = {}) {
   if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 1000 || typeof read !== 'function') return [];
   const title = titleOnly === true ? keyword.trim() : keyword.trim().replace(/\s+(?:19|20)\d{2}$/, ''), term = normalize(title);
-  const end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, now() + 3000);
+  const end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, now() + 10000);
   if (!term || end <= now()) return [];
   const names = [...new Set([title, ...(Array.isArray(aliases) ? aliases.slice(0, 10) : []).filter(value => typeof value === 'string' && value.length <= 300 && !/[\u0000-\u001f\u007f]/.test(value)).map(value => value.trim()).filter(Boolean)])];
   const query = { title, aliases: names.slice(1), year: year ?? (!titleOnly ? /\s+((?:19|20)\d{2})$/.exec(keyword)?.[1] : '') };
@@ -296,23 +306,36 @@ async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now,
     const identity = classifyQuarkCandidate(name, query);
     if (identity === 'unrelated' || identity === 'unknown' && !direct) return;
     if (direct) add(direct, name, publishedAt, identity === 'unknown');
-    else if (pages.size < 3 && !pages.has(url.href)) pages.set(url.href, { name, requireYear: googleHost(url.hostname) });
+    else if (!pages.has(url.href)) {
+      if (pages.size >= 10 && hasQuarkResourceCue(name)) {
+        const generic = [...pages].reverse().find(([_url, row]) => !hasQuarkResourceCue(row.name));
+        if (generic) pages.delete(generic[0]);
+      }
+      if (pages.size < 10) pages.set(url.href, { name, requireYear: googleHost(url.hostname) });
+    } else if (hasQuarkResourceCue(name) && !hasQuarkResourceCue(pages.get(url.href).name)) pages.get(url.href).name = name;
   };
   const queries = quarkSearchQueries(query);
   for (const q of queries) {
     search.href = engine === 'Google' ? googleQueryUrl(q, page) : bingQueryUrl(q, page);
-    let result = await load(search.href, 1500, true);
-    search.href = result.url;
-    if (engine === 'Google' && quarkSearchPageState(result.html, search.href) === 'javascript') { javascriptOnly = true; break; }
-    if (engine === 'Bing' && !extractQuarkSearchResults(result.html, { ...query, engine, url: search.href, now: now() }).length && end - now() >= 500) {
-      search.href = bingQueryUrl(q, page, true);
-      result = await load(search.href, 1000, true);
+    let result;
+    try {
+      result = await load(search.href, 1500, true);
       search.href = result.url;
+      if (engine === 'Google' && quarkSearchPageState(result.html, search.href) === 'javascript') { javascriptOnly = true; break; }
+      if (engine === 'Bing' && !extractQuarkSearchResults(result.html, { ...query, engine, url: search.href, now: now() }).length && end - now() >= 500) {
+        search.href = bingQueryUrl(q, page, true);
+        result = await load(search.href, 1000, true);
+        search.href = result.url;
+      }
+    } catch (cause) {
+      if (!rows.size && !pages.size) throw cause;
+      lastPageError = cause.quarkPoolReason || '公开网页搜索暂不可用';
+      break;
     }
     for (const row of extractQuarkSearchResults(result.html, { ...query, engine, url: search.href, now: now() })) addResult(row.url, row.name, row.publishedAt);
-    if ([...rows.values()].some(row => relevant(row.name)) || pages.size || end - now() < 250) break;
+    if ([...rows.values()].some(row => relevant(row.name)) || [...pages.values()].some(row => hasQuarkResourceCue(row.name)) || end - now() < 250) break;
   }
-  await Promise.all([...pages].map(async ([url, { requireYear }]) => {
+  await Promise.all([...pages].sort((a, b) => Number(hasQuarkResourceCue(b[1].name)) - Number(hasQuarkResourceCue(a[1].name))).map(async ([url, { requireYear }]) => {
     const result = await load(url, 1800);
     if (!result.html) return;
     readPages++;
@@ -325,7 +348,7 @@ async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now,
     if (row.url.includes('?pwd=')) Object.defineProperty(row, quarkPasswordDate, { value: passwordDates.get(key) ?? 0 });
     return row;
   });
-  if (!output.some(row => relevant(row.name))) Object.defineProperty(output, 'reason', { value: !pages.size ? javascriptOnly ? 'Google 搜索页面需要 JavaScript，当前未能读取搜索结果' : '未找到与片名相符的公开网页结果' : !readPages ? '资源网页读取未完成：' + (lastPageError || '已到搜索时间上限') : !matchedPages ? '搜索结果网页未通过片名核验' : '已读取相关网页，但未找到可核验的夸克分享链接' });
+  if (!output.some(row => relevant(row.name))) Object.defineProperty(output, 'reason', { value: output.length && lastPageError ? '部分公开搜索未完成：' + lastPageError : !pages.size ? javascriptOnly ? 'Google 搜索页面需要 JavaScript，当前未能读取搜索结果' : '未找到与片名相符的公开网页结果' : !readPages ? '资源网页读取未完成：' + (lastPageError || '已到搜索时间上限') : !matchedPages ? '搜索结果网页未通过片名核验' : '已读取相关网页，但未找到可核验的夸克分享链接' });
   return output;
 }
 

@@ -84,6 +84,23 @@ test('first page uses only the primary title and one official alias, with shared
   assert.ok(calls.every(call => call.duration <= 5000 && call.maxBytes === 512 * 1024 && call.end === now + 9000));
 });
 
+test('terminal punctuation tries the plain title within two queries without weakening film-year matching', async t => {
+  for (const title of ['八仙!', '八仙！']) await t.test(title, async () => {
+    const calls = [], search = createQuarkTelegramSearch();
+    const rows = await search(title, { aliases: ['Eight Immortals', 'Another Alias'], year: 2026, now: () => now, deadline: now + 9000, read: async (value, duration, maxBytes, end) => {
+      const url = new URL(value); calls.push({ q: url.searchParams.get('q'), duration, maxBytes, end });
+      if (url.searchParams.get('q') !== '八仙') return '';
+      return post(10, '八仙 (2026)', link)
+        + post(11, '八仙 (2016)', link.replace('abc123456789', 'old123456789'))
+        + post(12, '八仙过海 (2026)', link.replace('abc123456789', 'other1234567'))
+        + post(13, '八仙', link.replace('abc123456789', 'nodate123456'));
+    } });
+    assert.deepEqual(calls.map(call => call.q), [title, '八仙']);
+    assert.deepEqual(rows.map(row => row.url), [link]);
+    assert.ok(calls.every(call => call.duration <= 3000 && call.maxBytes === 512 * 1024 && call.end === now + 9000));
+  });
+});
+
 test('find more follows same-query before cursors instead of rereading only the first page', async () => {
   const calls = [];
   const rows = await createQuarkTelegramSearch()('希望', { year: 2026, page: 2, now: () => now, read: async url => {

@@ -86,6 +86,31 @@ test('article prefetch reads later static shares before rendering no-link pages 
   assert.deepEqual([...calls], urls.map(key => [key, 1]));
 });
 
+test('article prefetch reaches the ninth matched result when earlier articles fail or contain no share', async () => {
+  const reads = []; let active = 0, maximum = 0;
+  const search = createQuarkRenderedSearch({
+    render: async url => {
+      assert.ok(url.includes('google.com/search'), '已找到后续静态分享后不额外渲染文章');
+      return { url, html: Array.from({ length: 9 }, (_, index) => `<a href="https://public.example/article-${index + 1}"><h3>希望 (2026) 夸克网盘</h3></a>`).join('') };
+    },
+    read: async (url, { deadline }) => {
+      if (url.includes('bing')) return { url, html: '<rss><channel></channel></rss>' };
+      reads.push({ url, deadline, startedAt: Date.now() }); maximum = Math.max(maximum, ++active);
+      try {
+        await new Promise(resolve => setImmediate(resolve));
+        const index = Number(/article-(\d+)$/.exec(url)?.[1]);
+        if (index < 9 && index % 2) throw Object.assign(new Error('public article unavailable'), { status: 403 });
+        return { url, html: index === 9 ? article('ninth026', '2026-10-01') : '<title>希望 (2026)</title><article>影片介绍，没有分享。</article>' };
+      } finally { active--; }
+    },
+  });
+  const rows = await search(query);
+  assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/ninth026']);
+  assert.equal(reads.length, 9); assert.equal(maximum, 2); assert.equal(active, 0);
+  assert.equal(new Set(reads.map(call => call.deadline)).size, 1, '所有文章仍共享同一读取截止时间');
+  assert.ok(reads[0].deadline <= reads[0].startedAt + 8000, '增加候选数不能扩大8秒文章读取预算');
+});
+
 test('prefetched script shells render first without repeating reads or rendering complete no-link pages afterward', async () => {
   const calls = [], rendered = [];
   const search = createQuarkRenderedSearch({
@@ -112,9 +137,12 @@ test('complete article introductions can still load public shares dynamically af
       reads++;
       return { url, html: '<title>希望 (2026)</title><article>' + '这是完整的电影介绍。'.repeat(40) + '<a href="">查看资源下载页</a></article>' };
     },
-    render: async url => {
+    render: async (url, options) => {
       if (url.includes('google.com/search')) return { url, html: '<a href="https://public.example/dynamic"><h3>希望 (2026) 夸克网盘</h3></a>' };
-      renders++; return { url, html: article('dynamic26', '2026-10-01') };
+      const html = article('dynamic26', '2026-10-01');
+      assert.equal(typeof options.waitForShare, 'function'); assert.equal(options.waitForShare({ url, html }), true);
+      assert.equal(options.waitForShare({ url, html: '<title>其他电影 (2026)</title><main><a href="https://pan.quark.cn/s/unrelated26">分享</a></main>' }), false);
+      renders++; return { url, html };
     },
   });
   assert.deepEqual((await search(query)).map(row => row.url), ['https://pan.quark.cn/s/dynamic26']);
@@ -266,6 +294,95 @@ test('Bing RSS can supply articles when Google asks for verification', async () 
     render: async () => { renders++; throw Object.assign(new Error('verification'), { quarkPoolReason: 'browserBlocked' }); } });
   assert.equal((await search(query)).length, 1);
   assert.equal(renders, 1);
+});
+
+test('generic RSS candidates cannot suppress a later broad Bing HTML resource result or fill its bounded article slots', async () => {
+  const reads = [], htmlQueries = [];
+  const generic = '<rss><channel>' + Array.from({ length: 12 }, (_, index) => `<item><title>希望 (2026) 电影介绍 ${index}</title><link>https://public.example/generic-${index}</link><pubDate>2026-11-01</pubDate></item>`).join('') + '</channel></rss>';
+  const search = createQuarkRenderedSearch({
+    render: async url => { assert.ok(url.includes('google.com/search'), '静态匹配分享已找到后不能再渲染普通介绍页'); throw Object.assign(new Error('Google verification'), { quarkPoolReason: 'browserBlocked' }); },
+    read: async url => {
+      const target = new URL(url);
+      if (target.hostname.includes('bing')) {
+        if (target.searchParams.get('format') === 'rss') return { url, html: generic };
+        const term = target.searchParams.get('q'); htmlQueries.push(term);
+        return { url, html: term.includes('2026') ? '<main>暂无资源文章</main>' : [1, 2].map(index => `<li class="b_algo"><h2><a href="https://public.example/resource-${index}">希望 (2026) 夸克网盘资源 ${index}</a></h2><time datetime="2026-01-01"></time></li>`).join('') };
+      }
+      reads.push(target.pathname);
+      return { url, html: target.pathname.startsWith('/resource-') ? article(target.pathname.endsWith('1') ? 'broad001' : 'broad002', '2026-01-01') : '<title>希望 (2026)</title><main>电影介绍，没有分享。</main>' };
+    },
+  });
+  const rows = await search(query);
+  assert.ok(htmlQueries.some(term => !term.includes('2026')), 'generic RSS不能抑制后续宽查询HTML');
+  assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/broad001', 'https://pan.quark.cn/s/broad002']);
+  assert.deepEqual(reads.slice(0, 2), ['/resource-1', '/resource-2'], '有资源线索的较早文章优先于较新的普通介绍');
+  assert.equal(reads.length, 10, '保留12候选收集和10文章读取上限');
+});
+
+test('a matched generic Google page still permits the existing broad resource query within its budget', async () => {
+  const googleQueries = [];
+  const search = createQuarkRenderedSearch({
+    render: async url => {
+      assert.ok(url.includes('google.com/search'));
+      const term = new URL(url).searchParams.get('q'); googleQueries.push(term);
+      return { url, html: term.includes('2026') ? '<a href="https://public.example/encyclopedia"><h3>希望 HOPE (2026) 电影介绍</h3></a>' : '<a href="https://public.example/resource"><h3>希望 HOPE (2026) 夸克资源</h3></a>' };
+    },
+    read: async url => ({ url, html: url.includes('bing') ? '<rss><channel></channel></rss>' : url.endsWith('/resource') ? article('broadgg1', '2026-10-01') : '<title>希望 (2026)</title><main>电影介绍，没有分享。</main>' }),
+  });
+  const rows = await search({ title: '希望', aliases: ['HOPE'], year: '2026' });
+  assert.ok(googleQueries.some(term => !term.includes('2026')), '首轮只出现百科介绍时仍尝试已有宽查询');
+  assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/broadgg1']);
+});
+
+test('Bing RSS does not wait for a slow Google render to exhaust its independent search deadline', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  let rssCalls = 0;
+  const search = createQuarkRenderedSearch({
+    render: async () => {
+      await new Promise(resolve => setTimeout(resolve, 20000));
+      throw Object.assign(new Error('slow Google'), { quarkPoolReason: 'browserTimeout' });
+    },
+    read: async url => {
+      if (url.includes('bing')) {
+        if (new URL(url).searchParams.get('format') !== 'rss') return { url, html: '<main>暂无搜索结果</main>' };
+        rssCalls++;
+        return { url, html: '<rss><channel><item><title>希望 HOPE (2026) 夸克</title><link>https://public.example/rss</link></item></channel></rss>' };
+      }
+      return { url, html: article('bingrss26', '2026-09-13') };
+    },
+  });
+  const pending = search(query);
+  await new Promise(resolve => setImmediate(resolve));
+  const rssStartedBeforeGoogleFinished = rssCalls > 0;
+  t.mock.timers.tick(20000);
+  const rows = await pending;
+  assert.equal(rssStartedBeforeGoogleFinished, true, 'Bing HTML为空时RSS必须在Google仍等待时开始');
+  assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/bingrss26']);
+});
+
+test('a short Bing budget still requests RSS before an HTML read can consume the whole channel deadline', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  let rssCalls = 0;
+  const search = createQuarkRenderedSearch({
+    render: async () => { throw Object.assign(new Error('Google verification'), { quarkPoolReason: 'browserBlocked' }); },
+    read: async (url, { deadline }) => {
+      if (url.includes('bing')) {
+        if (new URL(url).searchParams.get('format') === 'rss') {
+          rssCalls++;
+          return { url, html: '<rss><channel><item><title>希望 HOPE (2026) 夸克</title><link>https://public.example/rss</link></item></channel></rss>' };
+        }
+        await new Promise(resolve => setTimeout(resolve, deadline - Date.now()));
+        throw Object.assign(new Error('Bing HTML deadline'), { name: 'TimeoutError' });
+      }
+      return { url, html: article('rssshort26', '2026-09-13') };
+    },
+  });
+  const pending = search(query, { deadline: Date.now() + 3000 });
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(1000);
+  const rows = await pending;
+  assert.equal(rssCalls, 1, 'HTML超时不能令独立RSS机会消失');
+  assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/rssshort26']);
 });
 
 test('Google JavaScript shells stop after one render while Chinese Bing independently finds exact official aliases', async () => {

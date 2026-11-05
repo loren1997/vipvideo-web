@@ -1,4 +1,4 @@
-import { googleQueryUrl, bingQueryUrl, quarkSearchQueries, quarkSearchPageState, extractQuarkSearchResults, extractQuarkArticle, classifyQuarkCandidate } from './quark-google-search.mjs';
+import { googleQueryUrl, bingQueryUrl, quarkSearchQueries, quarkSearchPageState, extractQuarkSearchResults, extractQuarkArticle, classifyQuarkCandidate, hasQuarkResourceCue } from './quark-google-search.mjs';
 
 const blocked = value => /g-recaptcha|h-captcha|cf-chl-|our systems have detected|unusual traffic|<title[^>]*>[^<]*(?:验证码|安全验证|登录|sign\s?in|log\s?in)|<title[^>]*>\s*人机验证\s*<\/title\s*>|^(?:人机验证|安全验证|检测到异常流量)/i.test(value);
 const direct = value => { const url = new URL(value); return url.protocol === 'https:' && url.hostname === 'pan.quark.cn' && /^\/s\/[a-z0-9]{6,32}\/?$/i.test(url.pathname); };
@@ -10,6 +10,7 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
     signal?.throwIfAborted();
     if (deadline <= now()) return [];
     const end = Math.min(deadline, now() + 45000), rows = new Map(), articles = new Map(), notes = new Set();
+    const resourceCount = () => [...articles.values()].filter(row => hasQuarkResourceCue(row.name)).length;
     const merge = items => {
       for (const row of items) {
         if (classifyQuarkCandidate(row.name, query) !== 'matched') continue;
@@ -25,9 +26,15 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
     const collect = (result, engine) => {
       let matched = false;
       for (const row of extractQuarkSearchResults(result.html, { ...query, engine, url: result.url, now: now() })) {
-        matched ||= classifyQuarkCandidate(row.name, query) === 'matched';
+        matched ||= classifyQuarkCandidate(row.name, query) === 'matched' && (direct(row.url) || hasQuarkResourceCue(row.name));
         if (direct(row.url)) merge([row]);
-        else if (!articles.has(row.url) && articles.size < 12) articles.set(row.url, row);
+        else if (!articles.has(row.url)) {
+          if (articles.size >= 12 && hasQuarkResourceCue(row.name)) {
+            const generic = [...articles.values()].reverse().find(value => !hasQuarkResourceCue(value.name));
+            if (generic) articles.delete(generic.url);
+          }
+          if (articles.size < 12) articles.set(row.url, row);
+        } else if (hasQuarkResourceCue(row.name) && !hasQuarkResourceCue(articles.get(row.url).name)) articles.set(row.url, row);
       }
       return matched;
     };
@@ -49,12 +56,15 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
     };
     for (const term of quarkSearchQueries(query)) {
       if (now() >= searchEnd && (googleStopped || now() >= googleEnd)) break;
-      if (read) await Promise.all([search('Google', term), search('Bing', term)]);
-      else await search('Google', term);
-      if ((read && articles.size < 6 && rows.size < 3) || (!read && !articles.size && !rows.size)) await search('Bing', term, true);
-      if (!read && (rows.size || articles.size)) break;
+      if (read) await Promise.all([search('Google', term), (async () => {
+        // RSS must start before a slow Google render or Bing HTML read spends its deadline.
+        await search('Bing', term, true);
+        if (resourceCount() < 6 && rows.size < 3) await search('Bing', term);
+      })()]);
+      else { await search('Google', term); if (!resourceCount() && !rows.size) await search('Bing', term, true); }
+      if (!read && (rows.size || resourceCount())) break;
     }
-    const selected = [...articles.values()].sort((a, b) => (b.publishedAt ?? -1) - (a.publishedAt ?? -1)).slice(0, 5);
+    const selected = [...articles.values()].sort((a, b) => Number(hasQuarkResourceCue(b.name)) - Number(hasQuarkResourceCue(a.name)) || (b.publishedAt ?? -1) - (a.publishedAt ?? -1)).slice(0, 10);
     const loaded = new Map(), excluded = new Set();
     const parse = (row, result) => extractQuarkArticle(result.html, { ...query, url: result.url, requireYear: row.googleRedirect === true, now: now() }).rows;
     // Read all selected articles before an unrelated dynamic page can spend the remaining budget.
@@ -99,7 +109,7 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
       if (now() >= end - 1000 || rows.size >= 30) break;
       try {
         signal?.throwIfAborted();
-        const result = await render(row.url, { signal, deadline: Math.min(end, now() + 12000) });
+        const result = await render(row.url, { signal, deadline: Math.min(end, now() + 12000), waitForShare: result => parse(row, result).length > 0 });
         if (blocked(result.text || '')) throw Object.assign(new Error('网页要求验证'), { quarkPoolReason: 'browserBlocked' });
         merge(parse(row, result));
       } catch (cause) { report(cause); }

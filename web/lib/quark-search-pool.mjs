@@ -2,7 +2,7 @@ import { Readable } from 'node:stream';
 import { readText, validateUrl } from './network.mjs';
 import { createQuarkPublicRequest } from './quark-search-network.mjs';
 import { createQuarkSearchRequest } from './quark-search.mjs';
-import { searchGoogleQuark, searchBingQuark, quarkPasswordDate, classifyQuarkCandidate } from './quark-google-search.mjs';
+import { searchGoogleQuark, searchBingQuark, quarkPasswordDate, classifyQuarkCandidate, quarkSearchTitleVariants } from './quark-google-search.mjs';
 
 const KEY = 'quark-search-pool-v1', DAY = 86_400_000, HEALTH_INTERVAL = 6 * 60 * 60_000;
 const RECALL_KEY = 'quark-search-availability-v3';
@@ -126,7 +126,7 @@ function queryTerms(keyword, values, yearHint) {
   const dated = yearHint !== undefined ? undefined : /^(.*?)\s+((?:19|20)\d{2})$/.exec(keyword), title = dated?.[1] || keyword;
   const aliases = (Array.isArray(values) ? values.slice(0, 10) : []).filter(value => typeof value === 'string' && value.trim() && value.length <= 300 && !/[\u0000-\u001f\u007f]/.test(value)).slice(0, 2).map(value => value.trim());
   const year = hinted ? String(yearHint) : dated?.[2];
-  return { title, aliases, words: [...new Set([title, ...aliases, ...(year ? [title + ' ' + year] : [])])], year };
+  return { title, aliases, words: [...new Set([...quarkSearchTitleVariants(title), ...aliases, ...(year ? [title + ' ' + year] : [])])], year };
 }
 function relevance(row, query) {
   return classifyQuarkCandidate(row.name, query) === 'matched' ? 1 : 0;
@@ -496,7 +496,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
             if (stopping) throw failure('公开搜索已停止', 503, true);
             if (!entry.webRequested) return result([...entry.rows.values()], query, entry.reason, false, known);
           }
-          const webDeadline = Math.min(entry.deadline, now() + 3000);
+          const webDeadline = Math.min(entry.deadline, now() + 10000);
           const pages = await Promise.allSettled([
             typeof renderSearch === 'function' ? [] : googleSearch(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(webDeadline, limit ?? webDeadline), true, entry.controller.signal), deadline: webDeadline, now }),
             searchBingQuark(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(webDeadline, limit ?? webDeadline), true, entry.controller.signal), deadline: webDeadline, now }),

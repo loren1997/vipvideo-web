@@ -100,6 +100,46 @@ test('exact title, official aliases and release year plan bounded search variant
   assert.equal(new URL(webSearch.bingQueryUrl('test', 2)).searchParams.get('first'), '21');
 });
 
+test('trailing title punctuation adds a search variant while preserving C++ and internal punctuation', () => {
+  const queries = webSearch.quarkSearchQueries({ title: '八仙！', year: '2026' });
+  assert.ok(queries.includes('"八仙！" 2026 夸克 网盘'));
+  assert.ok(queries.includes('"八仙" 2026 夸克 网盘'));
+  for (const title of ['C++', 'C#', 'E.T.', '星际·穿越', '你好，世界']) {
+    assert.deepEqual(webSearch.quarkSearchQueries({ title, year: '2026' }), [`"${title}" 2026 夸克 网盘`, `"${title}" 夸克`]);
+  }
+  assert.deepEqual(webSearch.quarkSearchTitleVariants('星际·穿越！？'), ['星际·穿越！？', '星际·穿越']);
+  assert.deepEqual(webSearch.quarkSearchTitleVariants('C++!'), ['C++!', 'C++']);
+  assert.deepEqual(webSearch.quarkSearchTitleVariants('仙！'), ['仙！'], 'a variant cannot broaden the query to one character');
+});
+
+test('Google and Bing find a punctuated short title through its search variant with strict year and title matching', async t => {
+  for (const engine of ['Google', 'Bing']) await t.test(engine, async () => {
+    const urls = [], expected = 'https://pan.quark.cn/s/punctuation26';
+    const rows = await (engine === 'Google' ? searchGoogleQuark : webSearch.searchBingQuark)('八仙！', { titleOnly: true, year: '2026', now: () => time, read: async value => {
+      const url = new URL(value), q = url.searchParams.get('q').replace(/^"([^"]+)"/, '$1'); urls.push(q);
+      if (q !== '八仙 2026 夸克 网盘') return url.searchParams.has('format') ? '<rss><channel></channel></rss>' : '<title>Search</title>';
+      const candidates = [[expected, '八仙 (2026) 夸克网盘'], ['https://pan.quark.cn/s/unrelated26', '八仙过海 (2026)'], ['https://pan.quark.cn/s/wrongyear26', '八仙 (2025)']];
+      return engine === 'Google' ? candidates.map(([url, name]) => link(url, name)).join('') : '<ol>' + candidates.map(([url, name]) => `<li class="b_algo"><h2><a href="${url}">${name}</a></h2></li>`).join('') + '</ol>';
+    } });
+    assert.deepEqual(rows.map(row => row.url), [expected]);
+    assert.ok(urls.includes('八仙 2026 夸克 网盘'));
+  });
+});
+
+test('later query failures preserve partial unnamed shares without promoting their film identity', async t => {
+  for (const engine of ['Google', 'Bing']) await t.test(engine, async () => {
+    const expected = 'https://pan.quark.cn/s/partial26'; let reads = 0;
+    const rows = await (engine === 'Google' ? searchGoogleQuark : webSearch.searchBingQuark)('八仙！', { titleOnly: true, year: '2026', now: () => time, read: async () => {
+      if (++reads > 1) throw Object.assign(new Error('private Cookie=secret'), { quarkPoolReason: '搜索请求超时' });
+      return engine === 'Google' ? link(expected, '夸克网盘') : `<li class="b_algo"><h2><a href="${expected}">夸克网盘</a></h2></li>`;
+    } });
+    assert.deepEqual(rows.map(row => row.url), [expected]);
+    assert.equal(webSearch.classifyQuarkCandidate(rows[0].name, { title: '八仙！', year: '2026' }), 'unknown');
+    assert.match(rows.reason, /搜索请求超时/);
+    assert.doesNotMatch(rows.reason, /private|Cookie|secret/);
+  });
+});
+
 test('a sanitized Google heading can retain only a same-origin opaque goto with verified film identity', () => {
   const query = { title: '希望', aliases: ['HOPE', '호프'], year: '2026', url: 'https://www.google.com/search?q=hope' };
   const jump = '/goto?url=' + 'A'.repeat(40);
@@ -312,21 +352,133 @@ test('web search distinguishes unindexed titles, unreadable articles and pages w
   assert.match((await searchGoogleQuark(title, javascript)).reason, /JavaScript.*未能读取/);
 });
 
-test('Google requests newest results without a date cutoff, following only three first-level results', async () => {
-  const pages = Object.fromEntries([1, 2, 3, 4].map(id => [`https://posts.example/${id}`, article(link(`https://pan.quark.cn/s/abcdef${id}`))]));
+test('Google requests newest results without a date cutoff, following only ten first-level results', async () => {
+  const ids = Array.from({ length: 11 }, (_value, index) => index + 1);
+  const pages = Object.fromEntries(ids.map(id => [`https://posts.example/${id}`, article(link(`https://pan.quark.cn/s/abcdef${id}`))]));
   const input = fixture([
     link('/url?q=' + encodeURIComponent('https://posts.example/1')),
     link('/url?url=' + encodeURIComponent('https://posts.example/2')),
-    link('https://posts.example/3'), link('https://posts.example/4'),
+    ...ids.slice(2).map(id => link(`https://posts.example/${id}`)),
   ].join(''), pages);
   const rows = await searchGoogleQuark(title, input);
-  assert.equal(rows.length, 3); assert.equal(input.calls.length, 4);
+  assert.equal(rows.length, 10); assert.equal(input.calls.length, 11);
   const query = new URL(input.calls[0].url);
   assert.equal(query.origin, 'https://www.google.com'); assert.equal(query.pathname, '/search');
   assert.equal(query.searchParams.get('q'), `${title} 夸克 网盘`); assert.equal(query.searchParams.get('tbs'), 'sbd:1'); assert.equal(query.searchParams.has('udm'), false); assert.equal(query.searchParams.has('num'), false);
-  assert.deepEqual(input.calls.slice(1).map(call => call.url), ['https://posts.example/1', 'https://posts.example/2', 'https://posts.example/3']);
-  for (const call of input.calls) { assert.equal(call.maxBytes, 512 * 1024); assert.equal(call.deadline, time + 3000); assert.ok(call.duration <= 2000); }
+  assert.deepEqual(input.calls.slice(1).map(call => call.url), ids.slice(0, 10).map(id => `https://posts.example/${id}`));
+  for (const call of input.calls) { assert.equal(call.maxBytes, 512 * 1024); assert.equal(call.deadline, time + 10000); assert.ok(call.duration <= 2000); }
   assert.equal(input.calls[0].duration, 1500);
+});
+
+test('the ninth static article can supply the verified share after eight empty or failed candidates', async t => {
+  for (const engine of ['Google', 'Bing']) await t.test(engine, async () => {
+    const readPages = [], expected = 'https://pan.quark.cn/s/ninth2026';
+    const rows = await (engine === 'Google' ? searchGoogleQuark : webSearch.searchBingQuark)('八仙！', { titleOnly: true, year: '2026', now: () => time, read: async value => {
+      const url = new URL(value);
+      if (url.hostname.endsWith('.google.com') || url.hostname.endsWith('.bing.com')) {
+        return Array.from({ length: 11 }, (_value, index) => {
+          const id = index + 1, href = `https://posts.example/${id}`, name = '八仙！ (2026) 夸克资源';
+          return engine === 'Google' ? link(href, name) : `<li class="b_algo"><h2><a href="${href}">${name}</a></h2></li>`;
+        }).join('');
+      }
+      const id = Number(url.pathname.slice(1)); readPages.push(id);
+      if (id < 9 && id % 2) throw new Error('fixture HTTP 403');
+      return `<title>八仙！ (2026)</title><article><h1>八仙！ (2026)</h1>${id === 9 ? link(expected, '八仙 (2026) 夸克网盘') : '<p>暂无分享链接</p>'}</article>`;
+    } });
+    assert.deepEqual(rows.map(row => row.url), [expected]);
+    assert.deepEqual(readPages, Array.from({ length: 10 }, (_value, index) => index + 1));
+    assert.ok(!readPages.includes(11));
+  });
+});
+
+test('generic search candidates do not suppress a later resource query or fill all article slots', async t => {
+  for (const engine of ['Google', 'Bing']) await t.test(engine, async () => {
+    const queries = [], articles = [], expected = 'https://pan.quark.cn/s/variant2026';
+    const rows = await (engine === 'Google' ? searchGoogleQuark : webSearch.searchBingQuark)('八仙!', { titleOnly: true, year: '2026', now: () => time, read: async value => {
+      const url = new URL(value);
+      if (url.hostname.endsWith('.google.com') || url.hostname.endsWith('.bing.com')) {
+        const q = url.searchParams.get('q').replace(/^"([^"]+)"/, '$1'); queries.push(q);
+        const candidates = q === '八仙! 夸克' ? [['https://posts.example/resource', '八仙 (2026) 夸克网盘资源']]
+          : Array.from({ length: 10 }, (_value, index) => [`https://posts.example/generic${index}`, '八仙 (2026) 电影介绍']);
+        return candidates.map(([href, title]) => engine === 'Google' ? link(href, title) : `<li class="b_algo"><h2><a href="${href}">${title}</a></h2></li>`).join('');
+      }
+      articles.push(url.pathname);
+      return `<title>八仙 (2026)</title><article><h1>八仙 (2026)</h1>${url.pathname === '/resource' ? link(expected, '夸克分享') : '<p>只有电影简介</p>'}</article>`;
+    } });
+    assert.ok(queries.includes('八仙 2026 夸克 网盘'));
+    assert.equal(queries.at(-1), '八仙! 夸克', 'the existing broad query remains reachable after generic exact queries');
+    assert.deepEqual(rows.map(row => row.url), [expected]);
+    assert.equal(articles[0], '/resource', 'resource evidence is read before generic fallbacks');
+    assert.equal(articles.length, 10); assert.equal(articles.includes('/generic9'), false);
+  });
+});
+
+test('a generic article remains available when no resource-labeled query result exists', async t => {
+  for (const engine of ['Google', 'Bing']) await t.test(engine, async () => {
+    const expected = 'https://pan.quark.cn/s/generic2026'; let articleReads = 0;
+    const rows = await (engine === 'Google' ? searchGoogleQuark : webSearch.searchBingQuark)('八仙!', { titleOnly: true, year: '2026', now: () => time, read: async value => {
+      const url = new URL(value);
+      if (url.hostname.endsWith('.google.com') || url.hostname.endsWith('.bing.com')) return engine === 'Google' ? link('https://posts.example/generic', '八仙 (2026) 电影介绍') : '<li class="b_algo"><h2><a href="https://posts.example/generic">八仙 (2026) 电影介绍</a></h2></li>';
+      articleReads++; return `<title>八仙 (2026)</title><article><h1>八仙 (2026)</h1><p>${expected}</p></article>`;
+    } });
+    assert.deepEqual(rows.map(row => row.url), [expected]); assert.equal(articleReads, 1);
+  });
+});
+
+test('a later resource label upgrades an existing generic URL without losing its article slot', async t => {
+  for (const engine of ['Google', 'Bing']) await t.test(engine, async () => {
+    const articles = [], expected = 'https://pan.quark.cn/s/upgraded2026';
+    const rows = await (engine === 'Google' ? searchGoogleQuark : webSearch.searchBingQuark)('八仙!', { titleOnly: true, year: '2026', now: () => time, read: async value => {
+      const url = new URL(value);
+      if (url.hostname.endsWith('.google.com') || url.hostname.endsWith('.bing.com')) {
+        const q = url.searchParams.get('q').replace(/^"([^"]+)"/, '$1');
+        const candidates = q === '八仙! 夸克' ? [['https://posts.example/generic9', '八仙 (2026) 夸克网盘资源']]
+          : Array.from({ length: 10 }, (_value, index) => [`https://posts.example/generic${index}`, '八仙 (2026) 电影介绍']);
+        return candidates.map(([href, title]) => engine === 'Google' ? link(href, title) : `<li class="b_algo"><h2><a href="${href}">${title}</a></h2></li>`).join('');
+      }
+      articles.push(url.pathname);
+      return `<title>八仙 (2026)</title><article><h1>八仙 (2026)</h1>${url.pathname === '/generic9' ? link(expected, '夸克分享') : '<p>只有电影简介</p>'}</article>`;
+    } });
+    assert.deepEqual(rows.map(row => row.url), [expected]);
+    assert.equal(articles[0], '/generic9'); assert.equal(articles.length, 10); assert.equal(new Set(articles).size, 10);
+  });
+});
+
+test('a later search failure still reads collected generic article fallbacks', async t => {
+  for (const engine of ['Google', 'Bing']) await t.test(engine, async () => {
+    const expected = 'https://pan.quark.cn/s/generic2026'; let queries = 0, articleReads = 0;
+    const rows = await (engine === 'Google' ? searchGoogleQuark : webSearch.searchBingQuark)('八仙!', { titleOnly: true, year: '2026', now: () => time, read: async value => {
+      const url = new URL(value);
+      if (url.hostname.endsWith('.google.com') || url.hostname.endsWith('.bing.com')) {
+        if (++queries > 1) throw new Error('later search unavailable');
+        return engine === 'Google' ? link('https://posts.example/generic', '八仙 (2026) 电影介绍') : '<li class="b_algo"><h2><a href="https://posts.example/generic">八仙 (2026) 电影介绍</a></h2></li>';
+      }
+      articleReads++; return `<title>八仙 (2026)</title><article><h1>八仙 (2026)</h1><p>${expected}</p></article>`;
+    } });
+    assert.deepEqual(rows.map(row => row.url), [expected]); assert.equal(articleReads, 1);
+  });
+});
+
+test('generic query fallbacks stop at the caller deadline before reading articles', async () => {
+  let clock = time; const calls = [];
+  const rows = await searchGoogleQuark('八仙!', { titleOnly: true, aliases: ['Eight Immortals', 'Another Alias'], year: '2026', now: () => clock, deadline: time + 3000, read: async (value, duration) => {
+    const url = new URL(value); calls.push({ host: url.hostname, duration }); clock += duration;
+    return Array.from({ length: 10 }, (_value, index) => link(`https://posts.example/generic${index}`, '八仙 (2026) 电影介绍')).join('');
+  } });
+  assert.deepEqual(rows, []); assert.equal(clock, time + 3000);
+  assert.deepEqual(calls, [{ host: 'www.google.com', duration: 1500 }, { host: 'www.google.com', duration: 1500 }]);
+});
+
+test('a real-clock caller deadline discards late static articles instead of extending the phase', async () => {
+  const deadline = Date.now() + 80, calls = [];
+  const rows = await searchGoogleQuark('八仙！', { titleOnly: true, year: '2026', deadline, read: async (url, duration, maxBytes, limit) => {
+    calls.push({ url, duration, maxBytes, deadline: limit });
+    if (url.includes('google.com')) return link('https://posts.example/late', '八仙！ (2026) 夸克网盘');
+    await new Promise(resolve => setTimeout(resolve, Math.max(1, limit - Date.now() + 20)));
+    return '<title>八仙！ (2026)</title><article>' + link('https://pan.quark.cn/s/late2026', '八仙 (2026) 夸克网盘') + '</article>';
+  } });
+  assert.deepEqual(rows, []); assert.equal(calls.length, 2);
+  assert.ok(calls.every(call => call.deadline === deadline && call.duration <= 80));
 });
 
 test('Google result headings are matched independently of their site attribution and breadcrumbs', async () => {
@@ -361,7 +513,7 @@ test('an empty canonical query tries one supplied alias within the original requ
   } });
   assert.equal(rows.length, 1); assert.equal(calls.length, 3);
   assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [`${title} 夸克 网盘`, 'Winter and Summer 夸克 网盘']);
-  assert.ok(calls.every(call => call.deadline === time + 3000));
+  assert.ok(calls.every(call => call.deadline === time + 10000));
 });
 
 test('an empty exact Google query falls back to the title and Quark without requiring cloud-drive wording', async () => {
@@ -374,7 +526,7 @@ test('an empty exact Google query falls back to the title and Quark without requ
   } });
   assert.equal(rows.length, 1);
   assert.deepEqual(calls.slice(0, 2).map(call => new URL(call.url).searchParams.get('q')), [`${title} 夸克 网盘`, `${title} 夸克`]);
-  assert.ok(calls.every(call => call.deadline === time + 3000));
+  assert.ok(calls.every(call => call.deadline === time + 10000));
 });
 
 test('multiple official aliases retain three exact queries and a broad Google fallback with film-year verification', async () => {
@@ -393,7 +545,7 @@ test('multiple official aliases retain three exact queries and a broad Google fa
   assert.deepEqual(calls.slice(0, 4).map(call => new URL(call.url).searchParams.get('q')), ['希望 2026 夸克 网盘', 'Hope 2026 夸克 网盘', '호프 2026 夸克 网盘', '希望 夸克']);
   assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/fallback1']);
   assert.equal(calls.length, 5);
-  assert.ok(calls.every(call => call.deadline === time + 3000 && call.duration <= 1800));
+  assert.ok(calls.every(call => call.deadline === time + 10000 && call.duration <= 1800));
 });
 
 test('Bing searches resource articles and follows relevant first-level pages as well as direct shares', async () => {
@@ -406,7 +558,7 @@ test('Bing searches resource articles and follows relevant first-level pages as 
   } });
   assert.deepEqual(rows, [{ url: 'https://pan.quark.cn/s/abcdef1?pwd=A1B2', name: '一路超平安 (2026) 4K资源', publishedAt: Date.parse('2026-10-13') }]);
   assert.equal(new URL(calls[0].url).searchParams.get('q'), '"一路超平安" 夸克 网盘');
-  assert.equal(calls.length, 2); assert.ok(calls.every(call => call.deadline === time + 3000));
+  assert.equal(calls.length, 2); assert.ok(calls.every(call => call.deadline === time + 10000));
 });
 
 test('visible resource buttons can encode a canonical Quark share without crawling redirect services', async () => {
@@ -431,7 +583,9 @@ test('Bing bounds article reads and refuses private pages, recursive crawling an
     return article(link('https://posts.example/child') + link('https://pan.quark.cn/s/abcdef1'));
   };
   assert.equal((await webSearch.searchBingQuark(title, { read, now: () => time })).length, 1);
-  assert.equal(calls.length, 4); assert.ok(calls.every(url => !/127\.0\.0\.1|\/child$/.test(url)));
+  assert.equal(calls.filter(url => new URL(url).hostname.endsWith('.bing.com')).length, 2);
+  assert.equal(calls.filter(url => new URL(url).hostname === 'posts.example').length, 4);
+  assert.ok(calls.every(url => !/127\.0\.0\.1|\/child$/.test(url)));
   await assert.rejects(webSearch.searchBingQuark(title, { now: () => time, read: async () => '<!DOCTYPE rss [<!ENTITY secret SYSTEM "file:///etc/passwd">]><rss><channel></channel></rss>' }), /Bing 公开搜索暂不可用/);
 });
 
@@ -568,7 +722,7 @@ test('Google validation pages report a fixed reason without parsing hidden resou
   assert.equal(input.calls.length, 1);
 });
 
-test('a slower search page shares the original three-second budget with follow-up pages', async () => {
+test('a slower search page shares the ten-second budget with follow-up pages', async () => {
   let current = time;
   const input = fixture(link('https://posts.example/movie'), { 'https://posts.example/movie': article(link('https://pan.quark.cn/s/abcdef1')) });
   const rows = await searchGoogleQuark(title, { now: () => current, read: async (...args) => {
@@ -577,8 +731,8 @@ test('a slower search page shares the original three-second budget with follow-u
     return html;
   } });
   assert.equal(rows.length, 1);
-  assert.equal(input.calls[1].duration, 1600);
-  assert.ok(input.calls.every(call => call.deadline === time + 3000));
+  assert.equal(input.calls[1].duration, 1800);
+  assert.ok(input.calls.every(call => call.deadline === time + 10000));
 });
 
 test('individual public-page failures and login challenges preserve other results without recursive crawling', async () => {

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
-import { spawn as spawnProcess } from 'node:child_process';
+import { spawn as spawnProcess, execFile } from 'node:child_process';
 import { chromium } from 'playwright-core';
 
 export const chromiumCleanupBudget = (deadline, now = Date.now()) => Math.min(1500, Math.max(0, (deadline - now) / 4));
@@ -40,10 +40,52 @@ function browserEndpoint(value, port) {
 export function createQuarkChromiumLauncher({ platform = process.platform, spawn = spawnProcess, reservePort = availablePort,
   xvfbRun = () => ['/usr/bin/xvfb-run', '/bin/xvfb-run'].find(existsSync),
   connect = (endpoint, options) => chromium.connectOverCDP(endpoint, options), managedLaunch = options => chromium.launch(options),
+  launchServer = options => chromium.launchServer(options), connectServer = (endpoint, options) => chromium.connect(endpoint, options),
+  killTree = (pid, milliseconds) => new Promise((resolve, reject) => execFile('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: milliseconds }, error => error ? reject(error) : resolve())),
   killGroup = (pid, signal) => process.kill(-pid, signal),
 } = {}) {
   return async function launch(options, { signal, deadline = Date.now() + (options.timeout || 25000) } = {}) {
     signal?.throwIfAborted();
+    if (platform === 'win32') {
+      // An owned server avoids a Playwright client close RPC that can hang after disconnect.
+      const workDeadline = Math.min(Date.now() + (options.timeout || 25000), deadline - chromiumCleanupBudget(deadline));
+      if (Date.now() >= workDeadline) throw timeoutFailure();
+      const server = await launchServer({ ...options, timeout: Math.max(1, workDeadline - Date.now()), headless: true, host: '127.0.0.1', handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false });
+      const child = server.process();
+      let browser, closing, reaped = child.exitCode !== null || child.signalCode !== null;
+      const closed = new Promise(resolve => { if (reaped) resolve(); else child.once('close', () => { reaped = true; resolve(); }); });
+      const cleanup = () => closing ||= (async () => {
+        signal?.removeEventListener('abort', abortCleanup);
+        // A late SDK launch still needs a bounded chance to reap its child after the work deadline.
+        const end = Date.now() + 1500, left = () => Math.max(0, end - Date.now());
+        // Kill this temporary tree before Chrome exits and leaves crashpad holding inherited pipes.
+        if (!reaped) {
+          try { await killTree(child.pid, Math.max(1, left())); }
+          catch (error) { if (!reaped) throw failure('CHROMIUM_CHILD_KILL_FAILED', error); }
+          await timeout(closed, left());
+        }
+        if (!reaped) throw Object.assign(failure('CHROMIUM_CHILD_NOT_REAPED'), { quarkPoolReason: 'browserFailed', status: 502 });
+        // Only call the SDK cleanup after exit: its live-process fallback uses an unhidden taskkill.
+        const result = await timeout(server.close().then(() => ({ ok: true }), error => ({ error })), left(), null);
+        if (!result) throw failure('CHROMIUM_CLEANUP_TIMEOUT');
+        if (result.error) throw failure('CHROMIUM_CLOSE_FAILED', result.error);
+        if (browser?.isConnected()) {
+          const disconnected = await timeout(disconnect().then(() => true), left(), false);
+          if (!disconnected) throw failure('CHROMIUM_DISCONNECT_TIMEOUT');
+        }
+      })();
+      const abortCleanup = () => { cleanup().catch(() => {}); };
+      signal?.addEventListener('abort', abortCleanup, { once: true });
+      let disconnect;
+      try {
+        signal?.throwIfAborted();
+        browser = await connectServer(server.wsEndpoint(), { timeout: Math.max(1, Math.min(options.timeout || 25000, deadline - Date.now() - chromiumCleanupBudget(deadline))) });
+        disconnect = browser.close.bind(browser);
+        browser.close = cleanup;
+        signal?.throwIfAborted();
+        return browser;
+      } catch (error) { await cleanup(); throw error; }
+    }
     if (platform !== 'linux') return managedLaunch({ ...options, headless: true });
     const wrapper = xvfbRun();
     if (!wrapper) throw failure('CHROMIUM_XVFB_UNAVAILABLE');

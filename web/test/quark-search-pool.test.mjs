@@ -321,6 +321,30 @@ function fixture({ request, discoveryRequest, webRequest, renderSearch, telegram
 const savedBackup = now => ({ candidates: [{ url: backup, automatic: true, status: 'healthy', addedAt: now - 100, checkedAt: now - 1, failures: 0, retryAt: 0 }] });
 const lookup = async (pool, url = 'https://manual.example/api/search?kw=电影') => JSON.parse(await readText(await pool.request(url, { headers: { Cookie: 'user-cookie', Authorization: 'user-token' } })));
 
+test('trailing title punctuation has a bounded API fallback without weakening film or year checks', async () => {
+  const expected = 'https://pan.quark.cn/s/punctuation26';
+  const f = fixture({ request: url => response(JSON.stringify({ results: new URL(url).searchParams.get('kw') === '八仙' ? [
+    { title: '八仙 (2026)', url: expected },
+    { title: '八仙过海 (2026)', url: 'https://pan.quark.cn/s/unrelated26' },
+    { title: '八仙 (2025)', url: 'https://pan.quark.cn/s/wrongyear26' },
+  ] : [] })) });
+  try {
+    const data = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?' + new URLSearchParams({ kw: '八仙！' }), { year: '2026' })));
+    assert.deepEqual(data.results.map(row => row.url), [expected]);
+    assert.deepEqual(f.calls.map(call => new URL(call.url).searchParams.get('kw')), ['八仙！', '八仙']);
+  } finally { await f.pool.stop(); }
+});
+
+test('empty APIs leave a fresh ten-second static phase inside the overall search budget', async () => {
+  let remaining;
+  const f = fixture({ request: url => response(url.includes('bing.com') ? '<rss><channel></channel></rss>' : '{"results":[]}'),
+    googleSearch: async (_title, { deadline, now }) => { remaining = deadline - now(); return [{ name: '电影', url: quarkUrl }]; } });
+  try {
+    assert.equal((await lookup(f.pool)).results[0].url, quarkUrl);
+    assert.ok(remaining > 9000 && remaining <= 10000, String(remaining));
+  } finally { await f.pool.stop(); }
+});
+
 test('only matching film titles are recommended; unnamed resources are separate and other films or years are discarded', async () => {
   const rows = [
     { name: '【电影】一路平安 (2026) 4K', url: quarkUrl },
@@ -971,7 +995,7 @@ test('explicit more checks APIs and continues public pages within two network sl
     peak = Math.max(peak, ++active); await new Promise(done => setImmediate(done)); active--;
     return response(url.includes('bing.com') ? `<rss><channel><item><title>电影 2026</title><pubDate>Tue, 01 Sep 2026 00:00:00 GMT</pubDate><link>${quarkUrl}?pwd=1234</link></item><item><title>电影 4K</title><link>https://pan.quark.cn/s/unknown12345</link></item></channel></rss>` : '<html>public index</html>');
   }, googleSearch: async (keyword, { read, deadline, now }) => {
-    googleCalls++; assert.equal(keyword, '电影'); assert.equal(deadline - now(), 3000);
+    googleCalls++; assert.equal(keyword, '电影'); assert.equal(deadline - now(), 10000);
     await read('https://www.google.com/search?q=' + encodeURIComponent(keyword), 3000, 512 * 1024, deadline);
     await read('https://index.example/movie', 3000, 512 * 1024, deadline);
     return [
@@ -1679,7 +1703,7 @@ test('a slow empty helper leaves a complete Google SERP and article budget for t
     t.mock.timers.tick(1400); await flush(); t.mock.timers.tick(900); await flush();
     const complete = JSON.parse(await readText(await f.pool.request(url, { year: '2026', poll: true })));
     assert.equal(complete.results[0].url, quarkUrl); assert.equal(complete.pending, undefined);
-    assert.equal(budgets.find(row => row.article).timeout, 1600, 'article receives the remainder of a fresh three-second web phase');
+    assert.equal(budgets.find(row => row.article).timeout, 1800, 'article retains its short request limit inside the fresh ten-second web phase');
   } finally { releaseApi?.(response('{"results":[]}')); await f.pool.stop(); }
 });
 

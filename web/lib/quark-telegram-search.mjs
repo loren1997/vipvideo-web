@@ -1,5 +1,5 @@
 import { validateUrl } from './network.mjs';
-import { extractQuarkArticle, quarkPasswordDate } from './quark-google-search.mjs';
+import { extractQuarkArticle, quarkPasswordDate, quarkSearchTitleVariants } from './quark-google-search.mjs';
 
 // PanSou's official channel catalog; each default has a readable, same-channel public post containing Quark links.
 export const DEFAULT_QUARK_TELEGRAM_CHANNELS = Object.freeze([
@@ -94,7 +94,7 @@ export function createQuarkTelegramSearch({ channels = DEFAULT_QUARK_TELEGRAM_CH
     const rows = new Map(), end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, now() + 35_000);
     if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 1000 || typeof read !== 'function' || now() >= end) return [];
     signal?.throwIfAborted();
-    const title = keyword.trim(), names = [...new Set([title, ...(Array.isArray(aliases) ? aliases.slice(0, 10) : []).filter(value => typeof value === 'string' && value.trim() && value.length <= 300).map(value => value.trim())])].slice(0, 2);
+    const title = keyword.trim(), names = [...new Set([...quarkSearchTitleVariants(title), ...(Array.isArray(aliases) ? aliases.slice(0, 10) : []).filter(value => typeof value === 'string' && value.trim() && value.length <= 300).map(value => value.trim())])].slice(0, 2);
     const key = JSON.stringify([title, names, year]);
     for (const [key, value] of cache) if (!value.users && value.expires <= now()) cache.delete(key);
     let entry = cache.get(key);

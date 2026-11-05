@@ -7,6 +7,9 @@ import http from 'node:http';
 import { chromium } from 'playwright-core';
 import { createRequest } from '../lib/network.mjs';
 import { createQuarkBrowser } from '../lib/quark-browser.mjs';
+import { createQuarkBrowserSearch } from '../lib/quark-browser-client.mjs';
+import { createBrowserWorker } from '../browser-worker.mjs';
+import { extractQuarkArticle } from '../lib/quark-google-search.mjs';
 
 const executablePath = [process.env.CHROMIUM_PATH, process.env.BROWSER_EXECUTABLE, '/opt/google/chrome/chrome', '/usr/bin/google-chrome', '/usr/bin/chromium', chromium.executablePath(),
   'C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'].find(value => value && existsSync(value));
@@ -93,6 +96,58 @@ test('a context timeout reports its phase and releases the launched browser', as
     await result;
     assert.equal(closed, 1);
   } finally { await renderer.close(); }
+});
+
+test('headless Chromium waits for a delayed public share after a visible article introduction', { skip: executablePath ? false : 'No local Chromium; set CHROMIUM_PATH to run rendering fixtures.' }, async t => {
+  const introduction = '<title>希望 (2026)</title><nav>公开导航</nav><aside><a href="https://pan.quark.cn/s/recommend26">希望 (2026) 推荐分享</a></aside><div hidden><a href="https://pan.quark.cn/s/hidden26">隐藏分享</a></div><article><h1>希望 (2026)</h1><p>完整影片介绍，分享入口稍后加载。</p><div id="shares"></div></article>';
+  const value = fixture({
+    '/search': () => response('<title>Google Search</title><a href="https://page.example/delayed-share"><h3>希望 (2026) 夸克网盘</h3></a>'),
+    '/delayed-share': () => response(introduction + '<script>setTimeout(() => { document.querySelector("#shares").innerHTML = \'<a href="https://pan.quark.cn/s/delayed26">夸克网盘分享</a>\'; }, 3000)</script>'),
+  });
+  const worker = createBrowserWorker({ browser: value.renderer, read: async url => ({ url, html: url.includes('bing') ? '<rss><channel></channel></rss>' : introduction }) });
+  await new Promise(resolve => worker.server.listen(0, '127.0.0.1', resolve));
+  const search = createQuarkBrowserSearch({ fetch: (url, options) => {
+    assert.equal(url, 'http://quark-browser:3020/search');
+    assert.deepEqual(Object.keys(JSON.parse(options.body)), ['title', 'aliases', 'year', 'page', 'budgetMs']);
+    return fetch('http://127.0.0.1:' + worker.server.address().port + '/search', options);
+  } });
+  const started = performance.now();
+  try {
+    const rows = await search({ title: '希望2026', year: '2026', aliases: [] }, { deadline: Date.now() + 20000 });
+    assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/delayed26']);
+    assert.ok(performance.now() - started < 20000, '公开分享等待仍受HTTP搜索总期限限制');
+  } finally {
+    await worker.close();
+    t.diagnostic(JSON.stringify({ elapsedMs: Math.round(performance.now() - started), requests: value.calls.length, activeBrowsers: value.active() }));
+  }
+  assert.equal(value.active(), 0);
+});
+
+test('headless Chromium promptly accepts visible plaintext and wrapped article shares', { skip: executablePath ? false : 'No local Chromium; set CHROMIUM_PATH to run rendering fixtures.' }, async t => {
+  for (const [kind, resource, expected] of [
+    ['plaintext', '<p>https://pan.quark.cn/s/plaintext26</p>', 'https://pan.quark.cn/s/plaintext26'],
+    ['wrapped', '<a href="https://page.example/out?url=https%3A%2F%2Fpan.quark.cn%2Fs%2Fwrapped26">夸克分享</a>', 'https://pan.quark.cn/s/wrapped26'],
+  ]) await t.test(kind, async () => {
+    const value = fixture({ '/ready-share': () => response(`<title>希望 (2026)</title><article><h1>希望 (2026)</h1>${resource}</article>`) });
+    const started = Date.now();
+    const parse = result => extractQuarkArticle(result.html, { title: '希望', year: '2026', url: result.url }).rows;
+    try {
+      const result = await value.renderer.render('https://page.example/ready-share', { deadline: started + 6000, waitForShare: result => parse(result).length > 0 });
+      assert.deepEqual(parse(result).map(row => row.url), [expected]);
+      assert.ok(Date.now() - started < 3000, `${kind}已有公开分享不能等满文章预算`);
+    } finally { await value.renderer.close(); }
+    assert.equal(value.active(), 0);
+  });
+});
+
+test('headless Chromium stops waiting when a public article explicitly requires a reply', { skip: executablePath ? false : 'No local Chromium; set CHROMIUM_PATH to run rendering fixtures.' }, async () => {
+  const value = fixture({ '/reply-locked': () => response('<title>希望 (2026)</title><article><h1>希望 (2026)</h1>本帖含有特定内容，请回复后再查看</article>') });
+  const started = Date.now();
+  try {
+    await assert.rejects(value.renderer.render('https://page.example/reply-locked', { waitForShare: () => false, deadline: started + 8000 }), { quarkPoolReason: 'browserLocked' });
+    assert.ok(Date.now() - started < 5000, '回复锁不消耗剩余分享等待期限');
+  } finally { await value.renderer.close(); }
+  assert.equal(value.active(), 0);
 });
 
 test('headless Chromium renders through the validated transport', { skip: executablePath ? false : 'No local Chromium; set CHROMIUM_PATH to run rendering and SSRF fixtures.' }, async t => {

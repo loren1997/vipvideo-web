@@ -13,7 +13,7 @@ export function createQuarkBrowser({ safeRequest = createQuarkPublicRequest(), e
   let closed = false;
   const jobs = new Set();
 
-  async function render(value, { deadline = Date.now() + 25000, signal } = {}) {
+  async function render(value, { deadline = Date.now() + 25000, signal, waitForShare = false } = {}) {
     const url = validateUrl(value).href;
     if (closed) throw failure('网页渲染器已关闭', 'browserUnavailable', 503);
     const controller = new AbortController(), end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, Date.now() + 25000);
@@ -159,32 +159,42 @@ export function createQuarkBrowser({ safeRequest = createQuarkPublicRequest(), e
             if (!contentReady) throw timeoutFailure();
             controller.signal.throwIfAborted();
             phase = 'snapshot';
-            const snapshot = await page.evaluate(() => {
-              const visible = element => {
-                const style = getComputedStyle(element);
-                return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && style.opacity !== '0' && !element.hidden;
-              };
-              const root = document.body?.cloneNode(true);
-              if (!root) return { title: document.title, text: '', body: '', metadata: '', links: [] };
-              const originals = [...document.body.querySelectorAll('*')], clones = [...root.querySelectorAll('*')];
-              for (let index = 0; index < originals.length; index++) {
-                const original = originals[index], clone = clones[index];
-                if (['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT', 'SVG', 'IFRAME', 'EMBED', 'AUDIO', 'VIDEO'].includes(original.tagName.toUpperCase()) || !visible(original)) { clone.remove(); continue; }
-                for (const attribute of [...clone.attributes]) if (!['class', 'id', 'href', 'datetime'].includes(attribute.name)) clone.removeAttribute(attribute.name);
-                if (original.tagName === 'A') {
-                  if (/^https?:/.test(original.href)) clone.setAttribute('href', original.href);
-                  else clone.removeAttribute('href');
+            const snapshotPage = async () => {
+              const snapshot = await page.evaluate(() => {
+                const visible = element => {
+                  const style = getComputedStyle(element);
+                  return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && style.opacity !== '0' && !element.hidden;
+                };
+                const root = document.body?.cloneNode(true);
+                if (!root) return { title: document.title, text: '', body: '', metadata: '', links: [] };
+                const originals = [...document.body.querySelectorAll('*')], clones = [...root.querySelectorAll('*')];
+                for (let index = 0; index < originals.length; index++) {
+                  const original = originals[index], clone = clones[index];
+                  if (['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT', 'SVG', 'IFRAME', 'EMBED', 'AUDIO', 'VIDEO'].includes(original.tagName.toUpperCase()) || !visible(original)) { clone.remove(); continue; }
+                  for (const attribute of [...clone.attributes]) if (!['class', 'id', 'href', 'datetime'].includes(attribute.name)) clone.removeAttribute(attribute.name);
+                  if (original.tagName === 'A') {
+                    if (/^https?:/.test(original.href)) clone.setAttribute('href', original.href);
+                    else clone.removeAttribute('href');
+                  }
                 }
-              }
-              const metadata = [...document.head.querySelectorAll('meta[property="og:title"],meta[property="article:published_time"],meta[itemprop="datePublished"],script[type="application/ld+json"]')].slice(0, 20).map(element => element.outerHTML).join('').slice(0, 32768);
-              const links = [...root.querySelectorAll('a[href]')].slice(0, 300).map(anchor => ({ url: anchor.href, text: anchor.textContent.trim().slice(0, 1000) }));
-              const mainText = document.querySelector('main,article')?.innerText.trim() || '';
-              return { title: document.title.slice(0, 1000), text: document.body.innerText.slice(0, 120000), body: root.innerHTML, metadata, links, failed: /^(?:加载失败|页面加载失败|网络异常|network error|failed to load)(?:\s|$)/i.test(mainText) };
-            });
-            if (snapshot.failed) throw failure('公开网页加载失败', 'browserFailed');
-            const html = `<!doctype html><html><head><title>${escape(snapshot.title)}</title>${snapshot.metadata}</head><body>${snapshot.body}</body></html>`;
-            if (Buffer.byteLength(html) > 512 * 1024) throw failure('动态网页正文过大', 'browserFailed');
-            return { url: validateUrl(page.url()).href, html, title: snapshot.title, text: snapshot.text, links: snapshot.links };
+                const metadata = [...document.head.querySelectorAll('meta[property="og:title"],meta[property="article:published_time"],meta[itemprop="datePublished"],script[type="application/ld+json"]')].slice(0, 20).map(element => element.outerHTML).join('').slice(0, 32768);
+                const links = [...root.querySelectorAll('a[href]')].slice(0, 300).map(anchor => ({ url: anchor.href, text: anchor.textContent.trim().slice(0, 1000) }));
+                const mainText = document.querySelector('main,article')?.innerText.trim() || '';
+                return { title: document.title.slice(0, 1000), text: document.body.innerText.slice(0, 120000), body: root.innerHTML, metadata, links, failed: /^(?:加载失败|页面加载失败|网络异常|network error|failed to load)(?:\s|$)/i.test(mainText) };
+              });
+              if (snapshot.failed) throw failure('公开网页加载失败', 'browserFailed');
+              const html = `<!doctype html><html><head><title>${escape(snapshot.title)}</title>${snapshot.metadata}</head><body>${snapshot.body}</body></html>`;
+              if (Buffer.byteLength(html) > 512 * 1024) throw failure('动态网页正文过大', 'browserFailed');
+              return { url: validateUrl(page.url()).href, html, title: snapshot.title, text: snapshot.text, links: snapshot.links };
+            };
+            let result = await snapshotPage();
+            while (typeof waitForShare === 'function' && !waitForShare(result)) {
+              if (/本帖含有特定内容，请回复后再查看/.test(result.text) || /kehua-hidden-block--locked/.test(result.html)) throw failure('公开文章要求登录或回复', 'browserLocked');
+              if (remaining() <= 250) break;
+              await page.waitForTimeout(Math.min(250, remaining() - 250));
+              controller.signal.throwIfAborted(); result = await snapshotPage();
+            }
+            return result;
           } catch (cause) {
             if (mainError) throw mainError;
             if (controller.signal.aborted) throw controller.signal.reason;
