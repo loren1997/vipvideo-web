@@ -260,6 +260,27 @@ test('one public channel read can time out without cancelling the shared search'
   } finally { await f.pool.stop(); }
 });
 
+test('one static article read can be cancelled without cancelling the remaining public search', async () => {
+  let completed = false;
+  const f = fixture({ request: value => response(value.includes('bing.com') ? '<rss><channel></channel></rss>' : '{"results":[]}'),
+    googleSearch: async (_title, options) => {
+      const local = new AbortController();
+      local.abort(new DOMException('Short link deadline', 'TimeoutError'));
+      await assert.rejects(options.read('https://t.cn/cancelled', 1000, 512 * 1024, options.deadline, local.signal), /搜索请求超时/);
+      await options.read('https://article.example/healthy', 1000, 512 * 1024, options.deadline);
+      completed = true;
+      return [{ name: '希望 (2026)', url: quarkUrl }];
+    },
+  });
+  try {
+    const result = JSON.parse(await readText(await f.pool.request('https://manual.example/api/search?kw=' + encodeURIComponent('希望'), { year: '2026' })));
+    assert.equal(completed, true);
+    assert.ok(result.results.some(row => row.url === quarkUrl));
+    assert.equal(f.calls.some(call => new URL(call.url).hostname === 't.cn'), false);
+    assert.ok(f.calls.some(call => new URL(call.url).hostname === 'article.example'));
+  } finally { await f.pool.stop(); }
+});
+
 test('a public channel adapter that stays pending cannot run an unbounded number of batches', async () => {
   let batches = 0;
   const f = fixture({ telegramSearch: async () => { batches++; return Object.assign([], { pending: true }); } });

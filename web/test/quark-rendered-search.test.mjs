@@ -10,6 +10,70 @@ const article = (id, date, position = 0) => `<html><head><meta property="og:titl
 const serp = '<a href="https://public.example/older"><h3>希望 HOPE (2026) 夸克</h3></a><a href="https://public.example/newer"><h3>2026韩国电影希望Hope！夸克网盘分享</h3></a><a href="https://public.example/wrong"><h3>希望 (2013) 夸克网盘</h3></a>';
 const bingSerp = '<ol><li class="b_algo"><h2><a href="https://public.example/older">希望 HOPE (2026) 夸克网盘</a></h2></li><li class="b_algo"><h2><a href="https://public.example/newer">2026韩国电影希望Hope！夸克网盘分享</a></h2></li></ol>';
 
+test('rendered search resolves a matching roundup block without borrowing neighbouring films or Baidu passwords', async () => {
+  const articleUrl = 'https://www.sina.cn/news/detail/1234567890123456.html', calls = [];
+  const html = '<title>多部影片合集</title><article>🔥其他影片 (2026)<br/>夸克：http://t.cn/Other001<br/><br/>🔥八仙！ (2026)（1080P）<br/>百度：http://t.cn/Baidu001 提取码:8888<br/>夸克：http://t.cn/Quark001<br/><br/>🔥奥德赛<br/>夸克：http://t.cn/Other002<br/><br/></article>';
+  const search = createQuarkRenderedSearch({
+    render: async url => {
+      assert.ok(url.includes('google.com/search'), 'successful static article resolution needs no article browser');
+      return { url, html: '<a href="' + articleUrl + '"><h3>🔥其他影片 (2026) 夸克 🔥八仙！ (2026)</h3></a>' };
+    },
+    read: async (url, options) => {
+      calls.push({ url, deadline: options.deadline });
+      if (url.includes('bing.com/search')) return { url, html: '<rss><channel></channel></rss>' };
+      if (url === articleUrl) return { url, html };
+      assert.equal(url, 'http://t.cn/Quark001'); return { url: 'https://pan.quark.cn/s/dynamic26', html: '' };
+    },
+  });
+  const rows = await search({ title: '八仙！', year: '2026', aliases: [] });
+  assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/dynamic26']);
+  assert.equal(rows[0].url.includes('8888'), false);
+  assert.deepEqual(calls.filter(row => row.url.includes('t.cn')).map(row => row.url), ['http://t.cn/Quark001']);
+});
+
+test('a dynamic roundup readiness callback stays synchronous while short-link network resolution happens afterwards', async () => {
+  const articleUrl = 'https://public.example/roundup', calls = [];
+  const html = '<article>🔥八仙！ (2026)<br/>夸克：http://t.cn/Quark001<br/><br/>🔥其他影片<br/>夸克：http://t.cn/Other001<br/><br/></article>';
+  let ready = false;
+  const search = createQuarkRenderedSearch({
+    render: async (url, options) => {
+      if (url.includes('google.com/search')) return { url, html: '<a href="' + articleUrl + '"><h3>八仙！ (2026) 夸克网盘</h3></a>' };
+      assert.equal(url, articleUrl);
+      const result = { url, html };
+      const readiness = options.waitForShare(result);
+      assert.equal(typeof readiness, 'boolean'); assert.equal(readiness, true);
+      assert.equal(calls.some(value => value.includes('t.cn')), false);
+      ready = true; return result;
+    },
+    read: async url => {
+      calls.push(url);
+      if (url.includes('bing.com/search')) return { url, html: '<rss><channel></channel></rss>' };
+      if (url === articleUrl) return { url, html: '<script>app()</script>' };
+      assert.equal(ready, true); assert.equal(url, 'http://t.cn/Quark001');
+      return { url: 'https://pan.quark.cn/s/rendered26', html: '' };
+    },
+  });
+  assert.deepEqual((await search({ title: '八仙！', year: '2026', aliases: [] })).map(row => row.url), ['https://pan.quark.cn/s/rendered26']);
+});
+
+test('a failed roundup short link is reported safely by the rendered search', async () => {
+  const articleUrl = 'https://public.example/roundup';
+  const html = '<article>🔥八仙！ (2026)<br/>夸克：http://t.cn/Quark001<br/><br/>🔥其他影片<br/>夸克：http://t.cn/Other001<br/><br/></article>';
+  const search = createQuarkRenderedSearch({
+    render: async (url, options) => url.includes('google.com/search')
+      ? { url, html: '<a href="' + articleUrl + '"><h3>八仙！ (2026) 夸克网盘</h3></a>' }
+      : { url, html },
+    read: async url => {
+      if (url.includes('bing.com/search')) return { url, html: '<rss><channel></channel></rss>' };
+      if (url === articleUrl) return { url, html };
+      throw Error('sensitive upstream message');
+    },
+  });
+  const found = await search({ title: '八仙！', year: '2026', aliases: [] });
+  assert.equal(found.length, 0); assert.ok(found.reason.includes('公开短链接暂时无法读取'));
+  assert.ok(!found.reason.includes('sensitive upstream message'));
+});
+
 test('advanced Google search opens matching articles, extracts anchors at any position, and sorts by actual publication time', async () => {
   const calls = [];
   const search = createQuarkRenderedSearch({ render: async url => {

@@ -20,6 +20,154 @@ function fixture(search, pages = {}) {
   return { calls, read, now: () => time };
 }
 
+const roundupUrl = 'https://www.sina.cn/news/detail/1234567890123456.html';
+const roundupQuery = { title: '八仙！', year: '2026' };
+const roundup = '<title>多部影片资源</title><article>🔥遮天.HD4K 更180<br/>夸克：https://pan.quark.cn/s/before26<br/><br/>🔥八仙！ (2026)（1080P）【喜剧/动画/奇幻/冒险】<br/>百度：http://t.cn/Baidu001<br/>提取码：8888<br/>百度: http://t.cn/Baidu002 提取码: 8888<br/>夸克：http://t.cn/Quark001<br/><br/>🔥奥德赛（1080P）【历史/奇幻】<br/>夸克：http://t.cn/Other001<br/><br/></article>';
+
+test('roundup extraction isolates a dated film block and only its explicitly labelled Quark link', async () => {
+  const plain = webSearch.extractQuarkArticle(roundup, { ...roundupQuery, url: roundupUrl });
+  assert.deepEqual(plain, { rows: [], matched: true }, 'the synchronous direct-link API keeps its original shape');
+  const calls = [];
+  const found = await webSearch.resolveQuarkArticle({ html: roundup, url: roundupUrl }, roundupQuery, {
+    now: () => time, deadline: time + 5000,
+    read: async (url, options) => { calls.push({ url, options }); return { url: 'https://pan.quark.cn/s/correct26', html: '' }; },
+  });
+  assert.deepEqual(calls.map(row => row.url), ['http://t.cn/Quark001']);
+  assert.equal(found.rows.length, 1); assert.equal(found.rows[0].url, 'https://pan.quark.cn/s/correct26');
+  assert.equal(found.rows[0].url.includes('8888'), false);
+  assert.equal(webSearch.classifyQuarkCandidate(found.rows[0].name, roundupQuery), 'matched');
+  assert.equal(calls[0].options.deadline, time + 1800);
+  assert.equal(calls[0].options.signal.aborted, true, 'short-link work is released after resolution');
+  assert.deepEqual(webSearch.extractQuarkArticle(roundup.replace('八仙！ (2026)', '八仙！ (2025)'), { ...roundupQuery, url: roundupUrl }), { rows: [], matched: false });
+});
+
+test('roundup canonical links stay inside the selected block even when the page title matches', () => {
+  const html = roundup.replace('<title>多部影片资源</title>', '<title>八仙！ (2026) 夸克资源</title>')
+    .replace('http://t.cn/Quark001', 'https://pan.quark.cn/s/selected26');
+  assert.deepEqual(webSearch.extractQuarkArticle(html, { ...roundupQuery, url: roundupUrl }).rows.map(row => row.url), ['https://pan.quark.cn/s/selected26']);
+  const ordinary = '<title>希望 (2026)</title><article><h1>希望 (2026)</h1><p>影片介绍</p><br/><br/><a href="https://pan.quark.cn/s/valid2026">夸克下载</a></article>';
+  assert.deepEqual(webSearch.extractQuarkArticle(ordinary, { title: '希望', year: '2026', requireYear: true, url: roundupUrl }).rows.map(row => row.url), ['https://pan.quark.cn/s/valid2026']);
+  const adjacent = '<article>🔥八仙！ (2026)<br/>夸克：http://t.cn/good001<br/>🔥八仙过海 (2026)<br/>夸克：http://t.cn/wrong01<br/><br/>🔥奥德赛<br/>夸克：http://t.cn/other01</article>';
+  assert.deepEqual(webSearch.extractQuarkArticle(adjacent, { ...roundupQuery, url: roundupUrl, includeShortLinks: true }).shortLinks.map(row => row.url), ['http://t.cn/good001']);
+  assert.deepEqual(webSearch.extractQuarkArticle(adjacent.replace('🔥八仙过海', '八仙过海'), { ...roundupQuery, url: roundupUrl, includeShortLinks: true }).shortLinks.map(row => row.url), ['http://t.cn/good001']);
+});
+
+test('hidden or recommended roundup blocks cannot establish the requested film scope', () => {
+  const target = '🔥八仙！ (2026)<br/>夸克：http://t.cn/Quark001<br/><br/>';
+  for (const attributes of ['hidden', 'hidden="false"', 'aria-hidden="true"', 'style="display:none"', 'style="visibility: hidden"', 'class="recommendations"']) {
+    const html = '<title>影片列表</title><article><div ' + attributes + '>' + target + '</div>🔥其他影片 (2026)<br/>夸克：http://t.cn/Other001<br/><br/>🔥奥德赛<br/>夸克：http://t.cn/Other002<br/><br/></article>';
+    assert.deepEqual(webSearch.extractQuarkArticle(html, { ...roundupQuery, url: roundupUrl }), { rows: [], matched: false }, attributes);
+  }
+});
+
+test('short-link resolution accepts only an actual HTTPS canonical Quark final URL', async () => {
+  for (const [url, html] of [
+    ['http://pan.quark.cn/s/correct26', ''], ['https://pan.quark.cn.evil.example/s/correct26', ''],
+    ['https://public.example/?url=https://pan.quark.cn/s/correct26', ''], ['http://127.0.0.1/private', ''],
+    ['https://pan.quark.cn/other/correct26', ''], ['https://pan.quark.cn/s/correct26?token=secret', ''],
+    ['https://pan.quark.cn/s/correct26', '<title>登录验证</title>'],
+  ]) {
+    const found = await webSearch.resolveQuarkArticle({ html: roundup, url: roundupUrl }, roundupQuery, {
+      now: () => time, deadline: time + 5000, read: async () => ({ url, html }),
+    });
+    assert.deepEqual(found.rows, [], url);
+  }
+});
+
+test('expired and cancelled short-link work cannot publish a late result', async () => {
+  let clock = time, calls = 0;
+  const found = await webSearch.resolveQuarkArticle({ html: roundup, url: roundupUrl }, roundupQuery, {
+    now: () => clock, deadline: time + 100,
+    read: async () => { calls++; clock += 101; return { url: 'https://pan.quark.cn/s/toolate26', html: '' }; },
+  });
+  assert.deepEqual(found.rows, []); assert.equal(calls, 1);
+  const controller = new AbortController(); controller.abort(new Error('account-free test cancelled'));
+  await assert.rejects(webSearch.resolveQuarkArticle({ html: roundup, url: roundupUrl }, roundupQuery, {
+    now: () => time, deadline: time + 1000, signal: controller.signal, read: async () => { throw Error('must not read'); },
+  }), /cancelled/);
+});
+
+test('Sina roundup SERP admission selects a strict dated heading rather than an arbitrary title substring', () => {
+  const heading = '🔥其他电影 (2026) 夸克资源 🔥八仙！ (2026)（1080P） 🔥奥德赛';
+  const results = webSearch.extractQuarkSearchResults(link(roundupUrl, heading), { ...roundupQuery });
+  assert.equal(results.length, 1); assert.equal(results[0].name, '八仙！ (2026)（1080P）');
+  for (const [url, name] of [
+    [roundupUrl, heading.replace('八仙！ (2026)', '八仙！ (2025)')],
+    [roundupUrl, heading.replace('八仙！ (2026)', '八仙！')],
+    ['https://arbitrary.example/article', heading],
+  ]) assert.deepEqual(webSearch.extractQuarkSearchResults(link(url, name), roundupQuery), []);
+});
+
+test('static search discovers a roundup and resolves only the selected short link within the shared budget', async () => {
+  const f = fixture(link(roundupUrl, '🔥其他电影 (2026) 夸克资源 🔥八仙！ (2026)（1080P）'), {
+    [roundupUrl]: roundup, 'http://t.cn/Quark001': { url: 'https://pan.quark.cn/s/static26', html: '' },
+  });
+  const found = await searchGoogleQuark('八仙！', { ...f, year: '2026', titleOnly: true, deadline: time + 10000 });
+  assert.deepEqual(found.map(row => row.url), ['https://pan.quark.cn/s/static26']);
+  assert.deepEqual(f.calls.filter(row => new URL(row.url).hostname === 't.cn').map(row => row.url), ['http://t.cn/Quark001']);
+  assert.ok(f.calls.every(row => row.deadline === time + 10000));
+});
+
+test('one static search bounds short-link reads across all candidate articles', async () => {
+  const urls = Array.from({ length: 6 }, (_, index) => 'https://public.example/roundup' + index);
+  const f = fixture(urls.map(url => link(url, '八仙！ (2026) 夸克网盘')).join(''), {
+    ...Object.fromEntries(urls.map(url => [url, roundup])),
+    'http://t.cn/Quark001': { url: 'https://pan.quark.cn/s/limited26', html: '' },
+  });
+  const found = await searchGoogleQuark('八仙！', { ...f, year: '2026', titleOnly: true });
+  assert.equal(found.length, 1);
+  assert.equal(f.calls.filter(row => new URL(row.url).hostname === 't.cn').length, 4);
+});
+
+test('static short-link errors retain a fixed safe reason instead of claiming no share exists', async () => {
+  const f = fixture(link(roundupUrl, '八仙！ (2026) 夸克网盘'), {
+    [roundupUrl]: roundup, 'http://t.cn/Quark001': new Error('private upstream detail token=do-not-display'),
+  });
+  const found = await searchGoogleQuark('八仙！', { ...f, year: '2026', titleOnly: true });
+  assert.equal(found.length, 0); assert.equal(found.reason, '公开短链接暂时无法读取');
+  assert.ok(!found.reason.includes('do-not-display'));
+});
+
+test('short-link redirects keep existing public-DNS guards and never contact a private target', async () => {
+  const contacted = [];
+  const transport = (url, options, callback) => {
+    const outgoing = new EventEmitter();
+    outgoing.destroy = error => outgoing.emit('error', error);
+    outgoing.end = () => queueMicrotask(() => {
+      contacted.push(url.href);
+      assert.ok(!Object.keys(options.headers || {}).some(key => /cookie|authorization/i.test(key)));
+      const response = Object.assign(Readable.from(['']), { statusCode: 302, headers: { location: 'http://private.example/share' } });
+      callback(response);
+    });
+    return outgoing;
+  };
+  const safe = createRequest({ lookup: async host => [{ address: host === 'private.example' ? '192.168.1.9' : '8.8.8.8', family: 4 }], httpRequest: transport, httpsRequest: transport });
+  const found = await webSearch.resolveQuarkArticle({ html: roundup, url: roundupUrl }, roundupQuery, {
+    deadline: Date.now() + 2000,
+    read: async (url, { deadline, signal }) => {
+      const response = await safe(url, { timeout: deadline - Date.now(), signal });
+      return { url: response.finalUrl, html: await readText(response, 512 * 1024) };
+    },
+  });
+  assert.deepEqual(contacted, ['http://t.cn/Quark001']);
+  assert.deepEqual(found.rows, []); assert.equal(found.reason, '公开短链接暂时无法读取');
+});
+
+test('a short-link read that ignores its deadline is aborted and cannot publish late', async () => {
+  let reading, requestedSignal;
+  const started = Date.now();
+  const work = webSearch.resolveQuarkArticle({ html: roundup, url: roundupUrl }, roundupQuery, {
+    deadline: started + 60,
+    read: async (url, { signal }) => { requestedSignal = signal; return new Promise(resolve => { reading = resolve; }); },
+  });
+  const found = await work;
+  assert.deepEqual(found.rows, []); assert.equal(found.reason, '公开短链接暂时无法读取');
+  assert.equal(requestedSignal.aborted, true); assert.ok(Date.now() - started < 1000);
+  reading({ url: 'https://pan.quark.cn/s/toolate26', html: '' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(found.rows, []);
+});
+
 test('resource identity requires the primary title or a supplied alias and separates unnamed links', () => {
   const query = { title: '一路平安', aliases: ['Safe Journey'], year: '2026' };
   for (const [label, expected] of [

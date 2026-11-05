@@ -498,8 +498,8 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           }
           const webDeadline = Math.min(entry.deadline, now() + 10000);
           const pages = await Promise.allSettled([
-            typeof renderSearch === 'function' ? [] : googleSearch(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(webDeadline, limit ?? webDeadline), true, entry.controller.signal), deadline: webDeadline, now }),
-            searchBingQuark(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, read: (url, duration, maxBytes, limit) => text(url, duration, request, maxBytes, Math.min(webDeadline, limit ?? webDeadline), true, entry.controller.signal), deadline: webDeadline, now }),
+            typeof renderSearch === 'function' ? [] : googleSearch(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, read: (url, duration, maxBytes, limit, readSignal) => text(url, duration, request, maxBytes, Math.min(webDeadline, limit ?? webDeadline), true, readSignal ? AbortSignal.any([entry.controller.signal, readSignal]) : entry.controller.signal), deadline: webDeadline, now }),
+            searchBingQuark(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, read: (url, duration, maxBytes, limit, readSignal) => text(url, duration, request, maxBytes, Math.min(webDeadline, limit ?? webDeadline), true, readSignal ? AbortSignal.any([entry.controller.signal, readSignal]) : entry.controller.signal), deadline: webDeadline, now }),
           ]);
           if (stopping) throw failure('公开搜索已停止', 503, true);
           for (const [index, page] of pages.entries()) {

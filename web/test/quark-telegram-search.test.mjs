@@ -257,9 +257,9 @@ test('does not accept redirects outside the public channel and preserves bounded
 const channelPost = (channel, ...args) => post(...args).replaceAll('Quark_Movies', channel);
 
 test('default catalog covers verified film, series and animation channels without duplicate usernames', () => {
-  assert.equal(DEFAULT_QUARK_TELEGRAM_CHANNELS.length, 27);
-  assert.equal(new Set(DEFAULT_QUARK_TELEGRAM_CHANNELS.map(value => value.toLowerCase())).size, 27);
-  for (const channel of ['Quark_Movies', 'Netdisk_Movies', 'kuakedongman', 'guoman4K', 'yunpanx']) assert.ok(DEFAULT_QUARK_TELEGRAM_CHANNELS.includes(channel));
+  assert.equal(DEFAULT_QUARK_TELEGRAM_CHANNELS.length, 28);
+  assert.equal(new Set(DEFAULT_QUARK_TELEGRAM_CHANNELS.map(value => value.toLowerCase())).size, 28);
+  for (const channel of ['Quark_Movies', 'panpansou', 'Netdisk_Movies', 'kuakedongman', 'guoman4K', 'yunpanx']) assert.ok(DEFAULT_QUARK_TELEGRAM_CHANNELS.includes(channel));
   assert.ok(Object.isFrozen(DEFAULT_QUARK_TELEGRAM_CHANNELS));
 });
 
@@ -306,9 +306,10 @@ test('more searches untouched channels before aliases or older pages even after 
   assert.equal(first.progress.attemptedChannels, 8);
   for (let batch = 1; batch < 4; batch++) await search('希望', { ...options, page: 1 });
   assert.equal(calls.length, 32); assert.equal(maximumActive, 2);
-  assert.deepEqual(calls.slice(0, 27).map(call => call.channel), [...DEFAULT_QUARK_TELEGRAM_CHANNELS]);
-  assert.ok(calls.slice(0, 27).every(call => call.q === '希望' && call.before === null));
-  assert.ok(calls.slice(27).every(call => call.q === 'Hope' && call.before === null));
+  const channels = DEFAULT_QUARK_TELEGRAM_CHANNELS.length;
+  assert.deepEqual(calls.slice(0, channels).map(call => call.channel), [...DEFAULT_QUARK_TELEGRAM_CHANNELS]);
+  assert.ok(calls.slice(0, channels).every(call => call.q === '希望' && call.before === null));
+  assert.ok(calls.slice(channels).every(call => call.q === 'Hope' && call.before === null));
 });
 
 test('publishes partial results while another channel is still being read and deduplicates cross-channel dates and codes', async () => {

@@ -1,9 +1,9 @@
 import { validateUrl } from './network.mjs';
 import { extractQuarkArticle, quarkPasswordDate, quarkSearchTitleVariants } from './quark-google-search.mjs';
 
-// PanSou's official channel catalog; each default has a readable, same-channel public post containing Quark links.
+// Verified public channels; each default has a readable, same-channel post containing Quark links.
 export const DEFAULT_QUARK_TELEGRAM_CHANNELS = Object.freeze([
-  'Quark_Movies', 'ucquark', 'QuarkFree', 'kuakedongman', 'guoman4K', 'PanjClub', 'SharePanFilms',
+  'Quark_Movies', 'panpansou', 'ucquark', 'QuarkFree', 'kuakedongman', 'guoman4K', 'PanjClub', 'SharePanFilms',
   'Netdisk_Movies', 'yunpanquark', 'quark_res', 'baicaoZY', 'tgsearchers7', 'yunpanx', 'yydf_hzl',
   'Aliyun_4K_Movies', 'shareAliyun', 'dianying4k', 'WPpindao', 'Panzi88com', 'zh_vip', 'rbzhwpzy',
   'gokuapan', 'jxwpzy', 'TG654TG', 'yoyokuakeduanju', 'Q66Share', 'leoziyuan'

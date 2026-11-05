@@ -1,4 +1,4 @@
-import { googleQueryUrl, bingQueryUrl, quarkSearchQueries, quarkSearchPageState, extractQuarkSearchResults, extractQuarkArticle, classifyQuarkCandidate, hasQuarkResourceCue } from './quark-google-search.mjs';
+import { googleQueryUrl, bingQueryUrl, quarkSearchQueries, quarkSearchPageState, extractQuarkSearchResults, extractQuarkArticle, resolveQuarkArticle, classifyQuarkCandidate, hasQuarkResourceCue } from './quark-google-search.mjs';
 
 const blocked = value => /g-recaptcha|h-captcha|cf-chl-|our systems have detected|unusual traffic|<title[^>]*>[^<]*(?:验证码|安全验证|登录|sign\s?in|log\s?in)|<title[^>]*>\s*人机验证\s*<\/title\s*>|^(?:人机验证|安全验证|检测到异常流量)/i.test(value);
 const direct = value => { const url = new URL(value); return url.protocol === 'https:' && url.hostname === 'pan.quark.cn' && /^\/s\/[a-z0-9]{6,32}\/?$/i.test(url.pathname); };
@@ -66,7 +66,16 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
     }
     const selected = [...articles.values()].sort((a, b) => Number(hasQuarkResourceCue(b.name)) - Number(hasQuarkResourceCue(a.name)) || (b.publishedAt ?? -1) - (a.publishedAt ?? -1)).slice(0, 10);
     const loaded = new Map(), excluded = new Set();
-    const parse = (row, result) => extractQuarkArticle(result.html, { ...query, url: result.url, requireYear: row.googleRedirect === true, now: now() }).rows;
+    let shortLinks = 0;
+    const articleQuery = row => ({ ...query, requireYear: row.googleRedirect === true });
+    const parse = (row, result) => extractQuarkArticle(result.html, { ...articleQuery(row), url: result.url, now: now(), includeShortLinks: true });
+    const resolve = async (row, result, deadline, reading = signal) => {
+      const found = await resolveQuarkArticle(result, articleQuery(row), {
+        read, deadline, now, signal: reading, takeShortLink: () => shortLinks++ < 4,
+      });
+      if (found.reason) notes.add(found.reason);
+      return found.rows;
+    };
     // Read all selected articles before an unrelated dynamic page can spend the remaining budget.
     if (read && selected.length && now() < end - 1000) {
       const deadline = Math.min(end - 1000, now() + 8000);
@@ -80,7 +89,7 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
             const result = await read(row.url, { signal: reading, deadline });
             if (reading.aborted || now() > deadline) return;
             if (blocked(result.html)) throw Object.assign(new Error('网页要求验证'), { quarkPoolReason: 'browserBlocked' });
-            const found = parse(row, result);
+            const found = await resolve(row, result, deadline, reading);
             if (!found.length && /本帖含有特定内容，请回复后再查看|kehua-hidden-block--locked/.test(result.html)) throw Object.assign(new Error('公开文章要求登录或回复'), { quarkPoolReason: 'browserLocked' });
             loaded.set(row.url, result); merge(found);
           } catch (cause) {
@@ -109,9 +118,12 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
       if (now() >= end - 1000 || rows.size >= 30) break;
       try {
         signal?.throwIfAborted();
-        const result = await render(row.url, { signal, deadline: Math.min(end, now() + 12000), waitForShare: result => parse(row, result).length > 0 });
+        const result = await render(row.url, { signal, deadline: Math.min(end, now() + 12000), waitForShare: result => {
+          const found = parse(row, result);
+          return found.rows.length > 0 || Boolean(found.shortLinks?.length);
+        } });
         if (blocked(result.text || '')) throw Object.assign(new Error('网页要求验证'), { quarkPoolReason: 'browserBlocked' });
-        merge(parse(row, result));
+        merge(await resolve(row, result, end));
       } catch (cause) { report(cause); }
     }
     const result = [...rows.values()].sort((a, b) => (b.publishedAt ?? -1) - (a.publishedAt ?? -1)).slice(0, 30);

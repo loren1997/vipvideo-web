@@ -119,7 +119,7 @@ function published(html, now, body = html, query) {
   }
 }
 
-function articleBody(html) {
+function articleBody(html, omitHidden = false) {
   const tags = /<\/?([a-z][\w:-]*)\b[^>]*>/gi;
   let result = '', start = 0, omitted = '', depth = 0;
   for (const match of html.matchAll(tags)) {
@@ -128,7 +128,9 @@ function articleBody(html) {
       if (name === omitted && (closing ? --depth : ++depth) === 0) { start = match.index + match[0].length; omitted = ''; }
       continue;
     }
-    if (!closing && (/^(?:aside|nav|footer)$/.test(name) || /^(?:div|section)$/.test(name) && /related|recommend/i.test(attribute(match[0], 'class') + ' ' + attribute(match[0], 'id')))) {
+    const hidden = omitHidden && !/^(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/.test(name)
+      && (/\shidden(?=\s|=|\/?>)/i.test(match[0].replace(/(["'])[\s\S]*?\1/g, '""')) || attribute(match[0], 'aria-hidden').toLowerCase() === 'true' || /(?:display\s*:\s*none|visibility\s*:\s*hidden)/i.test(attribute(match[0], 'style')));
+    if (!closing && (hidden || /^(?:aside|nav|footer)$/.test(name) || /^(?:div|section)$/.test(name) && /related|recommend/i.test(attribute(match[0], 'class') + ' ' + attribute(match[0], 'id')))) {
       result += html.slice(start, match.index); omitted = name; depth = 1;
     }
   }
@@ -167,7 +169,13 @@ export function extractQuarkSearchResults(raw, { engine = 'Google', url = engine
   const add = (value, name, publishedAt) => {
     const candidate = target(value, url, engine === 'Google' && classifyQuarkCandidate(name, query) === 'matched');
     if (!candidate || results.length >= 40) return;
-    const direct = share(candidate, name), identity = classifyQuarkCandidate(name, query);
+    const direct = share(candidate, name);
+    if (!direct && candidate.origin === 'https://www.sina.cn' && /^\/news\/detail\/\d+\.html$/.test(candidate.pathname) && name.includes('🔥')) {
+      const section = name.split('🔥').map(value => value.split(/百度|夸克|https?:\/\/|提取码/)[0].trim()).find(value =>
+        datedMovieHeading(value) && classifyQuarkCandidate(value, { ...query, requireYear: true }) === 'matched');
+      if (section) name = section;
+    }
+    const identity = classifyQuarkCandidate(name, query);
     if (identity === 'unrelated' || identity === 'unknown' && !direct) return;
     results.push({ url: direct || candidate.href, name, ...(googleHost(candidate.hostname) ? { googleRedirect: true } : {}), ...(publishedAt === undefined ? {} : { publishedAt }) });
   };
@@ -234,11 +242,50 @@ function nextQuarkResources(html, query, base) {
   return rows;
 }
 
-export function extractQuarkArticle(html, { url, title, aliases = [], year, requireYear = false, now = Date.now() } = {}) {
+const datedMovieHeading = name => /^[^:：]{1,180}[(（](?:19|20)\d{2}[)）]/.test(name);
+
+function scopedArticle(body, query, url, date) {
+  // A roundup's blank-line boundaries also isolate neighbouring films without a year.
+  const blocks = articleBody(body, true).replace(/[\r\n]+/g, ' ').split(/(?:<br\b[^>]*>\s*){2,}/i);
+  const opening = block => text(block.split(/<br\b[^>]*>/i)[0]).slice(0, 300);
+  if (blocks.filter(block => /^🔥/.test(opening(block))).length < 2 || !blocks.some(block => /^🔥/.test(opening(block)) && datedMovieHeading(opening(block)))) return null;
+  const rows = [], shortLinks = [], seen = new Set();
+  let matched = false;
+  for (const block of blocks) {
+    const name = opening(block);
+    if (!/^🔥/.test(name) || !datedMovieHeading(name) || classifyQuarkCandidate(name, { ...query, requireYear: true }) !== 'matched') continue;
+    matched = true;
+    for (const line of block.split(/<br\b[^>]*>/i).slice(1)) {
+      const label = text(line);
+      if (/^🔥/.test(label) || datedMovieHeading(label)) break;
+      if (!/^夸克(?:网盘)?\s*[:：]/i.test(label)) continue;
+      const values = [...line.matchAll(/<a\b([^>]*)>/gi)].map(match => attribute(match[1], 'href'));
+      values.push(...[...label.matchAll(/https?:\/\/[^\s<>"'，。]+/gi)].map(match => match[0]));
+      for (const value of values) {
+        const candidate = target(value, url);
+        if (!candidate) continue;
+        const direct = share(candidate, label);
+        if (direct && !seen.has(direct) && rows.length < 40) {
+          seen.add(direct); rows.push({ url: direct, name, ...(date === undefined ? {} : { publishedAt: date }) });
+        } else if (candidate.hostname === 't.cn' && !candidate.port && !candidate.search && !candidate.hash && /^\/[a-z0-9]{4,32}$/i.test(candidate.pathname) && !seen.has(candidate.href) && shortLinks.length < 2) {
+          seen.add(candidate.href); shortLinks.push({ url: candidate.href, name, ...(date === undefined ? {} : { publishedAt: date }) });
+        }
+      }
+    }
+  }
+  return { rows, matched, shortLinks };
+}
+
+export function extractQuarkArticle(html, { url, title, aliases = [], year, requireYear = false, now = Date.now(), includeShortLinks = false } = {}) {
   const rows = [], query = { title, aliases, year, requireYear }, relevant = name => classifyQuarkCandidate(name, query) === 'matched';
   if (typeof html !== 'string' || Buffer.byteLength(html) > MAX_BODY || blocked(html) || !target(url, url) || googleHost(new URL(url).hostname) || bingHost(new URL(url).hostname)) return { rows, matched: false };
   const content = visible(html), article = /<(?:article|main)\b[^>]*>([\s\S]*?)<\/(?:article|main)\s*>/i.exec(content)?.[1] || content;
   const body = articleBody(article);
+  const scoped = scopedArticle(body, query, url, published(html, now, body, query));
+  if (scoped) {
+    if (!includeShortLinks) delete scoped.shortLinks;
+    return scoped;
+  }
   const headings = ['title', 'h1'].map(tag => text(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}\\s*>`, 'i').exec(tag === 'h1' ? body : content)?.[1] || ''));
   for (const meta of content.matchAll(/<meta\b[^>]*>/gi)) if (attribute(meta[0], 'property').toLowerCase() === 'og:title') headings.push(attribute(meta[0], 'content'));
   const opening = text(/<(?:p|h2|strong)\b[^>]*>([\s\S]*?)<\/(?:p|h2|strong)\s*>/i.exec(body)?.[1] || '').slice(0, 300);
@@ -268,6 +315,33 @@ export function extractQuarkArticle(html, { url, title, aliases = [], year, requ
   return { rows, matched: true };
 }
 
+export async function resolveQuarkArticle(result, query, { read, deadline, now = Date.now, signal, takeShortLink = () => true } = {}) {
+  const extracted = extractQuarkArticle(result.html, { ...query, url: result.url, now: now(), includeShortLinks: true });
+  const rows = [...extracted.rows];
+  let reason;
+  for (const link of extracted.shortLinks || []) {
+    signal?.throwIfAborted();
+    if (typeof read !== 'function' || !Number.isFinite(deadline) || now() >= deadline || !takeShortLink()) break;
+    const end = Math.min(deadline, now() + 1800), controller = new AbortController();
+    let timer;
+    try {
+      const resolved = await Promise.race([
+        read(link.url, { deadline: end, signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal }),
+        new Promise((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('公开短链读取超时')); }, Math.max(1, end - now())); }),
+      ]);
+      signal?.throwIfAborted();
+      if (now() >= end || typeof resolved?.html !== 'string' || Buffer.byteLength(resolved.html) > MAX_BODY || blocked(resolved.html)) continue;
+      // Only the safe transport's actual official final URL counts, never a wrapper parameter.
+      const final = validateUrl(resolved.url);
+      if (final.protocol !== 'https:' || final.hash || [...final.searchParams.keys()].some(key => key !== 'pwd') || final.searchParams.getAll('pwd').length > 1) continue;
+      const canonical = share(final);
+      if (canonical && !rows.some(row => row.url === canonical)) rows.push({ ...link, url: canonical });
+    } catch (cause) { signal?.throwIfAborted(); reason = '公开短链接暂时无法读取'; }
+    finally { clearTimeout(timer); controller.abort(); }
+  }
+  return { rows, matched: extracted.matched, ...(reason ? { reason } : {}) };
+}
+
 async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now, aliases = [], year, titleOnly = false, page = 0 } = {}) {
   if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 1000 || typeof read !== 'function') return [];
   const title = titleOnly === true ? keyword.trim() : keyword.trim().replace(/\s+(?:19|20)\d{2}$/, ''), term = normalize(title);
@@ -286,11 +360,11 @@ async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now,
     if (preferPassword) passwordDates.set(key, publishedAt);
     rows.set(key, { ...old, url: !old || preferPassword ? url : old.url, name: !old || newer ? name.slice(0, 500) : old.name, ...(newer ? { publishedAt } : {}) });
   };
-  let readPages = 0, matchedPages = 0, lastPageError, javascriptOnly = false;
-  const load = async (url, duration, required = false) => {
+  let readPages = 0, matchedPages = 0, lastPageError, shortReadReason, javascriptOnly = false;
+  const load = async (url, duration, required = false, signal) => {
     if (end <= now()) return { html: '', url };
     try {
-      const result = await read(url, Math.min(duration, end - now()), MAX_BODY, end);
+      const result = await read(url, Math.min(duration, end - now()), MAX_BODY, end, signal);
       const html = typeof result === 'string' ? result : result?.html, finalUrl = typeof result?.url === 'string' ? result.url : url;
       if (now() > end) throw Object.assign(new Error(), { quarkPoolReason: '搜索请求超时' });
       if (typeof html !== 'string' || Buffer.byteLength(html) > MAX_BODY) throw Object.assign(new Error(), { quarkPoolReason: '搜索响应内容异常（超过大小限制或非网页响应）' });
@@ -335,11 +409,16 @@ async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now,
     for (const row of extractQuarkSearchResults(result.html, { ...query, engine, url: search.href, now: now() })) addResult(row.url, row.name, row.publishedAt);
     if ([...rows.values()].some(row => relevant(row.name)) || [...pages.values()].some(row => hasQuarkResourceCue(row.name)) || end - now() < 250) break;
   }
+  let shortLinks = 0;
   await Promise.all([...pages].sort((a, b) => Number(hasQuarkResourceCue(b[1].name)) - Number(hasQuarkResourceCue(a[1].name))).map(async ([url, { requireYear }]) => {
     const result = await load(url, 1800);
     if (!result.html) return;
     readPages++;
-    const extracted = extractQuarkArticle(result.html, { ...query, url: result.url, requireYear, now: now() });
+    const extracted = await resolveQuarkArticle(result, { ...query, requireYear }, {
+      deadline: end, now, takeShortLink: () => shortLinks++ < 4,
+      read: (url, { deadline, signal }) => load(url, Math.max(1, deadline - now()), true, signal),
+    });
+    if (extracted.reason) lastPageError = shortReadReason = extracted.reason;
     if (!extracted.matched) return;
     matchedPages++;
     for (const row of extracted.rows) add(row.url, row.name, row.publishedAt);
@@ -348,7 +427,7 @@ async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now,
     if (row.url.includes('?pwd=')) Object.defineProperty(row, quarkPasswordDate, { value: passwordDates.get(key) ?? 0 });
     return row;
   });
-  if (!output.some(row => relevant(row.name))) Object.defineProperty(output, 'reason', { value: output.length && lastPageError ? '部分公开搜索未完成：' + lastPageError : !pages.size ? javascriptOnly ? 'Google 搜索页面需要 JavaScript，当前未能读取搜索结果' : '未找到与片名相符的公开网页结果' : !readPages ? '资源网页读取未完成：' + (lastPageError || '已到搜索时间上限') : !matchedPages ? '搜索结果网页未通过片名核验' : '已读取相关网页，但未找到可核验的夸克分享链接' });
+  if (!output.some(row => relevant(row.name))) Object.defineProperty(output, 'reason', { value: shortReadReason || (output.length && lastPageError ? '部分公开搜索未完成：' + lastPageError : !pages.size ? javascriptOnly ? 'Google 搜索页面需要 JavaScript，当前未能读取搜索结果' : '未找到与片名相符的公开网页结果' : !readPages ? '资源网页读取未完成：' + (lastPageError || '已到搜索时间上限') : !matchedPages ? '搜索结果网页未通过片名核验' : '已读取相关网页，但未找到可核验的夸克分享链接') });
   return output;
 }
 
