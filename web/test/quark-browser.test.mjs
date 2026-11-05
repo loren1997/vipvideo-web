@@ -15,7 +15,7 @@ const executablePath = [process.env.CHROMIUM_PATH, process.env.BROWSER_EXECUTABL
   'C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'].find(value => value && existsSync(value));
 const response = (body, statusCode = 200, headers = { 'content-type': 'text/html; charset=utf-8' }) => Object.assign(typeof body === 'string' ? Readable.from([Buffer.from(body)]) : body, { statusCode, headers });
 
-function fixture(routes, { lookup, trace } = {}) {
+function fixture(routes, { lookup, trace, launchBrowser = options => chromium.launch(options) } = {}) {
   const calls = [], lookups = [], browsers = [], launchOptions = [];
   let active = 0, maximum = 0;
   const transport = (url, options, callback) => {
@@ -45,7 +45,7 @@ function fixture(routes, { lookup, trace } = {}) {
   const renderer = createQuarkBrowser({ safeRequest, executablePath, launch: async options => {
     launchOptions.push(options);
     trace?.({ event: 'launch-start' });
-    const browser = await chromium.launch(options);
+    const browser = await launchBrowser(options);
     trace?.({ event: 'launch-ready', version: browser.version() });
     browsers.push(browser);
     maximum = Math.max(maximum, ++active);
@@ -98,27 +98,43 @@ test('a context timeout reports its phase and releases the launched browser', as
   } finally { await renderer.close(); }
 });
 
-test('headless Chromium waits for a delayed public share after a visible article introduction', { skip: executablePath ? false : 'No local Chromium; set CHROMIUM_PATH to run rendering fixtures.' }, async t => {
+test('headless Chromium waits for a delayed public share after a visible article introduction', { skip: executablePath ? false : 'No local Chromium; set CHROMIUM_PATH to run rendering fixtures.', timeout: 70000 }, async t => {
   const introduction = '<title>希望 (2026)</title><nav>公开导航</nav><aside><a href="https://pan.quark.cn/s/recommend26">希望 (2026) 推荐分享</a></aside><div hidden><a href="https://pan.quark.cn/s/hidden26">隐藏分享</a></div><article><h1>希望 (2026)</h1><p>完整影片介绍，分享入口稍后加载。</p><div id="shares"></div></article>';
-  const value = fixture({
-    '/search': () => response('<title>Google Search</title><a href="https://page.example/delayed-share"><h3>希望 (2026) 夸克网盘</h3></a>'),
-    '/delayed-share': () => response(introduction + '<script>setTimeout(() => { document.querySelector("#shares").innerHTML = \'<a href="https://pan.quark.cn/s/delayed26">夸克网盘分享</a>\'; }, 3000)</script>'),
-  });
-  const worker = createBrowserWorker({ browser: value.renderer, read: async url => ({ url, html: url.includes('bing') ? '<rss><channel></channel></rss>' : introduction }) });
-  await new Promise(resolve => worker.server.listen(0, '127.0.0.1', resolve));
-  const search = createQuarkBrowserSearch({ fetch: (url, options) => {
-    assert.equal(url, 'http://quark-browser:3020/search');
-    assert.deepEqual(Object.keys(JSON.parse(options.body)), ['title', 'aliases', 'year', 'page', 'budgetMs']);
-    return fetch('http://127.0.0.1:' + worker.server.address().port + '/search', options);
-  } });
-  const started = performance.now();
+  const preparationStarted = performance.now(), events = [];
+  let prepared, value, worker, started, preparationMs, reason;
+  const trace = event => events.push({ elapsedMs: Math.round(performance.now() - started), ...event });
   try {
-    const rows = await search({ title: '希望2026', year: '2026', aliases: [] }, { deadline: Date.now() + 20000 });
-    assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/delayed26']);
+    // Host cold startup is a prerequisite; the HTTP deadline below measures delayed share readiness.
+    prepared = await chromium.launch({ executablePath, headless: true, timeout: 45000, args: ['--mute-audio', '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', '--host-resolver-rules=MAP * ~NOTFOUND'] });
+    const context = await prepared.newContext({ serviceWorkers: 'block' });
+    await context.newPage(); await context.close();
+    preparationMs = Math.round(performance.now() - preparationStarted);
+    value = fixture({
+      '/search': () => response('<title>Google Search</title><a href="https://page.example/delayed-share"><h3>希望 (2026) 夸克网盘</h3></a>'),
+      '/delayed-share': () => response(introduction + '<script>setTimeout(() => { document.querySelector("#shares").innerHTML = \'<a href="https://pan.quark.cn/s/delayed26">夸克网盘分享</a>\'; }, 3000)</script>'),
+    }, { trace, launchBrowser: options => {
+      trace({ event: 'launch-budget', timeoutMs: Math.round(options.timeout) });
+      if (prepared) { const browser = prepared; prepared = undefined; return browser; }
+      return chromium.launch(options);
+    } });
+    worker = createBrowserWorker({ browser: { close: value.renderer.close, render: async (...args) => {
+      try { return await value.renderer.render(...args); }
+      catch (error) { trace({ event: 'render-failed', reason: error.quarkPoolReason, phase: error.quarkBrowserPhase }); throw error; }
+    } }, read: async url => ({ url, html: url.includes('bing') ? '<rss><channel></channel></rss>' : introduction }) });
+    await new Promise(resolve => worker.server.listen(0, '127.0.0.1', resolve));
+    const search = createQuarkBrowserSearch({ fetch: (url, options) => {
+      assert.equal(url, 'http://quark-browser:3020/search');
+      assert.deepEqual(Object.keys(JSON.parse(options.body)), ['title', 'aliases', 'year', 'page', 'budgetMs']);
+      return fetch('http://127.0.0.1:' + worker.server.address().port + '/search', options);
+    } });
+    started = performance.now();
+    const rows = await search({ title: '希望2026', year: '2026', aliases: [] }, { deadline: Date.now() + 20000, signal: t.signal });
+    reason = rows.reason;
+    assert.deepEqual(rows.map(row => row.url), ['https://pan.quark.cn/s/delayed26'], reason);
     assert.ok(performance.now() - started < 20000, '公开分享等待仍受HTTP搜索总期限限制');
   } finally {
-    await worker.close();
-    t.diagnostic(JSON.stringify({ elapsedMs: Math.round(performance.now() - started), requests: value.calls.length, activeBrowsers: value.active() }));
+    try { if (worker) await worker.close(); else await value?.renderer.close(); }
+    finally { await prepared?.close(); t.diagnostic(JSON.stringify({ preparationMs, elapsedMs: started && Math.round(performance.now() - started), reason, events, requests: value?.calls.length, activeBrowsers: value?.active() })); }
   }
   assert.equal(value.active(), 0);
 });
