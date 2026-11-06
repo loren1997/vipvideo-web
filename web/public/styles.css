@@ -288,7 +288,7 @@ html[data-tv="true"] .quark-saved-file strong { font-size:20px; }
 .player-clock{display:flex;align-items:center;gap:1rem;padding:.5rem .1rem;color:var(--muted);font-size:.85rem;flex-wrap:wrap}.player-clock input[type=range]{flex:1;min-width:160px;accent-color:var(--accent)}
 .player-frame { position:relative; }
 .player-clock input[type=range],.player-film-controls input[type=range] { padding:0; border:0; background:transparent; height:32px; }
-.player-film-controls { position:absolute; left:0; right:0; bottom:0; z-index:3; max-height:100%; overflow:auto; padding:24px 16px 10px; background:linear-gradient(transparent,#000d); border-radius:0 0 10px 10px; transition:opacity .18s; }
+.player-film-controls { position:absolute; left:0; right:0; bottom:0; z-index:3; max-height:100%; overflow:auto; padding:24px 16px 10px; background:linear-gradient(transparent,#000d); border-radius:0 0 10px 10px; }
 .player-film-controls .button { background:transparent; border-color:transparent; }
 .player-film-controls .button:hover { background:#ffffff24; }
 .player-frame.player-controls-idle { cursor:none; }
