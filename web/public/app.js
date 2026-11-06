@@ -744,20 +744,29 @@ function pauseCompatibility(current, job) {
   current.updateClock?.();
 }
 
+function playbackPaused(current) {
+  if (current.transcodeLoading) return Boolean(current.transcodeResumeCancelled);
+  if (current.qualitySwitch) return current.qualitySwitch.paused;
+  return Boolean(current.transcodePause || current.video.paused);
+}
+
 function resumeVideo(current) {
   if (player !== current) return;
-  if (current.qualitySwitch) { current.qualitySwitch.paused = false; current.quarkPaused = false; if (current.qualitySwitch.loading) attemptPlay(current, current.mediaVersion); return; }
-  if (current.transcodeLoading) { current.transcodeResumeCancelled = false; current.quarkPaused = false; return; }
+  current.quarkPaused = false;
+  if (current.qualitySwitch) { current.qualitySwitch.paused = false; if (current.qualitySwitch.loading) attemptPlay(current, current.mediaVersion); current.updateClock?.(); return; }
+  if (current.transcodeLoading) { current.transcodeResumeCancelled = false; current.updateClock?.(); return; }
   if (current.transcodePause) void startCompatibility(current, current.seekPreview?.position ?? current.transcodePause.position);
   else void current.video.play().catch(error => notify(error.message, true));
 }
 
 function pauseVideo(current) {
   if (player !== current) return;
+  current.quarkPaused = true;
   if (current.qualitySwitch) { current.qualitySwitch.paused = true; current.quarkPaused = true; clearTimeout(current.loadTimer); current.note.textContent = '已暂停'; }
   if (current.transcodeLoading) { current.transcodeResumeCancelled = true; current.quarkPaused = true; current.note.textContent = '已暂停'; current.note.className = 'player-note'; }
   current.video.pause();
   if (current.transcoded && !current.transcodeLoading && !current.transcodeReady && current.transcodeId) pauseCompatibility(current, { id: current.transcodeId, position: playPosition(current) });
+  current.updateClock?.();
 }
 
 function compatibilityLabel(current) {
@@ -814,6 +823,7 @@ async function startCompatibility(current, position = current.seekPreview?.posit
         Object.assign(current, { transcodeId: job.id, transcoded: true, transcodeReady: false, startPosition: Number(job.startPosition) || 0, originalDuration: Number.isFinite(job.duration) && job.duration > 0 ? job.duration : 0, acceleration: job.acceleration, url: job.url, type: 'hls', usedProxy: false, started: true, position: Number(job.startPosition) || 0, introHandled: true, failed: false, recovering: false });
         current.transcodeLoading = false;
         if (current.transcodeResumeCancelled) { delete current.pendingTranscodePosition; pauseCompatibility(current, { id: job.id, position: pausedPosition }); return; }
+        if (!current.live && body.speed !== current.preferences.speed) current.pendingTranscodePosition ??= requested;
         if (current.pendingTranscodePosition !== undefined) continue;
         if (current.video) { resetDanmaku(current); loadMedia(current, `正在连接${compatibilityLabel(current)}…`); }
         else mountPlayer(current);
@@ -2232,7 +2242,7 @@ function mountPlayer(current) {
     note.textContent = '第三方网页可能拒绝嵌入；黑屏或无法播放时请切换解析线路或外部打开。这里只保存链接历史，无法同步网页内进度。';
     update(); return;
   }
-  const video = node('video'); video.controls = true; video.tabIndex = 0; video.playsInline = true; video.preload = 'metadata'; video.setAttribute('aria-label', `${current.detail.title} ${current.episodeName || ''}`); current.video = video; surface.append(video);
+  const video = node('video'); video.controls = false; video.tabIndex = 0; video.playsInline = true; video.preload = 'metadata'; video.setAttribute('aria-label', `${current.detail.title} ${current.episodeName || ''}`); current.video = video; surface.append(video);
   const backward = button('−10 秒', () => seekVideo(current, -10)); backward.setAttribute('aria-label', '快退 10 秒'); backward.disabled = Boolean(current.live);
   const forward = button('+10 秒', () => seekVideo(current, 10)); forward.setAttribute('aria-label', '快进 10 秒'); forward.disabled = Boolean(current.live);
   const speed = node('select'); speed.setAttribute('aria-label', '播放速度');
@@ -2242,14 +2252,12 @@ function mountPlayer(current) {
   speed.disabled = Boolean(current.live);
   speed.addEventListener('change', () => {
     const position = current.seekPreview?.position ?? playPosition(current); current.preferences.speed = Number(speed.value); video.playbackRate = current.preferences.speed;
-    if (current.transcoded) void startCompatibility(current, position);
+    if (current.transcoded && !playbackPaused(current)) void startCompatibility(current, position);
   });
   const full = button('全屏', async () => {
-    const target = current.fullFilmControls || current.quarkQualities?.length || current.transcoded ? frame : video;
-    try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) { if (target === frame && !current.fullFilmControls) { frame.append(qualityBar); qualityBar.append(full); } await target.requestFullscreen(); } else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else notify('当前浏览器不支持全屏。'); }
+    try { if (document.fullscreenElement) await document.exitFullscreen(); else if (frame.requestFullscreen) await frame.requestFullscreen(); else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else notify('当前浏览器不支持全屏。'); }
     catch (error) { current.updateClock?.(); notify(error.message, true); }
   });
-  toolbar.append(backward, forward, speed, full);
   const qualityBar = node('div', undefined, 'player-toolbar player-quality-controls'); qualityBar.style.padding = '0'; qualityBar.style.minWidth = '0';
   const playbackMode = node('span', undefined, 'playback-mode'); playbackMode.setAttribute('aria-label', '当前播放方式'); playbackMode.setAttribute('aria-live', 'polite');
   const qualitySelect = node('select'); qualitySelect.setAttribute('aria-label', '播放画质'); qualitySelect.hidden = true; qualitySelect.style.maxWidth = '100%'; qualitySelect.style.minWidth = '0';
@@ -2259,7 +2267,7 @@ function mountPlayer(current) {
     if (current.transcoded) {
       const height = Number(qualitySelect.value.replace('transcode-', '')); if (![720, 1080, 2160].includes(height)) return;
       current.transcodeQuality = height; refreshPlaybackQuality(current);
-      if (!video.paused || !current.transcodeReady && !current.transcodePause && !current.quarkPaused) void startCompatibility(current); return;
+      if (!playbackPaused(current)) void startCompatibility(current); return;
     }
     if (current.quarkQualities?.length) {
       const id = qualitySelect.value, option = id === '-1' ? current.quarkDefault : current.quarkQualities.find(option => option.id === id);
@@ -2272,7 +2280,7 @@ function mountPlayer(current) {
     const dimensions = video.videoWidth > 0 && video.videoHeight > 0 ? ` · ${video.videoWidth}×${video.videoHeight}` : '';
     playbackMode.textContent = `${current.transcoded ? '兼容转码播放' : current.quarkAsset ? '夸克官方播放' : '直接播放'}${dimensions}`;
   };
-  qualityBar.append(playbackMode, qualitySelect); toolbar.prepend(qualityBar);
+  qualityBar.append(playbackMode, qualitySelect);
   if (current.catalog || current.live) {
     current.compatibilityButton = button(current.transcoded ? '重新兼容播放' : '兼容播放', () => {
       if (current.manualOfficialQuality && !current.transcoded) {
@@ -2303,38 +2311,32 @@ function mountPlayer(current) {
   clock.append(clockText, timeline); host.insertBefore(clock, current.note);
   const filmControls = node('div', undefined, 'player-film-controls'); filmControls.id = 'full-film-controls'; filmControls.setAttribute('aria-label', '影片播放控制'); filmControls.hidden = true; frame.append(filmControls);
   const transport = node('div', undefined, 'player-toolbar');
-  const play = button('播放', () => { if (player !== current) return; if (video.paused) resumeVideo(current); else pauseVideo(current); });
+  const togglePlayback = () => { if (player !== current) return; if (playbackPaused(current)) resumeVideo(current); else pauseVideo(current); };
+  const play = button('播放', togglePlayback);
   const mute = button('静音', () => { video.muted = !video.muted; });
   const volumeLabel = node('label', '音量'); const volume = node('input'); volume.type = 'range'; volume.min = '0'; volume.max = '1'; volume.step = '0.05'; volume.value = String(video.volume); volume.setAttribute('aria-label', '音量'); volumeLabel.append(volume);
   volume.addEventListener('input', () => { video.volume = Number(volume.value); if (video.volume > 0) video.muted = false; });
-  transport.append(play, mute, volumeLabel); filmControls.append(transport);
-  const placeQualityControls = () => {
-    const target = current.fullFilmControls ? transport : document.fullscreenElement === frame ? frame : toolbar;
-    if (qualityBar.parentNode === target) return;
-    const focused = qualityBar.contains(document.activeElement) ? document.activeElement : null;
-    target.append(qualityBar); focused?.focus({ preventScroll: true });
-    if (!current.fullFilmControls && document.fullscreenElement === frame) qualityBar.append(full);
-  };
-  frame.addEventListener('fullscreenchange', placeQualityControls);
+  transport.append(play, backward, forward, speed, mute, volumeLabel, qualityBar, full); filmControls.append(transport);
   for (const event of ['loadedmetadata', 'loadeddata', 'resize']) video.addEventListener(event, current.updatePlaybackMode);
   const updateTransport = () => {
-    play.textContent = video.paused ? '播放' : '暂停'; play.disabled = Boolean(current.transcodeLoading);
+    play.textContent = playbackPaused(current) ? '播放' : '暂停';
     mute.textContent = video.muted ? '取消静音' : '静音'; volume.value = String(video.volume);
   };
   for (const event of ['play', 'pause', 'volumechange']) video.addEventListener(event, updateTransport);
   frame.addEventListener('fullscreenchange', () => { full.textContent = document.fullscreenElement === frame ? '退出全屏' : '全屏'; });
-  let pendingTimelinePosition, controlsTimer, controlsPointer = null, keyboardControls = false, controlsBuffering = false, controlsLoading = false;
+  let pendingTimelinePosition, controlsTimer, controlsPointer = null, controlsHovered = false, keyboardControls = false, controlsBuffering = false, controlsLoading = false;
   const controlEvents = new AbortController(), controlOptions = { signal: controlEvents.signal };
-  const canHideControls = () => (current.fullFilmControls || document.fullscreenElement === frame && current.quarkQualities?.length) && !video.paused && !video.ended && !video.error && !current.transcodeLoading && !controlsBuffering && controlsPointer === null && !(keyboardControls && (filmControls.contains(document.activeElement) || qualityBar.contains(document.activeElement)));
-  const scheduleControls = () => {
+  const canHideControls = () => !playbackPaused(current) && !video.ended && !video.error && !current.transcodeLoading && !controlsBuffering && !controlsHovered && controlsPointer === null && !(keyboardControls && filmControls.contains(document.activeElement));
+  const hideControls = () => {
     clearTimeout(controlsTimer);
     if (player !== current || !canHideControls()) return;
-    controlsTimer = setTimeout(() => {
-      if (player !== current || !canHideControls()) return;
-      if (filmControls.contains(document.activeElement) || qualityBar.contains(document.activeElement)) video.focus({ preventScroll: true });
-      clearTimeout(controlsTimer);
-      frame.classList.add('player-controls-idle');
-    }, 3000);
+    if (filmControls.contains(document.activeElement)) video.focus({ preventScroll: true });
+    clearTimeout(controlsTimer);
+    frame.classList.add('player-controls-idle');
+  };
+  const scheduleControls = () => {
+    clearTimeout(controlsTimer);
+    if (player === current && canHideControls()) controlsTimer = setTimeout(hideControls, 3000);
   };
   const showControls = (keyboard = keyboardControls) => {
     if (player !== current) return;
@@ -2346,19 +2348,28 @@ function mountPlayer(current) {
     if (controlsPointer !== event.pointerId) return;
     controlsPointer = null; showControls(false);
   };
-  frame.addEventListener('pointermove', () => showControls(), controlOptions);
-  frame.addEventListener('pointerdown', event => {
-    if (filmControls.contains(event.target) || qualityBar.contains(event.target)) controlsPointer = event.pointerId;
+  const pointerActivity = event => {
+    controlsHovered = event.pointerType !== 'touch' && filmControls.contains(event.target);
     showControls(false);
+  };
+  frame.addEventListener('pointermove', pointerActivity, controlOptions);
+  frame.addEventListener('pointerenter', pointerActivity, controlOptions);
+  frame.addEventListener('pointerleave', () => { controlsHovered = false; hideControls(); }, controlOptions);
+  filmControls.addEventListener('pointerenter', pointerActivity, controlOptions);
+  filmControls.addEventListener('pointerleave', () => { controlsHovered = false; scheduleControls(); }, controlOptions);
+  frame.addEventListener('pointerdown', event => {
+    if (filmControls.contains(event.target)) controlsPointer = event.pointerId;
+    pointerActivity(event);
+  }, controlOptions);
+  surface.addEventListener('click', event => {
+    if (event.button !== 0 || event.target !== video && event.target !== surface) return;
+    togglePlayback(); showControls(false);
   }, controlOptions);
   for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) window.addEventListener(event, releaseControls, controlOptions);
-  window.addEventListener('blur', () => { controlsPointer = null; keyboardControls = false; scheduleControls(); }, controlOptions);
+  window.addEventListener('blur', () => { controlsPointer = null; controlsHovered = false; keyboardControls = false; hideControls(); }, controlOptions);
   filmControls.addEventListener('focusin', () => showControls(), controlOptions);
   filmControls.addEventListener('focusout', scheduleControls, controlOptions);
   filmControls.addEventListener('click', () => showControls(false), controlOptions);
-  qualityBar.addEventListener('focusin', () => showControls(), controlOptions);
-  qualityBar.addEventListener('focusout', scheduleControls, controlOptions);
-  qualityBar.addEventListener('click', () => showControls(false), controlOptions);
   frame.addEventListener('fullscreenchange', () => showControls(), controlOptions);
   for (const event of ['play', 'pause', 'playing', 'canplay', 'waiting', 'loadstart', 'ended', 'error']) video.addEventListener(event, () => {
     if (event === 'waiting' || event === 'loadstart') controlsBuffering = true;
@@ -2373,17 +2384,13 @@ function mountPlayer(current) {
     const duration = playDuration(current), position = playPosition(current), preview = pendingTimelinePosition ?? current.seekPreview?.position;
     const shownPosition = preview ?? position;
     const previousControls = current.fullFilmControls;
-    current.fullFilmControls = Boolean(current.transcoded && !current.live && duration > 0);
+    current.fullFilmControls = true;
     clockText.textContent = `${preview !== undefined ? '跳转至 ' : current.transcoded && !current.fullFilmControls ? `${compatibilityLabel(current)} · ` : ''}${formatTime(shownPosition)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
-    filmControls.hidden = !current.fullFilmControls;
-    // Rewriting controls on every progress update resets the browser's auto-hide timer.
-    if (video.controls !== !current.fullFilmControls) video.controls = !current.fullFilmControls;
-    if (current.fullFilmControls) { if (clock.parentNode !== filmControls) filmControls.prepend(clock); if (full.parentNode !== transport) transport.append(full); }
-    else { if (clock.parentNode !== host) host.insertBefore(clock, current.note); const parent = document.fullscreenElement === frame ? qualityBar : toolbar; if (full.parentNode !== parent) parent.append(full); }
-    placeQualityControls();
+    filmControls.hidden = false;
+    if (clock.parentNode !== filmControls) filmControls.prepend(clock);
     qualitySelect.disabled = Boolean(current.transcodeLoading);
     updateTransport();
-    timeline.hidden = !current.transcoded || current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
+    timeline.hidden = current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
     if (pendingTimelinePosition === undefined) { timeline.max = String(duration); timeline.value = String(shownPosition); }
     timeline.setAttribute('aria-valuetext', `${preview !== undefined ? '跳转至 ' : ''}${formatTime(shownPosition)} / ${formatTime(duration)}`);
     // Progress updates must not restart the controls' idle timer.
@@ -2394,7 +2401,9 @@ function mountPlayer(current) {
   timeline.addEventListener('input', () => { if (player !== current) return; pendingTimelinePosition = Math.max(0, Math.min(playDuration(current), Number(timeline.value) || 0)); updateClock(); });
   timeline.addEventListener('change', () => {
     const position = pendingTimelinePosition ?? Number(timeline.value); pendingTimelinePosition = undefined;
-    if (player === current && current.transcoded) void startCompatibility(current, position);
+    if (player !== current) return;
+    if (current.transcoded) void startCompatibility(current, position);
+    else if (!current.live && playDuration(current) > 0) { video.currentTime = Math.max(0, Math.min(playDuration(current), Number(position) || 0)); updateClock(); }
   });
   timeline.addEventListener('pointercancel', () => { pendingTimelinePosition = undefined; updateClock(); });
   current.updateClock = updateClock;
@@ -2950,7 +2959,7 @@ window.addEventListener('keydown', event => {
     if (target.isContentEditable || textEntry && ['ArrowLeft', 'ArrowRight', 'Enter', ' ', 'Escape', 'Backspace'].includes(event.key) || target.matches('input[type="number"]') && ['ArrowUp', 'ArrowDown'].includes(event.key) || target.matches('select') && ['ArrowUp', 'ArrowDown', 'Enter', ' ', 'Escape'].includes(event.key) || target.matches('input[type="range"]') && ['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
     if (current?.video && (target === current.video || /^Media(?:Play|Pause|PlayPause|FastForward|Rewind)$/.test(event.key))) {
       if (['Enter', ' ', 'MediaPlay', 'MediaPause', 'MediaPlayPause'].includes(event.key)) {
-        event.preventDefault(); event.stopPropagation(); if (event.key === 'MediaPause' || event.key !== 'MediaPlay' && !current.video.paused) pauseVideo(current); else resumeVideo(current); return;
+        event.preventDefault(); event.stopPropagation(); if (event.key === 'MediaPause' || event.key !== 'MediaPlay' && !playbackPaused(current)) pauseVideo(current); else resumeVideo(current); return;
       }
       if (['ArrowLeft', 'ArrowRight', 'MediaFastForward', 'MediaRewind'].includes(event.key)) { event.preventDefault(); event.stopPropagation(); seekVideo(current, ['ArrowRight', 'MediaFastForward'].includes(event.key) ? 10 : -10); return; }
     }
@@ -2965,7 +2974,7 @@ window.addEventListener('keydown', event => {
   }
   if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || !current?.video || !(target instanceof Element) || !$('#player-host')?.contains(target) || target.matches('input,textarea,select') || target.closest('[contenteditable="true"]')) return;
   if (current.fullFilmControls && target === current.video && [' ', 'Enter', 'MediaPlayPause', 'MediaPlay', 'MediaPause'].includes(event.key)) {
-    event.preventDefault(); if (event.key === 'MediaPause' || event.key !== 'MediaPlay' && !current.video.paused) pauseVideo(current); else resumeVideo(current);
+    event.preventDefault(); if (event.key === 'MediaPause' || event.key !== 'MediaPlay' && !playbackPaused(current)) pauseVideo(current); else resumeVideo(current);
   } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); seekVideo(current, event.key === 'ArrowRight' ? 10 : -10); }
   else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
     const controls = [...$('#player-host').querySelectorAll('button,a[href],video[controls],select,input')].filter(element => !element.disabled && element.getClientRects().length);

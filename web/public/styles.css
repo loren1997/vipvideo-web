@@ -301,8 +301,7 @@ html[data-tv="true"] .quark-saved-file strong { font-size:20px; }
 .player-frame:fullscreen > .player-surface { flex:1; min-height:0; aspect-ratio:auto; border:0; border-radius:0; }
 .player-frame:fullscreen > .player-surface video { object-fit:contain; }
 .player-frame:fullscreen > .player-film-controls { border-radius:0; }
-.player-frame:fullscreen > .player-quality-controls { position:absolute; top:16px; right:16px; z-index:3; max-width:calc(100% - 32px); padding:8px !important; background:#000b; border-radius:8px; transition:opacity .18s; }
-.player-frame:fullscreen.player-controls-idle > .player-quality-controls { opacity:0; visibility:hidden; pointer-events:none; }
+@media(max-width:640px) { html:not([data-tv="true"]) .player-film-controls { padding:12px 10px 6px; } html:not([data-tv="true"]) .player-film-controls .player-clock { padding:0; } }
 html[data-tv="true"] { font-size:20px; scroll-padding:32px; }
 html[data-tv="true"] :focus { outline:4px solid var(--accent); outline-offset:5px; box-shadow:0 0 0 9px #62dcc833; }
 html[data-tv="true"] .player-surface:focus-within { outline:4px solid var(--accent); outline-offset:5px; box-shadow:0 0 0 9px #62dcc833; }
