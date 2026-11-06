@@ -292,13 +292,13 @@ try {
           if (['unverified', 'unverified-mixed'].includes(quarkMode)) return route.fulfill({ json: { resources: quarkMode === 'unverified-mixed' ? [{ id: 'share-fixture', name: '已匹配片名的分享', url: 'https://pan.quark.cn/s/fixture123' }] : [], reason: '固定搜索服务连接失败', unverified: [{ name: '', url: 'https://pan.quark.cn/s/unknown123?pwd=A1b2&token=redacted#secret' }, { name: '<img src=x onerror=alert(1)>', url: 'https://pan.quark.cn/s/unknown456' }, { name: '危险链接', url: 'https://pan.quark.cn.evil.example/s/unknown789' }, { name: '非法提取码', url: 'https://pan.quark.cn/s/unknown999?pwd=invalid%3D' }] } });
           const resourceReply = quarkResourceReply;
           if (holdQuarkResources) await new Promise(ok => { releaseQuarkResources = ok; });
-          if (resourceReply) return route.fulfill({ json: resourceReply });
+          if (resourceReply) return route.fulfill({ json: typeof resourceReply === 'function' ? await resourceReply(parsed) : resourceReply });
+          if (quarkMode === 'search-empty') return route.fulfill({ json: { resources: [], reason: '搜索渠道暂不可用：API 返回非 JSON；Google 暂不可访问。' } });
           if (parsed.searchParams.get('web') === '1') return route.fulfill({ json: { resources: [
             { id: 'share-new', name: '当前片新增公开资源', url: 'https://pan.quark.cn/s/new123456', publishedAt: Date.UTC(2026, 8, 20) },
             { id: 'share-old', name: '当前片已有公开资源', url: 'https://pan.quark.cn/s/old123456', publishedAt: Date.UTC(2025, 8, 20) },
             { id: 'share-undated', name: '当前片无日期资源', url: 'https://pan.quark.cn/s/nodate123' },
           ] } });
-          if (quarkMode === 'search-empty') return route.fulfill({ json: { resources: [], reason: '搜索渠道暂不可用：API 返回非 JSON；Google 暂不可访问。' } });
           if (quarkChoicesFixture) return route.fulfill({ json: { resources: ['first', 'second'].map(id => ({ id: `share-${id}`, name: `${id === 'first' ? '第一' : '第二'}份分享 · 4K HQ 60FPS 高码率 DTS 环绕声 内嵌简英字幕 ${'完整长标题'.repeat(12)}`, url: `https://pan.quark.cn/s/${id}` })), reason: '' } });
           return route.fulfill({ json: { resources: [{ id: 'share-fixture', name: '当前片分享样例', url: 'https://pan.quark.cn/s/fixture' }], reason: '' } });
         }
@@ -1008,6 +1008,97 @@ try {
     });
   }
 
+  async function verifyQuarkAutomaticWebFallback() {
+    const fresh = { id: 'share-web', name: '补查确认的可用视频', url: 'https://pan.quark.cn/s/webfixture' };
+    const pending = { resources: [], resourceSnapshot: true, pending: true, retryAfterMs: 500 };
+    for (const reason of ['暂未找到分享', '已隐藏 2 条当前无法读取或不含视频的分享']) {
+      await withCloudFixture(async open => {
+        quarkSettings.autoSave = true;
+        const before = quarkRequests.length, prepares = quarkCount('/api/quark/prepare'), plays = quarkCount('/api/quark/playback');
+        const reads = () => quarkRequests.slice(before).filter(row => row.path === '/api/quark/resources');
+        quarkResourceReply = parsed => !parsed.searchParams.has('web')
+          ? { resources: [], resourceSnapshot: true, reason }
+          : parsed.searchParams.has('poll') ? { resources: [fresh], resourceSnapshot: true } : pending;
+        const { page: p } = await open({ clock: true }), panel = p.locator('#quark-resources');
+        await panel.getByText(/正在继续查找公开资源/).waitFor();
+        assert.deepEqual(reads().map(row => [row.query.web, row.query.poll]), [[undefined, undefined], ['1', undefined]], reason);
+        await p.clock.fastForward(500);
+        await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
+        await until(() => panel.getByRole('button', { name: '查找更多公开资源', exact: true }).isEnabled(), '自动补查返回');
+        assert.deepEqual(reads().map(row => [row.query.web, row.query.poll]), [[undefined, undefined], ['1', undefined], ['1', '1']]);
+        await p.clock.fastForward(5000);
+        assert.equal(reads().length, 3); assert.equal(quarkCount('/api/quark/prepare'), prepares); assert.equal(quarkCount('/api/quark/playback'), plays);
+        assert.equal(await p.locator('video').count(), 0, '有账号和唯一匹配文件也不自动转存播放');
+      });
+    }
+    await withCloudFixture(async open => {
+      const before = quarkRequests.length;
+      quarkResourceReply = { resources: [fresh], resourceSnapshot: true };
+      const { page: p } = await open({ clock: true });
+      await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
+      await p.clock.fastForward(60000);
+      const reads = quarkRequests.slice(before).filter(row => row.path === '/api/quark/resources');
+      assert.equal(reads.length, 1); assert.equal(reads[0].query.web, undefined, '已有可用资源不补查');
+    });
+    await withCloudFixture(async open => {
+      const before = quarkRequests.length;
+      quarkResourceReply = { ...pending, pending: false, validationPending: true };
+      const { page: p } = await open({ clock: true });
+      await p.locator('#quark-resources').getByText(/正在继续查找公开资源/).waitFor();
+      assert.equal(quarkRequests.slice(before).filter(row => row.path === '/api/quark/resources').length, 1);
+      quarkResourceReply = { resources: [fresh], resourceSnapshot: true };
+      await p.clock.fastForward(500);
+      await p.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
+      assert.ok(quarkRequests.slice(before).filter(row => row.path === '/api/quark/resources').every(row => !row.query.web), '核验未完成不提前补查');
+    });
+    await withCloudFixture(async open => {
+      const before = quarkRequests.length;
+      quarkResourceReply = { resources: [], resourceSnapshot: true, reason: '暂无可用视频' };
+      const { page: p } = await open({ clock: true }), panel = p.locator('#quark-resources');
+      await panel.getByText(/本轮未发现新增可用资源/).waitFor();
+      const reads = () => quarkRequests.slice(before).filter(row => row.path === '/api/quark/resources');
+      assert.deepEqual(reads().map(row => row.query.web), [undefined, '1']);
+      await p.clock.fastForward(100000); assert.equal(reads().length, 2, '补查仍为零不循环');
+      await panel.getByRole('button', { name: '查找更多公开资源', exact: true }).click();
+      await until(() => reads().length === 3 && panel.getByRole('button', { name: '查找更多公开资源', exact: true }).isEnabled(), '手动更多完成');
+      assert.equal(reads()[2].query.web, '1');
+      await panel.getByRole('button', { name: '重试搜索', exact: true }).click();
+      await until(() => reads().length === 5 && panel.getByRole('button', { name: '查找更多公开资源', exact: true }).isEnabled(), '手动重试及一次补查完成');
+      assert.deepEqual(reads().slice(3).map(row => row.query.web), [undefined, '1']);
+    });
+    await withCloudFixture(async open => {
+      const before = quarkRequests.length;
+      quarkResourceReply = { resources: [], resourceSnapshot: true, reason: '已失效' }; holdQuarkResources = true;
+      const { page: p } = await open({ clock: true });
+      await until(() => Boolean(releaseQuarkResources), '普通搜索响应在途');
+      const release = releaseQuarkResources; releaseQuarkResources = null; holdQuarkResources = false;
+      await p.locator('nav a[href="#home"]').click(); await p.locator('#quark-resources').waitFor({ state: 'detached' }); release();
+      await p.clock.fastForward(60000);
+      const reads = quarkRequests.slice(before).filter(row => row.path === '/api/quark/resources');
+      assert.equal(reads.length, 1); assert.equal(reads[0].query.web, undefined, '切页后的旧零结果不补查');
+    });
+    await withCloudFixture(async open => {
+      const before = quarkCount('/api/quark/resources');
+      quarkResourceReply = { ...pending, retryAfterMs: 5000 };
+      const { page: p } = await open({ clock: true }), panel = p.locator('#quark-resources');
+      await panel.getByText(/正在继续查找公开资源/).waitFor();
+      for (let index = 1; index <= 10; index++) {
+        await p.clock.fastForward(5000);
+        await until(() => quarkCount('/api/quark/resources') === before + index + 1, '原预算内普通轮询');
+        await until(() => panel.getByRole('button', { name: '查找更多公开资源', exact: true }).isEnabled(), '普通快照完成');
+      }
+      quarkResourceReply = parsed => parsed.searchParams.has('web') ? { ...pending, retryAfterMs: 5000 } : { resources: [], resourceSnapshot: true };
+      holdQuarkResources = true; await p.clock.fastForward(5000); await until(() => Boolean(releaseQuarkResources), '55秒终态响应在途');
+      const release = releaseQuarkResources; releaseQuarkResources = null; holdQuarkResources = false;
+      await p.clock.fastForward(4000); release(); await panel.getByText(/正在继续查找公开资源/).waitFor();
+      await until(() => quarkCount('/api/quark/resources') === before + 13, '剩余预算内补查一次');
+      await until(() => panel.getByRole('button', { name: '查找更多公开资源', exact: true }).isEnabled(), '补查快照完成');
+      await p.clock.fastForward(1000); await panel.getByText(/已暂停自动检查/).waitFor();
+      await p.clock.fastForward(60000); assert.equal(quarkCount('/api/quark/resources'), before + 13, '补查不重新获得60秒');
+    });
+    console.log('PASS 零资源/失效分享自动补查一次Google与公开网页、web轮询同模式、有效或核验中不补、空结果不循环、原总预算/路由取消及不自动转存保持');
+  }
+
   async function verifyQuarkPendingSearch() {
     await withCloudFixture(async open => {
       const old = { id: 'share-fixture', name: '已选分享', url: 'https://pan.quark.cn/s/fixture123' }, fresh = { id: 'share-new', name: '新增分享', url: 'https://pan.quark.cn/s/new123456', publishedAt: Date.UTC(2026, 8, 20) };
@@ -1023,7 +1114,7 @@ try {
       assert.equal(await shares.inputValue(), ''); assert.equal(await files.isDisabled(), true); assert.equal(await panel.getByRole('button', { name: '转存所选单集', exact: true }).isDisabled(), true); assert.equal(await p.locator('video').evaluate(video => video.currentSrc), source); await panel.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
       assert.equal(quarkCount('/api/quark/prepare'), prepares + 1); await shares.selectOption(fresh.id); await until(() => files.isEnabled(), '手选替代分享后恢复文件'); assert.equal(await files.inputValue(), '', '替代文件仍需手选');
       quarkResourceReply = pending(); await panel.getByRole('button', { name: '查找更多公开资源', exact: true }).click(); await panel.getByText(/正在继续查找/).waitFor(); quarkResourceReply = { resources: [old], pending: false }; holdQuarkResources = true; await p.clock.fastForward(1500); await until(() => Boolean(releaseQuarkResources), '旧轮询在途');
-      const release = releaseQuarkResources; releaseQuarkResources = null; holdQuarkResources = false; quarkResourceReply = { resources: [], reason: '新集暂无资源' }; await p.getByLabel('夸克当前集数', { exact: true }).selectOption('1'); release(); await panel.getByText('新集暂无资源', { exact: true }).waitFor(); assert.equal(await p.locator('video').count(), 0); assert.equal(await panel.locator('option[value="share-fixture"]').count(), 0);
+      const release = releaseQuarkResources; releaseQuarkResources = null; holdQuarkResources = false; quarkResourceReply = { resources: [], reason: '新集暂无资源' }; await p.getByLabel('夸克当前集数', { exact: true }).selectOption('1'); release(); await panel.getByText(/^新集暂无资源/).waitFor(); assert.equal(await p.locator('video').count(), 0); assert.equal(await panel.locator('option[value="share-fixture"]').count(), 0);
       for (const [validation, limit] of [[false, 60000], [true, 100000]]) {
         quarkResourceReply = pending({ validationPending: validation, retryAfterMs: 5000 }); const c = await open({ clock: true }); await c.page.locator('#quark-resources').getByText(/正在继续查找/).waitFor(); const before = quarkCount('/api/quark/resources');
         for (let i = 1; i < limit / 5000; i++) { await c.page.clock.fastForward(5000); await until(() => quarkCount('/api/quark/resources') === before + i, '有界快照轮询'); await until(() => c.page.getByRole('button', { name: '查找更多公开资源', exact: true }).isEnabled(), '快照返回'); }
@@ -1440,7 +1531,8 @@ try {
   }
 
   if (process.argv.includes('--quark-library-only')) await verifyQuarkPublicSearch();
-  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkPendingSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
+  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkAutomaticWebFallback, verifyQuarkPendingSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
+  else if (process.argv.includes('--quark-web-fallback-only')) await verifyQuarkAutomaticWebFallback();
   else if (process.argv.includes('--quark-auto-transfer-only')) await verifyQuarkAutomaticTransfer();
   else if (process.argv.includes('--quark-playback-only')) { for (const verify of [verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure]) await verify(); }
   else if (process.argv.includes('--quark-progress-only')) await verifyQuarkProgressReadiness();
@@ -2410,6 +2502,7 @@ try {
   await verifyQuarkPictureReadiness();
   await verifyQuarkPublicSearch();
   await verifyQuarkSearchRetry();
+  await verifyQuarkAutomaticWebFallback();
   await verifyQuarkPendingSearch();
   await verifyQuarkChoices();
   await verifyCompactSettings();
