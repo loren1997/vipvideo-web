@@ -184,13 +184,14 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     const headers = status => {
       if (scope.closed || scope.error) return false;
       if (checked) return true;
-      const length = res.getHeader('content-length');
-      if (!/^\d+$/.test(String(length)) || !matchingRange(status, name => res.getHeader(name), start, end)) { reject(); return false; }
-      const total = Number(/^bytes \d+-\d+\/(\d+)$/.exec(String(res.getHeader('content-range')))[1]);
+      if (!matchingRange(status, name => res.getHeader(name), start, end)) { reject(); return false; }
+      const range = /^bytes \d+-(\d+)\/(\d+)$/.exec(String(res.getHeader('content-range')));
+      const total = Number(range[2]);
       if (scope.total !== undefined && scope.total !== total) { reject(); return false; }
       scope.total = total; checked = true;
       if (req.method !== 'HEAD') {
-        const actual = Number(length);
+        // Chunked 206 responses have no Content-Length; the validated range still fixes the exact byte count.
+        const actual = Number(range[1]) - start + 1;
         scope.reserved -= reserved - actual; reserved = left = actual;
       }
       return true;
@@ -203,7 +204,13 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
       left -= size; reserved -= size; scope.reserved -= size; scope.bytes += size;
       return true;
     };
-    const writeHead = res.writeHead.bind(res), write = res.write.bind(res), endResponse = res.end.bind(res);
+    const writeHead = res.writeHead.bind(res), write = res.write.bind(res), endResponse = res.end.bind(res), destroy = res.destroy.bind(res);
+    res.destroy = error => {
+      // Upstream failures must not turn partial reads into valid proof. A decoder
+      // may intentionally close its socket after reading a frame; that is allowed.
+      if (!encoder && error && !res.destroyed && !scope.closed && left > 0) reject();
+      return destroy(error);
+    };
     res.writeHead = (status, ...args) => headers(status) ? writeHead(status, ...args) : res;
     res.write = (chunk, encoding, callback) => count(chunk, encoding) ? write(chunk, encoding, callback) : false;
     res.end = (chunk, encoding, callback) => {

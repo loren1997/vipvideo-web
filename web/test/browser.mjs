@@ -1484,17 +1484,21 @@ try {
 
   async function verifyQuarkPictureReadiness() {
     for (const mode of ['audio-only', 'zero-frame']) await withCloudFixture(async open => {
-      quarkMode = mode;
+      quarkMode = mode; transcodeMode = 'enabled'; transcodeDuration = 1200;
       const { page: p } = await open({ clock: true });
-      if (mode === 'zero-frame') await p.evaluate(() => { HTMLVideoElement.prototype.getVideoPlaybackQuality = () => ({ totalVideoFrames: 0 }); });
-      await prepareCloudFile(p); const progress = quarkProgress.length, panel = p.locator('#quark-resources');
+      if (mode === 'zero-frame') await p.evaluate(() => { const quality = HTMLVideoElement.prototype.getVideoPlaybackQuality; HTMLVideoElement.prototype.getVideoPlaybackQuality = function() { return this.currentSrc.includes('/api/quark/media/') ? { totalVideoFrames: 0 } : quality.call(this); }; });
+      await prepareCloudFile(p); const progress = quarkProgress.length, jobs = transcodeStarts.length, plays = quarkCount('/api/quark/playback'), panel = p.locator('#quark-resources');
       await panel.getByRole('button', { name: '夸克播放', exact: true }).click();
       await until(() => p.locator('video').evaluate(video => video.readyState >= 2 && !video.paused).catch(() => false), '音频事件已触发但尚无可验证视频帧');
       assert.equal(await panel.getByRole('button', { name: '正在夸克播放', exact: true }).count(), 0);
+      assert.equal(quarkProgress.length, progress, '原流无视频帧不能写入观看进度');
       await p.clock.fastForward(15000);
-      await panel.getByText('播放源没有可解码的视频画面，请尝试兼容播放或选择其他官方在线版本。', { exact: true }).waitFor();
-      assert.equal(await panel.getByRole('button', { name: '重试夸克播放', exact: true }).isEnabled(), true);
-      assert.equal(quarkProgress.length, progress, '无视频帧不能写入观看进度');
+      await until(() => transcodeStarts.length === jobs + 1, `${mode}没有MediaError也自动尝试一次兼容`);
+      await panel.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
+      await assertVideoFrames(p.locator('video'), '无画面原流兼容后真实视频帧');
+      assert.equal(quarkCount('/api/quark/playback'), plays + 1, '有数据但无画面直接兼容，不先刷新原流地址');
+      await p.locator('video').evaluate(video => { Object.defineProperty(video, 'error', { configurable: true, value: { code: 3 } }); video.dispatchEvent(new Event('error')); });
+      await p.clock.fastForward(30000); assert.equal(transcodeStarts.length, jobs + 1, '兼容输出再次解码失败也不递归启动转码');
     });
     await withCloudFixture(async open => {
       const { page: p } = await open({ clock: true });
@@ -1513,7 +1517,128 @@ try {
       assert.equal(await panel.getByRole('button', { name: '重试夸克播放', exact: true }).isEnabled(), true);
       assert.equal(await p.locator('video').count(), 0);
     });
-    console.log('PASS 音频only与零视频帧不冒充夸克画面、不提前清除启动检查、不同步观看，具体错误显示在播放器上方');
+    console.log('PASS 音频only与零视频帧不冒充夸克画面、15秒后单次兼容且真实画面才playing、不递归重试，具体错误显示在播放器上方');
+  }
+
+  async function verifyQuarkPlaybackRecovery() {
+    const ordinary = playerRequests.length, reports = playabilityReports.length;
+    const instrument = (p, startup = false) => p.evaluate(startup => {
+        const Hls = window.Hls; window.quarkHlsFixtures = [];
+        window.Hls = class extends Hls {
+          constructor(...args) { super(...args); this.blocked = startup && window.quarkHlsFixtures.length === 0; this.levels = [{ height: 720, bitrate: 2000000 }, { height: 1080, bitrate: 4000000 }, { height: 2160, bitrate: 12000000 }]; this.startLevel = -1; this.currentLevel = -1; window.quarkHlsFixtures.push(this); }
+          attachMedia(video) { if (this.blocked) this.media = video; else super.attachMedia(video); }
+          on(name, callback) { if (name === Hls.Events.ERROR) this.fail = data => callback(name, data); if (!this.blocked || name !== Hls.Events.MANIFEST_PARSED) super.on(name, name === Hls.Events.MANIFEST_PARSED ? event => callback(event, { levels: this.levels }) : callback); }
+        };
+    }, startup);
+    const fail = (p, code = 0) => p.evaluate(code => window.quarkHlsFixtures.at(-1).fail({ fatal: true, type: 'networkError', details: 'fragLoadError', response: { code } }), code);
+    const recovered = async p => {
+      await until(() => p.locator('video').evaluate(video => video.readyState >= 2 && !video.paused && video.currentTime >= 1.9 && video.currentTime < 4).catch(() => false), '刷新后保留原片位置而不归零或重复加偏移');
+      await p.locator('#quark-resources').getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
+      await assertVideoFrames(p.locator('video'), '官方地址刷新后真实画面');
+    };
+    for (const kind of ['network', 'decode', 'startup']) await withCloudFixture(async open => {
+      quarkMode = 'hls'; transcodeMode = 'enabled';
+      const { page: p } = await open({ clock: true }); await instrument(p); let releaseMedia;
+      const reads = [], held = new Promise(resolve => { releaseMedia = resolve; });
+      if (kind === 'startup') await p.route('**/api/quark/media/**', route => {
+        const read = held.then(() => route.fulfill({ contentType: 'video/mp4', body: videoMedia, headers: { 'Accept-Ranges': 'bytes' } })); reads.push(read); return read;
+      });
+      try {
+        await prepareCloudFile(p);
+        if (kind === 'startup') {
+          await p.locator('#quark-resources').getByRole('button', { name: '夸克播放', exact: true }).click();
+          await until(() => p.locator('video').evaluate(video => !video.paused && video.readyState < 2), '原流已真实请求播放但媒体数据仍挂起');
+        } else { await playCloudFile(p); await assertVideoFrames(p.locator('video'), '用户暂停前真实画面'); }
+        await p.locator('video').evaluate(video => new Promise(resolve => { video.addEventListener('pause', () => resolve(), { once: true }); video.pause(); }));
+        const plays = quarkCount('/api/quark/playback'), jobs = transcodeStarts.length;
+        if (kind === 'network') await fail(p);
+        else if (kind === 'decode') await p.locator('video').evaluate(video => { Object.defineProperty(video, 'error', { configurable: true, value: { code: 3 } }); video.dispatchEvent(new Event('error')); });
+        await p.clock.fastForward(30000);
+        assert.equal(quarkCount('/api/quark/playback'), plays, `用户先暂停后${kind}故障不能自动刷新地址`);
+        assert.equal(transcodeStarts.length, jobs, `用户先暂停后${kind}故障不能自动启动兼容`);
+        assert.equal(await p.locator('video').evaluate(video => video.paused), true, `用户先暂停后${kind}故障不能自动恢复播放`);
+      } finally { releaseMedia(); await Promise.all(reads); }
+    });
+    for (const kind of ['hls-network', 'native-network', 'startup-timeout', 'server-error']) await withCloudFixture(async open => {
+      quarkMode = kind === 'native-network' ? 'webm' : 'hls'; quarkAssetPosition = 2;
+      const { page: p } = await open({ clock: true }); await instrument(p, kind === 'startup-timeout'); await prepareCloudFile(p);
+      if (kind === 'startup-timeout') {
+        await p.locator('#quark-resources').getByRole('button', { name: '夸克播放', exact: true }).click();
+        await until(() => p.evaluate(() => window.quarkHlsFixtures.length === 1), '原HLS启动无数据');
+      } else {
+        await playCloudFile(p); await assertVideoFrames(p.locator('video'), '网络故障前原流真实画面');
+        await p.locator('video').evaluate(video => { video.pause(); video.currentTime = 2; return video.play(); });
+      }
+      if (kind === 'hls-network') {
+        assert.equal(await p.evaluate(() => window.quarkHlsFixtures.at(-1).startLevel), -1, '夸克原HLS由带宽测量自适应起播，不强制1080p');
+        const quality = p.getByLabel('播放画质', { exact: true }); assert.deepEqual(await quality.locator('option').allTextContents(), ['自动画质', '720p', '1080p', '4K']);
+        await quality.selectOption('2'); assert.equal(await p.evaluate(() => window.quarkHlsFixtures.at(-1).currentLevel), 2);
+        await quality.selectOption('-1'); assert.equal(await p.evaluate(() => window.quarkHlsFixtures.at(-1).currentLevel), -1, '手选清晰度后仍可回到ABR');
+      }
+      const plays = quarkCount('/api/quark/playback'), prepares = quarkCount('/api/quark/prepare'), files = quarkCount('/api/quark/files');
+      holdQuarkPlayback = true;
+      if (kind === 'startup-timeout') { await p.clock.fastForward(14999); assert.equal(quarkCount('/api/quark/playback'), plays); await p.clock.fastForward(1); }
+      else if (kind === 'native-network') await p.locator('video').evaluate(video => { Object.defineProperty(video, 'error', { configurable: true, value: { code: 2 } }); video.dispatchEvent(new Event('error')); });
+      else await fail(p, kind === 'server-error' ? 503 : 0);
+      await until(() => typeof releaseQuarkPlayback === 'function', `${kind}只刷新一次官方播放地址`);
+      assert.equal(quarkCount('/api/quark/playback'), plays + 1);
+      if (kind === 'hls-network') { await fail(p); assert.equal(quarkCount('/api/quark/playback'), plays + 1, '刷新在途重复error不并发重发'); }
+      holdQuarkPlayback = false; releaseQuarkPlayback(); releaseQuarkPlayback = null; await recovered(p);
+      if (kind === 'hls-network') {
+        await fail(p); await p.clock.fastForward(60000); assert.equal(quarkCount('/api/quark/playback'), plays + 1, '自动刷新预算跨新player保留');
+        await p.locator('#quark-resources').getByRole('button', { name: '重试夸克播放', exact: true }).click(); await recovered(p);
+        assert.equal(quarkCount('/api/quark/playback'), plays + 2);
+        await fail(p); await until(() => quarkCount('/api/quark/playback') === plays + 3, '用户手动重试重新获得一次自动刷新预算'); await recovered(p);
+      }
+      assert.equal(quarkCount('/api/quark/prepare'), prepares); assert.equal(quarkCount('/api/quark/files'), files);
+    });
+    await withCloudFixture(async open => {
+      quarkMode = 'hls'; const { page: p } = await open({ clock: true }); await instrument(p); await prepareCloudFile(p); await playCloudFile(p);
+      const plays = quarkCount('/api/quark/playback'), jobs = transcodeStarts.length, panel = p.locator('#quark-resources');
+      await fail(p, 403); await panel.getByText(/HTTP 403/).waitFor();
+      assert.equal(quarkCount('/api/quark/playback'), plays); assert.equal(transcodeStarts.length, jobs);
+      await p.locator('video').evaluate(video => { video.pause(); return video.play(); });
+      await panel.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor(); await assertVideoFrames(p.locator('video'), '错误后迟到playing有真实画面');
+      await fail(p, 404); await panel.getByText(/HTTP 404/).waitFor();
+      await p.clock.fastForward(60000); assert.equal(quarkCount('/api/quark/playback'), plays); assert.equal(transcodeStarts.length, jobs, '显式4xx不循环刷新或尝试转码');
+    });
+    for (const kind of ['stalled', 'progress', 'pause']) await withCloudFixture(async open => {
+      quarkMode = 'hls'; const { page: p } = await open({ clock: true }); await instrument(p); await prepareCloudFile(p); await playCloudFile(p); await assertVideoFrames(p.locator('video'), '卡顿前已确认画面');
+      const plays = quarkCount('/api/quark/playback');
+      await p.locator('video').evaluate(video => { window.quarkStallPosition = 2; Object.defineProperty(video, 'currentTime', { configurable: true, get: () => window.quarkStallPosition }); video.getVideoPlaybackQuality = () => ({ totalVideoFrames: 10 }); video.dispatchEvent(new Event('waiting')); });
+      if (kind === 'stalled') {
+        for (let i = 0; i < 3; i++) { await p.clock.fastForward(5000); await p.locator('video').dispatchEvent('waiting'); }
+        await p.clock.fastForward(4999); assert.equal(quarkCount('/api/quark/playback'), plays);
+        await p.clock.fastForward(1); await until(() => quarkCount('/api/quark/playback') === plays + 1, '重复waiting不能延长20秒无进展恢复时限'); await recovered(p);
+      } else {
+        await p.clock.fastForward(10000);
+        if (kind === 'progress') { await p.locator('video').evaluate(video => { window.quarkStallPosition = 3; video.dispatchEvent(new Event('timeupdate')); }); await p.clock.fastForward(10001); assert.equal(quarkCount('/api/quark/playback'), plays, '原片时间真实进展取消旧卡顿计时'); }
+        await p.locator('video').evaluate(video => video.pause()); await p.clock.fastForward(30000);
+        assert.equal(quarkCount('/api/quark/playback'), plays, '用户暂停期间不自动恢复播放');
+      }
+    });
+    for (const cancel of ['pause', 'navigation']) await withCloudFixture(async open => {
+      quarkMode = 'hls'; const { page: p } = await open({ clock: true }); await instrument(p); await prepareCloudFile(p); await playCloudFile(p);
+      const plays = quarkCount('/api/quark/playback'), jobs = transcodeStarts.length;
+      holdQuarkPlayback = true; await fail(p); await until(() => typeof releaseQuarkPlayback === 'function', '自动刷新API在途');
+      if (cancel === 'pause') await p.locator('video').evaluate(video => new Promise(resolve => { video.addEventListener('pause', () => resolve(), { once: true }); video.pause(); }));
+      else { await p.locator('nav a[href="#home"]').click(); await until(() => p.locator('video').count().then(count => count === 0), '导航离开取消自动恢复'); }
+      const progress = quarkProgress.length;
+      holdQuarkPlayback = false; releaseQuarkPlayback(); releaseQuarkPlayback = null; await p.clock.fastForward(35000);
+      if (cancel === 'pause') assert.equal(await p.locator('video').evaluate(video => video.paused), true, '暂停后迟到刷新响应不能自动播放');
+      else assert.equal(await p.locator('video').count(), 0, '导航后迟到刷新响应不能重建播放器');
+      assert.equal(quarkCount('/api/quark/playback'), plays + 1); assert.equal(transcodeStarts.length, jobs); assert.equal(quarkProgress.length, progress, '取消后迟到响应不写观看进度');
+    });
+    await withCloudFixture(async open => {
+      quarkMode = 'hls'; transcodeMode = 'enabled'; const { page: p } = await open({ clock: true }); await prepareCloudFile(p);
+      await p.evaluate(() => { window.Hls.isSupported = () => false; const supports = HTMLVideoElement.prototype.canPlayType; HTMLVideoElement.prototype.canPlayType = function(type) { return /mpegurl/i.test(type) ? '' : supports.call(this, type); }; });
+      const jobs = transcodeStarts.length, plays = quarkCount('/api/quark/playback'); await p.locator('#quark-resources').getByRole('button', { name: '夸克播放', exact: true }).click();
+      await until(() => transcodeStarts.length === jobs + 1, 'HLS两种播放能力均不支持时仅尝试一次兼容');
+      await p.clock.fastForward(60000); assert.equal(transcodeStarts.length, jobs + 1); assert.equal(quarkCount('/api/quark/playback'), plays + 1);
+      assert.equal(await p.locator('#quark-resources').getByRole('button', { name: '正在夸克播放', exact: true }).count(), 0, '无HLS能力不能伪称转换后已成功播放');
+    });
+    assert.equal(playerRequests.length, ordinary); assert.equal(playabilityReports.length, reports);
+    console.log('PASS 夸克网络/启动超时/20秒卡顿最多刷新一次、完整位置/手动预算/4xx/迟到playing、waiting/进展/暂停/导航取消、无HLS能力不循环、不访问普通影视源');
   }
 
   async function verifyQuarkStartupFailure() {
@@ -1671,10 +1796,10 @@ try {
   }
 
   if (process.argv.includes('--quark-library-only')) await verifyQuarkPublicSearch();
-  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkAutomaticWebFallback, verifyQuarkPendingSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
+  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkAutomaticWebFallback, verifyQuarkPendingSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkPlaybackRecovery, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
   else if (process.argv.includes('--quark-web-fallback-only')) await verifyQuarkAutomaticWebFallback();
   else if (process.argv.includes('--quark-auto-transfer-only')) await verifyQuarkAutomaticTransfer();
-  else if (process.argv.includes('--quark-playback-only')) { for (const verify of [verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkStartupFailure]) await verify(); }
+  else if (process.argv.includes('--quark-playback-only')) { for (const verify of [verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkPlaybackRecovery, verifyQuarkStartupFailure]) await verify(); }
   else if (process.argv.includes('--quark-progress-only')) await verifyQuarkProgressReadiness();
   else if (process.argv.includes('--full-film-timeline-only')) await verifyFullFilmTimeline();
   else if (process.argv.includes('--fullscreen-controls-only')) await verifyNativeFullscreenControls();
@@ -1683,7 +1808,7 @@ try {
     app.store.setConfig({ ...app.store.config(), sources: ['first', 'second'].map((id, index) => ({ id, name: ['第一源', '第二源'][index], api: `https://api.example.com/${id}`, enabled: true })) });
     for (const verify of [verifyQuarkPublicSearch, verifyQuarkPendingSearch, verifyQuarkAutoplay]) { app.store.remove('history', cloudFilm.key); await verify(); }
   }
-  else if (process.argv.includes('--quark-startup-only')) await verifyQuarkStartupFailure();
+  else if (process.argv.includes('--quark-startup-only')) { await verifyQuarkPlaybackRecovery(); await verifyQuarkPictureReadiness(); await verifyQuarkStartupFailure(); }
   else if (process.argv.includes('--quark-subtitles-only')) await verifyQuarkSubtitles();
   else if (process.argv.includes('--playback-fixes-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyFullFilmTimeline, verifyQuarkSubtitles, verifyQuarkCleanupFeedback, verifyAutomaticDanmaku]) await verify(); }
   else if (process.argv.includes('--tv-only')) { await verifyTvRemote(); await verifyFullFilmTimeline(); }
@@ -2685,6 +2810,7 @@ try {
   await page.locator('#login-view').waitFor({ state: 'visible' });
   console.log('PASS 退出登录；浏览器验收完成');
   await verifyTvRemote();
+  await verifyQuarkPlaybackRecovery();
   await verifyQuarkStartupFailure();
   await verifyQuarkSubtitles();
   await verifyFullFilmTimeline();

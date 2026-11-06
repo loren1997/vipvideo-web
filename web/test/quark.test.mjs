@@ -371,11 +371,13 @@ test('new episode names require consistent season and episode metadata and prese
   });
 });
 
-test('rename collisions preserve another file and keep the new copy ready under its original name', async t => {
+test('rename collisions preserve another file and assign a readable version without another transfer', async t => {
   const { service, state, connect, save } = await fixture(t); await connect({ cleanupEnabled: true });
   state.beforeRequest = call => { if (call.path === '/share/sharepage/save') state.files.push({ ...sourceVideo('existing-user-copy', '影片 (2026).mp4'), account: 'A', pdir_fid: state.folders.get('A').fid }); };
-  const saved = await save(); assert.equal(saved.status, 'ready'); assert.equal(saved.name, '影片.2026.mp4'); assert.match(saved.renameReason, /名称已存在/);
-  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 0);
+  const saved = await save(); assert.equal(saved.status, 'ready'); assert.equal(saved.name, '影片 (2026) [版本 2].mp4'); assert.equal(saved.renameReason, undefined);
+  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 1);
+  const again = await save(); assert.equal(again.assetId, saved.assetId); assert.equal(again.name, saved.name); assert.equal(state.saved, 1);
+  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 1);
   await service.progress(saved.assetId, { position: 100, duration: 100, ended: true }); state.clock += 8 * DAY;
   assert.equal((await service.cleanup()).deleted, 1); assert.ok(state.files.some(row => row.fid === 'existing-user-copy'));
 });
@@ -402,17 +404,95 @@ test('failed or lost rename acknowledgements never duplicate transfers and only 
   });
 });
 
-test('legacy registered videos without a rename plan are never renamed when prepared again', async t => {
-  const { service, state, connect, select, metadata, options } = await fixture(t); await connect(); const selected = await select(); await service.prepare(detail, selected);
+test('verified legacy videos and registered captions receive names without another transfer', async t => {
+  const { service, state, connect, select, metadata, options, userFile } = await fixture(t); await connect(); state.source.push(sourceSubtitle()); const selected = await select(); await service.prepare(detail, selected);
   await service.stop();
-  const registry = JSON.parse(metadata.get('quark-registry-v1')); registry.assets[0].name = '影片.2026.mp4'; delete registry.assets[0].sourceName;
+  const registry = JSON.parse(metadata.get('quark-registry-v1')), asset = registry.assets[0]; asset.name = '影片.2026.mp4'; delete asset.sourceName; delete asset.renameBase;
+  for (const caption of asset.subtitles) { caption.name = '影片.2026.chs.srt'; delete caption.renameBase; delete caption.sourceName; state.files.find(row => row.fid === caption.fid).file_name = caption.name; }
   metadata.set('quark-registry-v1', JSON.stringify(registry)); state.files.find(row => row.fid === registry.assets[0].fid).file_name = registry.assets[0].name;
   const restarted = createQuark(options); t.after(() => restarted.stop());
   const resource = (await restarted.resources(detail)).resources[0], listing = await restarted.files(detail, { shareId: resource.id });
   const calls = state.calls.filter(row => row.path === '/file/rename').length;
   const again = await restarted.prepare(detail, { shareId: resource.id, fileId: listing.files[0].id });
+  assert.equal(again.status, 'ready'); assert.equal(again.name, '影片 (2026).mp4'); assert.equal(state.saved, 2);
+  assert.deepEqual((await restarted.subtitles(again.assetId)).map(row => row.name), ['影片 (2026).chs.srt']);
+  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, calls + 2); assert.equal(userFile.file_name, '用户原有影片.mp4');
+});
+
+test('explicit animated movies and movies without years get readable names without fabricated metadata', async t => {
+  for (const year of ['2026', '']) await t.test(year || 'unknown year', async t => {
+    const { state, connect, save } = await fixture(t); await connect();
+    const film = { ...detail, title: '八仙！', type: 'movie', category: 'anime', year };
+    state.source = [sourceVideo('animation', 'All.Wishes.Come.True.2026.2160p.WEB-DL.HQ.H265.SDR.10bit.60fps.DTS5.1.13Audios.mkv')];
+    const saved = await save(film);
+    assert.equal(saved.status, 'ready'); assert.equal(saved.name, `八仙!${year ? ' (2026)' : ''}.mkv`);
+    assert.equal(state.saved, 1);
+  });
+});
+
+test('two shares of the same movie keep distinct stable video and language-caption names', async t => {
+  const { service, state, connect, metadata } = await fixture(t); await connect();
+  const film = { ...detail, quarkShares: [...detail.quarkShares, 'https://pan.quark.cn/s/second123456'] };
+  const resources = (await service.resources(film)).resources; assert.equal(resources.length, 2);
+  const saved = [];
+  for (const [index, resource] of resources.entries()) {
+    const original = `影片.2026.${index ? '1080p' : '2160p'}.SDR.mkv`;
+    state.source = [sourceVideo('video-' + index, original), sourceSubtitle('caption-' + index, original.replace(/mkv$/, 'chs.srt'))];
+    const files = await service.files(film, { shareId: resource.id });
+    const options = { shareId: resource.id, fileId: files.files[0].id };
+    const item = await service.prepare(film, options); saved.push(item);
+    const stem = `影片 (2026)${index ? ' [版本 2]' : ''}`;
+    assert.equal(item.name, stem + '.mkv');
+    assert.deepEqual((await service.subtitles(item.assetId)).map(row => row.name), [stem + '.chs.srt']);
+    const again = await service.prepare(film, options); assert.equal(again.assetId, item.assetId); assert.equal(again.name, item.name);
+  }
+  assert.notEqual(saved[0].assetId, saved[1].assetId); assert.equal(state.saved, 4);
+  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 4);
+  const registry = JSON.parse(metadata.get('quark-registry-v1'));
+  assert.equal(registry.assets[1].renameBase, '影片 (2026).mkv');
+});
+
+test('version allocation skips unregistered occupied names and preserves its plan on later retries', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect();
+  state.beforeRequest = call => {
+    if (call.path === '/share/sharepage/save') for (const [index, fileName] of ['影片 (2026).mp4', '影片 (2026) [版本 2].MP4'].entries()) state.files.push({ ...sourceVideo('private-' + index, fileName), account: 'A', pdir_fid: state.folders.get('A').fid });
+  };
+  const selected = await select(), saved = await service.prepare(detail, selected);
+  assert.equal(saved.name, '影片 (2026) [版本 3].mp4');
+  const privateFiles = state.files.filter(row => row.fid.startsWith('private-'));
+  assert.deepEqual(privateFiles.map(row => row.file_name), ['影片 (2026).mp4', '影片 (2026) [版本 2].MP4']);
+  state.files = state.files.filter(row => !row.fid.startsWith('private-')); state.beforeRequest = null;
+  const again = await service.prepare(detail, selected);
+  assert.equal(again.name, saved.name); assert.equal(state.saved, 1);
+  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 1);
+});
+
+test('pending transfer naming plans reserve their names before a second version finishes', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect();
+  state.source = [sourceVideo('first-version', '影片.2026.2160p.mkv')]; state.pending = true;
+  const first = await select(); assert.equal((await service.prepare(detail, first)).status, 'pending');
+  state.source = [sourceVideo('second-version', '影片.2026.1080p.mkv')]; state.pending = false;
+  const second = await select(), readySecond = await service.prepare(detail, second);
+  assert.equal(readySecond.name, '影片 (2026) [版本 2].mkv');
+  const readyFirst = await service.prepare(detail, first);
+  assert.equal(readyFirst.name, '影片 (2026).mkv'); assert.equal(state.saved, 2);
+  assert.equal((await service.prepare(detail, second)).name, readySecond.name);
+});
+
+test('an externally occupied rename target never authorizes another transfer or an overwrite retry', async t => {
+  const { service, state, connect, select } = await fixture(t); await connect();
+  state.beforeRequest = call => {
+    if (call.path === '/file/rename') {
+      state.files.push({ ...sourceVideo('private-race', call.body.file_name), account: 'A', pdir_fid: state.folders.get('A').fid });
+      return reply(null, { code: 500, status: 409 });
+    }
+  };
+  const selected = await select(), saved = await service.prepare(detail, selected);
+  assert.equal(saved.status, 'ready'); assert.match(saved.renameReason, /自动命名未完成/);
+  const again = await service.prepare(detail, selected);
   assert.equal(again.status, 'ready'); assert.equal(again.name, '影片.2026.mp4'); assert.equal(state.saved, 1);
-  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, calls);
+  assert.equal(state.files.find(row => row.fid === 'private-race').file_name, '影片 (2026).mp4');
+  assert.equal(state.calls.filter(row => row.path === '/file/rename').length, 1);
 });
 
 test('a temporarily stale post-rename listing retains the journal until the actual new name appears', async t => {

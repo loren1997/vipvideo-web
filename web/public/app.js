@@ -724,7 +724,8 @@ function compatibilityLabel(current) {
 
 async function startCompatibility(current, position = playPosition(current), automatic = false) {
   if (player !== current || !(current.catalog || current.live) || !(current.quarkAsset ? ['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'] : ['hls', 'mp4']).includes(current.originalType || current.type)) return;
-  if (automatic && current.flow?.transcodeTried) return;
+  if (automatic && (current.flow?.transcodeTried || current.quarkPaused)) return;
+  if (!automatic) current.quarkPaused = false;
   if (automatic) current.flow.transcodeTried = true;
   if (!current.transcodePromise) current.request = ++playVersion;
   if (current.catalog && !current.preferences) {
@@ -1497,7 +1498,7 @@ function restartQuarkFromBeginning(current) {
   void startCompatibility(current, 0);
 }
 
-async function playQuark(current, assetId, valid = () => true) {
+async function playQuark(current, assetId, valid = () => true, flow) {
   if (player !== current || !current.catalog || !valid()) return;
   const stamp = routeVersion, scope = adScope(current);
   if (current.quarkOnly || current.quarkAsset === assetId) setQuarkPlaybackStatus(current, 'loading');
@@ -1508,7 +1509,7 @@ async function playQuark(current, assetId, valid = () => true) {
     if (url.origin !== location.origin || url.username || url.password || !url.pathname.startsWith('/api/') || !['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'].includes(data.type) || data.assetId !== assetId) throw new Error('网盘返回了无效的播放地址。');
     const ready = current.quarkState?.ready, saved = library.history.find(record => record.source === 'quark-library' && record.quarkAsset === assetId);
     const position = current.quarkOnly && current.quarkAsset !== assetId ? ready?.assetId === assetId && Number.isFinite(ready.position) ? ready.position : Number.isFinite(saved?.position) ? saved.position : 0 : playPosition(current), request = ++playVersion; void stopPlayer(false);
-    player = { detail: current.detail, line: current.line, episode: current.episode, episodeName: current.quarkOnly ? ready?.name || current.episodeName : current.episodeName, position, started: true, catalog: true, quarkOnly: current.quarkOnly === true, flow: { tried: new Set() }, request, stamp, mode: 'direct', preferences: normalizePreferences(preferences), quarkAsset: assetId, quarkPlaybackStatus: 'loading', quarkVersion: typeof data.version === 'string' ? data.version : JSON.stringify(data.quality ?? 'default'), requiresCompatibility: data.requiresCompatibility === true, quarkState: current.quarkState, quarkUrl: url.href, originalUrl: current.originalUrl || current.url, url: url.href, type: data.type, introHandled: current.introHandled };
+    player = { detail: current.detail, line: current.line, episode: current.episode, episodeName: current.quarkOnly ? ready?.name || current.episodeName : current.episodeName, position, started: true, catalog: true, quarkOnly: current.quarkOnly === true, flow: flow || { tried: new Set() }, request, stamp, mode: 'direct', preferences: normalizePreferences(preferences), quarkAsset: assetId, quarkPlaybackStatus: 'loading', quarkVersion: typeof data.version === 'string' ? data.version : JSON.stringify(data.quality ?? 'default'), requiresCompatibility: data.requiresCompatibility === true, quarkState: current.quarkState, quarkUrl: url.href, originalUrl: current.originalUrl || current.url, url: url.href, type: data.type, introHandled: current.introHandled };
     mountPlayer(player);
   } catch (error) { if (player === current && stamp === routeVersion && valid()) { current.note.textContent = `夸克播放未启动：${error.message}`; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); notify(current.note.textContent, true); } }
 }
@@ -2199,10 +2200,12 @@ function mountPlayer(current) {
       if (current.preferences.introSeconds > 0) video.currentTime = Math.min(current.preferences.introSeconds, Math.max(0, video.duration - 1));
     }
   });
-  video.addEventListener('pause', () => { if (player === current) { if (current.transcoded && !current.transcodeLoading) current.pausedAt = Date.now(); void saveHistory(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
+  video.addEventListener('pause', () => { if (player === current) { clearQuarkStall(); if (current.quarkAsset && !current.transcodeLoading && !video.error) current.quarkPaused = true; if (current.quarkRefreshing) { current.quarkRefreshCancelled = true; note.textContent = '已暂停自动恢复，可点击“重试夸克播放”继续。'; note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); } if (current.transcoded && !current.transcodeLoading) current.pausedAt = Date.now(); void saveHistory(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
   video.addEventListener('seeked', () => { if (player === current && current.quarkAsset) void saveHistory(current); });
   video.addEventListener('play', () => {
-    if (player !== current || !current.transcoded || current.transcodeLoading) return;
+    if (player !== current) return;
+    current.quarkPaused = false;
+    if (!current.transcoded || current.transcodeLoading) return;
     if (current.pausedAt && Date.now() - current.pausedAt >= 120000 && !current.expiryRecovered) {
       current.expiryRecovered = true; void startCompatibility(current, playPosition(current));
     }
@@ -2211,7 +2214,9 @@ function mountPlayer(current) {
   video.addEventListener('ended', () => { if (player === current) { void saveHistory(current, true); if (current.catalog && !current.quarkOnly && current.preferences.autoNext && !current.nextPending) { current.nextPending = true; void nextEpisode(current); } } });
   video.addEventListener('loadeddata', () => { if (player === current) { if (!current.quarkAsset || hasVideoFrame(video)) { clearTimeout(current.loadTimer); if (current.transcoded) current.transcodeReady = true; if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); } updateClock(); resetDanmaku(current); } });
   const markPlaying = () => {
-    if (player !== current || current.transcodeLoading || current.quarkAsset && (video.paused || !hasVideoFrame(video))) return;
+    if (player !== current || current.transcodeLoading || current.quarkRefreshing || current.quarkAsset && (video.paused || !hasVideoFrame(video))) return;
+    if (current.quarkAsset) current.failed = false;
+    clearQuarkStall();
     if (current.quarkAsset && current.transcoded) current.transcodeReady = true;
     if (current.transcoded && !current.transcodeReady) return;
     delete current.quarkRestartPosition; clearTimeout(current.loadTimer); note.textContent = `${current.quarkAsset ? '夸克播放 · ' : ''}${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${current.live ? `正在直播 · ${current.detail.title}` : `${current.episodeName || current.detail.title} · 进度每 10 秒自动保存`}`; note.className = 'player-note'; setQuarkPlaybackStatus(current, 'playing'); current.overlay?.classList.remove('paused'); if (current.catalog) { startDanmakuSync(current); drawDanmaku(current); }
@@ -2219,6 +2224,7 @@ function mountPlayer(current) {
   video.addEventListener('playing', markPlaying);
   video.addEventListener('timeupdate', () => {
     if (player !== current) return;
+    if (current.stallTimer && video.currentTime > current.stallPosition + 0.25) clearQuarkStall();
     if (current.quarkAsset && current.quarkPlaybackStatus === 'loading') markPlaying();
     updateClock();
     if (!current.catalog) return;
@@ -2230,7 +2236,19 @@ function mountPlayer(current) {
       current.nextPending = true; if (current.quarkAsset) void saveHistory(current, true, true); void nextEpisode(current);
     }
   });
-  video.addEventListener('waiting', () => { if (player === current) note.textContent = '正在缓冲…'; });
+  function clearQuarkStall() { clearTimeout(current.stallTimer); current.stallTimer = null; }
+  function watchQuarkStall() {
+    if (player !== current || !current.quarkAsset || current.transcoded || current.transcodeLoading || current.quarkRefreshing || current.failed || video.paused || video.ended || !hasVideoFrame(video) || current.stallTimer) return;
+    current.stallPosition = video.currentTime;
+    current.stallTimer = setTimeout(() => {
+      current.stallTimer = null;
+      if (player !== current || video.paused || video.ended || current.transcodeLoading || current.transcoded || current.quarkRefreshing || current.failed) return;
+      if (video.currentTime > current.stallPosition + 0.25) return watchQuarkStall();
+      playbackError(current, { type: 'networkError', details: 'playbackStall' });
+    }, 20000);
+  }
+  video.addEventListener('waiting', () => { if (player === current && !current.failed && !current.quarkRefreshing) { note.textContent = '正在缓冲…'; watchQuarkStall(); } });
+  video.addEventListener('stalled', watchQuarkStall);
   video.addEventListener('error', () => { if (player === current && video.error) playbackError(current); });
   if (!current.live) current.timer = setInterval(() => {
     if (player !== current || video.paused) return;
@@ -2244,8 +2262,8 @@ function mountPlayer(current) {
 }
 
 function playbackError(current, hlsError) {
-  if (player !== current || current.failed) return;
-  clearTimeout(current.loadTimer);
+  if (player !== current || current.failed || current.quarkRefreshing) return;
+  clearTimeout(current.loadTimer); clearTimeout(current.stallTimer); current.stallTimer = null;
   if (current.transcodeLoading) return;
   if (current.transcoded) {
     current.position = playPosition(current); current.failed = true;
@@ -2254,11 +2272,21 @@ function playbackError(current, hlsError) {
     void stopTranscode(current.transcodeId); current.transcodeId = null; return;
   }
   if (current.quarkAsset) {
-    const decodeError = hlsError
-      ? hlsError.type === 'mediaError' && ['manifestIncompatibleCodecsError', 'bufferAddCodecError', 'bufferIncompatibleCodecsError', 'bufferAppendError', 'bufferAppendingError'].includes(hlsError.details) && !(hlsError.response?.code >= 400)
-      : [3, 4].includes(current.video?.error?.code);
-    if (decodeError && !current.requiresCompatibility && !current.flow.transcodeTried) { void startCompatibility(current, playPosition(current), true); return; }
-    current.failed = true; current.note.textContent = current.video?.readyState >= 2 && !hasVideoFrame(current.video) ? '播放源没有可解码的视频画面，请尝试兼容播放或选择其他官方在线版本。' : `夸克播放中断。可重试夸克播放，或${current.quarkOnly ? '返回夸克资源' : '返回原线路；原影视源不会因此停用'}。`; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); return;
+    const status = Number(hlsError?.response?.code || hlsError?.response?.status) || 0;
+    const noFrame = current.video?.readyState >= 2 && !hasVideoFrame(current.video);
+    const decodeError = status < 400 && (noFrame || (hlsError
+      ? hlsError.type === 'mediaError' && ['manifestIncompatibleCodecsError', 'bufferAddCodecError', 'bufferIncompatibleCodecsError', 'bufferAppendError', 'bufferAppendingError'].includes(hlsError.details)
+      : [3, 4].includes(current.video?.error?.code)));
+    const networkError = hlsError ? hlsError.type === 'networkError' && (!status || status === 408 || status >= 500) : current.video?.error?.code === 2;
+    if (decodeError && !current.quarkPaused && !current.requiresCompatibility && !current.flow.transcodeTried) { void startCompatibility(current, playPosition(current), true); return; }
+    if (networkError && !current.quarkPaused && !current.flow.quarkRefreshTried) {
+      current.flow.quarkRefreshTried = true; current.quarkRefreshing = true; current.quarkRefreshCancelled = false;
+      hls?.stopLoad?.(); current.note.textContent = '正在重新连接夸克，恢复后将从当前进度继续播放…'; current.note.className = 'player-note'; setQuarkPlaybackStatus(current, 'loading');
+      void playQuark(current, current.quarkAsset, () => current.quarkRefreshing && !current.quarkRefreshCancelled && !current.quarkPaused, current.flow).finally(() => { current.quarkRefreshing = false; });
+      return;
+    }
+    const reason = status ? `媒体请求返回 HTTP ${status}` : hlsError?.details === 'startupTimeout' ? '视频加载超时' : hlsError?.details === 'playbackStall' ? '持续缓冲，暂时无法继续播放' : networkError ? '播放连接中断' : decodeError ? '浏览器无法解码当前视频' : '当前视频暂时无法播放';
+    current.failed = true; current.note.textContent = noFrame ? '播放源没有可解码的视频画面，请尝试兼容播放或选择其他官方在线版本。' : `夸克播放中断：${reason}。可重试夸克播放，或${current.quarkOnly ? '返回夸克资源' : '返回原线路；原影视源不会因此停用'}。`; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); return;
   }
   if (current.catalog) void recoverPlayback(current);
   else if (current.live) void recoverLive(current);
@@ -2287,6 +2315,7 @@ async function recoverPlayback(current) {
 }
 
 function attemptPlay(current, generation) {
+  if (player !== current || generation !== current.mediaVersion || current.quarkPaused) return;
   void current.video.play().catch(error => {
     if (player !== current || generation !== current.mediaVersion) return;
     if (error.name === 'NotAllowedError') { clearTimeout(current.loadTimer); current.note.textContent = '视频已准备好，浏览器需要你点击播放器的播放按钮开始。'; }
@@ -2314,7 +2343,7 @@ async function loadMedia(current, message = '正在连接播放地址…') {
     }
     if (player !== current || generation !== current.mediaVersion) return;
   }
-  current.loadTimer = setTimeout(() => { if (player === current && generation === current.mediaVersion && (video.readyState < 2 || current.quarkAsset && !hasVideoFrame(video))) playbackError(current); }, 15000);
+  current.loadTimer = setTimeout(() => { if (player === current && generation === current.mediaVersion && (video.readyState < 2 || current.quarkAsset && !hasVideoFrame(video))) playbackError(current, { type: 'networkError', details: 'startupTimeout' }); }, 15000);
   if (current.type === 'hls' && window.Hls?.isSupported()) {
     const quality = current.live && !current.transcoded ? liveQuality(current.channel.streams[current.line]) : null;
     const selectLevel = Boolean(quality) || !current.live;
@@ -2335,14 +2364,14 @@ async function loadMedia(current, message = '正在连接播放地址…') {
       if (selectLevel) {
         const choices = levels.map((level, index) => ({ ...level, index })).filter(level => Number.isInteger(level.height) && level.height > 0);
         const preferred = choices.filter(level => level.height <= 1080).sort((a, b) => b.height - a.height || (a.bitrate || 0) - (b.bitrate || 0))[0] || choices.sort((a, b) => a.height - b.height)[0];
-        const index = quality ? hlsInitialLevel(levels, quality) : preferred?.index ?? -1;
-        if (index >= 0) instance.startLevel = index;
+        const index = quality ? hlsInitialLevel(levels, quality) : current.quarkAsset && !current.transcoded ? -1 : preferred?.index ?? -1;
+        if (index >= 0 || current.quarkAsset && !current.transcoded) instance.startLevel = index;
         instance.startLoad?.(current.transcoded ? 0 : -1);
       }
       applySubtitleTrack(current); attemptPlay(current, generation);
     });
   } else if (current.type === 'hls' && !video.canPlayType('application/vnd.apple.mpegurl')) {
-    clearTimeout(current.loadTimer); playbackError(current);
+    clearTimeout(current.loadTimer); playbackError(current, { type: 'mediaError', details: 'manifestIncompatibleCodecsError' });
   } else { video.src = url; attemptPlay(current, generation); }
 }
 
@@ -2371,7 +2400,7 @@ function stopPlayer(invalidate = true) {
   current.clearFilmControls?.();
   clearInterval(current.timer);
   clearInterval(current.danmakuTimer); clearDanmaku(current);
-  clearTimeout(current.loadTimer);
+  clearTimeout(current.loadTimer); clearTimeout(current.stallTimer);
   clearTimeout(current.quarkTimer);
   current.cancelQuarkSearch?.();
   for (const request of current.subtitleRequests || []) request.abort();
@@ -2747,7 +2776,7 @@ window.addEventListener('pagehide', () => {
   const current = player;
   playVersion++; player = null;
   current.clearFilmControls?.();
-  clearInterval(current.timer); clearInterval(current.danmakuTimer); clearTimeout(current.loadTimer); clearDanmaku(current);
+  clearInterval(current.timer); clearInterval(current.danmakuTimer); clearTimeout(current.loadTimer); clearTimeout(current.stallTimer); clearDanmaku(current);
   if (hls) { hls.destroy(); hls = null; }
   current.video?.pause();
   void stopTranscode(current.transcodeId, true); current.transcodeId = null;

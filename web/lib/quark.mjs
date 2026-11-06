@@ -129,7 +129,7 @@ function detailInfo(detail, options = {}) {
   const rawTitle = name(detail?.title || detail?.name), year = String(detail?.year || '').slice(0, 4);
   if (!rawTitle) throw failure('影片详情缺少名称', 400);
   const key = hash(JSON.stringify([String(detail.source || ''), String(detail.id || ''), rawTitle, year]));
-  const series = detail.type === 'series' || ['tv', 'anime'].includes(detail.category) || Array.isArray(detail.lines) && detail.lines.some(line => line.episodes?.length > 1);
+  const series = detail.type !== 'movie' && (detail.type === 'series' || ['tv', 'anime'].includes(detail.category) || Array.isArray(detail.lines) && detail.lines.some(line => line.episodes?.length > 1));
   let title = rawTitle.normalize('NFKC');
   if (series) for (let count = 0; count < 6; count++) {
     const cleaned = title.replace(/(?:\s*[(\[【]?\s*(?:更新至\s*第?\s*[零〇一二两三四五六七八九十百\d]+\s*[集话]?|第[零〇一二两三四五六七八九十百\d]+[集话季]|(?:全|共)\d+集|\d+集全|完结季|国语|粤语|普通话|双语|中字|中英字幕)|[\s._-]+[(\[【]?\s*(?:s\d{1,2}(?:[ ._-]*e\d{1,3})?|(?:episode|ep|e)[ ._-]*\d{1,3}|\d{1,2}x\d{1,3}|完结|全集|高清|超清|日语|英语|1080p|2160p|4k|HD))\s*[)\]】]?\s*$/i, '').trim();
@@ -144,7 +144,7 @@ function detailInfo(detail, options = {}) {
 }
 
 function videoRename(info, file) {
-  if (!info.year) return;
+  if (info.series && !info.year) return;
   const title = info.searchTitle.replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').replace(/^[ .]+|[ .]+$/g, '').slice(0, 180).trim();
   const extension = /\.[a-z0-9]{2,5}$/i.exec(file.name)?.[0].toLowerCase();
   if (!title || !extension) return;
@@ -155,12 +155,12 @@ function videoRename(info, file) {
     if (!seasons.length || !episodes.length || seasons.some(value => !Number.isInteger(value) || value < 1 || value > 99 || value !== seasons[0]) || episodes.some(value => !Number.isInteger(value) || value < 1 || value > 999 || value !== episodes[0])) return;
     suffix = ` S${String(seasons[0]).padStart(2, '0')}E${String(episodes[0]).padStart(2, '0')}`;
   } else if (episodeNumber(file.name) !== undefined) return;
-  return `${title} (${info.year})${suffix}${extension}`;
+  return `${title}${info.year ? ` (${info.year})` : ''}${suffix}${extension}`;
 }
 function subtitleRename(asset, candidate) {
   const original = candidate.name.normalize('NFKC').replace(/\.[^.]+$/, ''), stem = subtitleStem(candidate.name);
   const suffix = languageName(stem) ? '.' + stem : original.slice(stem.length);
-  const target = (asset.renameTo || asset.name).replace(/\.[^.]+$/, '') + suffix + '.' + candidate.type;
+  const target = asset.name.replace(/\.[^.]+$/, '') + suffix + '.' + candidate.type;
   return target.length <= 300 && !/[\\/:*?"<>|\u0000-\u001f\u007f]/.test(target) ? target : undefined;
 }
 
@@ -651,9 +651,29 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       if (record.renameAttempted) { await ownedFile(context, asset, record); return; }
       const folder = await ownedFolder(context), listing = await ownList(context, folder.fid); current(context);
       registeredFile(asset, record, folder.fid, listing.list);
-      if (record.renameTo === record.name) { delete record.renameTo; persist(); return; }
-      if (!listing.complete || listing.list.some(row => row.fid !== record.fid && row.file_name === record.renameTo)) {
-        delete record.renameTo; record.renameWarning = true; asset.renameReason = '目标名称已存在或目录未完整核验，已保留转存文件原名'; persist(); return;
+      if (!listing.complete) {
+        record.renameWarning = true; asset.renameReason = '目录未完整核验，已保留转存文件现有名称'; persist(); return;
+      }
+      const reserved = registry.assets.filter(row => row.account === asset.account && row.parent === asset.parent && row.status !== 'deleted').flatMap(row => [row, ...(row.subtitles || [])]).filter(row => row !== record && row.fid !== record.fid && row.status !== 'deleted').flatMap(row => [row.name, row.renameTo]).filter(value => typeof value === 'string');
+      const sameName = (left, right) => left.normalize('NFKC').toLowerCase() === right.normalize('NFKC').toLowerCase();
+      const occupied = target => listing.list.some(row => row.fid !== record.fid && typeof row.file_name === 'string' && sameName(row.file_name, target)) || reserved.some(value => sameName(value, target));
+      if (occupied(record.renameTo)) {
+        if (record === asset) {
+          const base = record.renameBase || record.renameTo, extension = /\.[a-z0-9]{2,5}$/i.exec(base)?.[0];
+          const stem = extension && base.slice(0, -extension.length);
+          let target;
+          if (stem) for (let version = 2; version <= 1000; version++) {
+            const candidate = `${stem} [版本 ${version}]${extension}`;
+            if (candidate.length <= 300 && !occupied(candidate)) { target = candidate; break; }
+          }
+          if (target) { record.renameBase ||= base; record.renameTo = target; persist(); }
+          else { record.renameWarning = true; asset.renameReason = '无法分配不重名的视频名称，已保留转存文件现有名称'; persist(); return; }
+        } else { record.renameWarning = true; asset.renameReason = '字幕目标名称已存在，已保留转存字幕现有名称'; persist(); return; }
+      }
+      if (record.renameTo === record.name) {
+        delete record.renameTo; delete record.renameWarning;
+        if (!asset.renameWarning && !(asset.subtitles || []).some(row => row.renameWarning)) delete asset.renameReason;
+        persist(); return;
       }
       const target = record.renameTo;
       record.renameFrom = record.name; record.renameAttempted = true; reserveRegistration(); persist();
@@ -707,18 +727,32 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     let queuedSubtitle;
     try {
       if (asset.subtitleRegistryInvalid) throw failure('字幕登记无效，请先检查专用目录', 409);
+      if (!asset.renameBase && !asset.renameAttempted) {
+        const target = videoRename(info, { ...selected, name: asset.sourceName || selected.name });
+        if (target) { await ownedFile(context, asset); current(context); asset.sourceName ||= selected.name; asset.renameBase = target; asset.renameTo ||= target; persist(); }
+      }
       await renameOwned(context, asset);
       const matching = await matchingSubtitles(context, info, selected, resource); current(context);
+      if (matching.length && asset.renameAttempted) await ownedFile(context, asset);
       for (const candidate of matching) {
         queuedSubtitle = undefined;
         const source = hash(resource.pwdId + ':' + candidate.fid);
         let record = (asset.subtitles || []).find(row => row.source === source && row.status !== 'deleted');
-        if (record && record.status !== 'queued') { await resumeSubtitle(context, asset, record); continue; }
+        if (record && record.status !== 'queued') {
+          await resumeSubtitle(context, asset, record);
+          const target = !asset.renameAttempted && subtitleRename(asset, candidate);
+          if (record.status === 'ready' && !record.renameAttempted && target && record.renameBase !== target) {
+            record.sourceName ||= candidate.name; record.renameBase = target; record.renameTo = target; persist();
+            await renameOwned(context, asset, record);
+          }
+          continue;
+        }
         if (!record && (asset.subtitles || []).length >= SUBTITLE_LIMIT) break;
         const day = new Date(now()).toISOString().slice(0, 10);
         if (dailyBytes(context.account, day) + candidate.size > config.maxDailyBytes) throw failure('字幕转存达到每日容量上限', 429);
         if (!record) {
-          record = { id: id(), source, parent: asset.parent, name: candidate.name, size: candidate.size, type: candidate.type, day, status: 'queued', ...(subtitleRename(asset, candidate) ? { renameTo: subtitleRename(asset, candidate) } : {}) };
+          const target = !asset.renameAttempted && subtitleRename(asset, candidate);
+          record = { id: id(), source, parent: asset.parent, name: candidate.name, sourceName: candidate.name, size: candidate.size, type: candidate.type, day, status: 'queued', ...(target ? { renameBase: target, renameTo: target } : {}) };
           reserveRegistration(record);
           queuedSubtitle = record; (asset.subtitles ||= []).push(record); persist();
         } else reserveRegistration();
@@ -866,7 +900,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         if (reconnected) { if (detail.category === 'adult' || !reconnected.category) { reconnected.category = name(detail.category).slice(0, 32); persist(); } if (reconnected.status === 'ready') await ownedFile(context, reconnected); else await resume(context, reconnected); return await prepareSubtitles(context, info, file, resource, reconnected, true); }
         const reconnectedToday = registry.assets.filter(asset => asset.account === context.account && asset.day === day && asset.status !== 'queued');
         if (reconnectedToday.length >= config.maxDailyTransfers || dailyBytes(context.account, day) + file.size > config.maxDailyBytes || registry.assets.length >= 1000) throw failure('已达到本应用每日转存数量或容量上限', 429);
-        const asset = { id: id(), account: context.account, managed: true, source, parent: folder.fid, name: file.name, sourceName: file.name, ...(videoRename(info, file) ? { renameTo: videoRename(info, file) } : {}), size: file.size, category: name(detail.category).slice(0, 32), day, createdAt: now(), lastActivity: now(), status: 'queued' };
+        const asset = { id: id(), account: context.account, managed: true, source, parent: folder.fid, name: file.name, sourceName: file.name, ...(videoRename(info, file) ? { renameBase: videoRename(info, file), renameTo: videoRename(info, file) } : {}), size: file.size, category: name(detail.category).slice(0, 32), day, createdAt: now(), lastActivity: now(), status: 'queued' };
         reserveRegistration(asset);
         queuedAsset = asset;
         registry.assets.push(asset); persist();

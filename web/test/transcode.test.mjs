@@ -82,12 +82,16 @@ function probeRangeMedia(mode = 'valid', size = 4 * 1024 * 1024 + 17) {
     const match = /^bytes=(\d+)-(\d*)$/.exec(options.headers.range || 'bytes=0-');
     const first = Number(match[1]), last = Math.min(match[2] ? Number(match[2]) : size - 1, size - 1), length = last - first + 1;
     const headers = { 'content-type': 'application/octet-stream', 'content-length': String(length), 'content-range': `bytes ${first}-${last}/${mode === 'changed-total' && calls.length > 1 ? size + 1 : size}` };
-    if (mode === 'mismatch') headers['content-range'] = `bytes ${first + 1}-${last}/${size}`;
-    if (mode === 'missing-length') delete headers['content-length'];
+    if (mode === 'mismatch' || mode === 'missing-length-mismatch') headers['content-range'] = `bytes ${first + 1}-${last}/${size}`;
+    if (mode.startsWith('missing-length')) delete headers['content-length'];
+    if (mode === 'missing-length-no-range') delete headers['content-range'];
     if (mode === 'bad-length') headers['content-length'] = String(length + 1);
     let response;
-    if (mode === 'stalled') { response = new PassThrough(); response.write(Buffer.alloc(1)); }
-    else response = Readable.from([Buffer.alloc(mode === 'overlong' ? length + 1 : mode === 'short' ? length - 1 : length)]);
+    if (mode === 'stalled' || mode === 'missing-length-abrupt') {
+      response = new PassThrough(); response.write(Buffer.alloc(1));
+      if (mode === 'missing-length-abrupt') setImmediate(() => response.destroy(new Error('fixture upstream truncated')));
+    }
+    else response = Readable.from([Buffer.alloc(mode === 'overlong' || mode === 'missing-length-overlong' ? length + 1 : mode === 'short' || mode === 'missing-length-short' ? length - 1 : length)]);
     streams.push(response);
     return Object.assign(response, { statusCode: mode === 'ignored' ? 200 : 206, headers, finalUrl: String(target) });
   } });
@@ -165,8 +169,37 @@ test('an invalid Dolby encoder response stops an already-started process instead
   } finally { trigger(); await f.close(); }
 });
 
-test('Dolby HTTP color probes reject ignored ranges, missing lengths and mismatched totals without encoding', async () => {
-  for (const mode of ['ignored', 'mismatch', 'missing-length', 'bad-length', 'overlong', 'short', 'changed-total']) {
+test('chunked Dolby range responses keep probe and encoder windows bounded across large-file tail seeks', async () => {
+  const size = 32 * 1024 * 1024 * 1024 + 17, source = probeRangeMedia('missing-length', size);
+  const largeDolby = { ...rawDolby, url: 'https://movies.example/large-original.mp4', type: 'mp4' };
+  const inspect = async ({ input }) => {
+    for (const [start, expected] of [[0, 2 * 1024 * 1024], [size - 1024, 1024]]) {
+      const response = await fetch(input, { headers: { Range: `bytes=${start}-` } });
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-length'), null);
+      assert.equal(response.headers.get('content-range'), `bytes ${start}-${start + expected - 1}/${size}`);
+      assert.equal((await response.arrayBuffer()).byteLength, expected);
+    }
+  };
+  const f = await fixture({ media: source.media, colorProbe: dolbyProbe(), di: { probeTimeout: 3000, startupTimeout: 5000 }, inspect,
+    run: async ({ input, write }) => {
+      const response = await fetch(input, { headers: { Range: 'bytes=0-' } });
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-length'), null);
+      assert.equal((await response.arrayBuffer()).byteLength, 8 * 1024 * 1024);
+      await write();
+    },
+  });
+  try {
+    const proof = await f.service.inspectColor({ episode: largeDolby, sourceColorSpace: 'dolby-vision', owner: 'probe', valid: () => true });
+    assert.equal(proof.rpuSeen, true);
+    await start(f.service, { episode: largeDolby });
+    assert.deepEqual(source.calls, ['bytes=0-2097151', `bytes=${size - 1024}-${size - 1}`, 'bytes=0-2097151', `bytes=${size - 1024}-${size - 1}`, 'bytes=0-8388607']);
+  } finally { await f.close(); }
+});
+
+test('Dolby HTTP color probes reject ignored ranges, inconsistent lengths and mismatched totals without encoding', async () => {
+  for (const mode of ['ignored', 'mismatch', 'bad-length', 'overlong', 'short', 'changed-total', 'missing-length-overlong', 'missing-length-short', 'missing-length-no-range', 'missing-length-mismatch']) {
     const source = probeRangeMedia(mode);
     const f = await fixture({ media: source.media, colorProbe: dolbyProbe(), di: { probeTimeout: 3000 },
       inspect: async ({ input }) => {
@@ -181,6 +214,25 @@ test('Dolby HTTP color probes reject ignored ranges, missing lengths and mismatc
       assert.ok(source.streams.every(stream => stream.destroyed));
     } finally { await f.close(); }
   }
+});
+
+test('chunked Dolby range truncation cannot be hidden by decoded frame metadata', async () => {
+  const source = probeRangeMedia('missing-length-abrupt');
+  const f = await fixture({ media: source.media, colorProbe: dolbyProbe(), di: { probeTimeout: 3000 },
+    inspect: async ({ input }) => {
+      // A decoder can already have frame metadata when an upstream body fails.
+      await assert.rejects(async () => {
+        const response = await fetch(input, { headers: { Range: 'bytes=0-' } });
+        await response.arrayBuffer();
+      });
+    },
+  });
+  try {
+    await assert.rejects(f.service.inspectColor({ episode: rawDolby, owner: 'probe', valid: () => true }),
+      error => error.code === 'QUARK_COLOR_PROBE_READ_FAILED');
+    assert.equal(f.calls.filter(call => call.args.includes('-c:v')).length, 0);
+    assert.ok(source.streams.every(stream => stream.destroyed));
+  } finally { await f.close(); }
 });
 
 test('one Dolby probe shares its sixteen MiB and sixteen HTTP request limits across all seeks', async () => {
