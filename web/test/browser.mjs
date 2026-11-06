@@ -103,6 +103,7 @@ let quarkAssetPosition = 0;
 let quarkChoicesFixture = false, quarkFilesFixture = 'matched';
 let quarkSubtitleFixture = false, releaseQuarkSubtitle = null;
 let quarkCleanupReply = null, automaticDanmakuFixture = false;
+let quarkQualityFixture = '', quarkSavedFixture = false;
 const subtitleFixtures = {
   srt: '1\n00:00:00,000 --> 00:00:04,000\n开头字幕\n\n2\n00:00:05,000 --> 00:00:10,000\n续播字幕\n\n3\n00:00:20,000 --> 00:00:25,000\n末段字幕\n',
   vtt: 'WEBVTT\n\nNOTE 备注不应显示\n00:00.000 --> 00:03.000\n这不是字幕\n\n00:00.000 --> 00:04.000\nVTT 第一行\n第二行\n',
@@ -247,7 +248,7 @@ try {
         if (transcodeMode === 'not-seekable') return route.fulfill({ status: 409, json: { error: '原文件暂不支持定位续播，请从头播放或换官方在线线路', code: 'TRANSCODE_INPUT_NOT_SEEKABLE' } });
         assert.ok(body.liveId ? body.position === 0 && body.speed === 1 : body.quarkAsset ? typeof body.quarkAsset === 'string' && body.position >= 0 && body.position <= 86400 : typeof body.id === 'string' && Number.isInteger(body.line) && Number.isInteger(body.episode) && body.position >= 0 && body.position <= 86400);
         const id = `fixture-${transcodeStarts.length}`;
-        return route.fulfill({ json: { id, url: `/api/transcode/${id}/index.m3u8`, type: 'hls', transcoded: true, startPosition: body.position, duration: transcodeDuration, acceleration: transcodeAcceleration } });
+        return route.fulfill({ json: { id, url: `/api/transcode/${id}/index.m3u8`, type: 'hls', transcoded: true, startPosition: body.position, duration: transcodeDuration, acceleration: transcodeAcceleration, quality: body.quality || 720 } });
       }
       // UI flows decode a real H.264/AAC sample; actual FFmpeg HLS has a separate integration test.
       if (parsed.origin === base && /^\/api\/transcode\/fixture-\d+\/index\.(?:m3u8|mp4)$/.test(parsed.pathname)) return route.fulfill({ status: 200, contentType: 'video/mp4', body: videoMedia, headers: { 'Accept-Ranges': 'bytes' } });
@@ -339,7 +340,16 @@ try {
           if (type === 'late') await new Promise(ok => { releaseQuarkSubtitle = ok; });
           return route.fulfill(type === 'bad' ? { status: 502, body: '固定字幕读取失败' } : { contentType: 'text/plain; charset=utf-8', body: subtitleFixtures[type] || subtitleFixtures.srt });
         }
-        if (parsed.pathname === '/api/quark/playback') { if (holdQuarkPlayback) await new Promise(ok => { releaseQuarkPlayback = ok; }); if (quarkMode === 'playback-error') return route.fulfill({ status: 502, json: { error: '固定夸克播放链接错误' } }); assert.ok(quarkAssets.has(body.assetId)); const type = quarkMode === 'requires' ? 'mkv' : ['webm', 'avi', 'mpegts'].includes(quarkMode) ? quarkMode : 'hls'; return route.fulfill({ json: { assetId: body.assetId, name: quarkAssets.get(body.assetId).name, url: `/api/quark/media/${body.assetId}/index.${type === 'hls' ? 'm3u8' : type}`, type, size: 10485760, version: 'official-fixture-h264-v1', requiresCompatibility: ['requires', 'avi', 'mpegts'].includes(quarkMode), duration: 30 } }); }
+        if (parsed.pathname === '/api/quark/saved') return route.fulfill({ json: { files: quarkSavedFixture ? [...quarkAssets].slice(-2).map(([assetId, row], index) => ({ assetId, name: row.name, size: 10485760, sourceName: `原始版本${index + 1}.mkv`, available: quarkSavedFixture !== 'missing', status: 'ready', saved: true, position: 0, subtitles: [{ name: `版本${index + 1}.srt`, type: 'srt', size: 100, status: 'ready', available: true }] })) : [] } });
+        if (parsed.pathname === '/api/quark/playback') {
+          if (holdQuarkPlayback) await new Promise(ok => { releaseQuarkPlayback = ok; });
+          if (quarkMode === 'playback-error') return route.fulfill({ status: 502, json: { error: '固定夸克播放链接错误' } });
+          assert.ok(quarkAssets.has(body.assetId)); const type = quarkMode === 'requires' ? 'mkv' : ['webm', 'avi', 'mpegts'].includes(quarkMode) ? quarkMode : 'hls';
+          const qualityOptions = [2160, 1080, 720].slice(quarkQualityFixture === 'single' ? 2 : 0).map((height, index) => ({ id: `q${index}`, label: height === 2160 ? '4K' : `${height}p`, type: quarkQualityFixture === 'master' || height === 720 ? 'hls' : 'mp4', width: Math.round(height * 16 / 9), height, url: `/api/quark/media/${body.assetId}?token=q${index}` }));
+          const selectedQuality = qualityOptions[quarkQualityFixture === 'single' ? 0 : 1];
+          if (quarkQualityFixture) qualityOptions.push({ id: 'unsafe', label: '伪造8K', type: 'mp4', url: 'https://example.invalid/private.mp4' });
+          return route.fulfill({ json: { assetId: body.assetId, name: quarkAssets.get(body.assetId).name, url: quarkQualityFixture === 'master' ? `/api/quark/media/${body.assetId}?token=master` : quarkQualityFixture ? selectedQuality.url : `/api/quark/media/${body.assetId}/index.${type === 'hls' ? 'm3u8' : type}`, type: quarkQualityFixture ? selectedQuality.type : type, ...(quarkQualityFixture ? { qualityOptions, quality: quarkQualityFixture === 'master' ? '自动画质' : selectedQuality.label } : {}), size: 10485760, version: 'official-fixture-h264-v1', requiresCompatibility: ['requires', 'avi', 'mpegts'].includes(quarkMode), duration: 30 } });
+        }
         if (parsed.pathname === '/api/quark/progress') { assert.ok(quarkAssets.has(body.assetId), `未知测试资产 ${body.assetId} / ${[...quarkAssets.keys()].join(',')}`); assert.ok(Number.isFinite(body.position) && Number.isFinite(body.duration) && typeof body.ended === 'boolean'); assert.ok(body.position >= 0 && body.duration > 0 && body.duration <= 86400 && body.position <= body.duration + 2, '观看进度遵守服务端时长及范围校验'); quarkProgress.push(body); return route.fulfill({ json: { ok: true } }); }
         if (parsed.pathname.startsWith('/api/quark/media/')) return route.fulfill({ contentType: quarkMode === 'audio-only' ? 'audio/wav' : 'video/mp4', body: quarkMode === 'audio-only' ? media : videoMedia, headers: { 'Accept-Ranges': 'bytes' } });
       }
@@ -654,9 +664,9 @@ try {
         window.Hls = class CloudFixtureHls {
           constructor() { this.handlers = {}; this.stopLoads = 0; this.reloads = 0; (window.cloudHlsInstances ||= []).push(this); }
           static Events = { ERROR: 'error', MANIFEST_PARSED: 'manifest' }; static isSupported() { return true; }
-          loadSource(url) { this.url = url; } attachMedia(video) { this.media = video; video.src = this.url.replace('.m3u8', '.mp4'); if (window.pauseReloadFixture) this.poller = setInterval(() => { this.reloads++; void fetch(this.url); }, 2000); }
+          loadSource(url) { this.url = url; if (window.qualityMasterFixture) this.levels = [2160, 1080, 720].map((height, index) => { const selected = new URL(url, location.href); selected.searchParams.set('token', `q${index}`); return { height, bitrate: (3 - index) * 2000000, url: [selected.href] }; }); } attachMedia(video) { this.media = video; video.src = this.url.replace('.m3u8', '.mp4'); if (window.pauseReloadFixture) this.poller = setInterval(() => { this.reloads++; void fetch(this.url); }, 2000); }
           // Hls.js 清单重载会清空已有 TextTrack，应用须在 manifest 后重建外挂字幕。
-          on(name, callback) { this.handlers[name] = callback; if (name === 'manifest') queueMicrotask(() => { for (const track of this.media.textTracks) { for (const cue of [...(track.cues || [])]) track.removeCue(cue); track.mode = 'disabled'; } callback(name, { levels: [] }); }); } startLoad() {} stopLoad() { this.stopLoads++; clearInterval(this.poller); } destroy() { clearInterval(this.poller); }
+          on(name, callback) { this.handlers[name] = callback; if (name === 'manifest') queueMicrotask(() => { for (const track of this.media.textTracks) { for (const cue of [...(track.cues || [])]) track.removeCue(cue); track.mode = 'disabled'; } callback(name, { levels: this.levels || [] }); }); } startLoad() {} stopLoad() { this.stopLoads++; clearInterval(this.poller); } destroy() { clearInterval(this.poller); }
         };
       });
       if (hash !== '#quark') await p.evaluate(hash => { location.hash = hash; }, hash);
@@ -672,6 +682,7 @@ try {
       releaseQuarkSubtitle?.(); releaseQuarkSubtitle = null; quarkSubtitleFixture = false;
       holdPreferences = false; releasePreferences?.(); releasePreferences = null;
       quarkCleanupReply = null; automaticDanmakuFixture = false;
+      quarkQualityFixture = ''; quarkSavedFixture = false;
       for (const c of contexts) await c.value.close();
       quarkResourceReply = null; quarkChoicesFixture = false; quarkFilesFixture = 'matched'; quarkFolderRepairFails = false; quarkAssetPosition = 0;
       Object.assign(quarkSettings, settings); quarkMode = mode; transcodeDuration = duration; transcodeMode = transcode; app.store.setConfig(configBefore);
@@ -1655,6 +1666,108 @@ try {
     console.log('PASS 完整7116.05秒/5375偏移、原生滑块端点几何与音量/进度真实交互、兼容悬浮控件闲置隐藏/唤醒/暂停/加载/拖动/TV键盘焦点/路由清理、字幕与手机/未知时长/直放回退');
   }
 
+  async function verifyQuarkPlaybackQuality() {
+    for (const tv of [false, true]) await withCloudFixture(async open => {
+      quarkQualityFixture = 'official'; const { page: p } = await open({ tv, clock: true }); await prepareCloudFile(p); await playCloudFile(p);
+      const video = p.locator('video'), quality = p.getByLabel('播放画质', { exact: true }), mode = p.getByLabel('当前播放方式', { exact: true }), jobs = transcodeStarts.length, plays = quarkCount('/api/quark/playback');
+      await video.evaluate(v => { window.qualityVideo = v; window.qualityEvents = []; for (const type of ['pause', 'play', 'loadedmetadata', 'loadeddata', 'playing', 'seeking', 'seeked']) v.addEventListener(type, () => window.qualityEvents.push({ type, token: new URL(v.currentSrc || location.href).searchParams.get('token'), time: v.currentTime, paused: v.paused, ready: v.readyState })); v.currentTime = 4; });
+      await p.locator('.player-subtitles summary').click(); await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: 'quality.srt', mimeType: 'text/plain', buffer: Buffer.from('1\n00:00:00,000 --> 00:00:10,000\n画质切换字幕\n') });
+      await p.getByText('本机字幕已添加。', { exact: true }).waitFor();
+      assert.deepEqual(await quality.locator('option').allTextContents(), ['4K', '1080p', '720p']); assert.equal(await quality.inputValue(), 'q1', '默认保持服务端选中的1080而非最高4K'); assert.match(await mode.textContent(), /夸克官方播放/);
+      await p.locator('.player-frame').evaluate(frame => { frame.requestFullscreen = () => Promise.reject(new Error('本次全屏被浏览器拒绝')); });
+      await p.getByRole('button', { name: '全屏', exact: true }).click(); await p.getByText('本次全屏被浏览器拒绝', { exact: true }).waitFor();
+      assert.equal(await quality.evaluate(el => Boolean(el.closest('.player-frame'))), false, '全屏被拒后画质控件恢复到普通工具栏');
+      await p.locator('.player-frame').evaluate(frame => { delete frame.requestFullscreen; });
+      await p.getByRole('button', { name: '全屏', exact: true }).click(); await until(() => p.evaluate(() => document.fullscreenElement?.classList.contains('player-frame')), '官方画质控件可在全屏访问');
+      await p.clock.runFor(100); await quality.focus(); await until(() => quality.evaluate(el => document.activeElement === el), '全屏画质控件实际获得焦点');
+      assert.deepEqual(await quality.evaluate(select => ['ArrowDown', 'Enter'].map(key => { const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }); select.dispatchEvent(event); return event.defaultPrevented; })), [false, false], '方向及确认键交给画质select');
+      if (tv) { await p.keyboard.press('ArrowUp'); await p.keyboard.press('Enter'); } else await quality.selectOption('q0');
+      try { await until(() => video.evaluate(v => v.currentSrc.includes('token=q0') && v.readyState >= 2 && !v.seeking && !v.paused && v.currentTime >= 4).catch(() => false), '官方MP4切档保留实际位置并继续播放'); }
+      catch (error) { console.error('官方切档诊断', { errors: errors.slice(-5), media: await p.evaluate(() => ({ events: window.qualityEvents, note: document.querySelector('.player-note')?.textContent, selected: document.querySelector('[aria-label="播放画质"]').value, time: window.qualityVideo.currentTime, duration: window.qualityVideo.duration, paused: window.qualityVideo.paused, ready: window.qualityVideo.readyState })) }); throw error; }
+      await video.evaluate(v => v.focus()); await p.keyboard.press('Shift'); await p.clock.fastForward(4000); assert.equal(await quality.isVisible(), false, '官方全屏播放闲置时隐藏额外画质控件'); await p.locator('.player-frame').dispatchEvent('pointermove'); await quality.waitFor();
+      assert.equal(await video.evaluate(v => v === window.qualityVideo), true, '切档保留同一播放器及全屏'); assert.equal(await p.evaluate(() => Boolean(document.fullscreenElement)), true);
+      assert.equal(await p.getByLabel('播放字幕', { exact: true }).inputValue(), 'manual'); await until(() => p.locator('video track').evaluate(t => t.track.cues?.[0]?.text === '画质切换字幕'), '切档恢复外挂字幕');
+      await video.evaluate(v => { v.currentTime = 5; v.pause(); }); await until(() => video.evaluate(v => v.paused && !v.seeking && Math.abs(v.currentTime - 5) < .1), '原档实际暂停并完成定位'); await quality.selectOption('q2');
+      try { await until(() => video.evaluate(v => v.currentSrc.includes('token=q2') && v.readyState >= 2 && v.paused && Math.abs(v.currentTime - 5) < .1).catch(() => false), '暂停中切官方HLS档保留暂停和位置'); }
+      catch (error) { console.error('暂停切档诊断', { errors: errors.slice(-5), media: await p.evaluate(() => ({ events: window.qualityEvents, note: document.querySelector('.player-note')?.textContent, selected: document.querySelector('[aria-label="播放画质"]').value, time: window.qualityVideo.currentTime, paused: window.qualityVideo.paused, ready: window.qualityVideo.readyState })) }); throw error; }
+      await p.clock.fastForward(20000); assert.equal(await video.evaluate(v => v.paused), true); assert.equal(transcodeStarts.length, jobs); assert.equal(quarkCount('/api/quark/playback'), plays, '官方切档不重新转存/刷新账号播放或启动转码');
+      await p.getByRole('button', { name: '退出全屏', exact: true }).click(); await until(() => p.evaluate(() => !document.fullscreenElement), '退出官方画质全屏');
+      quarkQualityFixture = 'single'; await p.locator('.player-toolbar').getByRole('button', { name: '重试夸克播放', exact: true }).click(); await until(() => quality.locator('option').count().then(n => n === 1), '单个官方档位如实可见');
+      assert.equal(await quality.isVisible(), true); assert.deepEqual(await quality.locator('option').allTextContents(), ['720p']);
+    });
+    await withCloudFixture(async open => {
+      quarkQualityFixture = 'master'; const { page: p } = await open(); await p.evaluate(() => { window.qualityMasterFixture = true; }); await prepareCloudFile(p); await playCloudFile(p);
+      const quality = p.getByLabel('播放画质', { exact: true }), video = p.locator('video'), source = await video.evaluate(v => v.currentSrc), count = await p.evaluate(() => window.cloudHlsInstances.length);
+      await quality.selectOption('q0'); assert.equal(await p.evaluate(() => window.cloudHlsInstances.at(-1).currentLevel), 0, '官方master复用Hls当前层');
+      await quality.selectOption('-1'); assert.equal(await p.evaluate(() => window.cloudHlsInstances.at(-1).currentLevel), -1);
+      assert.equal(await video.evaluate(v => v.currentSrc), source); assert.equal(await p.evaluate(() => window.cloudHlsInstances.length), count, 'master切档不重建Hls或播放器');
+      await video.evaluate(v => { v.currentTime = 4; }); await until(() => video.evaluate(v => v.readyState >= 2 && !v.seeking), '快速切档前定位');
+      await quality.evaluate(select => {
+        window.cloudHlsInstances.at(-1).levels = window.cloudHlsInstances.at(-1).levels.filter(level => level.height !== 2160);
+        select.value = 'q0'; select.dispatchEvent(new Event('change'));
+        select.value = '-1'; select.dispatchEvent(new Event('change'));
+      });
+      await until(() => video.evaluate(v => v.currentSrc.includes('token=master') && v.readyState >= 2 && !v.seeking && !v.paused && v.currentTime >= 4), '快速切回自动画质以最后选择为准');
+      assert.equal(await quality.inputValue(), '-1', '旧切档的迟到pause不能覆盖最后选择');
+    });
+    for (const tv of [false, true]) await withCloudFixture(async open => {
+      quarkMode = 'requires'; quarkAssetPosition = 5; transcodeMode = 'enabled'; transcodeDuration = 1200;
+      const { page: p } = await open({ tv }); await prepareCloudFile(p); await playCloudFile(p);
+      const video = p.locator('video'), quality = p.getByLabel('播放画质', { exact: true });
+      assert.deepEqual(await quality.locator('option').allTextContents(), ['最高4K', '最高1080p', '最高720p']); assert.equal(await quality.inputValue(), 'transcode-720'); assert.equal(transcodeStarts.at(-1).quality, undefined, '默认保持原720上限');
+      await video.evaluate(v => { v.currentTime = 2; v.pause(); }); const before = transcodeStarts.length;
+      await quality.selectOption('transcode-2160'); assert.equal(transcodeStarts.length, before, '暂停选更高上限不浪费NAS转码');
+      const play = p.getByRole('button', { name: '播放', exact: true }); if (tv) { await play.focus(); await p.keyboard.press('Enter'); } else await play.click();
+      await until(() => transcodeStarts.length === before + 1 && video.evaluate(v => !v.paused).catch(() => false), '明确恢复后才应用新上限');
+      assert.equal(transcodeStarts.at(-1).quality, 2160); assert.equal(transcodeStarts.at(-1).position, 7);
+      await until(() => p.getByLabel('当前播放方式', { exact: true }).textContent().then(text => /兼容转码播放.*\d+×\d+/.test(text)), '兼容播放显示实际尺寸');
+      assert.doesNotMatch(await p.getByLabel('当前播放方式', { exact: true }).textContent(), /4K/, '低分辨率样例不能冒充4K输出');
+      await quality.selectOption('transcode-1080'); await until(() => transcodeStarts.at(-1).quality === 1080, '播放中明确切换1080上限');
+    });
+    await withCloudFixture(async open => {
+      quarkQualityFixture = 'official'; transcodeMode = 'enabled'; const { page: p } = await open({ clock: true }); await prepareCloudFile(p); await playCloudFile(p);
+      const quality = p.getByLabel('播放画质', { exact: true }), video = p.locator('video'), jobs = transcodeStarts.length;
+      await quality.selectOption('q1'); await until(() => video.evaluate(v => v.currentSrc.includes('token=q1') && !v.paused), '手动官方档准备');
+      await quality.selectOption('q0'); await until(() => video.evaluate(v => v.currentSrc.includes('token=q0') && !v.paused), '手动官方4K准备');
+      await video.evaluate(v => { Object.defineProperty(v, 'error', { configurable: true, value: { code: 4 } }); v.dispatchEvent(new Event('error')); delete v.error; });
+      await p.locator('.player-note').getByText(/无法解码所选官方画质/).waitFor(); await p.clock.fastForward(30000); assert.equal(transcodeStarts.length, jobs, '手选官方4K失败不能静默降为720转码');
+      await p.getByRole('button', { name: '兼容播放', exact: true }).click(); await until(() => transcodeStarts.length === jobs + 1, '用户明确选择才启动兼容'); assert.equal(transcodeStarts.at(-1).quality, 2160, '明确兼容保留所选4K上限');
+    });
+    await withCloudFixture(async open => {
+      quarkSavedFixture = true;
+      for (const index of [1, 2]) quarkAssets.set(cloudAssetId('saved-quality', `version-${index}`), { name: `已存版本${index}.mkv`, body: { source: cloudFilm.source, id: cloudFilm.id, line: 0, episode: 0 } });
+      const { page: p } = await open(); const saved = p.locator('.quark-saved'); await saved.locator('summary').filter({ hasText: '已转存文件（2）' }).waitFor(); assert.equal(await saved.evaluate(el => el.open), true, '已有转存文件默认展开'); assert.equal(await p.locator('.quark-discovery').evaluate(el => el.open), false, '已有可用文件时折叠搜索其他版本');
+      const second = saved.locator('.quark-saved-file').filter({ hasText: '已存版本2.mkv' }); await second.getByText('已存版本2.mkv', { exact: true }).waitFor();
+      await second.getByText('原始名称与字幕', { exact: true }).click(); await second.getByText(/版本2.srt/).waitFor();
+      const prepares = quarkCount('/api/quark/prepare'); await second.getByRole('button', { name: '播放此文件', exact: true }).click(); await until(() => p.locator('video').evaluate(v => v.readyState >= 2).catch(() => false), '直接播放已存第二版本');
+      assert.equal(quarkRequests.filter(row => row.path === '/api/quark/playback').at(-1).body.assetId, cloudAssetId('saved-quality', 'version-2')); assert.equal(quarkCount('/api/quark/prepare'), prepares, '已存切换不重复转存');
+    });
+    await withCloudFixture(async open => {
+      quarkMode = 'requires'; transcodeMode = 'enabled'; transcodeDuration = 1200;
+      const { page: p } = await open({ tv: true }); let held = false, released = false, release;
+      const gate = new Promise(resolve => { release = resolve; });
+      await p.route('**/api/transcode/**', async route => { if (!released && route.request().method() === 'GET' && route.request().url().includes('index.mp4')) { held = true; await gate; } await route.fallback(); });
+      try {
+        await prepareCloudFile(p); const stops = transcodeStops.length;
+        await p.getByRole('button', { name: '夸克播放', exact: true }).click(); await until(() => held, '兼容任务已返回但首帧仍等待');
+        const video = p.locator('video'), quality = p.getByLabel('播放画质', { exact: true }), starts = transcodeStarts.length;
+        await video.evaluate(v => v.dispatchEvent(new KeyboardEvent('keydown', { key: 'MediaPause', bubbles: true, cancelable: true })));
+        await until(() => transcodeStops.length === stops + 1, '首帧前显式暂停也释放转码任务');
+        await quality.selectOption('transcode-2160'); assert.equal(transcodeStarts.length, starts, '首帧前暂停后切档不重启转码');
+        released = true; release(); await p.waitForTimeout(100); assert.equal(await video.evaluate(v => v.paused), true, '迟到的媒体响应不会推翻暂停');
+        await p.getByRole('button', { name: '播放', exact: true }).click(); await until(() => transcodeStarts.length === starts + 1 && video.evaluate(v => v.readyState >= 2 && !v.paused), '明确播放才按新画质恢复');
+        assert.equal(transcodeStarts.at(-1).quality, 2160);
+      } finally { released = true; release(); }
+    });
+    for (const savedState of [false, 'missing']) await withCloudFixture(async open => {
+      quarkSavedFixture = savedState; const searches = quarkCount('/api/quark/resources'); const { page: p } = await open();
+      await until(() => quarkCount('/api/quark/resources') > searches, '没有可用已存文件时自动搜索');
+      assert.equal(await p.locator('.quark-discovery').evaluate(el => el.open), true, '没有可用已存文件时优先展开搜索');
+      if (!savedState) assert.equal(await p.locator('.quark-saved').isHidden(), true, '无文件不显示空的转存区');
+    });
+    console.log('PASS 官方MP4/HLS多档及单档、真实Hls层切换、位置/暂停/字幕/全屏/TV确认保留、最高720/1080/4K按需转码与实际尺寸、手选解码失败不静默降档、已存两版本和字幕直播');
+  }
+
   async function verifyQuarkPictureReadiness() {
     for (const mode of ['audio-only', 'zero-frame']) await withCloudFixture(async open => {
       quarkMode = mode; transcodeMode = 'enabled'; transcodeDuration = 1200;
@@ -1858,6 +1971,23 @@ try {
     app.store.setConfig({ ...before, sources: ['first', 'second'].map(id => ({ id, name: id, api: `https://api.example.com/${id}`, enabled: true })), liveSources: [{ id: 'fixture-live', name: '测试直播源', url: 'https://live.example/test.m3u', enabled: true }] });
     Object.assign(quarkSettings, { enabled: true, configured: true, autoSave: false, account: { connected: true, label: '测试账号' } });
     try {
+      const loginContext = await browser.newContext({ viewport: { width: 1280, height: 720 }, userAgent: 'VIPVideoWebTV/1.0' });
+      try {
+        await loginContext.route('**/*', async route => {
+          const url = new URL(route.request().url());
+          if (url.origin !== base) return route.abort();
+          if (url.pathname === '/api/auth') return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ authenticated: false }) });
+          if (url.pathname === '/api/auth/login') { await new Promise(done => setTimeout(done, 40)); return route.fulfill({ status: 401, contentType: 'application/json', body: JSON.stringify({ error: '测试密码不正确' }) }); }
+          return route.continue();
+        });
+        const loginPage = await loginContext.newPage(); await loginPage.goto(base);
+        await loginPage.locator('#password').fill('fixture-invalid-password'); await loginPage.locator('#password').focus();
+        await loginPage.keyboard.press('ArrowDown'); await loginPage.keyboard.press('Enter');
+        await loginPage.locator('#login-error').getByText('测试密码不正确').waitFor();
+        assert.equal(await loginPage.locator('#password').evaluate(el => el === document.activeElement), true, 'TV登录失败把焦点还给密码输入框');
+        await loginPage.keyboard.press('ArrowDown'); assert.equal(await loginPage.locator('#login-form button').evaluate(el => el === document.activeElement), true, '失败后仍可用方向键到登录按钮');
+        await loginPage.keyboard.press('ArrowUp'); assert.equal(await loginPage.locator('#password').evaluate(el => el === document.activeElement), true);
+      } finally { await loginContext.close(); }
       isolated = await context({ width: 1920, height: 1080 }, true, false, '#home', 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36 VIPVideoWebTV/1.0'); const p = isolated.page;
       await p.locator('.poster-link').first().waitFor(); assert.equal(await p.locator('html').getAttribute('data-tv'), 'true');
       assert.equal(await p.evaluate(() => window.__vipTvFocus), true, '既有APK不重复安装方向键处理');
@@ -1893,6 +2023,13 @@ try {
       await p.locator('nav a[href="#home"]').focus(); for (let index = 0; index < 5; index++) await p.keyboard.press('ArrowDown'); await p.keyboard.press('Enter');
       await p.getByLabel('本机界面模式', { exact: true }).waitFor(); const summary = p.locator('details.settings-section > summary').first(); await summary.focus(); await p.keyboard.press('Enter');
       assert.equal(await summary.evaluate(element => element.parentElement.open), true); await p.keyboard.press('ArrowDown'); assert.equal(await p.evaluate(() => document.activeElement.tagName), 'INPUT');
+      const sourcesPanel = p.locator('details.settings-section').filter({ has: p.getByRole('heading', { name: '影视源', exact: true }) });
+      if (!await sourcesPanel.evaluate(el => el.open)) { await sourcesPanel.locator(':scope > summary').focus(); await p.keyboard.press('Enter'); }
+      await sourcesPanel.getByRole('button', { name: '＋ 添加', exact: true }).focus(); await p.keyboard.press('Enter');
+      const movingRow = sourcesPanel.locator('[data-focus-scope="sources:first"]');
+      await movingRow.getByRole('button', { name: '↓ 下移', exact: true }).focus(); await p.keyboard.press('Enter');
+      await until(() => movingRow.getByRole('button', { name: '↓ 下移', exact: true }).evaluate(el => el === document.activeElement), '同名排序按钮重绘后仍聚焦刚移动的资源');
+      assert.equal(await sourcesPanel.locator('.config-row').nth(1).getAttribute('data-focus-scope'), 'sources:first');
       const mode = p.getByLabel('本机界面模式', { exact: true }); await mode.selectOption('standard'); assert.equal(await p.locator('html').getAttribute('data-tv'), 'false');
       await p.reload(); await mode.waitFor(); assert.equal(await p.locator('html').getAttribute('data-tv'), 'false', '本机模式重启保留'); await mode.selectOption('auto'); assert.equal(await p.locator('html').getAttribute('data-tv'), 'true');
       await p.evaluate(() => {
@@ -1961,6 +2098,11 @@ try {
         assert.equal(await p.evaluate(() => Boolean(document.activeElement.closest('details.settings-section[open]'))), true, `末尾设置展开后控件可达 ${await p.evaluate(() => JSON.stringify({ width: innerWidth, active: document.activeElement.outerHTML.slice(0, 300) }))}`);
         await captureLayout(`tv-${viewport.width}-settings-scroll`);
         await p.locator('nav a[href="#quark"]').focus(); await p.keyboard.press('Enter');
+        const cinemaSort = p.getByLabel('夸克影片排序', { exact: true }); await cinemaSort.waitFor();
+        const previousSort = await cinemaSort.elementHandle(); await cinemaSort.focus(); await p.keyboard.press('ArrowUp');
+        await until(() => previousSort.evaluate(el => !el.isConnected), 'TV影院排序筛选完成重绘'); await previousSort.dispose();
+        await until(() => cinemaSort.inputValue().then(value => value === 'score'), 'TV影院保留豆瓣高分筛选');
+        const cinemaHash = await p.evaluate(() => location.hash);
         const cloudPoster = p.getByRole('button', { name: `查看 ${cloudMovie.title}`, exact: true }); await cloudPoster.waitFor();
         await p.locator('.category-tabs button').first().focus(); await p.keyboard.press('ArrowDown');
         assert.equal(await p.evaluate(() => Boolean(document.activeElement.closest('.browse-filters'))), true, 'TV影院分类下键进入筛选');
@@ -1969,7 +2111,10 @@ try {
         const moreResources = p.getByRole('button', { name: '查找更多公开资源', exact: true });
         await until(() => moreResources.isEnabled(), 'TV影院资源面板就绪'); await moreResources.focus();
         await captureLayout(`tv-${viewport.width}-cinema-detail`);
-        await p.goBack(); await cloudPoster.waitFor(); await until(() => cloudPoster.evaluate(el => el === document.activeElement), 'TV影院返回保留原海报焦点');
+        if (viewport.width === 1920) await p.keyboard.press('Escape');
+        else await p.locator(':focus').dispatchEvent('keydown', { key: 'BrowserBack', bubbles: true, cancelable: true });
+        await cloudPoster.waitFor(); await until(() => cloudPoster.evaluate(el => el === document.activeElement), 'TV影院返回键保留原海报焦点');
+        assert.equal(await p.evaluate(() => location.hash), cinemaHash, 'TV影院返回保留来时的筛选地址');
       }
       for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
         const ordinary = await context(viewport); try { assert.equal(await ordinary.page.locator('html').getAttribute('data-tv'), 'false'); assert.ok(await ordinary.page.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1); } finally { await ordinary.value.close(); }
@@ -1985,6 +2130,7 @@ try {
   else if (process.argv.includes('--quark-auto-transfer-only')) await verifyQuarkAutomaticTransfer();
   else if (process.argv.includes('--quark-playback-only')) { for (const verify of [verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkPlaybackRecovery, verifyQuarkStartupFailure]) await verify(); }
   else if (process.argv.includes('--quark-http-status-only')) await verifyQuarkPlaybackRecovery();
+  else if (process.argv.includes('--quark-quality-only')) await verifyQuarkPlaybackQuality();
   else if (process.argv.includes('--quark-progress-only')) await verifyQuarkProgressReadiness();
   else if (process.argv.includes('--full-film-timeline-only')) await verifyFullFilmTimeline();
   else if (process.argv.includes('--compatibility-pause-only')) await verifyCompatibilityPauseRelease();
@@ -3003,6 +3149,7 @@ try {
   await verifyNativeFullscreenControls();
   await verifyQuarkCleanupFeedback();
   await verifyAutomaticDanmaku();
+  await verifyQuarkPlaybackQuality();
   }
   // 显式启用联网验收；固定样例保持可离线重复，不把清单200等同于实际解码。
   if (process.env.VIPVIDEO_REAL_LIVE === '1') {

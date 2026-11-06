@@ -1103,7 +1103,82 @@ test('software output uses a private bridge, bounded HLS window, one thread and 
     assert.equal(args[args.indexOf('-f') + 1], 'hls'); assert.equal(args[args.indexOf('-allowed_extensions') + 1], 'ALL'); assert.equal(args.includes('-format_whitelist'), false);
     assert.equal(args[args.indexOf('-hls_time') + 1], '2'); assert.equal(args[args.indexOf('-hls_list_size') + 1], '30'); assert.equal(args[args.indexOf('-hls_flags') + 1], 'delete_segments+temp_file'); assert.ok(args.includes('libx264')); assert.ok(args.includes('aac')); assert.equal(args.includes('-atempo'), false); assert.equal(args.some(value => value.includes('setpts')), false); assert.equal((await f.service.status()).running, true);
     assert.equal(args[args.indexOf('-r') + 1], '30'); assert.equal(args[args.indexOf('-maxrate') + 1], '3500k'); assert.equal(args[args.indexOf('-bufsize') + 1], '7000k');
+    assert.equal(result.quality, 720);
     assert.ok(args.every((value, index) => !['-threads', '-filter_threads'].includes(value) || args[index + 1] === '1'));
+  } finally { await f.close(); }
+});
+
+test('quality limits dimensions and bitrate across software, VAAPI and Dolby mapping without increasing thread limits', async () => {
+  for (const [quality, width, bitrate, maxrate] of [[720, 1280, 2500, 3500], [1080, 1920, 5000, 7000], [2160, 3840, 14000, 18000]]) {
+    for (const [hardware, dolby] of [[false, false], [true, false], [false, true], [true, true]]) {
+      const f = await fixture({ gpu: hardware, env: { TRANSCODE_ACCEL: hardware ? 'vaapi' : 'software' }, colorProbe: dolbyProbe() });
+      try {
+        const result = await start(f.service, { quality, episode: dolby ? rawDolby : episode });
+        assert.equal(result.quality, quality); assert.equal(result.acceleration, hardware ? 'vaapi' : 'software');
+        const args = f.calls.find(call => call.args.includes('-c:v')).args, filter = args[args.indexOf('-vf') + 1];
+        assert.ok(filter.includes(`w='min(${width},iw)':h='min(${quality},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`));
+        assert.ok(filter.includes(dolby ? 'libplacebo=' : hardware ? 'scale_vaapi=' : 'scale='));
+        if (dolby) assert.match(filter, /apply_dolbyvision=1:colorspace=bt709:color_primaries=bt709:color_trc=bt709/);
+        if (hardware) assert.equal(args[args.indexOf('-b:v') + 1], `${bitrate}k`);
+        assert.equal(args[args.indexOf('-maxrate') + 1], `${maxrate}k`); assert.equal(args[args.indexOf('-bufsize') + 1], `${maxrate * 2}k`);
+        assert.equal(args[args.indexOf('-r') + 1], '30');
+        assert.deepEqual(args.flatMap((value, index) => value === '-threads' ? [args[index + 1]] : []), [dolby && !hardware ? '4' : '1', '1']);
+        assert.equal(args[args.indexOf('-filter_threads') + 1], '1'); assert.equal(args[args.indexOf('-hls_list_size') + 1], quality === 2160 ? '15' : '30', '4K码率较高，缩短缓存窗口以适配128MiB临时目录');
+      } finally { await f.close(); }
+    }
+  }
+});
+
+test('higher quality retains linear-light HDR mapping and cannot enable forbidden software encoding', async () => {
+  for (const quality of [1080, 2160]) {
+    const f = await fixture();
+    try {
+      await start(f.service, { quality, episode: { ...episode, colorSpace: 'pq', sourceColorSpace: 'dolby-vision' } });
+      const args = f.calls.find(call => call.args.includes('-c:v')).args, filter = args[args.indexOf('-vf') + 1];
+      assert.ok(filter.includes(`h='min(${quality},ih)'`));
+      assert.match(filter, /zscale=transfer=linear.*tonemap=tonemap=hable.*zscale=transfer=bt709/);
+      assert.equal(args[args.indexOf('-color_trc') + 1], 'bt709');
+    } finally { await f.close(); }
+    const protectedService = await fixture({ env: { TRANSCODE_ACCEL: 'auto', TRANSCODE_ALLOW_SOFTWARE: 'false' } });
+    try {
+      await assert.rejects(start(protectedService.service, { quality }), statusError(503));
+      assert.equal(protectedService.calls.some(call => call.args.includes('-c:v')), false);
+    } finally { await protectedService.close(); }
+  }
+});
+
+test('unsupported or coerced quality values fail before starting processes or replacing the active job', async () => {
+  const f = await fixture();
+  try {
+    for (const quality of [null, '720', '1080', '2160', 0, 480, 1440, 4320, 720.5, Infinity, NaN, {}, []]) await assert.rejects(start(f.service, { quality }), statusError(400));
+    assert.equal(f.calls.length, 0);
+    const original = await start(f.service, { quality: 1080 });
+    await assert.rejects(start(f.service, { quality: '2160' }), statusError(400));
+    assert.equal((await f.service.status()).running, true); assert.equal(f.children[1].signals.length, 0);
+    assert.equal(await f.service.cancel(original.id, 'device-a'), true);
+  } finally { await f.close(); }
+});
+
+test('real quality scaling keeps 720p sources unchanged and bounds 4K sources at each selected height', { timeout: 30000 }, async t => {
+  const { execFile } = await import('node:child_process'), { promisify } = await import('node:util');
+  const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg';
+  const run = args => promisify(execFile)(ffmpeg, args, { windowsHide: true, timeout: 10000, maxBuffer: 1024 * 1024 });
+  try { await run(['-version']); }
+  catch (error) { if (error.code === 'ENOENT') return t.skip('Local FFmpeg is required for actual scaling dimensions'); throw error; }
+  const f = await fixture();
+  try {
+    for (const quality of [720, 1080, 2160]) {
+      await start(f.service, { quality });
+      const args = f.calls.at(-1).args, filter = args[args.indexOf('-vf') + 1];
+      for (const sourceHeight of [720, 2160]) {
+        const { stderr } = await run(['-hide_banner', '-nostdin', '-threads', '1', '-filter_threads', '1', '-f', 'lavfi', '-i', `testsrc2=size=${sourceHeight * 16 / 9}x${sourceHeight}:rate=1`,
+          '-vf', `${filter},showinfo`, '-frames:v', '1', '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-f', 'null', '-']);
+        const dimensions = /\[Parsed_showinfo_[^\r\n]+\bs:(\d+)x(\d+)\b/.exec(stderr);
+        assert.ok(dimensions, 'FFmpeg must report a decoded output frame');
+        const height = Math.min(sourceHeight, quality);
+        assert.deepEqual(dimensions.slice(1).map(Number), [height * 16 / 9, height], `source=${sourceHeight} quality=${quality}`);
+      }
+    }
   } finally { await f.close(); }
 });
 
@@ -1173,7 +1248,7 @@ test('single-task ownership rejects other devices and a same-device seek stops a
   try {
     const first = await start(f.service); const firstDir = join(f.calls[1].args.at(-1), '..');
     await assert.rejects(start(f.service, { owner: 'device-b' }), statusError(409)); await assert.rejects(f.service.cancel(first.id, 'device-b'), statusError(403));
-    const second = await start(f.service, { position: 45 }); assert.notEqual(first.id, second.id); assert.equal(second.startPosition, 45); assert.ok(f.children[1].signals.includes('SIGTERM')); await assert.rejects(readFile(join(firstDir, 'index.m3u8')));
+    const second = await start(f.service, { position: 45, quality: 1080 }); assert.notEqual(first.id, second.id); assert.equal(second.startPosition, 45); assert.equal(second.quality, 1080); assert.ok(f.children[1].signals.includes('SIGTERM')); await assert.rejects(readFile(join(firstDir, 'index.m3u8')));
     assert.equal(await f.service.cancel(first.id, 'device-a'), false); assert.equal(await f.service.cancel(second.id, 'device-a'), true); assert.equal((await f.service.status()).running, false); assert.deepEqual(await readdir(f.root), []);
   } finally { await f.close(); }
 });

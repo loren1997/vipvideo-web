@@ -85,7 +85,8 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
     finally { clearTimeout(timer); }
   }
   return {
-    async playback(assetId, { valid: authorized = () => true, owner } = {}) {
+    async playback(assetId, { valid: authorized = () => true, owner, quality } = {}) {
+      if (quality !== undefined && ![720, 1080, 2160].includes(quality)) throw failure('兼容播放清晰度不正确', 400);
       if (!authorized()) throw failure('登录会话已结束，请重新登录', 401);
       const before = generation;
       const descriptor = await quark.playback(assetId, { valid: authorized });
@@ -105,6 +106,16 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
         if (variant.colorSpace !== undefined && !colors.has(variant.colorSpace)) throw failure('夸克播放色彩信息无效', 502);
         variants.set(url, { ...variant, url });
       }
+      if (descriptor.qualityOptions !== undefined && (!Array.isArray(descriptor.qualityOptions) || descriptor.qualityOptions.length > 8)) throw failure('夸克官方清晰度列表无效', 502);
+      const qualities = new Map();
+      for (const row of descriptor.qualityOptions || []) {
+        if (!row || !['hls', 'mp4'].includes(row.type) || typeof row.label !== 'string' || !row.label.trim() || row.label.length > 80 || /[\r\n]/.test(row.label) ||
+            row.colorSpace !== undefined && !colors.has(row.colorSpace) ||
+            ['videoCodec', 'audioCodec'].some(key => row[key] !== undefined && (typeof row[key] !== 'string' || !/^[a-z0-9][a-z0-9_.-]{0,79}$/i.test(row[key]))) ||
+            (row.width !== undefined || row.height !== undefined) && (!Number.isSafeInteger(row.width) || row.width < 16 || row.width > 8192 || !Number.isSafeInteger(row.height) || row.height < 16 || row.height > 4320)) throw failure('夸克官方清晰度无效', 502);
+        const url = validateUrl(row.url).href;
+        qualities.set(url, { url, type: row.type, label: row.label, colorSpace: row.colorSpace || 'unknown', ...(row.width !== undefined ? { width: row.width, height: row.height } : {}), ...(row.videoCodec ? { videoCodec: row.videoCodec } : {}), ...(row.audioCodec ? { audioCodec: row.audioCodec } : {}) });
+      }
       if (descriptor.candidates !== undefined && (!Array.isArray(descriptor.candidates) || descriptor.candidates.length > 8)) throw failure('夸克播放候选列表无效', 502);
       const candidates = new Map([[validateUrl(episode.url).href, { ...episode, url: validateUrl(episode.url).href }]]);
       for (const row of descriptor.candidates || []) {
@@ -114,7 +125,8 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
         candidates.set(url, { ...row, url });
       }
       if (candidates.size > 8) throw failure('夸克播放候选列表过长', 502);
-      const cookieOrigins = new Set((descriptor.allowCookieOrigins || []).slice(0, 10).map(value => {
+      if (descriptor.allowCookieOrigins !== undefined && (!Array.isArray(descriptor.allowCookieOrigins) || descriptor.allowCookieOrigins.length > 25)) throw failure('夸克账号凭证目标列表无效', 502);
+      const cookieOrigins = new Set((descriptor.allowCookieOrigins || []).map(value => {
         const url = validateUrl(value);
         if (url.protocol !== 'https:' || !official(url.hostname) || url.href !== `${url.origin}/`) throw failure('夸克账号凭证目标无效', 502);
         return url.origin;
@@ -134,7 +146,7 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
       const id = randomBytes(16).toString('hex'), proxyPath = `/api/quark/media/${id}`;
       const metadata = descriptor.metadata || {}, version = String(metadata.version || assetId).slice(0, 300), sourceColorSpace = metadata.sourceColorSpace ?? 'unknown';
       if (!colors.has(sourceColorSpace) || sourceColorSpace === 'browser-default') throw failure('夸克原文件色彩信息无效', 502);
-      const dolbyRisk = sourceColorSpace === 'dolby-vision' || [...candidates.values(), ...variants.values()].some(row => row.colorSpace === 'dolby-vision');
+      const dolbyRisk = sourceColorSpace === 'dolby-vision' || [...candidates.values(), ...variants.values(), ...qualities.values()].some(row => row.colorSpace === 'dolby-vision');
       const lease = { id, assetId, episode, sourceColorSpace, dolbyRisk, originalDolby: metadata.mode === 'download' && sourceColorSpace === 'dolby-vision', proxyPath, category: metadata.category, generation, authorized, owner, expires: now() + 2 * 60 * 60_000, streams: new Set(), controller: new AbortController() };
       lease.media = createMedia({ proxyPath, request: async (target, options = {}) => {
         if (!valid(lease)) throw failure('夸克播放会话已过期，请重新播放');
@@ -166,19 +178,36 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
       } });
       visible(lease.category); leases.set(id, lease); lease.valid = () => valid(lease);
       let selected;
-      try { selected = await selectColor(lease, [...candidates.values()], version); if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409); visible(lease.category); }
+      let colorCandidates = [...candidates.values()];
+      if (quality !== undefined && !lease.dolbyRisk) {
+        const sized = [...qualities.values()].filter(row => Number.isSafeInteger(row.height)).sort((a, b) => a.height - b.height);
+        const chosen = sized.filter(row => row.height <= quality).at(-1) || sized[0];
+        if (chosen) colorCandidates = [chosen, ...colorCandidates.filter(row => row.url !== chosen.url)];
+      }
+      try { selected = await selectColor(lease, colorCandidates, version); if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409); visible(lease.category); }
       catch (error) { close(lease); leases.delete(id); throw error; }
       episode = lease.episode = { ...selected.episode, sourceColorSpace: lease.dolbyRisk ? 'dolby-vision' : lease.sourceColorSpace }; lease.colorProbe = selected.proof;
       const result = lease.media.playback({ lines: [{ episodes: [episode] }] }, 0, 0);
+      const qualityOptions = [], qualityUrls = new Map(); lease.qualityTokens = new Map();
+      for (const row of qualities.values()) {
+        if (lease.dolbyRisk && row.colorSpace !== 'sdr' && cachedColor(lease, row, version)?.colorSpace !== 'sdr') continue;
+        const playback = lease.media.playback({ lines: [{ episodes: [row] }] }, 0, 0), id = `q${qualityOptions.length}`;
+        // Keep upstream URLs inside this lease; the browser only receives opaque local selectors.
+        lease.qualityTokens.set(id, new URL(playback.proxyUrl, 'http://localhost').searchParams.get('token'));
+        const option = { id, label: row.label, type: row.type, url: `${proxyPath}?token=${id}`, colorSpace: lease.dolbyRisk ? 'sdr' : row.colorSpace, ...(row.width !== undefined ? { width: row.width, height: row.height } : {}), ...(row.videoCodec ? { videoCodec: row.videoCodec } : {}), ...(row.audioCodec ? { audioCodec: row.audioCodec } : {}) };
+        qualityOptions.push(option); qualityUrls.set(row.url, option.url);
+        if (row.url === episode.url && row.type === episode.type) result.proxyUrl = option.url;
+      }
       const sdrVariants = episode.colorSpace === 'sdr' ? [...variants.values()].filter(row => row.colorSpace === 'sdr' || cachedColor(lease, row, version)?.colorSpace === 'sdr') : [];
-      if (sdrVariants.length > 1) {
+      if (quality === undefined && sdrVariants.length > 1) {
         lease.master = '#EXTM3U\n#EXT-X-VERSION:3\n' + sdrVariants.map(variant => {
           const playback = lease.media.playback({ lines: [{ episodes: [variant] }] }, 0, 0);
-          return `#EXT-X-STREAM-INF:BANDWIDTH=${variant.bandwidth},RESOLUTION=${variant.width}x${variant.height}\n${playback.proxyUrl}\n`;
+          return `#EXT-X-STREAM-INF:BANDWIDTH=${variant.bandwidth},RESOLUTION=${variant.width}x${variant.height}\n${qualityUrls.get(variant.url) || playback.proxyUrl}\n`;
         }).join('');
         result.proxyUrl = `${proxyPath}?token=master`;
       }
       lease.response = { assetId, url: result.proxyUrl, type: episode.type,
+        ...(qualityOptions.length ? { qualityOptions } : {}),
         name: String(metadata.name || '').slice(0, 300), size: Number(metadata.size) || 0,
         version, requiresCompatibility: lease.dolbyRisk && !['sdr', 'browser-default'].includes(episode.colorSpace) || !['hls', 'mp4', 'webm'].includes(episode.type),
         ...(episode.colorSpace ? { colorSpace: episode.colorSpace } : {}),
@@ -201,7 +230,7 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
         res.end(req.method === 'HEAD' ? undefined : lease.master);
         return;
       }
-      return lease.media.serve(req, res, token);
+      return lease.media.serve(req, res, lease.qualityTokens?.get(token) || token);
     },
     invalidate() {
       generation++;

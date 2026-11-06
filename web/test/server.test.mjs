@@ -20,6 +20,33 @@ const detail = { key: 'film', source: 'demo', id: '1', title: '测试影片', ye
 const catalog = { async search() { return { groups: [{ ...detail, items: [{ source: 'demo', id: '1' }] }], failedSources: [] }; },
   async detail() { return detail; } };
 
+test('saved Quark files use authenticated catalog scope and category visibility', async t => {
+  const calls = [], source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
+  const { call, login } = await running(t, { initialConfig: { ...empty, sources: [source] }, quark: {
+    savedFiles: async (film, options) => { calls.push(film); options.valid(); options.visible('movie'); return { files: [{ assetId: 'saved-file', name: '测试影片.mp4', available: true }] }; }
+  } });
+  const path = '/api/quark/saved?source=demo&id=1';
+  assert.equal((await call(path)).status, 401); assert.equal(calls.length, 0);
+  const cookie = await login(), response = await call(path + '&title=untrusted', undefined, cookie);
+  assert.equal(response.status, 200); assert.equal((await response.json()).files[0].name, '测试影片.mp4');
+  assert.equal(calls[0].title, detail.title);
+  assert.equal((await call('/api/quark/saved?source=missing&id=1', undefined, cookie)).status, 400);
+});
+
+test('transcode quality is bounded at the HTTP boundary and forwarded explicitly', async t => {
+  const calls = [], source = { id: 'demo', name: '演示', api: 'https://source.example/api', enabled: true };
+  const { call, login } = await running(t, { initialConfig: { ...empty, sources: [source] }, transcoder: {
+    start: async input => { calls.push(input); return { id: 'test', quality: input.quality }; }, stop: async () => {}
+  } });
+  const cookie = await login(), body = { source: 'demo', id: '1' };
+  for (const quality of [undefined, 720, 1080, 2160]) {
+    const response = await call('/api/transcode/start', { ...body, ...(quality === undefined ? {} : { quality }) }, cookie);
+    assert.equal(response.status, 200); assert.equal((await response.json()).quality, quality ?? 720);
+  }
+  for (const quality of [null, '2160', 480, 4320, -1, {}]) assert.equal((await call('/api/transcode/start', { ...body, quality }, cookie)).status, 400);
+  assert.equal(calls.length, 4);
+});
+
 test('incomplete HTTP requests time out with 408 while malformed requests remain rejected', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vipvideo-timeout-'));
   const app = createApp({ password: 'test-password', dataDir, initialConfig: empty, catalog });

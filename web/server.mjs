@@ -238,6 +238,11 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           valid(); const result = await quarkService.repairFolder({ valid }); valid(); cloudMedia.invalidate();
           return json(res, 200, { ...result, searchPool: searchPool.status() });
         }
+        if (path === '/api/quark/saved' && method === 'GET') {
+          const selected = await cloudSelection(Object.fromEntries(url.searchParams), hashToken(token));
+          const result = await quarkService.savedFiles(selected.detail, { ...selected.options, valid: selected.valid, visible: ensureVisible });
+          selected.valid(); return json(res, 200, result);
+        }
         if (['/api/quark/resources', '/api/quark/files'].includes(path) && method === 'GET') {
           const input = Object.fromEntries(url.searchParams), selected = await cloudSelection(input, hashToken(token));
           if (input.web !== undefined && input.web !== '1') throw badRequest('公开网页搜索选项无效');
@@ -306,13 +311,14 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           const body = await readBody(req);
           const line = body?.line === undefined ? 0 : body.line, episode = body?.episode === undefined ? 0 : body.episode;
           const position = body?.position === undefined ? 0 : body.position, speed = body?.speed === undefined ? 1 : body.speed;
+          const quality = body?.quality === undefined ? 720 : body.quality;
           if (!Number.isSafeInteger(line) || !Number.isSafeInteger(episode) || line < 0 || episode < 0 ||
               typeof position !== 'number' || !Number.isFinite(position) || position < 0 || position > 86400 ||
-              ![0.5, 0.75, 1, 1.25, 1.5, 2, 3].includes(speed)) throw badRequest('转码线路、进度或倍速不正确');
+              ![0.5, 0.75, 1, 1.25, 1.5, 2, 3].includes(speed) || ![720, 1080, 2160].includes(quality)) throw badRequest('转码线路、进度、倍速或清晰度不正确');
           const snapshot = store.config(), owner = hashToken(token);
           let selected, category, unchanged, mediaOverride, proxyPath, trustedColorProbe;
           if (body?.quarkAsset !== undefined) {
-            const lease = await cloudMedia.playback(text(body.quarkAsset, '夸克影片标识', 200), { owner, valid: () => store.authenticated(owner) });
+            const lease = await cloudMedia.playback(text(body.quarkAsset, '夸克影片标识', 200), { owner, quality, valid: () => store.authenticated(owner) });
             selected = lease.episode; category = lease.category; ensureVisible(category);
             mediaOverride = lease.media; proxyPath = lease.proxyPath; unchanged = lease.valid;
             if (lease.originalDolby && selected.type !== 'hls' && selected.colorSpace === 'dolby-vision' && selected.sourceColorSpace === 'dolby-vision' &&
@@ -335,7 +341,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           if (!selected || !['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'].includes(selected.type)) throw badRequest('请选择有效的媒体');
           if (!unchanged()) throw Object.assign(new Error('播放源已修改，请刷新后重试'), { status: 409 });
           const valid = () => store.authenticated(owner) && unchanged() && (category !== 'adult' || store.config().showAdult === true);
-          const result = await transcodeService.start({ episode: selected, position, speed, owner, valid, ...(mediaOverride ? { mediaOverride, proxyPath } : {}), ...(trustedColorProbe ? { trustedColorProbe } : {}) });
+          const result = await transcodeService.start({ episode: selected, position, speed, quality, owner, valid, ...(mediaOverride ? { mediaOverride, proxyPath } : {}), ...(trustedColorProbe ? { trustedColorProbe } : {}) });
           if (!valid()) {
             await transcodeService.cancel(result.id, owner);
             ensureVisible(category);

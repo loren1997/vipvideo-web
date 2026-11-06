@@ -4,6 +4,7 @@ let config = { platforms: [], parsers: [], sources: [], subscriptions: [], liveS
 let library = { favorites: [], history: [] };
 let lastSearch = { q: '', groups: [] };
 let browseGroups = [];
+let quarkLibraryHash = '#quark';
 let openingItem = null;
 let detail = null;
 let detailTarget = null;
@@ -42,7 +43,7 @@ function tvControls(root = document) {
   return [...root.querySelectorAll('a[href],button,input,select,textarea,summary,video[controls],[tabindex]')].filter(element => (!document.fullscreenElement || document.fullscreenElement.contains(element)) && element.tabIndex >= 0 && !element.disabled && !element.closest('[hidden],[inert],[aria-hidden="true"],details:not([open]) > :not(summary)') && element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden');
 }
 function tvFocusKey(element) {
-  return `${element.tagName}:${element.getAttribute('aria-label') || element.id || element.getAttribute('href') || element.textContent.trim().slice(0, 120)}`;
+  return `${element.closest('[data-focus-scope]')?.dataset.focusScope || ''}:${element.tagName}:${element.getAttribute('aria-label') || element.id || element.getAttribute('href') || element.textContent.trim().slice(0, 120)}`;
 }
 function tvFocusRoute(final = false) {
   if (!tvMode || $('#app-view').hidden) return;
@@ -297,6 +298,7 @@ function openItem(item, resume = false) {
 
 function card(item, options = {}) {
   const element = node('article', undefined, 'media-card');
+  element.dataset.focusScope = `film:${item.key || JSON.stringify([item.source, item.id, item.title, item.year])}`;
   const cover = button('', () => openItem(item, options.resume), 'poster-link');
   cover.setAttribute('aria-label', `${options.resume ? '继续观看' : item.source === 'quark-library' ? '查看' : '播放'} ${item.title}`);
   const poster = posterFor(item);
@@ -532,6 +534,7 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
 }
 
 async function renderQuarkLibrary(params, stamp) {
+  quarkLibraryHash = location.hash;
   const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺' };
   const category = Object.hasOwn(categories, params.get('category')) ? params.get('category') : 'movie';
   const filters = { genre: params.get('genre') || '', year: params.get('year') || '', sort: ['release', 'score', 'release-score'].includes(params.get('sort')) ? params.get('sort') : 'release-score' };
@@ -743,6 +746,7 @@ function pauseCompatibility(current, job) {
 
 function resumeVideo(current) {
   if (player !== current) return;
+  if (current.qualitySwitch) { current.qualitySwitch.paused = false; current.quarkPaused = false; if (current.qualitySwitch.loading) attemptPlay(current, current.mediaVersion); return; }
   if (current.transcodeLoading) { current.transcodeResumeCancelled = false; current.quarkPaused = false; return; }
   if (current.transcodePause) void startCompatibility(current, current.seekPreview?.position ?? current.transcodePause.position);
   else void current.video.play().catch(error => notify(error.message, true));
@@ -750,8 +754,10 @@ function resumeVideo(current) {
 
 function pauseVideo(current) {
   if (player !== current) return;
+  if (current.qualitySwitch) { current.qualitySwitch.paused = true; current.quarkPaused = true; clearTimeout(current.loadTimer); current.note.textContent = '已暂停'; }
   if (current.transcodeLoading) { current.transcodeResumeCancelled = true; current.quarkPaused = true; current.note.textContent = '已暂停'; current.note.className = 'player-note'; }
   current.video.pause();
+  if (current.transcoded && !current.transcodeLoading && !current.transcodeReady && current.transcodeId) pauseCompatibility(current, { id: current.transcodeId, position: playPosition(current) });
 }
 
 function compatibilityLabel(current) {
@@ -799,6 +805,7 @@ async function startCompatibility(current, position = current.seekPreview?.posit
           if (current.transcodePause === paused) delete current.transcodePause;
         }
         const body = current.live ? { liveId: current.channel.id, line: current.line, position: 0, speed: 1 } : current.quarkAsset ? { quarkAsset: current.quarkAsset, position: requested, speed: current.preferences.speed } : { ...playbackSelection(current.detail, current.line, current.episode), id: String(current.detail.id), position: requested, speed: current.preferences.speed };
+        if (current.transcodeQuality) body.quality = current.transcodeQuality;
         const job = await api('/api/transcode/start', { method: 'POST', body, timeoutMs: 35000 });
         if (!valid()) { await stopTranscode(job.id, true); return; }
         if (!job.id || !mediaUrl(job.url) || job.type !== 'hls') { await stopTranscode(job.id, true); throw new Error('兼容播放服务返回了无效的播放任务。'); }
@@ -991,7 +998,10 @@ function renderDetail(data, candidates) {
   const info = node('div', undefined, 'detail-info');
   info.append(node('h2', data.title), node('p', `${data.year || '年份未知'} · ${data.typeName || typeLabel(data.type)} · ${sourceName(data.source)}`, 'meta'));
   const ratings = node('div', '正在读取评分…', 'film-ratings'); ratings.setAttribute('aria-live', 'polite'); info.append(ratings);
-  if (data.description) info.append(node('p', data.description, 'detail-description'));
+  if (data.description && data.description.length > 160) {
+    const description = node('details', undefined, 'detail-description');
+    description.append(node('summary', '剧情简介'), node('p', data.description)); info.append(description);
+  } else if (data.description) info.append(node('p', data.description, 'detail-description'));
   else if (data.source === 'quark-library') info.append(node('p', '暂无中文简介，可参考上映年份和类型。', 'detail-description'));
   if (data.source === 'quark-library' && data.originalDescription) { const original = node('details'); original.className = 'detail-original-description'; original.append(node('summary', '查看原文简介'), node('p', data.originalDescription, 'muted')); info.append(original); }
   const actions = node('div', undefined, 'detail-actions');
@@ -1002,7 +1012,7 @@ function renderDetail(data, candidates) {
   }, 'button primary');
   start.disabled = !data.lines.some(line => line.episodes.length);
   const favorite = button('', () => void toggleFavorite(data, favorite)); updateFavoriteButton(data, favorite);
-  actions.append(...(data.source === 'quark-library' ? [button('返回夸克影院', () => goto('quark'), 'button subtle'), favorite] : [start, favorite])); info.append(actions); summary.append(info);
+  actions.append(...(data.source === 'quark-library' ? [button('返回夸克影院', () => { location.hash = quarkLibraryHash; }, 'button subtle'), favorite] : [start, favorite])); info.append(actions); summary.append(info);
   if (data.source === 'quark-library') {
     if (Number.isSafeInteger(data.episodeCount) && data.episodeCount > 1) {
       const field = node('label', '当前集数', 'quark-episode-choice'), select = node('select'); select.setAttribute('aria-label', '夸克当前集数');
@@ -1546,6 +1556,65 @@ function restartQuarkFromBeginning(current) {
   void startCompatibility(current, 0);
 }
 
+function officialQualityOptions(value) {
+  const rows = [], ids = new Set();
+  for (const item of (Array.isArray(value) ? value : []).slice(0, 8)) {
+    try {
+      const url = new URL(item.url, location.origin);
+      if (!/^[a-z0-9_-]{1,32}$/i.test(item.id) || ids.has(item.id) || !['hls', 'mp4'].includes(item.type) || typeof item.label !== 'string' || !item.label.trim() || url.origin !== location.origin || url.username || url.password || !url.pathname.startsWith('/api/quark/media/')) continue;
+      ids.add(item.id); rows.push({ ...item, label: item.label.slice(0, 80), url: url.href });
+    } catch { /* 忽略无效的播放档位。 */ }
+  }
+  return rows;
+}
+
+function refreshPlaybackQuality(current) {
+  if (player !== current || !current.qualitySelect) return;
+  const select = current.qualitySelect;
+  select.replaceChildren();
+  if (current.transcoded) {
+    for (const height of [2160, 1080, 720]) select.append(new Option(height === 2160 ? '最高4K' : `最高${height}p`, `transcode-${height}`));
+    select.value = `transcode-${current.transcodeQuality || 720}`; select.hidden = false;
+  } else if (current.quarkQualities?.length) {
+    if (current.quarkDefault.quality === '自动画质') select.append(new Option('自动画质', '-1'));
+    for (const option of current.quarkQualities) select.append(new Option(option.label, option.id));
+    select.value = current.quarkQuality || '-1'; select.hidden = false;
+  } else {
+    select.append(new Option('自动画质', '-1'));
+    const heights = new Set();
+    for (const [index, level] of (current.qualityLevels || []).entries()) {
+      const height = level.height;
+      if (!Number.isInteger(height) || height < 144 || height > 4320 || heights.has(height)) continue;
+      heights.add(height); select.append(new Option(height === 2160 ? '4K' : `${height}p`, String(index)));
+    }
+    select.hidden = heights.size < (current.quarkAsset ? 1 : 2);
+  }
+  select.disabled = Boolean(current.transcodeLoading);
+  current.updatePlaybackMode?.();
+}
+
+async function switchOfficialQuality(current, option, id) {
+  if (player !== current || current.transcoded) return;
+  current.manualOfficialQuality = id !== '-1';
+  const instance = hls, absolute = value => { try { return new URL(value, location.origin).href; } catch { return ''; } };
+  const level = instance?.levels?.findIndex(row => (Array.isArray(row.url) ? row.url : [row.url]).some(value => absolute(value) === option.url));
+  if (!current.failed && !current.qualitySwitch && instance && (id === '-1' && current.url === current.quarkDefault.url || level >= 0)) {
+    current.quarkQuality = id; instance.currentLevel = id === '-1' ? -1 : level; refreshPlaybackQuality(current); return;
+  }
+  const position = playPosition(current), version = (current.qualityVersion || 0) + 1;
+  current.qualityVersion = version; current.qualitySwitch = { paused: current.qualitySwitch?.paused ?? current.video.paused, loading: false };
+  if (!current.video.paused) {
+    current.qualityPausing = version;
+    await new Promise(resolve => { current.video.addEventListener('pause', resolve, { once: true }); current.video.pause(); });
+    if (current.qualityPausing === version) delete current.qualityPausing;
+  }
+  if (player !== current || current.qualityVersion !== version) return;
+  current.position = position; current.quarkPaused = current.qualitySwitch.paused; current.qualitySwitch.loading = true;
+  current.quarkQuality = id; current.url = option.url; current.type = option.type; current.failed = false; current.recovering = false;
+  current.quarkUrl = option.url;
+  current.video.preload = 'auto'; refreshPlaybackQuality(current); void loadMedia(current, '正在切换官方画质…');
+}
+
 async function playQuark(current, assetId, valid = () => true, flow) {
   if (player !== current || !current.catalog || !valid()) return;
   const stamp = routeVersion, scope = adScope(current);
@@ -1553,11 +1622,21 @@ async function playQuark(current, assetId, valid = () => true, flow) {
   try {
     const [data, preferences] = await Promise.all([api('/api/quark/playback', { method: 'POST', body: { assetId }, timeoutMs: 35000 }), current.preferences ? Promise.resolve(current.preferences) : (current.detail.preferencesPromise ||= api(`/api/player/preferences?${new URLSearchParams({ key: current.detail.key })}`).catch(error => { console.warn('网盘播放偏好读取失败', error.message); return defaultPreferences; }))]);
     if (player !== current || stamp !== routeVersion || scope !== adScope(current) || !valid()) return;
+    const qualities = officialQualityOptions(data.qualityOptions), defaultQuality = { url: new URL(data.url, location.origin).href, type: data.type, quality: data.quality }, manualQuality = current.manualOfficialQuality && !current.transcoded && current.quarkQualities?.find(option => option.id === current.quarkQuality);
+    if (manualQuality) {
+      const identity = row => JSON.stringify([row.type, row.width, row.height, row.label, row.videoCodec, row.audioCodec]);
+      const selected = qualities.find(row => identity(row) === identity(manualQuality));
+      if (!selected) throw new Error('所选官方画质暂不可用，请选择其他画质。');
+      data.url = selected.url; data.type = selected.type;
+    }
     const url = new URL(data.url, location.origin);
     if (url.origin !== location.origin || url.username || url.password || !url.pathname.startsWith('/api/') || !['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'].includes(data.type) || data.assetId !== assetId) throw new Error('网盘返回了无效的播放地址。');
     const ready = current.quarkState?.ready, saved = library.history.find(record => record.source === 'quark-library' && record.quarkAsset === assetId);
     const position = current.quarkOnly && current.quarkAsset !== assetId ? ready?.assetId === assetId && Number.isFinite(ready.position) ? ready.position : Number.isFinite(saved?.position) ? saved.position : 0 : playPosition(current), request = ++playVersion; void stopPlayer(false);
     player = { detail: current.detail, line: current.line, episode: current.episode, episodeName: current.quarkOnly ? ready?.name || current.episodeName : current.episodeName, position, started: true, catalog: true, quarkOnly: current.quarkOnly === true, flow: flow || { tried: new Set() }, request, stamp, mode: 'direct', preferences: normalizePreferences(preferences), quarkAsset: assetId, quarkPlaybackStatus: 'loading', quarkVersion: typeof data.version === 'string' ? data.version : JSON.stringify(data.quality ?? 'default'), requiresCompatibility: data.requiresCompatibility === true, quarkState: current.quarkState, quarkUrl: url.href, originalUrl: current.originalUrl || current.url, url: url.href, type: data.type, introHandled: current.introHandled };
+    player.quarkQualities = qualities; player.manualOfficialQuality = Boolean(manualQuality);
+    player.quarkDefault = defaultQuality;
+    player.quarkQuality = player.quarkQualities.find(option => option.url === url.href)?.id || '-1';
     mountPlayer(player);
   } catch (error) { if (player === current && stamp === routeVersion && valid()) { current.note.textContent = `夸克播放未启动：${error.message}`; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); notify(current.note.textContent, true); } }
 }
@@ -1569,6 +1648,9 @@ function mountQuark(current) {
   const feedback = node('p', '正在按作品名称查找夸克分享…', 'muted'); feedback.setAttribute('aria-live', 'polite');
   const choices = node('div', undefined, 'quark-choices'), result = node('div', undefined, 'quark-ready'); panel.append(feedback, choices, result); host.replaceChildren(panel);
   const state = current.quarkState ||= { resources: [], files: [], version: 0 };
+  const savedPanel = node('details', undefined, 'quark-saved'); savedPanel.open = true; savedPanel.hidden = true;
+  const savedSummary = node('summary', '已转存文件'), savedBody = node('div', undefined, 'quark-saved-body');
+  savedPanel.append(savedSummary, savedBody); panel.insertBefore(savedPanel, feedback);
   const unverified = node('details'); unverified.hidden = true; unverified.className = 'quark-unverified'; panel.append(unverified);
   function showUnverified(rows) {
     const links = new Map();
@@ -1593,6 +1675,42 @@ function mountQuark(current) {
   const searchActions = node('div', undefined, 'settings-actions'); searchActions.append(retry, more, externalLink('用浏览器查 Google ↗', `https://www.google.com/search?${googleQuery}`, 'button subtle small')); panel.append(searchActions);
   const account = button('连接夸克账号', () => goto('settings'), 'button small'); account.hidden = true; searchActions.append(account);
   const accountNote = node('p', '公开分享可继续查找；转存和播放个人文件需要连接并启用夸克账号。', 'muted'); accountNote.hidden = true; panel.append(accountNote);
+  panel.insertBefore(result, savedPanel);
+  choices.setAttribute('aria-label', '查找并转存其他版本');
+  const discovery = node('details', undefined, 'quark-discovery'), discoverySummary = node('summary', '搜索资源'); discovery.open = true;
+  discovery.append(discoverySummary, feedback, choices, searchActions, accountNote, unverified); panel.append(discovery);
+  let savedVersion = 0, savedLoaded = false;
+  const savedRefresh = button('刷新已转存文件', () => void loadSaved(), 'button subtle small');
+  async function loadSaved() {
+    if (!valid()) return;
+    const version = ++savedVersion; savedRefresh.disabled = true;
+    if (!canTransfer) { savedPanel.hidden = true; savedRefresh.disabled = false; return 0; }
+    try {
+      const data = await api(`/api/quark/saved?${new URLSearchParams(playbackSelection(current.detail, current.line, current.episode))}`);
+      if (!valid() || version !== savedVersion) return;
+      const files = Array.isArray(data.files) ? data.files : [], playable = files.filter(file => file.available).length;
+      savedPanel.hidden = files.length === 0; discoverySummary.textContent = files.length ? '搜索其他版本' : '搜索资源';
+      if (!savedLoaded && !discovery.contains(document.activeElement)) discovery.open = playable === 0;
+      savedLoaded = true;
+      savedSummary.textContent = `已转存文件（${files.length}）`; savedBody.replaceChildren();
+      if (!files.length) savedBody.append(node('p', '这部影片还没有已登记的转存文件。', 'muted'));
+      for (const file of files) {
+        const row = node('div', undefined, 'quark-saved-file'), info = node('div'); row.dataset.focusScope = `saved:${file.assetId}`;
+        info.append(node('strong', file.name || '视频文件'), node('p', [fileSize(file.size), file.available ? '可播放' : file.reason || '转存处理中'].filter(Boolean).join(' · '), 'muted'));
+        const extra = node('details'), summary = node('summary', '原始名称与字幕'); extra.append(summary);
+        if (file.sourceName) extra.append(node('p', file.sourceName, 'muted'));
+        for (const subtitle of Array.isArray(file.subtitles) ? file.subtitles : []) extra.append(node('p', `${subtitle.name} · ${subtitle.available ? '已转存' : subtitle.status === 'pending' ? '准备中' : '暂不可用'}`, 'muted'));
+        if (!file.subtitles?.length) extra.append(node('p', '未登记配套字幕，可在播放器中刷新目录字幕。', 'muted'));
+        info.append(extra);
+        const active = current.quarkAsset === file.assetId;
+        const play = button(active ? '正在播放' : '播放此文件', () => { if (!valid()) return; current.cancelQuarkSearch(); ready({ ...file, resume: true }); void playQuark(current, file.assetId); }, 'button small');
+        play.disabled = !file.available || active; row.append(info, play); savedBody.append(row);
+      }
+      savedBody.append(savedRefresh);
+      return playable;
+    } catch (error) { if (valid() && version === savedVersion) { savedPanel.hidden = false; savedBody.replaceChildren(node('p', `已转存文件读取失败：${error.message}`, 'muted'), savedRefresh); } }
+    finally { if (valid() && version === savedVersion) savedRefresh.disabled = false; }
+  }
   function ready(data) {
     state.ready = data; result.replaceChildren(node('p', `${data.name || '当前集'}：${data.status === 'ready' ? '已准备好' : data.status === 'pending' ? '正在准备' : '准备未完成'}${data.saved ? ' · 已转存' : ''}`, 'muted'));
     if (data.renameReason) result.append(node('p', data.renameReason, 'muted'));
@@ -1633,6 +1751,7 @@ function mountQuark(current) {
       if (!valid() || version !== state.version) return;
       if (data.needsSelection) { feedback.textContent = data.reason || '无法唯一匹配当前集，请核对并选择一个视频文件。'; return; }
       ready(data);
+      void loadSaved();
       if (data.status === 'ready' && data.assetId && current.quarkOnly) feedback.textContent = '当前文件已准备，请点击夸克播放。';
       else if (data.status === 'ready' && data.assetId && current.quarkAsset !== data.assetId) {
         feedback.textContent = '已转存，正在自动切换夸克播放…';
@@ -1700,6 +1819,7 @@ function mountQuark(current) {
   shareSelect.addEventListener('change', () => { current.cancelQuarkSearch(); delete state.selectionRequired; void loadFiles(autoTransfer); }); fileSelect.addEventListener('change', () => { current.cancelQuarkSearch(); clearTimeout(current.quarkTimer); state.version++; delete state.ready; delete state.selection; result.replaceChildren(); clearPreparedSubtitles(); const file = state.files.find(value => value.id === fileSelect.value); transfer.disabled = !canTransfer || !file; fileSelect.title = file?.name || '请选择当前集视频'; const resource = state.resources.find(value => value.id === shareSelect.value); if (autoTransfer && resource && file) void prepare(resource, file); });
   async function load(webSearch = false, automatic = true) {
     if (loading) return;
+    if (webSearch) discovery.open = true;
     current.cancelQuarkSearch(); loading = true;
     const search = searchVersion; let configured = false, pendingSearch = false, searchLimitMs = 60000; more.disabled = retry.disabled = true;
     const startedAt = Date.now(), initialResourceIds = new Set(state.resources.map(resource => resource.id));
@@ -1708,9 +1828,11 @@ function mountQuark(current) {
     try {
       const settings = await api('/api/quark/settings'); if (!currentSearch()) return;
       canTransfer = settings.configured === true && settings.enabled === true; account.hidden = accountNote.hidden = canTransfer; transfer.disabled = !canTransfer || !state.files.some(file => file.id === fileSelect.value);
+      const savedCount = await loadSaved(); if (!currentSearch()) return;
       autoTransfer = canTransfer && settings.autoSave === true;
       if (!canTransfer && !current.quarkOnly) { feedback.textContent = '连接并启用夸克后，可为当前单集准备网盘版本。'; choices.replaceChildren(button('设置夸克账号', () => goto('settings'), 'button small')); return; }
       configured = current.quarkOnly || canTransfer;
+      if (savedCount > 0 && automatic && !webSearch && !state.ready?.assetId) { feedback.textContent = '可播放已转存文件，也可继续搜索其他版本。'; return; }
       if (state.ready && !webSearch) { if (shareSelect.options.length) choices.replaceChildren(shareField, fileField, actions); ready(state.ready); feedback.textContent = current.quarkAsset === state.ready.assetId ? quarkPlaybackMessage(current) : '当前文件已准备，可点击夸克播放。'; if (!state.ready.resume || current.quarkAsset) return; }
       let autoSaveAvailable = autoTransfer && automatic && !webSearch && !state.ready?.assetId && current.flow.quarkAutomatic !== false;
       async function update(poll = false) {
@@ -2123,17 +2245,42 @@ function mountPlayer(current) {
     if (current.transcoded) void startCompatibility(current, position);
   });
   const full = button('全屏', async () => {
-    const target = current.fullFilmControls ? frame : video;
-    try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) await target.requestFullscreen(); else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else notify('当前浏览器不支持全屏。'); }
-    catch (error) { notify(error.message, true); }
+    const target = current.fullFilmControls || current.quarkQualities?.length || current.transcoded ? frame : video;
+    try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) { if (target === frame && !current.fullFilmControls) { frame.append(qualityBar); qualityBar.append(full); } await target.requestFullscreen(); } else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else notify('当前浏览器不支持全屏。'); }
+    catch (error) { current.updateClock?.(); notify(error.message, true); }
   });
   toolbar.append(backward, forward, speed, full);
-  const qualitySelect = node('select'); qualitySelect.setAttribute('aria-label', '播放画质'); qualitySelect.hidden = true;
+  const qualityBar = node('div', undefined, 'player-toolbar player-quality-controls'); qualityBar.style.padding = '0'; qualityBar.style.minWidth = '0';
+  const playbackMode = node('span', undefined, 'playback-mode'); playbackMode.setAttribute('aria-label', '当前播放方式'); playbackMode.setAttribute('aria-live', 'polite');
+  const qualitySelect = node('select'); qualitySelect.setAttribute('aria-label', '播放画质'); qualitySelect.hidden = true; qualitySelect.style.maxWidth = '100%'; qualitySelect.style.minWidth = '0';
   const automaticQuality = node('option', '自动画质'); automaticQuality.value = '-1'; qualitySelect.append(automaticQuality); current.qualitySelect = qualitySelect;
-  qualitySelect.addEventListener('change', () => { const level = Number(qualitySelect.value); if (player === current && hls && (level === -1 || Number.isInteger(level) && level >= 0 && level < hls.levels.length)) hls.currentLevel = level; });
-  toolbar.append(qualitySelect);
+  qualitySelect.addEventListener('change', () => {
+    if (player !== current) return;
+    if (current.transcoded) {
+      const height = Number(qualitySelect.value.replace('transcode-', '')); if (![720, 1080, 2160].includes(height)) return;
+      current.transcodeQuality = height; refreshPlaybackQuality(current);
+      if (!video.paused || !current.transcodeReady && !current.transcodePause && !current.quarkPaused) void startCompatibility(current); return;
+    }
+    if (current.quarkQualities?.length) {
+      const id = qualitySelect.value, option = id === '-1' ? current.quarkDefault : current.quarkQualities.find(option => option.id === id);
+      if (option) void switchOfficialQuality(current, option, id); return;
+    }
+    const level = Number(qualitySelect.value); if (hls && (level === -1 || Number.isInteger(level) && level >= 0 && level < hls.levels.length)) hls.currentLevel = level;
+  });
+  current.updatePlaybackMode = () => {
+    if (player !== current) return;
+    const dimensions = video.videoWidth > 0 && video.videoHeight > 0 ? ` · ${video.videoWidth}×${video.videoHeight}` : '';
+    playbackMode.textContent = `${current.transcoded ? '兼容转码播放' : current.quarkAsset ? '夸克官方播放' : '直接播放'}${dimensions}`;
+  };
+  qualityBar.append(playbackMode, qualitySelect); toolbar.prepend(qualityBar);
   if (current.catalog || current.live) {
-    current.compatibilityButton = button(current.transcoded ? '重新兼容播放' : '兼容播放', () => void startCompatibility(current));
+    current.compatibilityButton = button(current.transcoded ? '重新兼容播放' : '兼容播放', () => {
+      if (current.manualOfficialQuality && !current.transcoded) {
+        const quality = current.quarkQualities?.find(option => option.id === current.quarkQuality);
+        current.transcodeQuality = quality?.height > 1080 || /4k/i.test(quality?.label || '') ? 2160 : quality?.height > 720 || /1080/.test(quality?.label || '') ? 1080 : 720;
+      }
+      void startCompatibility(current);
+    });
     current.compatibilityButton.title = '原始线路无法解码或有画面无声音时，通过服务器转换为兼容格式'; toolbar.append(current.compatibilityButton);
   }
   if (current.quarkAsset) toolbar.append(button('重试夸克播放', () => void playQuark(current, current.quarkAsset)), button(current.quarkOnly ? '返回夸克资源' : '返回原线路', () => returnFromQuark(current)));
@@ -2161,6 +2308,15 @@ function mountPlayer(current) {
   const volumeLabel = node('label', '音量'); const volume = node('input'); volume.type = 'range'; volume.min = '0'; volume.max = '1'; volume.step = '0.05'; volume.value = String(video.volume); volume.setAttribute('aria-label', '音量'); volumeLabel.append(volume);
   volume.addEventListener('input', () => { video.volume = Number(volume.value); if (video.volume > 0) video.muted = false; });
   transport.append(play, mute, volumeLabel); filmControls.append(transport);
+  const placeQualityControls = () => {
+    const target = current.fullFilmControls ? transport : document.fullscreenElement === frame ? frame : toolbar;
+    if (qualityBar.parentNode === target) return;
+    const focused = qualityBar.contains(document.activeElement) ? document.activeElement : null;
+    target.append(qualityBar); focused?.focus({ preventScroll: true });
+    if (!current.fullFilmControls && document.fullscreenElement === frame) qualityBar.append(full);
+  };
+  frame.addEventListener('fullscreenchange', placeQualityControls);
+  for (const event of ['loadedmetadata', 'loadeddata', 'resize']) video.addEventListener(event, current.updatePlaybackMode);
   const updateTransport = () => {
     play.textContent = video.paused ? '播放' : '暂停'; play.disabled = Boolean(current.transcodeLoading);
     mute.textContent = video.muted ? '取消静音' : '静音'; volume.value = String(video.volume);
@@ -2169,13 +2325,13 @@ function mountPlayer(current) {
   frame.addEventListener('fullscreenchange', () => { full.textContent = document.fullscreenElement === frame ? '退出全屏' : '全屏'; });
   let pendingTimelinePosition, controlsTimer, controlsPointer = null, keyboardControls = false, controlsBuffering = false, controlsLoading = false;
   const controlEvents = new AbortController(), controlOptions = { signal: controlEvents.signal };
-  const canHideControls = () => current.fullFilmControls && !video.paused && !video.ended && !video.error && !current.transcodeLoading && !controlsBuffering && controlsPointer === null && !(keyboardControls && filmControls.contains(document.activeElement));
+  const canHideControls = () => (current.fullFilmControls || document.fullscreenElement === frame && current.quarkQualities?.length) && !video.paused && !video.ended && !video.error && !current.transcodeLoading && !controlsBuffering && controlsPointer === null && !(keyboardControls && (filmControls.contains(document.activeElement) || qualityBar.contains(document.activeElement)));
   const scheduleControls = () => {
     clearTimeout(controlsTimer);
     if (player !== current || !canHideControls()) return;
     controlsTimer = setTimeout(() => {
       if (player !== current || !canHideControls()) return;
-      if (filmControls.contains(document.activeElement)) video.focus({ preventScroll: true });
+      if (filmControls.contains(document.activeElement) || qualityBar.contains(document.activeElement)) video.focus({ preventScroll: true });
       clearTimeout(controlsTimer);
       frame.classList.add('player-controls-idle');
     }, 3000);
@@ -2192,7 +2348,7 @@ function mountPlayer(current) {
   };
   frame.addEventListener('pointermove', () => showControls(), controlOptions);
   frame.addEventListener('pointerdown', event => {
-    if (filmControls.contains(event.target)) controlsPointer = event.pointerId;
+    if (filmControls.contains(event.target) || qualityBar.contains(event.target)) controlsPointer = event.pointerId;
     showControls(false);
   }, controlOptions);
   for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) window.addEventListener(event, releaseControls, controlOptions);
@@ -2200,6 +2356,9 @@ function mountPlayer(current) {
   filmControls.addEventListener('focusin', () => showControls(), controlOptions);
   filmControls.addEventListener('focusout', scheduleControls, controlOptions);
   filmControls.addEventListener('click', () => showControls(false), controlOptions);
+  qualityBar.addEventListener('focusin', () => showControls(), controlOptions);
+  qualityBar.addEventListener('focusout', scheduleControls, controlOptions);
+  qualityBar.addEventListener('click', () => showControls(false), controlOptions);
   frame.addEventListener('fullscreenchange', () => showControls(), controlOptions);
   for (const event of ['play', 'pause', 'playing', 'canplay', 'waiting', 'loadstart', 'ended', 'error']) video.addEventListener(event, () => {
     if (event === 'waiting' || event === 'loadstart') controlsBuffering = true;
@@ -2220,7 +2379,9 @@ function mountPlayer(current) {
     // Rewriting controls on every progress update resets the browser's auto-hide timer.
     if (video.controls !== !current.fullFilmControls) video.controls = !current.fullFilmControls;
     if (current.fullFilmControls) { if (clock.parentNode !== filmControls) filmControls.prepend(clock); if (full.parentNode !== transport) transport.append(full); }
-    else { if (clock.parentNode !== host) host.insertBefore(clock, current.note); if (full.parentNode !== toolbar) toolbar.append(full); }
+    else { if (clock.parentNode !== host) host.insertBefore(clock, current.note); const parent = document.fullscreenElement === frame ? qualityBar : toolbar; if (full.parentNode !== parent) parent.append(full); }
+    placeQualityControls();
+    qualitySelect.disabled = Boolean(current.transcodeLoading);
     updateTransport();
     timeline.hidden = !current.transcoded || current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
     if (pendingTimelinePosition === undefined) { timeline.max = String(duration); timeline.value = String(shownPosition); }
@@ -2251,7 +2412,7 @@ function mountPlayer(current) {
       if (current.preferences.introSeconds > 0) video.currentTime = Math.min(current.preferences.introSeconds, Math.max(0, video.duration - 1));
     }
   });
-  video.addEventListener('pause', () => { if (player === current) { clearQuarkStall(); if (current.quarkAsset && !current.transcodeLoading && !video.error) current.quarkPaused = true; if (current.quarkRefreshing) { current.quarkRefreshCancelled = true; note.textContent = '已暂停自动恢复，可点击“重试夸克播放”继续。'; note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); } void saveHistory(current); pauseCompatibility(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
+  video.addEventListener('pause', () => { if (player === current) { clearQuarkStall(); if (current.quarkAsset && !current.transcodeLoading && !video.error && !current.qualityPausing) current.quarkPaused = true; if (current.quarkRefreshing) { current.quarkRefreshCancelled = true; note.textContent = '已暂停自动恢复，可点击“重试夸克播放”继续。'; note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); } void saveHistory(current); pauseCompatibility(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
   video.addEventListener('seeked', () => { if (player === current && current.quarkAsset) void saveHistory(current); });
   for (const event of ['seeking', 'seeked']) video.addEventListener(event, () => { if (player === current) updateClock(); });
   video.addEventListener('play', () => {
@@ -2260,7 +2421,7 @@ function mountPlayer(current) {
     current.quarkPaused = false;
   });
   video.addEventListener('ended', () => { if (player === current) { void saveHistory(current, true); if (current.catalog && !current.quarkOnly && current.preferences.autoNext && !current.nextPending) { current.nextPending = true; void nextEpisode(current); } } });
-  video.addEventListener('loadeddata', () => { if (player === current && !current.transcodePause && !current.transcodeLoading) { if (!current.quarkAsset || hasVideoFrame(video)) { clearTimeout(current.loadTimer); if (current.transcoded) current.transcodeReady = true; if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); } updateClock(); resetDanmaku(current); } });
+  video.addEventListener('loadeddata', () => { if (player === current && !current.transcodePause && !current.transcodeLoading) { if (!current.quarkAsset || hasVideoFrame(video)) { clearTimeout(current.loadTimer); if (current.transcoded) current.transcodeReady = true; if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); } if (current.qualitySwitch?.paused) { clearTimeout(current.loadTimer); current.quarkPaused = true; video.pause(); note.textContent = '已暂停'; } delete current.qualitySwitch; updateClock(); resetDanmaku(current); } });
   const markPlaying = () => {
     if (player !== current || current.transcodePause || current.transcodeLoading || current.quarkRefreshing || current.quarkAsset && (video.paused || !hasVideoFrame(video))) return;
     if (current.quarkAsset) current.failed = false;
@@ -2306,13 +2467,18 @@ function mountPlayer(current) {
     }
   }, 10000);
   if (current.requiresCompatibility && !current.transcoded) void startCompatibility(current, current.position); else loadMedia(current);
-  updateClock(); void saveHistory(current); if (current.quarkOnly) mountQuark(current);
+  refreshPlaybackQuality(current); updateClock(); void saveHistory(current); if (current.quarkOnly) mountQuark(current);
 }
 
 function playbackError(current, hlsError) {
   if (player !== current || current.failed || current.quarkRefreshing || current.transcodePause) return;
   clearTimeout(current.loadTimer); clearTimeout(current.stallTimer); current.stallTimer = null;
   if (current.transcodeLoading) return;
+  const status = Number(hlsError?.response?.code || hlsError?.response?.status) || 0;
+  if (!current.transcoded && current.manualOfficialQuality && status < 400 && (hlsError?.type === 'mediaError' || [3, 4].includes(current.video?.error?.code) || !status && current.video?.readyState >= 2 && !hasVideoFrame(current.video))) {
+    current.failed = true; current.recovering = false; delete current.qualitySwitch;
+    current.note.textContent = '当前设备无法解码所选官方画质，请换一个画质，或点击兼容播放。'; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); return;
+  }
   if (current.transcoded) {
     current.position = playPosition(current); current.failed = true;
     delete current.seekPreview; current.updateClock?.();
@@ -2321,7 +2487,6 @@ function playbackError(current, hlsError) {
     void stopTranscode(current.transcodeId); current.transcodeId = null; return;
   }
   if (current.quarkAsset) {
-    const status = Number(hlsError?.response?.code || hlsError?.response?.status) || 0;
     const noFrame = current.video?.readyState >= 2 && !hasVideoFrame(current.video);
     const decodeError = status < 400 && (noFrame || (hlsError
       ? hlsError.type === 'mediaError' && ['manifestIncompatibleCodecsError', 'bufferAddCodecError', 'bufferIncompatibleCodecsError', 'bufferAppendError', 'bufferAppendingError'].includes(hlsError.details)
@@ -2383,7 +2548,7 @@ async function loadMedia(current, message = '正在连接播放地址…') {
   setQuarkPlaybackStatus(current, 'loading');
   const video = current.video;
   current.updateClock?.();
-  if (current.qualitySelect) { current.qualitySelect.hidden = true; current.qualitySelect.replaceChildren(new Option('自动画质', '-1')); }
+  current.qualityLevels = []; refreshPlaybackQuality(current);
   if (current.type === 'hls') {
     try { await ensureHls(); }
     catch (error) {
@@ -2404,15 +2569,7 @@ async function loadMedia(current, message = '正在连接播放地址…') {
     hls.on(window.Hls.Events.MANIFEST_PARSED, (_event, data) => {
       if (player !== current || generation !== current.mediaVersion) return;
       const levels = data?.levels || instance.levels || [];
-      if (current.qualitySelect) {
-        const heights = new Set();
-        for (let index = 0; index < levels.length; index++) {
-          const height = levels[index].height;
-          if (!Number.isInteger(height) || height < 144 || height > 4320 || heights.has(height)) continue;
-          heights.add(height); const option = new Option(height === 2160 ? '4K' : `${height}p`, String(index)); current.qualitySelect.append(option);
-        }
-        current.qualitySelect.hidden = heights.size < 2;
-      }
+      current.qualityLevels = levels; refreshPlaybackQuality(current);
       if (selectLevel) {
         const choices = levels.map((level, index) => ({ ...level, index })).filter(level => Number.isInteger(level.height) && level.height > 0);
         const preferred = choices.filter(level => level.height <= 1080).sort((a, b) => b.height - a.height || (a.bitrate || 0) - (b.bitrate || 0))[0] || choices.sort((a, b) => a.height - b.height)[0];
@@ -2698,7 +2855,7 @@ function renderSettings() {
       list.replaceChildren();
       if (!draft[kind].length) { list.append(node('p', '暂无配置，点击添加或导入配置。', 'muted')); return; }
       draft[kind].forEach((item, index) => {
-        const row = node('div', undefined, 'config-row'); const fields = node('div', undefined, 'config-fields');
+        const row = node('div', undefined, 'config-row'); row.dataset.focusScope = `${kind}:${item.id}`; const fields = node('div', undefined, 'config-fields');
         for (const [key, caption] of [['id', '唯一标识'], ['name', '显示名称'], [urlKey, '地址'], ...(kind === 'platforms' ? [['category', '分类']] : [])]) {
           const label = node('label', caption, 'config-field'); const input = node('input'); input.value = item[key] || ''; input.setAttribute('aria-label', `${title} ${index + 1} ${caption}`); input.addEventListener('input', () => { item[key] = input.value.trim(); }); label.append(input); fields.append(label);
         }
@@ -2772,7 +2929,7 @@ async function boot() {
 $('#login-form').addEventListener('submit', async event => {
   event.preventDefault(); const submit = $('button', event.currentTarget); submit.disabled = true; $('#login-error').textContent = '';
   try { await api('/api/auth/login', { method: 'POST', body: { password: $('#password').value } }); $('#password').value = ''; await boot(); }
-  catch (error) { $('#login-error').textContent = error.message; }
+  catch (error) { $('#login-error').textContent = error.message; $('#password').focus({ preventScroll: true }); }
   finally { submit.disabled = false; }
 });
 $('#logout').addEventListener('click', async () => {
@@ -2782,7 +2939,7 @@ $('#logout').addEventListener('click', async () => {
 window.addEventListener('hashchange', () => void renderRoute());
 window.addEventListener('keydown', event => {
   const current = player, target = event.target;
-  if (current?.fullFilmControls && target instanceof Element && (event.key === 'Tab' || /^Media/.test(event.key) || tvMode && target === document.body && /^Arrow/.test(event.key) || $('#player-host')?.contains(target))) current.showFilmControls?.(true);
+  if ((current?.fullFilmControls || document.fullscreenElement?.classList.contains('player-frame')) && target instanceof Element && (event.key === 'Tab' || /^Media/.test(event.key) || tvMode && target === document.body && /^Arrow/.test(event.key) || $('#player-host')?.contains(target))) current.showFilmControls?.(true);
   if (tvMode && !event.defaultPrevented && !event.altKey && !event.ctrlKey && !event.metaKey && !event.isComposing && target instanceof Element) {
     if (target.matches('input[type="number"]') && event.key === 'Enter') { event.preventDefault(); moveTvFocus('ArrowDown', target); return; }
     if (target.matches('textarea')) {
@@ -2799,7 +2956,11 @@ window.addEventListener('keydown', event => {
     }
     if (event.key === 'Enter' && target.matches('input[type="checkbox"],input[type="radio"]')) { event.preventDefault(); target.click(); return; }
     if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.key)) { event.preventDefault(); moveTvFocus(event.key, target); return; }
-    if (event.key === 'Escape' && !document.fullscreenElement && location.hash.startsWith('#detail')) { event.preventDefault(); if (history.length > 1) history.back(); else goto('home'); return; }
+    if (['Escape', 'BrowserBack', 'GoBack'].includes(event.key)) {
+      if (document.fullscreenElement) { if (event.key !== 'Escape') { event.preventDefault(); void document.exitFullscreen().catch(error => notify(error.message, true)); } return; }
+      if (location.hash.startsWith('#quark-detail')) { event.preventDefault(); location.hash = quarkLibraryHash; return; }
+      if (location.hash.startsWith('#detail')) { event.preventDefault(); if (history.length > 1) history.back(); else goto('home'); return; }
+    }
     return;
   }
   if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || !current?.video || !(target instanceof Element) || !$('#player-host')?.contains(target) || target.matches('input,textarea,select') || target.closest('[contenteditable="true"]')) return;

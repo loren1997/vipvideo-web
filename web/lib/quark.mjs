@@ -721,6 +721,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     record.fid = fids[0]; await ownedFile(context, asset, record); current(context); record.status = 'ready'; persist(); await renameOwned(context, asset, record);
   }
   async function prepareSubtitles(context, info, selected, resource, asset, reused = false) {
+    if (asset.status === 'ready' && asset.detailKey !== info.key) { asset.detailKey = info.key; persist(); }
     if (asset.status !== 'ready') return publicAsset(asset, reused);
     asset.subtitleTitle = info.searchTitle; asset.series = info.series;
     if (Number.isInteger(info.season ?? info.titleSeason)) asset.subtitleSeason = info.season ?? info.titleSeason;
@@ -911,6 +912,30 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     }).finally(() => prepareFlights.delete(key));
     prepareFlights.set(key, job); return job;
   }
+  async function savedFiles(detail, options = {}) {
+    const info = detailInfo(detail, options), context = await snapshot(); context.valid = options.valid; current(context);
+    let folder;
+    if (!registry.folders[context.account]?.fid && Object.values(registry.folders).some(entry => entry.fid)) {
+      try { folder = await ownedFolder(context); }
+      catch (error) { current(context); if (error.status !== 409) throw error; }
+    }
+    const rows = registry.assets.filter(asset => asset.account === context.account && asset.managed === true && asset.parent === registry.folders[context.account]?.fid && ['ready', 'saving', 'queued'].includes(asset.status) &&
+      (asset.detailKey === info.key || !asset.detailKey && asset.renameBase && asset.renameBase === videoRename(info, { name: asset.sourceName || asset.name, path: [] })));
+    for (const asset of rows) { options.visible?.(asset.category); current(context); }
+    if (!rows.length) return { files: [] };
+    folder ||= await ownedFolder(context);
+    const listing = await ownList(context, folder.fid); current(context);
+    for (const asset of rows) { options.visible?.(asset.category); current(context); }
+    const available = (asset, record = asset) => {
+      if (record.status !== 'ready') return false;
+      try { registeredFile(asset, record, folder.fid, listing.list); return true; } catch { return false; }
+    };
+    return { files: rows.sort((a, b) => b.createdAt - a.createdAt).map(asset => ({
+      ...publicAsset(asset, true), size: asset.size, sourceName: name(asset.sourceName), available: available(asset),
+      ...(!available(asset) && asset.status === 'ready' ? { reason: '文件已移动、删除或信息发生变化，暂不能播放' } : {}),
+      subtitles: (asset.subtitles || []).filter(row => row.status !== 'deleted').map(row => ({ name: name(row.name), type: row.type, size: row.size, available: available(asset, row), status: row.status === 'ready' ? 'ready' : 'pending' }))
+    })) };
+  }
   async function playback(assetId, options = {}) {
     const context = await snapshot(); context.valid = typeof options.valid === 'function' ? options.valid : undefined; current(context);
     const asset = findAsset(assetId, context);
@@ -919,23 +944,30 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     const file = await ownedFile(context, asset); current(context);
     const sourceColors = [fileColorRisk(asset.sourceName || asset.name), streamColor(file), streamColor(file.video_info || {})];
     const sourceColorSpace = ['dolby-vision', 'pq', 'hlg', 'hdr', 'sdr'].find(value => sourceColors.includes(value)) || 'unknown';
-    let target, type, mode = 'official', quality, variants, candidates, officialError, colorSpace, downloadCookies;
+    let target, type, mode = 'official', quality, variants, candidates, qualityOptions, officialError, colorSpace, downloadCookies;
     const diagnostic = cause => [Number.isInteger(cause?.quarkUpstreamStatus) ? 'HTTP ' + cause.quarkUpstreamStatus : '', Number.isSafeInteger(cause?.quarkUpstreamCode) ? 'API ' + cause.quarkUpstreamCode : ''].filter(Boolean).join('，');
     try {
       const result = await auth(context, '/file/v2/play', { method: 'POST', userAgent: PLAYBACK_UA, body: { fid: asset.fid, resolutions: 'normal,low,high,super,2k,4k', supports: 'fmp4,m3u8' } }); current(context);
-      const list = (Array.isArray(result.data?.video_list) ? result.data.video_list : []).slice(0, 64).filter(row => row?.accessable !== false && row?.accessable !== 0 && !['transcoding', 'fail'].includes(row?.trans_status)).map(row => row?.video_info).filter(info => typeof info?.url === 'string' && info.success !== false && info.finish !== false).sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
+      const list = (Array.isArray(result.data?.video_list) ? result.data.video_list : []).slice(0, 64).filter(row => row?.accessable !== false && row?.accessable !== 0 && !['transcoding', 'fail'].includes(row?.trans_status)).map(row => row?.video_info && { ...row.video_info, resolution: row.resolution ?? row.video_info.resolution }).filter(info => typeof info?.url === 'string' && info.success !== false && info.finish !== false).sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
       const streams = [];
       for (const info of list) {
         try {
           const url = validateUrl(info.url).href, type = /\.m3u8$/i.test(new URL(url).pathname) || /hls|m3u8/i.test(String(info.file_format || info.format || info.hls_type || '')) ? 'hls' : 'mp4';
-          const dimensions = Number.isSafeInteger(info.width) && Number.isSafeInteger(info.height) && info.width >= 16 && info.width <= 8192 && info.height >= 16 && info.height <= 4320 ? { width: info.width, height: info.height } : {};
+          const dimension = value => typeof value === 'string' && /^\d{1,4}$/.test(value) ? Number(value) : value;
+          const width = dimension(info.width), height = dimension(info.height);
+          const dimensions = Number.isSafeInteger(width) && Number.isSafeInteger(height) && width >= 16 && width <= 8192 && height >= 16 && height <= 4320 ? { width, height } : {};
+          const labels = { normal: '流畅', low: '标清', high: '高清', super: '超清', '2k': '2K', '4k': '4K' }, resolution = typeof info.resolution === 'string' ? info.resolution.toLowerCase() : '';
+          const label = dimensions.height ? `${height === 2160 ? '4K ' : height === 1440 ? '2K ' : height === 1080 ? '超清 ' : height === 720 ? '高清 ' : height <= 480 ? '流畅 ' : ''}${height}p`
+            : Object.hasOwn(labels, resolution) ? labels[resolution] : '';
           // Quark can omit bitrate; a conservative resolution estimate lets HLS adapt after measuring fragments.
           const bitrate = Number(info.bitrate), bandwidth = Number.isFinite(bitrate) && bitrate >= 100000 && bitrate <= 200000000 ? Math.ceil(bitrate) : Math.ceil((dimensions.width || 1920) * (dimensions.height || 1080) * 3);
           const videoCodec = typeof info.codec === 'string' ? info.codec.trim().toLowerCase() : '', audioCodec = typeof info.audio?.codec === 'string' ? info.audio.codec.trim().toLowerCase() : '';
           const preferred = /^(?:h264|h\.264|avc1)(?:$|\.)/.test(videoCodec) && /^(?:aac|mp4a|mp3)(?:$|\.)/.test(audioCodec);
-          const incompatible = /^(?:hevc|h265|h\.265|hvc1|hev1|dvhe|dvh1|dolby_vision)(?:$|\.)/.test(videoCodec) || /^(?:dts|dca|truehd|mlp|ac3|eac3)(?:$|\.)/.test(audioCodec);
+          const incompatibleAudio = /^(?:dts|dca|truehd|mlp|ac3|eac3)(?:$|\.)/.test(audioCodec);
+          const incompatible = /^(?:hevc|h265|h\.265|hvc1|hev1|dvhe|dvh1|dolby_vision)(?:$|\.)/.test(videoCodec) || incompatibleAudio;
+          const codecHint = value => typeof value === 'string' && /^[a-z0-9][a-z0-9_.-]{0,79}$/i.test(value.trim()) ? value.trim() : '';
           const colorSpace = streamColor(info) || 'unknown';
-          streams.push({ url, type, ...dimensions, bandwidth, preferred, incompatible, colorSpace });
+          streams.push({ url, type, ...dimensions, bandwidth, preferred, incompatible, manualCompatible: !incompatibleAudio, videoCodec: codecHint(info.codec), audioCodec: codecHint(info.audio?.codec), colorSpace, label });
         } catch {}
       }
       streams.sort((a, b) => Number(b.preferred) - Number(a.preferred));
@@ -947,12 +979,19 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       if (adaptive.length >= 2 && (!preferred.length || selected?.type === 'hls' && adaptive.some(row => row.preferred))) {
         const compatible = adaptive.filter(row => row.preferred), choices = compatible.length ? compatible : adaptive;
         selected = choices.find(row => row.height <= 1080) || choices.at(-1);
-        variants = adaptive.sort((a, b) => a.height - b.height).map(({ preferred, incompatible, ...row }) => row);
+        variants = adaptive.sort((a, b) => a.height - b.height).map(({ preferred, incompatible, manualCompatible, videoCodec, audioCodec, label, ...row }) => row);
       }
       if (sourceColorSpace === 'dolby-vision' && !sdr.some(row => !row.incompatible)) { selected = undefined; variants = undefined; }
       if (selected) {
         target = selected.url; type = selected.type; colorSpace = selected.colorSpace;
         if (selected.width && selected.height) quality = { width: selected.width, height: selected.height };
+        qualityOptions = [];
+        for (const row of [selected, ...streams]) if (row.manualCompatible && row.label && row.colorSpace !== 'dolby-vision' && (sourceColorSpace !== 'dolby-vision' || row.colorSpace === 'sdr') &&
+            !qualityOptions.some(other => other.url === row.url || row.height && other.height === row.height || !row.height && other.label === row.label) && qualityOptions.length < 8) {
+          const { url, type, colorSpace, label, width, height, videoCodec, audioCodec } = row;
+          qualityOptions.push({ url, type, colorSpace, label, ...(width && height ? { width, height } : {}), ...(videoCodec ? { videoCodec } : {}), ...(audioCodec ? { audioCodec } : {}) });
+        }
+        qualityOptions.sort((a, b) => (b.height || 0) - (a.height || 0));
         const alternatives = streams.filter(row => row !== selected && (!variants || variants.some(other => other.url === row.url))).sort((a, b) => (a.height || Infinity) - (b.height || Infinity));
         candidates = [selected, ...alternatives].filter((row, index, rows) => rows.findIndex(other => other.url === row.url) === index).slice(0, 8)
           .map(({ url, type, colorSpace, width, height, bandwidth }) => ({ url, type, colorSpace, ...(width && height ? { width, height } : {}), bandwidth }));
@@ -971,9 +1010,9 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       try { target = validateUrl(row.download_url).href; } catch { throw failure('夸克返回的播放地址不符合安全限制'); }
       type = /\.mkv$/i.test(asset.name) ? 'mkv' : /\.webm$/i.test(asset.name) ? 'webm' : /\.avi$/i.test(asset.name) ? 'avi' : /\.(?:ts|m2ts)$/i.test(asset.name) ? 'mpegts' : 'mp4';
     }
-    const origins = [...new Set([target, ...(variants || []).map(row => row.url), ...(candidates || []).map(row => row.url)].map(value => new URL(value)).filter(parsed => parsed.protocol === 'https:' && (parsed.hostname === 'quark.cn' || parsed.hostname.endsWith('.quark.cn') || parsed.hostname === 'uc.cn' || parsed.hostname.endsWith('.uc.cn'))).map(parsed => parsed.origin))];
+    const origins = [...new Set([target, ...(qualityOptions || []).map(row => row.url), ...(variants || []).map(row => row.url), ...(candidates || []).map(row => row.url)].map(value => new URL(value)).filter(parsed => parsed.protocol === 'https:' && (parsed.hostname === 'quark.cn' || parsed.hostname.endsWith('.quark.cn') || parsed.hostname === 'uc.cn' || parsed.hostname.endsWith('.uc.cn'))).map(parsed => parsed.origin))];
     current(context);
-    return { episode: { url: target, type, colorSpace }, ...(variants ? { variants } : {}), ...(candidates ? { candidates } : {}), headers: { referer: REFERER, 'user-agent': PLAYBACK_UA, ...(origins.length ? { cookie: downloadMediaCookie(context.cookie, downloadCookies, target, now()) } : {}) }, allowCookieOrigins: origins, metadata: { assetId: asset.id, name: asset.name, size: asset.size, category: asset.category || '', mode, sourceColorSpace, version: hash(JSON.stringify([asset.fid, mode, target, quality || null, colorSpace, sourceColorSpace, ...(variants ? [variants.map(({ width, height }) => [width, height])] : []), ...(candidates ? [candidates] : [])])).slice(0, 24), ...(quality ? { quality } : {}), colorSpace, requiresCompatibility: !['hls', 'mp4', 'webm'].includes(type) || colorSpace !== 'sdr' } };
+    return { episode: { url: target, type, colorSpace }, ...(variants ? { variants } : {}), ...(candidates ? { candidates } : {}), ...(qualityOptions?.length ? { qualityOptions } : {}), headers: { referer: REFERER, 'user-agent': PLAYBACK_UA, ...(origins.length ? { cookie: downloadMediaCookie(context.cookie, downloadCookies, target, now()) } : {}) }, allowCookieOrigins: origins, metadata: { assetId: asset.id, name: asset.name, size: asset.size, category: asset.category || '', mode, sourceColorSpace, version: hash(JSON.stringify([asset.fid, mode, target, quality || null, colorSpace, sourceColorSpace, ...(variants ? [variants.map(({ width, height }) => [width, height])] : []), ...(candidates ? [candidates] : []), ...(qualityOptions?.length ? [qualityOptions] : [])])).slice(0, 24), ...(quality ? { quality } : {}), colorSpace, requiresCompatibility: !['hls', 'mp4', 'webm'].includes(type) || colorSpace !== 'sdr' } };
   }
   async function progress(assetId, input) {
     const context = await snapshot(), asset = findAsset(assetId, context);
@@ -1052,5 +1091,5 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     stopPromise = (async () => { await shareValidator.stop(); await Promise.allSettled([...jobs]); await tail; })();
     return stopPromise;
   };
-  return { settings: track(settings), configure: track(configure), clearAccount: track(clearAccount), resources: track(resources), files: track(files), prepare: track(prepare), playback: track(playback), subtitles: track(subtitles), subtitle: track(subtitle), progress: track(progress), repairFolder: track(repairFolder), cleanup: track(cleanup), start, stop };
+  return { settings: track(settings), configure: track(configure), clearAccount: track(clearAccount), resources: track(resources), files: track(files), savedFiles: track(savedFiles), prepare: track(prepare), playback: track(playback), subtitles: track(subtitles), subtitle: track(subtitle), progress: track(progress), repairFolder: track(repairFolder), cleanup: track(cleanup), start, stop };
 }

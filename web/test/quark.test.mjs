@@ -19,6 +19,41 @@ function textReply(value) { return Object.assign(Readable.from([Buffer.from(valu
 const sourceVideo = (fid = 'share-video', fileName = '影片.2026.mp4', size = 9 * 1024 * 1024) => ({ fid, file_name: fileName, size, file: true, category: 1, pdir_fid: '0', share_fid_token: 'synthetic-file-token-' + fid });
 const sourceSubtitle = (fid = 'caption', fileName = '影片.2026.chs.srt', parent = '0', size = 128) => ({ ...sourceVideo(fid, fileName, size), category: 4, pdir_fid: parent });
 const SRT = '1\n00:00:01,000 --> 00:00:03,000\n中文字幕\n';
+test('saved file inventory lists this film versions and sidecars without transfers or credentials', async t => {
+  const { service, state, metadata, connect, select } = await fixture(t); await connect();
+  state.source = [sourceVideo('first', '影片.2026.1080p.mp4'), sourceVideo('second', '影片.2026.2160p.mp4'), sourceSubtitle('caption', '影片.2026.1080p.chs.srt')];
+  const selection = await select();
+  for (const file of selection.files.files) assert.equal((await service.prepare(detail, { shareId: selection.shareId, fileId: file.id })).status, 'ready');
+  const start = state.calls.length, saved = await service.savedFiles(detail);
+  assert.equal(saved.files.length, 2); assert.equal(new Set(saved.files.map(file => file.name)).size, 2);
+  assert.ok(saved.files.every(file => file.available && file.saved));
+  assert.equal(saved.files.flatMap(file => file.subtitles).length, 1);
+  assert.equal(saved.files.flatMap(file => file.subtitles)[0].available, true);
+  assert.ok(state.calls.slice(start).every(call => !call.options.method || call.options.method === 'GET'));
+  assert.doesNotMatch(JSON.stringify(saved), /synthetic|share_fid_token|fid|account|cookie/i);
+  assert.deepEqual((await service.savedFiles({ ...detail, id: 'other', title: '另一影片' })).files, []);
+  const registry = JSON.parse(metadata.get('quark-registry-v1')), first = registry.assets.find(asset => asset.id === saved.files[0].assetId);
+  state.files = state.files.filter(file => file.fid !== first.fid);
+  assert.equal((await service.savedFiles(detail)).files.find(file => file.assetId === first.id).available, false);
+  await assert.rejects(service.savedFiles(detail, { visible: () => { throw Object.assign(new Error('hidden'), { status: 403 }); } }), { status: 403 });
+  await connect({ cookie: COOKIE_B }); assert.deepEqual((await service.savedFiles(detail)).files, []);
+});
+
+test('saved inventory recognizes legacy renamed film records but does not guess from a short title', async t => {
+  const { service, options, metadata, connect, save } = await fixture(t); await connect(); await save();
+  const registry = JSON.parse(metadata.get('quark-registry-v1')); delete registry.assets[0].detailKey;
+  metadata.set('quark-registry-v1', JSON.stringify(registry)); await service.stop();
+  const restored = createQuark(options); t.after(() => restored.stop());
+  assert.equal((await restored.savedFiles(detail)).files.length, 1);
+  assert.deepEqual((await restored.savedFiles({ ...detail, title: '影' })).files, []);
+});
+
+test('saved inventory rechecks asset visibility after awaiting the directory', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); await save({ ...detail, category: 'adult', type: 'movie' });
+  let visible = true;
+  state.beforeRequest = call => { if (call.path === '/file/sort') visible = false; };
+  await assert.rejects(service.savedFiles(detail, { visible: category => { if (category === 'adult' && !visible) throw Object.assign(new Error('hidden'), { status: 403 }); } }), { status: 403 });
+});
 async function fixture(t, extra = {}) {
   const dataDir = await mkdtemp(resolve(tmpdir(), 'vipvideo-quark-test-'));
   t.after(async () => { const target = resolve(dataDir); assert.ok(target.startsWith(resolve(tmpdir()) + sep)); assert.ok(basename(target).startsWith('vipvideo-quark-test-')); await rm(target, { recursive: true, force: true }); });
@@ -988,6 +1023,11 @@ test('a rotated fallback Cookie identity reconnects only the registered root fol
     }
     await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
     if (mode === 'ready-with-numeric-root') state.folders.get('A').pdir_fid = 0;
+    const beforeInventory = state.calls.length, inventory = await restored.savedFiles(detail);
+    assert.equal(inventory.files.length, 1, 'the verified old namespace is available before preparing the file again');
+    assert.equal(inventory.files[0].assetId, oldAsset.id);
+    assert.equal(inventory.files[0].available, !state.pending);
+    assert.ok(state.calls.slice(beforeInventory).every(call => !call.options.method || call.options.method === 'GET'), 'listing migrates only local registration after readonly ownership verification');
     const selectRestored = async instance => {
       const shareId = (await instance.resources(detail)).resources[0].id;
       const fileId = (await instance.files(detail, { shareId, line: 0, episode: 0 })).files[0].id;
@@ -2355,6 +2395,52 @@ test('official nonadaptive qualities also prefer 1080p instead of forcing 4K', a
   const result = await service.playback(saved.assetId);
   assert.equal(result.episode.url, 'https://video-cloud.quark.cn/1080.mp4'); assert.equal(result.episode.type, 'mp4');
   assert.deepEqual(result.metadata.quality, { width: 1920, height: 1080 }); assert.equal(result.variants, undefined);
+});
+
+test('official manual qualities retain MP4 and unmarked HLS without inventing source dimensions', async t => {
+  const { service, connect, save, state } = await fixture(t); await connect(); const saved = await save();
+  let topUrl = 'https://fourk.quark.cn/4k.mp4?sign=real';
+  state.beforeRequest = call => call.path === '/file/v2/play' ? reply({ video_list: [
+    { resolution: '4k', video_info: { url: topUrl, width: '3840', height: '2160', codec: 'h264', audio: { codec: 'aac' } } },
+    { resolution: 'super', video_info: { url: 'https://video-cloud.quark.cn/1080.m3u8', width: '1920', height: '1080', codec: 'h264', audio: { codec: 'aac' } } },
+    { resolution: 'normal', video_info: { url: 'https://video-cloud.quark.cn/low.mp4' } },
+    { resolution: 'constructor', video_info: { url: 'https://video-cloud.quark.cn/unlabelled.mp4' } },
+    { resolution: '4k', video_info: { url: 'https://video-cloud.quark.cn/false-label.mp4', width: 1280, height: 720 } },
+    { resolution: 'super', accessable: false, video_info: { url: 'https://locked.quark.cn/locked.mp4', width: 1920, height: 1080 } },
+    { resolution: '4k', video_info: { url: 'http://127.0.0.1/private.mp4', width: 3840, height: 2160 } },
+    { resolution: '2k', video_info: { url: 'https://video-cloud.quark.cn/dts.mp4', width: 2560, height: 1440, audio: { codec: 'dts' } } },
+  ] }) : undefined;
+  const result = await service.playback(saved.assetId);
+  assert.equal(result.episode.url, 'https://video-cloud.quark.cn/1080.m3u8');
+  assert.equal(result.variants, undefined, 'unmarked colors never enter automatic adaptive playback');
+  assert.deepEqual(result.qualityOptions.map(row => [row.type, row.label, row.height]), [
+    ['mp4', '4K 2160p', 2160], ['hls', '超清 1080p', 1080], ['mp4', '高清 720p', 720], ['mp4', '流畅', undefined],
+  ]);
+  assert.equal(result.qualityOptions.at(-1).width, undefined, 'official resolution names do not fabricate pixel dimensions');
+  assert.ok(result.allowCookieOrigins.includes('https://fourk.quark.cn'));
+  assert.equal(state.calls.filter(call => call.path === '/file/download').length, 0);
+  const unchanged = await service.playback(saved.assetId);
+  assert.equal(unchanged.metadata.version, result.metadata.version);
+  topUrl = 'https://fourk.quark.cn/4k.mp4?sign=changed';
+  assert.notEqual((await service.playback(saved.assetId)).metadata.version, result.metadata.version, 'manual quality URLs participate in source identity');
+});
+
+test('official HEVC with compatible audio remains a manual quality without entering AVC adaptive playback', async t => {
+  const { service, connect, save, state } = await fixture(t); await connect(); const saved = await save();
+  state.beforeRequest = call => call.path === '/file/v2/play' ? reply({ video_list: [
+    { video_info: { url: 'https://video-cloud.quark.cn/4k.mp4', width: 3840, height: 2160, codec: 'hvc1.1.6.L153.B0', audio: { codec: 'aac' }, dynamic_range: 'SDR' } },
+    { video_info: { url: 'https://video-cloud.quark.cn/1080.m3u8', width: 1920, height: 1080, codec: 'h264', audio: { codec: 'aac' }, dynamic_range: 'SDR' } },
+    { video_info: { url: 'https://video-cloud.quark.cn/720.m3u8', width: 1280, height: 720, codec: 'h264', audio: { codec: 'aac' }, dynamic_range: 'SDR' } },
+    { video_info: { url: 'https://video-cloud.quark.cn/dts.mp4', width: 2560, height: 1440, codec: 'hevc', audio: { codec: 'dts' }, dynamic_range: 'SDR' } },
+    { video_info: { url: 'https://video-cloud.quark.cn/dv.mp4', width: 3840, height: 2160, codec: 'dvh1', audio: { codec: 'aac' } } },
+  ] }) : undefined;
+  const result = await service.playback(saved.assetId);
+  assert.equal(result.episode.url, 'https://video-cloud.quark.cn/1080.m3u8');
+  assert.deepEqual(result.variants.map(row => row.height), [720, 1080], 'automatic AVC playback remains separate');
+  assert.deepEqual(result.qualityOptions.map(row => row.height), [2160, 1080, 720]);
+  assert.equal(result.qualityOptions[0].videoCodec, 'hvc1.1.6.L153.B0');
+  assert.equal(result.qualityOptions[0].audioCodec, 'aac');
+  assert.ok(result.qualityOptions.every(row => !/dts|dv\.mp4/.test(row.url)));
 });
 
 test('download fallback preserves the exact request Cookie snapshot and MKV compatibility metadata', async t => {

@@ -48,7 +48,7 @@ test('publishes an adaptive master without disclosing upstream links or account 
     { type: 'hls', colorSpace: 'sdr', url: 'https://video.quark.cn/1080.m3u8?sign=1080-secret', width: 1920, height: 1080, bandwidth: 6000000 },
     { type: 'hls', colorSpace: 'sdr', url: 'https://video.quark.cn/2160.m3u8?sign=2160-secret', width: 3840, height: 2160, bandwidth: 18000000 },
   ];
-  const { cloud, calls, base } = await fixture(t, { quark: { playback: async () => descriptor({ variants: [...variants, variants[0]] }) } });
+  const { cloud, calls, base } = await fixture(t, { quark: { playback: async () => descriptor({ variants: [...variants, variants[0]], qualityOptions: variants.map(row => ({ ...row, label: `${row.height}p` })) }) } });
   const lease = await cloud.playback('asset');
   assert.equal(lease.response.quality, '自动画质');
   const response = await fetch(base + lease.response.url), master = await response.text();
@@ -61,6 +61,7 @@ test('publishes an adaptive master without disclosing upstream links or account 
   const children = master.split('\n').filter(line => line.startsWith('/api/quark/media/'));
   assert.equal(children.length, 3, 'Duplicate upstream qualities are omitted');
   assert.ok(children.every(url => url.startsWith(lease.proxyPath + '?token=')));
+  assert.deepEqual(children, lease.response.qualityOptions.map(row => row.url), 'manual HLS qualities reuse the master selectors');
   assert.equal((await fetch(base + children[1])).status, 200);
   assert.equal(calls[0].url, variants[1].url);
   assert.equal(calls[0].headers.cookie, '__puus=account-secret');
@@ -69,6 +70,118 @@ test('publishes an adaptive master without disclosing upstream links or account 
   cloud.invalidate();
   assert.equal((await fetch(base + lease.response.url)).status, 403);
   assert.equal((await fetch(base + children[0])).status, 403);
+});
+
+test('manual official qualities use the current signed lease for MP4 and unmarked HLS', async t => {
+  const options = [
+    { type: 'mp4', url: 'https://video.quark.cn/4k.mp4?sign=private', colorSpace: 'unknown', width: 3840, height: 2160, label: '4K 2160p', videoCodec: 'hvc1.1.6.L153.B0', audioCodec: 'mp4a.40.2' },
+    { type: 'hls', url: 'https://cdn.example/1080.m3u8?sign=private', colorSpace: 'unknown', width: 1920, height: 1080, label: '超清 1080p' },
+    { type: 'mp4', url: 'https://video.quark.cn/low.mp4', colorSpace: 'unknown', label: '流畅' },
+  ];
+  let probes = 0;
+  const f = await fixture(t, { quark: { playback: async () => descriptor({ episode: { type: 'hls', url: options[1].url, colorSpace: 'unknown' }, metadata: { sourceColorSpace: 'sdr' }, qualityOptions: options }) }, probeColor: async () => { probes++; throw new Error('ordinary sources must not probe'); } });
+  const lease = await f.cloud.playback('asset', { owner: 'household' });
+  assert.equal(probes, 0); assert.equal(lease.response.type, 'hls');
+  assert.equal(lease.response.qualityOptions[0].videoCodec, 'hvc1.1.6.L153.B0');
+  assert.equal(lease.response.qualityOptions[0].audioCodec, 'mp4a.40.2');
+  assert.deepEqual(lease.response.qualityOptions.map(({ id, label, type }) => ({ id, label, type })), [
+    { id: 'q0', label: '4K 2160p', type: 'mp4' }, { id: 'q1', label: '超清 1080p', type: 'hls' }, { id: 'q2', label: '流畅', type: 'mp4' },
+  ]);
+  assert.doesNotMatch(JSON.stringify(lease.response), /video\.quark\.cn|cdn\.example|account-secret|private/);
+  for (const option of lease.response.qualityOptions) {
+    assert.match(option.url, new RegExp(`^/api/quark/media/${lease.id}\\?token=q[0-7]$`));
+    assert.equal((await fetch(f.base + option.url, { headers: { cookie: 'browser-secret', authorization: 'browser-secret' } })).status, 200);
+  }
+  assert.equal(lease.response.url, lease.response.qualityOptions[1].url, 'the selected 1080p default matches its own option rather than the first 4K option');
+  assert.equal(f.calls[0].headers.cookie, '__puus=account-secret');
+  assert.equal(f.calls[0].headers.authorization, undefined);
+  assert.equal(f.calls.find(call => call.url.includes('cdn.example')).headers.cookie, undefined);
+  const signed = lease.response.qualityOptions[0].url;
+  assert.equal((await fetch(f.base + signed.replace(/token=./, 'token=x'))).status, 403);
+  f.cloud.revoke('household'); assert.equal((await fetch(f.base + signed)).status, 403);
+});
+
+test('manual official qualities cannot bypass known Dolby color protection', async t => {
+  const safe = { type: 'hls', url: 'https://video.quark.cn/sdr.m3u8', colorSpace: 'sdr', label: '超清 1080p', width: 1920, height: 1080 };
+  const hidden = ['unknown', 'pq', 'hlg', 'dolby-vision'].map((colorSpace, index) => ({ type: 'mp4', url: `https://video.quark.cn/unsafe-${index}.mp4`, colorSpace, label: '4K', width: 3840, height: 2160 }));
+  const f = await fixture(t, { quark: { playback: async () => descriptor({ episode: safe, metadata: { sourceColorSpace: 'dolby-vision' }, qualityOptions: [safe, ...hidden] }) } });
+  const lease = await f.cloud.playback('asset');
+  assert.deepEqual(lease.response.qualityOptions.map(row => row.label), ['超清 1080p']);
+});
+
+test('manual official qualities reject invalid lists before media reads and expire with household authorization', async t => {
+  const safe = { type: 'mp4', url: 'https://video.quark.cn/sdr.mp4', colorSpace: 'sdr', label: '超清', width: 1920, height: 1080 };
+  let reads = 0;
+  for (const qualityOptions of [Array(9).fill(safe), [{ ...safe, url: 'http://127.0.0.1/private.mp4' }], [{ ...safe, type: 'page' }], [{ ...safe, label: 'bad\r\nheader' }], [{ ...safe, width: undefined }], [{ ...safe, height: 4321 }], [{ ...safe, colorSpace: 'unverified' }], [{ ...safe, videoCodec: 'bad\r\ncodec' }]]) {
+    const cloud = createQuarkMedia({ quark: { playback: async () => descriptor({ qualityOptions }) }, request: async () => { reads++; throw new Error('invalid options must not fetch'); } });
+    await assert.rejects(cloud.playback('asset'));
+    cloud.invalidate();
+  }
+  assert.equal(reads, 0);
+  let authorized = true;
+  const f = await fixture(t, { quark: { playback: async () => descriptor({ qualityOptions: [safe] }) } });
+  const lease = await f.cloud.playback('asset', { valid: () => authorized });
+  assert.equal((await fetch(f.base + lease.response.qualityOptions[0].url)).status, 200);
+  authorized = false;
+  assert.equal((await fetch(f.base + lease.response.qualityOptions[0].url)).status, 403);
+  assert.equal(f.calls.length, 1, 'a revoked quality never reaches the upstream media');
+});
+
+test('manual and adaptive official origins retain exact credentials within a bounded list', async t => {
+  const variants = Array.from({ length: 8 }, (_, index) => ({ type: 'hls', colorSpace: 'sdr', url: `https://adaptive-${index}.quark.cn/video.m3u8`, width: 1280, height: 240 + index * 120, bandwidth: 3000000 }));
+  const qualityOptions = Array.from({ length: 8 }, (_, index) => ({ type: 'mp4', colorSpace: 'sdr', url: `https://manual-${index}.quark.cn/video.mp4`, label: `${240 + index * 120}p`, width: 1280, height: 240 + index * 120 }));
+  const allowCookieOrigins = ['https://video.quark.cn', ...qualityOptions.map(row => new URL(row.url).origin), ...variants.map(row => new URL(row.url).origin)];
+  const f = await fixture(t, { quark: { playback: async () => descriptor({ variants, qualityOptions, allowCookieOrigins }) } });
+  const lease = await f.cloud.playback('asset');
+  const master = await (await fetch(f.base + lease.response.url)).text();
+  const children = master.split('\n').filter(row => row.startsWith('/api/quark/media/'));
+  assert.equal((await fetch(f.base + children.at(-1))).status, 200);
+  assert.equal(f.calls.at(-1).headers.cookie, '__puus=account-secret', 'a valid adaptive origin after the first ten keeps its own account headers');
+  assert.equal((await fetch(f.base + lease.response.qualityOptions.at(-1).url)).status, 200);
+  assert.equal(f.calls.at(-1).headers.cookie, '__puus=account-secret');
+  const cloud = createQuarkMedia({ quark: { playback: async () => descriptor({ allowCookieOrigins: Array.from({ length: 26 }, (_, index) => `https://v${index}.quark.cn`) }) } });
+  await assert.rejects(cloud.playback('asset'), /凭证目标列表/); cloud.invalidate();
+});
+
+test('compatibility input quality selects real official source heights without probing or creating adaptive input', async t => {
+  const qualityOptions = [
+    { type: 'mp4', colorSpace: 'sdr', url: 'https://video.quark.cn/4k.mp4', label: '4K 2160p', width: 3840, height: 2160, videoCodec: 'hevc', audioCodec: 'aac' },
+    { type: 'hls', colorSpace: 'sdr', url: 'https://video.quark.cn/1080.m3u8', label: '超清 1080p', width: 1920, height: 1080 },
+    { type: 'hls', colorSpace: 'sdr', url: 'https://video.quark.cn/720.m3u8', label: '高清 720p', width: 1280, height: 720 },
+  ];
+  const variants = qualityOptions.slice(1).map(row => ({ ...row, bandwidth: 3000000 }));
+  let lookups = 0, probes = 0;
+  const f = await fixture(t, { quark: { playback: async () => { lookups++; return descriptor({ episode: qualityOptions[1], metadata: { sourceColorSpace: 'sdr' }, variants, qualityOptions }); } }, probeColor: async () => { probes++; throw new Error('ordinary source must not probe'); } });
+  const ordinary = await f.cloud.playback('asset');
+  assert.equal(ordinary.episode.url, qualityOptions[1].url); assert.equal(ordinary.response.quality, '自动画质');
+  for (const quality of [720, 1080, 2160]) {
+    const lease = await f.cloud.playback('asset', { quality });
+    assert.equal(lease.episode.height, quality);
+    assert.equal(lease.episode.url, qualityOptions.find(row => row.height === quality).url);
+    assert.equal(lease.master, undefined, 'an explicit compatibility input never falls back through a lower ABR level');
+    assert.equal(lease.response.url, lease.response.qualityOptions.find(row => row.height === quality).url);
+  }
+  assert.equal(lookups, 4); assert.equal(probes, 0); assert.equal(f.calls.length, 0);
+  const only1080 = await fixture(t, { quark: { playback: async () => descriptor({ episode: qualityOptions[1], qualityOptions: [qualityOptions[1]] }) } });
+  for (const quality of [720, 2160]) assert.equal((await only1080.cloud.playback('asset', { quality })).episode.height, 1080, 'the smallest actual source above a low cap and the only source below 4K both stay 1080p');
+});
+
+test('compatibility input quality never overrides the existing Dolby color decision', async t => {
+  const safe = { type: 'hls', colorSpace: 'sdr', url: 'https://video.quark.cn/1080.m3u8', label: '超清', width: 1920, height: 1080 };
+  const unverified = { type: 'mp4', colorSpace: 'unknown', url: 'https://video.quark.cn/4k.mp4', label: '4K', width: 3840, height: 2160, videoCodec: 'hevc', audioCodec: 'aac' };
+  let probes = 0;
+  const f = await fixture(t, { quark: { playback: async () => descriptor({ episode: safe, metadata: { sourceColorSpace: 'dolby-vision' }, qualityOptions: [unverified, safe] }) }, probeColor: async () => { probes++; throw new Error('verified SDR remains sufficient'); } });
+  const lease = await f.cloud.playback('asset', { quality: 2160 });
+  assert.equal(lease.episode.url, safe.url);
+  assert.deepEqual(lease.response.qualityOptions.map(row => row.url), [lease.response.url]);
+  assert.equal(probes, 0);
+});
+
+test('compatibility input quality rejects unsupported values before account lookup', async () => {
+  let lookups = 0;
+  const cloud = createQuarkMedia({ quark: { playback: async () => { lookups++; return descriptor(); } } });
+  for (const quality of [null, '2160', 480, 0, Infinity]) await assert.rejects(cloud.playback('asset', { quality }), error => error.status === 400);
+  assert.equal(lookups, 0); cloud.invalidate();
 });
 
 test('ordinary SDR, unknown and HDR Vivid HLS, MP4 and WebM play directly without color inspection', async t => {

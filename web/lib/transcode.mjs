@@ -9,6 +9,7 @@ import { pipeline } from 'node:stream/promises';
 import { validateUrl } from './network.mjs';
 
 const speeds = new Set([0.5, 0.75, 1, 1.25, 1.5, 2, 3]);
+const qualities = new Map([[720, { width: 1280, bitrate: 2500, maxrate: 3500 }], [1080, { width: 1920, bitrate: 5000, maxrate: 7000 }], [2160, { width: 3840, bitrate: 14000, maxrate: 18000 }]]);
 const inputFormats = { hls: 'hls', mp4: 'mov', mkv: 'matroska', webm: 'matroska', avi: 'avi', mpegts: 'mpegts' };
 const rawInputFormats = 'mov,matroska,webm,mpegts,avi';
 const colorSpaces = new Set(['sdr', 'pq', 'hlg', 'dolby-vision', 'hdr', 'unknown', 'browser-default']);
@@ -355,23 +356,25 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     }
   }
   function argumentsFor(task, acceleration) {
-    const scale = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
+    const { width, bitrate, maxrate } = qualities.get(task.quality);
+    const size = `w='min(${width},iw)':h='min(${task.quality},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`;
+    const scale = `scale=${size}`;
     const dolby = task.colorSpace === 'dolby-vision', hardware = acceleration === 'vaapi';
     const toneMapped = dolby || task.sourceColorSpace === 'dolby-vision' && ['pq', 'hlg'].includes(task.colorSpace);
     const toneMap = `${scale},zscale=transfer=linear:npl=100,format=gbrpf32le,zscale=primaries=bt709,tonemap=tonemap=hable:desat=2,zscale=transfer=bt709:matrix=bt709:range=limited,format=yuv420p,sidedata=mode=delete:type=MASTERING_DISPLAY_METADATA,sidedata=mode=delete:type=CONTENT_LIGHT_LEVEL`;
     // The original HEVC RPU must reach libplacebo; an already miscoloured AVC stream cannot be repaired here.
-    const dolbyMap = `fps='if(gt(source_fps,0),min(source_fps,30),30)',${hardware ? 'hwmap=derive_device=vulkan,format=vulkan' : 'hwupload'},libplacebo=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:format=yuv420p:apply_dolbyvision=1:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:tonemapping=hable:peak_detect=false:upscaler=none:downscaler=none,hwdownload,format=yuv420p${hardware ? ',format=nv12,hwupload' : ''}`;
+    const dolbyMap = `fps='if(gt(source_fps,0),min(source_fps,30),30)',${hardware ? 'hwmap=derive_device=vulkan,format=vulkan' : 'hwupload'},libplacebo=${size}:format=yuv420p:apply_dolbyvision=1:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:tonemapping=hable:peak_detect=false:upscaler=none:downscaler=none,hwdownload,format=yuv420p${hardware ? ',format=nv12,hwupload' : ''}`;
     return ['-hide_banner', '-loglevel', 'info', '-nostats', '-nostdin', '-threads', dolby && !hardware ? '4' : '1', '-filter_threads', '1',
       ...(dolby ? ['-init_hw_device', hardware ? `vaapi=va:${device}` : 'vulkan=vk:0', '-filter_hw_device', hardware ? 'va' : 'vk'] : []),
       ...(hardware ? ['-hwaccel', 'vaapi', '-hwaccel_device', dolby ? 'va' : device, '-hwaccel_output_format', 'vaapi'] : []),
       '-protocol_whitelist', 'http,tcp,crypto', '-readrate', String(task.speed), ...(task.position > 0 ? ['-ss', String(task.position)] : []),
       ...(task.type === 'hls' ? ['-f', 'hls'] : ['-format_whitelist', rawInputFormats]),
       ...(task.type === 'hls' ? ['-allowed_extensions', 'ALL'] : []), ...(task.encoderReads ? ['-reconnect', '1'] : []), '-i', task.input,
-      '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn', '-vf', dolby ? dolbyMap : toneMapped ? toneMap : hardware ? "scale_vaapi=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12" : `${scale},format=yuv420p`,
+      '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn', '-vf', dolby ? dolbyMap : toneMapped ? toneMap : hardware ? `scale_vaapi=${size}:format=nv12` : `${scale},format=yuv420p`,
       ...(toneMapped ? ['-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709'] : []),
-      '-c:v', acceleration === 'vaapi' ? 'h264_vaapi' : 'libx264', ...(acceleration === 'vaapi' ? ['-rc_mode', 'VBR', '-b:v', '2500k'] : ['-preset', 'veryfast', '-crf', '23']),
-      '-maxrate', '3500k', '-bufsize', '7000k', '-r', '30', '-threads', '1', '-force_key_frames', 'expr:gte(t,n_forced*2)', '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
-      '-f', 'hls', '-hls_time', '2', '-hls_list_size', '30', '-hls_flags', 'delete_segments+temp_file', '-hls_segment_filename', join(task.dir, 'segment%06d.ts'), join(task.dir, 'index.m3u8')];
+      '-c:v', acceleration === 'vaapi' ? 'h264_vaapi' : 'libx264', ...(acceleration === 'vaapi' ? ['-rc_mode', 'VBR', '-b:v', `${bitrate}k`] : ['-preset', 'veryfast', '-crf', '23']),
+      '-maxrate', `${maxrate}k`, '-bufsize', `${maxrate * 2}k`, '-r', '30', '-threads', '1', '-force_key_frames', 'expr:gte(t,n_forced*2)', '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+      '-f', 'hls', '-hls_time', '2', '-hls_list_size', task.quality === 2160 ? '15' : '30', '-hls_flags', 'delete_segments+temp_file', '-hls_segment_filename', join(task.dir, 'segment%06d.ts'), join(task.dir, 'index.m3u8')];
   }
   async function ready(task, deadline) {
     while (now() < deadline) {
@@ -417,16 +420,17 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         return { ...task.colorProbe };
       } finally { signal?.removeEventListener('abort', abort); await cleanup(task); }
     },
-    async start({ episode, position = 0, speed = 1, owner, valid: isValid, mediaOverride, proxyPath = '/api/media', trustedColorProbe } = {}) {
+    async start({ episode, position = 0, speed = 1, quality = 720, owner, valid: isValid, mediaOverride, proxyPath = '/api/media', trustedColorProbe } = {}) {
       if (!enabled || closed) throw failure('兼容播放已关闭', 503);
       const selectedMedia = mediaOverride ?? media;
       if (!selectedMedia?.playback || !selectedMedia?.serve) throw failure('兼容播放需要签名媒体转发模块', 503);
+      if (!qualities.has(quality)) throw failure('兼容播放清晰度参数无效', 400);
       if (typeof owner !== 'string' || !owner || owner.length > 256 || typeof isValid !== 'function' || !Number.isFinite(position) || position < 0 || position > 604800 || !speeds.has(speed) || !Object.hasOwn(inputFormats, episode?.type) || typeof episode.url !== 'string' || episode.url.length > 8192 || !/^\/api\/[a-z0-9/_-]{1,120}$/.test(proxyPath)) throw failure('兼容播放参数无效', 400);
       if (episode.colorSpace !== undefined && !colorSpaces.has(episode.colorSpace)) throw failure('兼容播放色彩参数无效', 400);
       if (episode.sourceColorSpace !== undefined && (!colorSpaces.has(episode.sourceColorSpace) || episode.sourceColorSpace === 'browser-default')) throw failure('原文件色彩参数无效', 400);
       const url = validateUrl(episode.url).href;
       if (current && !current.stopped && current.owner !== owner) throw failure('另一台设备正在使用兼容播放，请稍后再试', 409);
-      const previous = current, task = { id: randomBytes(16).toString('hex'), owner, valid: isValid, position, speed, type: episode.type, colorSpace: episode.colorSpace, sourceColorSpace: episode.sourceColorSpace ?? 'unknown', duration: null, stopped: false, media: selectedMedia, proxyPath };
+      const previous = current, task = { id: randomBytes(16).toString('hex'), owner, valid: isValid, position, speed, quality, type: episode.type, colorSpace: episode.colorSpace, sourceColorSpace: episode.sourceColorSpace ?? 'unknown', duration: null, stopped: false, media: selectedMedia, proxyPath };
       current = task;
       try {
         if (previous) await cleanup(previous);
@@ -471,7 +475,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
           }
         }
         assertValid(task); lastError = undefined; armIdle(task);
-        return { id: task.id, url: `/api/transcode/${task.id}/index.m3u8`, type: 'hls', transcoded: true, startPosition: position, duration: task.duration, acceleration };
+        return { id: task.id, url: `/api/transcode/${task.id}/index.m3u8`, type: 'hls', transcoded: true, startPosition: position, duration: task.duration, acceleration, quality };
       } catch (error) {
         lastError = error.status ? error.message : '兼容播放启动失败，请检查 FFmpeg';
         if (task.attempt?.stderr) logger.error('兼容播放失败', diagnostics(task.attempt.stderr));
