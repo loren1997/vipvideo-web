@@ -11,14 +11,14 @@ import { createQuarkSearchPool } from '../lib/quark-search-pool.mjs';
 import { readText } from '../lib/network.mjs';
 
 test('optional Quark search companion preserves Compose settings and accepts real search responses', {
-  skip: process.env.GITHUB_ACTIONS !== 'true', timeout: 180_000,
+  skip: process.env.GITHUB_ACTIONS !== 'true', timeout: 360_000,
 }, async () => {
   const root = fileURLToPath(new URL('../../', import.meta.url));
   const name = `vipvideo-quark-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}-${process.pid}`;
   const files = ['-f', 'docker-compose.yml', '-f', 'compose.quark.yaml'];
-  const compose = args => execFileSync('docker', ['compose', '-p', name, ...files, ...args], {
+  const compose = (args, options = {}) => execFileSync('docker', ['compose', '-p', name, ...files, ...args], {
     cwd: root, windowsHide: true, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'pipe', 'pipe'], ...options,
   });
   const baseline = JSON.parse(execFileSync('docker', ['compose', '-f', 'docker-compose.yml', 'config', '--format', 'json'], {
     cwd: root, windowsHide: true, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
@@ -93,6 +93,8 @@ test('optional Quark search companion preserves Compose settings and accepts rea
     unlinkSync(nasFile);
   }
   try {
+    // Prepare the web image separately so a cold pull cannot consume the protocol check's 60 seconds.
+    compose(['pull', 'web'], { timeout: 180_000, stdio: ['ignore', 'inherit', 'inherit'] });
     compose(['up', '-d', 'pansou']);
     let healthy = false;
     for (let i = 0; i < 40; i++) {
@@ -106,7 +108,7 @@ test('optional Quark search companion preserves Compose settings and accepts rea
     const health = JSON.parse(compose(['exec', '-T', 'pansou', 'wget', '-qO-', 'http://127.0.0.1:8888/api/health']));
     assert.ok(health.status || health.success || health.code !== undefined);
     // Use the web service's network and current transport; a nonexistent plugin avoids upstream requests.
-    const body = compose(['run', '--rm', '-T', '--no-deps', '--volume', `${join(root, 'web/lib')}:/app/lib:ro`,
+    const body = compose(['run', '--rm', '-T', '--no-deps', '--pull', 'never', '--volume', `${join(root, 'web/lib')}:/app/lib:ro`,
       'web', 'node', '--input-type=module', '-e', `
         import { createQuarkSearchRequest } from './lib/quark-search.mjs';
         import { readText } from './lib/network.mjs';
@@ -138,6 +140,14 @@ test('optional Quark search companion preserves Compose settings and accepts rea
       assert.equal(primaryCalls, 2, 'A valid empty response must keep the primary available for another title');
     } finally { await pool.stop(); }
   } catch (error) {
+    if (error.stdout) process.stderr.write(error.stdout);
+    if (error.stderr) process.stderr.write(error.stderr);
+    const state = spawnSync('docker', ['compose', '-p', name, ...files, 'ps', '--all', '--format', 'json'], {
+      cwd: root, windowsHide: true, encoding: 'utf8', timeout: 10_000,
+    });
+    if (state.stdout) process.stderr.write(state.stdout);
+    if (state.stderr) process.stderr.write(state.stderr);
+    if (state.error) process.stderr.write(`Compose status unavailable: ${state.error.message}\n`);
     const log = spawnSync('docker', ['compose', '-p', name, ...files, 'logs', '--no-color', 'pansou'], {
       cwd: root, windowsHide: true, encoding: 'utf8', timeout: 10_000,
     });
