@@ -1229,8 +1229,71 @@ try {
   async function verifyFullFilmTimeline() {
     for (const tv of [false, true]) await withCloudFixture(async open => {
       quarkMode = 'requires'; quarkAssetPosition = 5375; transcodeMode = 'enabled'; transcodeDuration = 7116.05;
-      const { page: p } = await open({ tv }); await prepareCloudFile(p); await playCloudFile(p);
-      const video = p.locator('video'), controls = p.locator('#full-film-controls'), timeline = p.getByLabel('原片进度', { exact: true });
+      const { page: p } = await open({ tv, clock: true }); await prepareCloudFile(p);
+      await p.evaluate(() => {
+        const add = window.addEventListener; window.filmListenerProbe = { registered: 0, afterStop: 0, stopped: false };
+        window.addEventListener = function(type, listener, options) {
+          if (options?.signal && ['pointerup', 'pointercancel', 'lostpointercapture', 'blur'].includes(type)) {
+            window.filmListenerProbe.registered++;
+            const original = listener; listener = function(event) { if (window.filmListenerProbe.stopped) window.filmListenerProbe.afterStop++; return original.call(this, event); };
+          }
+          return add.call(this, type, listener, options);
+        };
+        window.restoreFilmListenerProbe = () => { window.addEventListener = add; };
+      });
+      await playCloudFile(p);
+      const video = p.locator('video'), frame = p.locator('.player-frame'), controls = p.locator('#full-film-controls'), timeline = p.getByLabel('原片进度', { exact: true }), volume = p.getByLabel('音量', { exact: true });
+      await video.evaluate(v => { window.filmPlayingCount = 0; v.addEventListener('playing', () => window.filmPlayingCount++); });
+      await frame.evaluate(frame => {
+        window.filmFullscreenCount = 0; window.filmControlEvents = [];
+        const record = event => { if (event.type === 'fullscreenchange') window.filmFullscreenCount++; window.filmControlEvents.push({ type: event.type, at: Date.now(), idle: frame.classList.contains('player-controls-idle'), active: document.activeElement?.tagName }); if (window.filmControlEvents.length > 40) window.filmControlEvents.shift(); };
+        for (const name of ['pointermove', 'focusin', 'focusout', 'fullscreenchange']) frame.addEventListener(name, record);
+        for (const name of ['playing', 'waiting', 'pause', 'canplay']) frame.querySelector('video').addEventListener(name, record);
+        new MutationObserver(() => record({ type: 'class' })).observe(frame, { attributes: true, attributeFilter: ['class'] });
+      });
+      const playControl = async (keyboard = false) => {
+        const before = await p.evaluate(() => window.filmPlayingCount), play = p.getByRole('button', { name: '播放', exact: true });
+        if (keyboard) { await play.focus(); await p.keyboard.press('Enter'); } else await play.click();
+        await until(() => p.evaluate(before => window.filmPlayingCount > before && !document.querySelector('video').paused, before), '控件激活后收到真实playing再开始闲置计时');
+      };
+      const rangeEdges = async (range, label) => {
+        const saved = await range.inputValue(), cdp = await p.context().newCDPSession(p), measured = [];
+        try {
+          const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+          const find = (node, predicate) => {
+            if (predicate(node)) return node;
+            for (const child of [...(node.children || []), ...(node.shadowRoots || [])]) { const found = find(child, predicate); if (found) return found; }
+          };
+          const attr = (node, name) => { const i = node.attributes?.indexOf(name); return i >= 0 ? node.attributes[i + 1] : undefined; };
+          const input = find(root, node => node.nodeName === 'INPUT' && attr(node, 'aria-label') === label);
+          const thumb = input && find(input, node => attr(node, 'id') === 'thumb');
+          assert.ok(thumb, `${label}必须测量真实Chromium滑块`);
+          for (const edge of ['min', 'max']) {
+            await range.evaluate((input, edge) => { input.value = input[edge]; }, edge);
+            const box = await range.boundingBox(), { model } = await cdp.send('DOM.getBoxModel', { backendNodeId: thumb.backendNodeId });
+            const borders = await range.evaluate(input => { const s = getComputedStyle(input); return { left: parseFloat(s.borderLeftWidth), right: parseFloat(s.borderRightWidth) }; });
+            const xs = model.border.filter((_value, index) => index % 2 === 0);
+            const gap = edge === 'min' ? Math.min(...xs) - box.x - borders.left : box.x + box.width - borders.right - Math.max(...xs);
+            measured.push({ edge, gap, input: box, thumb: model.border });
+          }
+          const mode = await p.evaluate(() => document.fullscreenElement ? 'fullscreen' : 'window');
+          await writeFile(join(output, `range-edges-${tv ? 'tv' : 'desktop'}-${p.viewportSize().width}-${mode}-${label}.json`), JSON.stringify(measured, null, 2));
+          for (const { edge, gap } of measured) assert.ok(Math.abs(gap) <= 2, `${label} ${edge}滑块应到达轨道边缘，实际内缩${gap}px`);
+          return measured;
+        } finally { await range.evaluate((input, value) => { input.value = value; }, saved); await cdp.detach(); }
+      };
+      const shown = async label => { assert.equal(await frame.evaluate(el => el.classList.contains('player-controls-idle')), false, label); assert.equal(await controls.isVisible(), true, label); };
+      const hidden = async label => {
+        const state = await video.evaluate(v => ({ paused: v.paused, ended: v.ended, readyState: v.readyState, time: v.currentTime, active: document.activeElement?.outerHTML?.slice(0, 240) }));
+        const idle = await frame.evaluate(el => el.classList.contains('player-controls-idle'));
+        if (!idle) await writeFile(join(output, `compatible-control-events-${tv ? 'tv' : 'desktop'}.json`), JSON.stringify(await p.evaluate(() => window.filmControlEvents), null, 2));
+        assert.equal(idle, true, `${label} ${JSON.stringify(state)}`); await until(() => controls.isHidden(), label);
+      };
+      const overlay = async () => {
+        const boxes = await frame.evaluate(el => ({ surface: el.querySelector('.player-surface').getBoundingClientRect().toJSON(), controls: el.querySelector('#full-film-controls').getBoundingClientRect().toJSON() }));
+        await writeFile(join(output, `compatible-overlay-${tv ? 'tv' : 'desktop'}-${p.viewportSize().width}.json`), JSON.stringify(boxes, null, 2));
+        assert.ok(boxes.controls.top >= boxes.surface.top && boxes.controls.bottom <= boxes.surface.bottom + 1, `完整控件悬浮在视频底部，不挤占画面高度 ${JSON.stringify(boxes)}`);
+      };
       await p.getByRole('button', { name: '暂停', exact: true }).click();
       // Reproduce a newly generated two-second HLS window while the original movie is almost two hours.
       await video.evaluate(v => { Object.defineProperty(v, 'duration', { configurable: true, get: () => 2.021333 }); v.currentTime = 1; v.dispatchEvent(new Event('timeupdate')); });
@@ -1245,6 +1308,18 @@ try {
       await p.getByRole('button', { name: '取消静音', exact: true }).click();
       await p.getByLabel('音量', { exact: true }).fill('0.35'); await p.getByLabel('音量', { exact: true }).dispatchEvent('input');
       assert.ok(Math.abs(await video.evaluate(v => v.volume) - .35) < .001); assert.equal(await video.evaluate(v => v.muted), false);
+      await rangeEdges(timeline, '原片进度'); await rangeEdges(volume, '音量'); await overlay();
+      {
+        const box = await volume.boundingBox(), y = box.y + box.height / 2;
+        await p.mouse.click(box.x + 1, y); assert.equal(await video.evaluate(v => v.volume), 0, '真实点击音量左端为零');
+        await p.mouse.click(box.x + box.width - 1, y); assert.equal(await video.evaluate(v => v.volume), 1, '真实点击音量右端为最大');
+        await p.mouse.move(box.x + 1, y); await p.mouse.down(); await p.mouse.move(box.x + box.width - 1, y, { steps: 8 }); await p.mouse.up();
+        assert.equal(await video.evaluate(v => v.volume), 1, '真实拖动音量到右端为最大');
+        await volume.focus(); await p.keyboard.press('Home'); assert.equal(await video.evaluate(v => v.volume), 0);
+        await p.keyboard.press('End'); assert.equal(await video.evaluate(v => v.volume), 1);
+        await p.keyboard.press('ArrowLeft'); assert.ok(Math.abs(await video.evaluate(v => v.volume) - .95) < .001);
+        await p.keyboard.press('ArrowRight'); assert.equal(await video.evaluate(v => v.volume), 1); assert.equal(await video.evaluate(v => v.muted), false);
+      }
       if (!tv) {
         await p.locator('.player-subtitles summary').click();
         await p.getByLabel('添加字幕文件', { exact: true }).setInputFiles({ name: 'timeline.srt', mimeType: 'text/plain', buffer: Buffer.from('1\n01:40:00,000 --> 01:40:03,000\n全片定位字幕\n') });
@@ -1253,11 +1328,40 @@ try {
       await p.getByRole('button', { name: '全屏', exact: true }).click();
       await until(() => p.evaluate(() => document.fullscreenElement?.classList.contains('player-frame')), '完整时间轴与基本控件共同进入全屏');
       assert.equal(await controls.evaluate(el => document.fullscreenElement.contains(el)), true);
+      await overlay(); await rangeEdges(timeline, '原片进度'); await rangeEdges(volume, '音量');
+      {
+        await playControl();
+        const box = await frame.boundingBox(); await p.mouse.move(box.x + box.width / 3, box.y + box.height / 3);
+        for (let i = 0; i < 3; i++) { await p.clock.fastForward(1000); await video.evaluate(v => v.dispatchEvent(new Event('timeupdate'))); }
+        await p.clock.fastForward(1); await hidden('播放timeupdate不能反复唤醒全屏悬浮控件');
+        await p.screenshot({ path: join(output, `compatible-controls-idle-${tv ? 'tv' : 'desktop'}.png`) });
+        await p.mouse.move(box.x + box.width / 2, box.y + box.height / 3); await shown('鼠标移动唤醒兼容控件');
+        await p.clock.fastForward(3001); await hidden('鼠标停止后兼容控件再次自动隐藏');
+        await video.focus();
+        if (tv) {
+          await video.evaluate(v => v.blur()); assert.equal(await p.evaluate(() => document.activeElement === document.body), true);
+          await p.keyboard.press('ArrowDown'); await shown('TV隐藏控件且焦点丢失到body时首个方向键立即唤醒');
+          await timeline.focus();
+        }
+        await p.keyboard.press('Tab');
+        assert.equal(await controls.evaluate(el => el.contains(document.activeElement)), true, '键盘或TV方向键唤醒并进入控件');
+        await p.mouse.move(box.x + box.width * .6, box.y + box.height / 3);
+        await p.clock.fastForward(5000); await shown('键盘焦点停留控件时保持可操作');
+        await p.getByRole('button', { name: '静音', exact: true }).click();
+        await p.clock.fastForward(3001); await hidden('鼠标点击留下的控件焦点不能永久阻止隐藏');
+        await video.evaluate(v => v.pause()); await shown('暂停立即显示兼容控件');
+        await p.clock.fastForward(5000); await shown('暂停时控件保持显示');
+        await p.getByRole('button', { name: '取消静音', exact: true }).click();
+        await playControl(true);
+        await p.clock.fastForward(3001); await hidden('键盘激活播放后仍按闲置时间隐藏');
+        await video.evaluate(v => v.pause()); await shown('键盘播放测试结束后暂停显示控件');
+      }
       if (tv) {
         const tvOutput = resolve(process.env.TV_TEST_OUTPUT || '.test-output'); await mkdir(tvOutput, { recursive: true });
         const fullscreenLayouts = [];
         for (const viewport of [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }]) {
           await p.setViewportSize(viewport);
+          await rangeEdges(timeline, '原片进度'); await rangeEdges(volume, '音量'); await overlay();
           for (const button of await controls.locator('button').all()) for (const key of ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) {
             await button.focus(); await p.keyboard.press(key);
             assert.equal(await p.evaluate(() => document.fullscreenElement.contains(document.activeElement)), true, `TV全屏${key}不把焦点移到屏外控件`);
@@ -1274,6 +1378,7 @@ try {
           await until(() => p.evaluate(() => document.fullscreenElement.contains(document.activeElement)), 'TV全屏移除当前末端控件后MutationObserver恢复屏内焦点');
           const layout = await controls.evaluate(el => ({ width: innerWidth, height: innerHeight, overflow: document.documentElement.scrollWidth - innerWidth, controls: el.getBoundingClientRect().toJSON() }));
           assert.ok(layout.overflow <= 1 && layout.controls.top >= 0 && layout.controls.bottom <= layout.height, 'TV全屏完整控制条在视口内且不溢出');
+          assert.equal(await controls.evaluate(el => el.scrollHeight <= el.clientHeight + 1), true, '正常TV全屏控件无需内部滚动');
           fullscreenLayouts.push(layout); await p.screenshot({ path: join(tvOutput, `tv-${viewport.width}-fullscreen.png`) });
         }
         await writeFile(join(tvOutput, 'tv-fullscreen-layouts.json'), JSON.stringify(fullscreenLayouts, null, 2));
@@ -1281,6 +1386,20 @@ try {
         await p.keyboard.press('Enter');
       } else await p.getByRole('button', { name: '退出全屏', exact: true }).click();
       await until(() => p.evaluate(() => !document.fullscreenElement), '完整播放器退出全屏');
+      await shown('退出全屏保留可操作的兼容控件'); await overlay();
+      await playControl();
+      let fullscreenEvents = await p.evaluate(() => window.filmFullscreenCount);
+      await p.getByRole('button', { name: '全屏', exact: true }).focus(); await p.keyboard.press('Enter');
+      await until(() => p.evaluate(before => window.filmFullscreenCount > before && document.fullscreenElement?.classList.contains('player-frame'), fullscreenEvents), '键盘Enter激活后收到真实fullscreenchange');
+      await p.clock.fastForward(3001); await hidden('键盘激活全屏后仍按闲置时间隐藏');
+      fullscreenEvents = await p.evaluate(() => window.filmFullscreenCount);
+      await p.evaluate(() => document.exitFullscreen());
+      await until(() => p.evaluate(before => window.filmFullscreenCount > before && !document.fullscreenElement, fullscreenEvents), '退出后收到真实fullscreenchange');
+      await shown('退出全屏立即显示窗口控件');
+      await p.clock.fastForward(3001); await hidden('窗口模式兼容控件同样闲置隐藏');
+      await frame.dispatchEvent('pointerdown', { pointerId: 99, pointerType: 'touch', bubbles: true }); await shown('触摸视频唤醒窗口控件');
+      await frame.dispatchEvent('pointercancel', { pointerId: 99, pointerType: 'touch', bubbles: true });
+      await video.evaluate(v => v.pause());
       const before = transcodeStarts.length, progress = quarkProgress.length;
       holdTranscode = true;
       await timeline.evaluate(input => { input.focus(); input.value = '6000'; input.dispatchEvent(new Event('input', { bubbles: true })); input.blur(); });
@@ -1291,6 +1410,7 @@ try {
       await until(() => transcodeStarts.length === before + 1, '超出当前HLS窗口的完整影片定位');
       assert.equal(transcodeStarts.at(-1).position, 6000); assert.ok(transcodeStarts.at(-1).quarkAsset);
       assert.equal(await timeline.isDisabled(), true, '定位在途不能反复拖动');
+      await p.clock.fastForward(4000); await shown('定位加载在途时控件不能自动隐藏');
       holdTranscode = false; releaseTranscode(); releaseTranscode = null;
       await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused && v.currentSrc.includes('/api/transcode/')).catch(() => false), '绝对定位后重新解码');
       await assertVideoFrames(video, '完整影片定位后真实画面');
@@ -1305,8 +1425,9 @@ try {
         assert.equal(transcodeStarts.at(-1).position, 6002, '方向键按原片秒数定位而非片段时间');
         await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused).catch(() => false), '方向键定位后继续播放');
       }
-      if (!tv) for (const drag of [false, true]) {
-        await p.getByRole('button', { name: '暂停', exact: true }).click();
+      if (!tv) for (const target of [0, .35, .65]) {
+        const drag = target === .65;
+        if (!drag) await p.getByRole('button', { name: '暂停', exact: true }).click();
         await timeline.scrollIntoViewIfNeeded(); const box = await timeline.boundingBox(); assert.ok(box);
         const count = transcodeStarts.length, duration = Number(await timeline.getAttribute('max'));
         holdTranscode = true; let selected;
@@ -1314,23 +1435,32 @@ try {
           const position = Number(await timeline.inputValue());
           await p.mouse.move(box.x + box.width * position / duration, box.y + box.height / 2); await p.mouse.down();
           await p.mouse.move(box.x + box.width * .65, box.y + box.height / 2, { steps: 8 });
+          await p.clock.fastForward(4000); await shown('播放中持续拖动进度条时保持显示');
           selected = Number(await timeline.inputValue());
           await timeline.evaluate(input => input.blur()); await video.evaluate(v => v.dispatchEvent(new Event('timeupdate')));
           assert.equal(Number(await timeline.inputValue()), selected, '真实拖动后的失焦进度更新保留所选时间');
           await p.mouse.up();
         } else {
           await timeline.evaluate(input => input.addEventListener('input', () => { input.blur(); document.querySelector('video').dispatchEvent(new Event('timeupdate')); }, { once: true }));
-          await p.mouse.click(box.x + box.width * .35, box.y + box.height / 2);
+          await p.mouse.click(box.x + (target === 0 ? 1 : box.width * target), box.y + box.height / 2);
         }
         await until(() => transcodeStarts.length === count + 1, drag ? '真实鼠标拖动提交一次定位' : '真实鼠标点击提交一次定位');
         const requested = transcodeStarts.at(-1).position;
-        assert.ok(Math.abs(requested / duration - (drag ? .65 : .35)) < .03, '点击或拖动保留原片绝对时间而非回到0');
+        if (target === 0) assert.equal(requested, 0, '点击进度条最左端真实提交原片零秒');
+        else assert.ok(Math.abs(requested / duration - target) < .03, '点击或拖动保留原片绝对时间而非回到0');
         if (drag) assert.equal(requested, selected, '拖动提交捕获的时间');
         assert.equal(await timeline.isDisabled(), true);
         holdTranscode = false; releaseTranscode(); releaseTranscode = null;
         await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused && v.currentSrc.includes('/api/transcode/')).catch(() => false), '鼠标定位后继续解码播放');
       }
+      await video.evaluate(v => v.pause());
+      await shown('切换手机视口前暂停控件可见');
       await p.setViewportSize({ width: 390, height: 844 }); assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '完整控件手机无横向溢出');
+      await rangeEdges(timeline, '原片进度'); await rangeEdges(volume, '音量'); await overlay();
+      await p.getByRole('button', { name: '全屏', exact: true }).focus();
+      const lastControl = await controls.evaluate(el => ({ controls: el.getBoundingClientRect().toJSON(), button: [...el.querySelectorAll('button')].at(-1).getBoundingClientRect().toJSON(), needsScroll: el.scrollHeight > el.clientHeight + 1 }));
+      assert.ok(lastControl.button.top >= lastControl.controls.top - 1 && lastControl.button.bottom <= lastControl.controls.bottom + 1, '窄窗口末尾全屏按钮聚焦后自动滚入控件可见区域');
+      if (!tv) assert.equal(lastControl.needsScroll, false, '普通手机完整控件无需内部滚动');
       await p.screenshot({ path: join(output, `full-film-timeline-${tv ? 'tv' : 'mobile'}.png`), fullPage: true });
       transcodeDuration = null; await p.locator('.player-toolbar').getByRole('button', { name: '重新兼容播放', exact: true }).click();
       await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused).catch(() => false), '未知原总长仍能播放');
@@ -1338,8 +1468,18 @@ try {
       quarkMode = 'webm'; await p.locator('.player-toolbar').getByRole('button', { name: '重试夸克播放', exact: true }).click();
       await until(() => p.locator('video').evaluate(v => v.readyState >= 2 && v.currentSrc.includes('/api/quark/media/')).catch(() => false), '切回直接播放');
       assert.equal(await p.locator('video').evaluate(v => v.controls), true, '普通直放保留原生控件'); assert.equal(await p.locator('#full-film-controls').isHidden(), true);
+      await p.locator('nav a[href="#home"]').click(); await until(() => p.locator('video').count().then(count => count === 0), '离开路由卸载播放器');
+      await p.evaluate(() => {
+        window.filmListenerProbe.stopped = true;
+        for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) window.dispatchEvent(new PointerEvent(type, { pointerId: 1 }));
+        window.dispatchEvent(new Event('blur'));
+      });
+      await p.clock.fastForward(10000);
+      const listeners = await p.evaluate(() => window.filmListenerProbe);
+      assert.ok(listeners.registered >= 4); assert.equal(listeners.afterStop, 0, '退出路由移除兼容控件的window监听器');
+      await p.evaluate(() => window.restoreFilmListenerProbe());
     });
-    console.log('PASS 完整7116.05秒/5375偏移、失焦进度更新与鼠标点击拖动不覆盖定位、键盘TV/进度/字幕、手机与未知时长/直放回退');
+    console.log('PASS 完整7116.05秒/5375偏移、原生滑块端点几何与音量/进度真实交互、兼容悬浮控件闲置隐藏/唤醒/暂停/加载/拖动/TV键盘焦点/路由清理、字幕与手机/未知时长/直放回退');
   }
 
   async function verifyQuarkPictureReadiness() {
@@ -2161,7 +2301,8 @@ try {
   await until(() => comments.get(episodeKey(compatibilityFilm.key, '第1集')).some(value => value.text === '兼容原片时间' && value.time >= 62 && value.time < 65), '兼容弹幕按原片绝对时间');
   await cp.locator('video').evaluate(video => video.pause());
   await until(() => app.store.list('history').some(value => value.key === compatibilityFilm.key && value.position >= 62 && value.duration === 1200), '兼容保存原片进度和总时长');
-  assert.match(await cp.locator('.player-clock').textContent(), /软件兼容播放/);
+  assert.match(await cp.locator('.player-note').textContent(), /软件兼容播放/);
+  assert.match(await cp.locator('.player-clock').textContent(), /^\d{2}:\d{2} \/ 20:00$/);
   assert.equal(await cp.locator('video').evaluate(video => video.controls), false, '完整原片时间轴关闭原生短窗口控件');
   assert.equal(playabilityReports.length, originalReports, '转码成功不报告原始URL可播');
   await cp.screenshot({ path: join(output, 'desktop-compatible-player.png'), fullPage: true });

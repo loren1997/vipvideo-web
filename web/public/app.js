@@ -2118,11 +2118,52 @@ function mountPlayer(current) {
   };
   for (const event of ['play', 'pause', 'volumechange']) video.addEventListener(event, updateTransport);
   frame.addEventListener('fullscreenchange', () => { full.textContent = document.fullscreenElement === frame ? '退出全屏' : '全屏'; });
-  let pendingTimelinePosition;
+  let pendingTimelinePosition, controlsTimer, controlsPointer = null, keyboardControls = false, controlsBuffering = false, controlsLoading = false;
+  const controlEvents = new AbortController(), controlOptions = { signal: controlEvents.signal };
+  const canHideControls = () => current.fullFilmControls && !video.paused && !video.ended && !video.error && !current.transcodeLoading && !controlsBuffering && controlsPointer === null && !(keyboardControls && filmControls.contains(document.activeElement));
+  const scheduleControls = () => {
+    clearTimeout(controlsTimer);
+    if (player !== current || !canHideControls()) return;
+    controlsTimer = setTimeout(() => {
+      if (player !== current || !canHideControls()) return;
+      if (filmControls.contains(document.activeElement)) video.focus({ preventScroll: true });
+      clearTimeout(controlsTimer);
+      frame.classList.add('player-controls-idle');
+    }, 3000);
+  };
+  const showControls = (keyboard = keyboardControls) => {
+    if (player !== current) return;
+    keyboardControls = keyboard;
+    frame.classList.remove('player-controls-idle');
+    scheduleControls();
+  };
+  const releaseControls = event => {
+    if (controlsPointer !== event.pointerId) return;
+    controlsPointer = null; showControls(false);
+  };
+  frame.addEventListener('pointermove', () => showControls(), controlOptions);
+  frame.addEventListener('pointerdown', event => {
+    if (filmControls.contains(event.target)) controlsPointer = event.pointerId;
+    showControls(false);
+  }, controlOptions);
+  for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) window.addEventListener(event, releaseControls, controlOptions);
+  window.addEventListener('blur', () => { controlsPointer = null; keyboardControls = false; scheduleControls(); }, controlOptions);
+  filmControls.addEventListener('focusin', () => showControls(), controlOptions);
+  filmControls.addEventListener('focusout', scheduleControls, controlOptions);
+  filmControls.addEventListener('click', () => showControls(false), controlOptions);
+  frame.addEventListener('fullscreenchange', () => showControls(), controlOptions);
+  for (const event of ['play', 'pause', 'playing', 'canplay', 'waiting', 'loadstart', 'ended', 'error']) video.addEventListener(event, () => {
+    if (event === 'waiting' || event === 'loadstart') controlsBuffering = true;
+    else if (event === 'playing' || event === 'canplay' || event === 'ended' || event === 'error') controlsBuffering = false;
+    showControls();
+  }, controlOptions);
+  current.showFilmControls = showControls;
+  current.clearFilmControls = () => { clearTimeout(controlsTimer); controlEvents.abort(); };
   const updateClock = () => {
     const duration = playDuration(current), position = playPosition(current);
-    clockText.textContent = `${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${formatTime(position)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
+    const previousControls = current.fullFilmControls;
     current.fullFilmControls = Boolean(current.transcoded && !current.live && duration > 0);
+    clockText.textContent = `${current.transcoded && !current.fullFilmControls ? `${compatibilityLabel(current)} · ` : ''}${formatTime(position)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
     filmControls.hidden = !current.fullFilmControls;
     // Rewriting controls on every progress update resets the browser's auto-hide timer.
     if (video.controls !== !current.fullFilmControls) video.controls = !current.fullFilmControls;
@@ -2132,6 +2173,10 @@ function mountPlayer(current) {
     timeline.hidden = !current.transcoded || current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
     if (pendingTimelinePosition === undefined) { timeline.max = String(duration); timeline.value = String(position); }
     timeline.setAttribute('aria-valuetext', `${formatTime(position)} / ${formatTime(duration)}`);
+    // Progress updates must not restart the controls' idle timer.
+    if (previousControls !== current.fullFilmControls || controlsLoading !== Boolean(current.transcodeLoading)) {
+      controlsLoading = Boolean(current.transcodeLoading); showControls();
+    }
   };
   timeline.addEventListener('input', () => { pendingTimelinePosition = Number(timeline.value); });
   timeline.addEventListener('change', () => {
@@ -2323,6 +2368,7 @@ function stopPlayer(invalidate = true) {
   const current = player; player = null;
   if (!current) return Promise.resolve();
   const save = saveHistory(current);
+  current.clearFilmControls?.();
   clearInterval(current.timer);
   clearInterval(current.danmakuTimer); clearDanmaku(current);
   clearTimeout(current.loadTimer);
@@ -2655,6 +2701,7 @@ $('#logout').addEventListener('click', async () => {
 window.addEventListener('hashchange', () => void renderRoute());
 window.addEventListener('keydown', event => {
   const current = player, target = event.target;
+  if (current?.fullFilmControls && target instanceof Element && (event.key === 'Tab' || /^Media/.test(event.key) || tvMode && target === document.body && /^Arrow/.test(event.key) || $('#player-host')?.contains(target))) current.showFilmControls?.(true);
   if (tvMode && !event.defaultPrevented && !event.altKey && !event.ctrlKey && !event.metaKey && !event.isComposing && target instanceof Element) {
     if (target.matches('input[type="number"]') && event.key === 'Enter') { event.preventDefault(); moveTvFocus('ArrowDown', target); return; }
     if (target.matches('textarea')) {
@@ -2699,6 +2746,7 @@ window.addEventListener('pagehide', () => {
   if (!player) return;
   const current = player;
   playVersion++; player = null;
+  current.clearFilmControls?.();
   clearInterval(current.timer); clearInterval(current.danmakuTimer); clearTimeout(current.loadTimer); clearDanmaku(current);
   if (hls) { hls.destroy(); hls = null; }
   current.video?.pause();
