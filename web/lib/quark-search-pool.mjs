@@ -2,7 +2,7 @@ import { Readable } from 'node:stream';
 import { readText, validateUrl } from './network.mjs';
 import { createQuarkPublicRequest } from './quark-search-network.mjs';
 import { createQuarkSearchRequest } from './quark-search.mjs';
-import { searchGoogleQuark, searchBingQuark, quarkPasswordDate, classifyQuarkCandidate, quarkSearchTitleVariants } from './quark-google-search.mjs';
+import { searchGoogleQuark, searchBingQuark, quarkPasswordDate, classifyQuarkCandidate, quarkSearchTitleVariants, createGoogleSearchCooldown } from './quark-google-search.mjs';
 
 const KEY = 'quark-search-pool-v1', DAY = 86_400_000, HEALTH_INTERVAL = 6 * 60 * 60_000;
 const RECALL_KEY = 'quark-search-availability-v3';
@@ -145,6 +145,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
   let state = { candidates: [], retired: [], lastDiscovery: 0, lastHealth: 0, healthCursor: 0, discoveryCursor: 0, discoveryError: '' };
   let active = 0, timer, started = false, stopping = false, discoveryJob, currentPrimary;
   const waiting = [], jobs = new Set(), recent = new Map(), rendered = new Map(), activeQueries = new Map();
+  const googleCooldown = createGoogleSearchCooldown({ now });
   try {
     const text = store.meta(KEY);
     if (typeof text === 'string' && text.length <= 64 * 1024) {
@@ -219,7 +220,10 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
             ? { accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'accept-language': 'zh-CN,zh;q=0.9', 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' }
             : { accept: 'application/json, application/rss+xml, text/plain', 'user-agent': 'VipVideo-Web-quark-search' } });
           if (expired) { response.destroy(); throw failure('公开搜索超时', 504); }
-          if (response.statusCode !== 200) throw failure('搜索接口返回 HTTP ' + (Number.isInteger(response.statusCode) && response.statusCode >= 100 && response.statusCode <= 599 ? response.statusCode : 502));
+          if (response.statusCode !== 200) {
+            const httpStatus = Number.isInteger(response.statusCode) && response.statusCode >= 100 && response.statusCode <= 599 ? response.statusCode : 502;
+            throw Object.assign(failure('搜索接口返回 HTTP ' + httpStatus), { httpStatus });
+          }
           reading = true;
           const html = await readText(response, maxBytes);
           return followRedirects ? { html, url: response.finalUrl || url } : html;
@@ -498,7 +502,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           }
           const webDeadline = Math.min(entry.deadline, now() + 10000);
           const pages = await Promise.allSettled([
-            typeof renderSearch === 'function' ? [] : googleSearch(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, read: (url, duration, maxBytes, limit, readSignal) => text(url, duration, request, maxBytes, Math.min(webDeadline, limit ?? webDeadline), true, readSignal ? AbortSignal.any([entry.controller.signal, readSignal]) : entry.controller.signal), deadline: webDeadline, now }),
+            typeof renderSearch === 'function' ? [] : googleSearch(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, cooldown: googleCooldown, read: (url, duration, maxBytes, limit, readSignal) => text(url, duration, request, maxBytes, Math.min(webDeadline, limit ?? webDeadline), true, readSignal ? AbortSignal.any([entry.controller.signal, readSignal]) : entry.controller.signal), deadline: webDeadline, now }),
             searchBingQuark(query.title, { aliases: query.aliases, year: query.year, page, titleOnly: true, read: (url, duration, maxBytes, limit, readSignal) => text(url, duration, request, maxBytes, Math.min(webDeadline, limit ?? webDeadline), true, readSignal ? AbortSignal.any([entry.controller.signal, readSignal]) : entry.controller.signal), deadline: webDeadline, now }),
           ]);
           if (stopping) throw failure('公开搜索已停止', 503, true);

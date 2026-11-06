@@ -20,6 +20,84 @@ function fixture(search, pages = {}) {
   return { calls, read, now: () => time };
 }
 
+test('Google cooldown admits one SERP and bounds repeated restrictions until a ready response', () => {
+  let current = time;
+  const cooldown = webSearch.createGoogleSearchCooldown({ now: () => current });
+  for (const duration of [60_000, 120_000, 240_000, 480_000, 900_000, 900_000]) {
+    assert.equal(cooldown.acquire().allowed, true);
+    assert.equal(cooldown.acquire().reason, 'busy');
+    cooldown.blocked(); cooldown.release();
+    const retryAt = current + duration;
+    assert.deepEqual(cooldown.acquire(), { allowed: false, reason: 'cooldown', retryAt });
+    current = retryAt - 1;
+    assert.equal(cooldown.acquire().allowed, false);
+    current++;
+  }
+  assert.equal(cooldown.acquire().allowed, true);
+  current += 900_000;
+  assert.equal(cooldown.acquire().reason, 'busy', 'an expired deadline does not admit another in-flight recovery');
+  cooldown.ready(); cooldown.release();
+  assert.equal(cooldown.acquire().allowed, true);
+  cooldown.blocked(); cooldown.release();
+  assert.equal(cooldown.acquire().retryAt, current + 60_000, 'ready Google results reset the backoff');
+});
+
+test('static Google restrictions share cooldown across films and preserve trusted HTTP status', async t => {
+  for (const upstream of ['<title>安全验证</title>', 403, 429]) await t.test(String(upstream), async () => {
+    let current = time, calls = 0;
+    const cooldown = webSearch.createGoogleSearchCooldown({ now: () => current });
+    const input = { now: () => current, cooldown, read: async () => {
+      calls++;
+      if (typeof upstream === 'number') throw Object.assign(new Error('private upstream body'), { httpStatus: upstream });
+      return upstream;
+    } };
+    await assert.rejects(searchGoogleQuark(title, input), error => {
+      assert.match(error.quarkPoolReason, /Google.*暂缓重试/);
+      assert.equal(error.httpStatus, typeof upstream === 'number' ? upstream : undefined);
+      assert.equal(JSON.stringify(error).includes('private upstream body'), false);
+      return true;
+    });
+    const skipped = await searchGoogleQuark('另一影片', { ...input, page: 1 });
+    assert.deepEqual(skipped, []); assert.match(skipped.reason, /暂缓重试/);
+    assert.equal(calls, 1);
+    current += 60_000;
+    const rows = await searchGoogleQuark(title, { ...input, read: async () => { calls++; return link('https://pan.quark.cn/s/ready001'); } });
+    assert.equal(rows.length, 1); assert.equal(calls, 2);
+  });
+});
+
+test('static Google leaves the SERP gate before reading ordinary articles', async () => {
+  const cooldown = webSearch.createGoogleSearchCooldown({ now: () => time });
+  let started;
+  const articleStarted = new Promise(resolve => { started = resolve; });
+  let finish;
+  const articleWait = new Promise(resolve => { finish = resolve; });
+  const first = searchGoogleQuark(title, { now: () => time, cooldown, read: async url => {
+    if (url.includes('google.com/search')) return link('https://posts.example/slow');
+    started(); await articleWait; throw Object.assign(new Error('private article'), { httpStatus: 403 });
+  } });
+  await articleStarted;
+  let secondReads = 0;
+  const second = await searchGoogleQuark('另一影片', { now: () => time, cooldown, read: async () => { secondReads++; return link('https://pan.quark.cn/s/other001', '另一影片 夸克资源'); } });
+  assert.equal(second.length, 1); assert.equal(secondReads, 1);
+  finish(); await first;
+  const permit = cooldown.acquire();
+  assert.equal(permit.allowed, true, 'ordinary article HTTP 403 does not pause Google'); cooldown.release();
+});
+
+test('Google JS shells, timeouts and address guards do not count as search restrictions', async t => {
+  for (const upstream of ['Please enable JavaScript to use Google Search.', Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }), Object.assign(new Error('address denied'), { status: 403 })]) await t.test(String(upstream), async () => {
+    const cooldown = webSearch.createGoogleSearchCooldown({ now: () => time });
+    const input = fixture(upstream);
+    await searchGoogleQuark(title, { ...input, cooldown }).catch(error => { assert.match(error.message, /Google 公开搜索暂不可用/); });
+    assert.equal(cooldown.acquire().allowed, true); cooldown.release();
+  });
+  const first = fixture('<title>安全验证</title>'), second = fixture('<title>安全验证</title>');
+  await assert.rejects(searchGoogleQuark(title, first));
+  await assert.rejects(searchGoogleQuark(title, second));
+  assert.equal(first.calls.length, 1); assert.equal(second.calls.length, 1, 'library calls without a supplied cooldown stay independent');
+});
+
 const roundupUrl = 'https://www.sina.cn/news/detail/1234567890123456.html';
 const roundupQuery = { title: '八仙！', year: '2026' };
 const roundup = '<title>多部影片资源</title><article>🔥遮天.HD4K 更180<br/>夸克：https://pan.quark.cn/s/before26<br/><br/>🔥八仙！ (2026)（1080P）【喜剧/动画/奇幻/冒险】<br/>百度：http://t.cn/Baidu001<br/>提取码：8888<br/>百度: http://t.cn/Baidu002 提取码: 8888<br/>夸克：http://t.cn/Quark001<br/><br/>🔥奥德赛（1080P）【历史/奇幻】<br/>夸克：http://t.cn/Other001<br/><br/></article>';
@@ -863,7 +941,7 @@ test('Google preserves classified reader failures and error codes while keeping 
 test('Google validation pages report a fixed reason without parsing hidden resources', async () => {
   const input = fixture('<title>安全验证</title>private Cookie=secret ' + link('https://pan.quark.cn/s/hidden1'));
   await assert.rejects(searchGoogleQuark(title, input), error => {
-    assert.equal(error.quarkPoolReason, '搜索页面要求登录或人机验证，已停止自动读取');
+    assert.equal(error.quarkPoolReason, 'Google 搜索要求验证或限制访问，已暂缓重试并继续其他公开渠道');
     assert.equal(/private|Cookie|secret|hidden1/.test(JSON.stringify(error)), false);
     return true;
   });

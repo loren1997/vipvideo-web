@@ -1,4 +1,4 @@
-import { googleQueryUrl, bingQueryUrl, quarkSearchQueries, quarkSearchPageState, extractQuarkSearchResults, extractQuarkArticle, resolveQuarkArticle, classifyQuarkCandidate, hasQuarkResourceCue } from './quark-google-search.mjs';
+import { googleQueryUrl, bingQueryUrl, quarkSearchQueries, quarkSearchPageState, extractQuarkSearchResults, extractQuarkArticle, resolveQuarkArticle, classifyQuarkCandidate, hasQuarkResourceCue, createGoogleSearchCooldown } from './quark-google-search.mjs';
 
 const blocked = value => /g-recaptcha|h-captcha|cf-chl-|our systems have detected|unusual traffic|<title[^>]*>[^<]*(?:验证码|安全验证|登录|sign\s?in|log\s?in)|<title[^>]*>\s*人机验证\s*<\/title\s*>|^(?:人机验证|安全验证|检测到异常流量)/i.test(value);
 const direct = value => { const url = new URL(value); return url.protocol === 'https:' && url.hostname === 'pan.quark.cn' && /^\/s\/[a-z0-9]{6,32}\/?$/i.test(url.pathname); };
@@ -6,6 +6,7 @@ const reasons = { browserUnavailable: '动态网页搜索助手未启动，请�
 
 // Public pages only; the renderer never receives the family's cloud credentials.
 export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
+  const googleCooldown = createGoogleSearchCooldown({ now });
   return async (query, { signal, deadline = now() + 45000 } = {}) => {
     signal?.throwIfAborted();
     if (deadline <= now()) return [];
@@ -41,18 +42,32 @@ export function createQuarkRenderedSearch({ render, read, now = Date.now }) {
     const search = async (engine, term, rss = false) => {
       const searchDeadline = engine === 'Google' ? googleEnd : searchEnd;
       if (now() >= searchDeadline || engine === 'Google' && googleStopped) return;
-      const url = engine === 'Google' ? googleQueryUrl(term, query.page) : bingQueryUrl(term, query.page, rss);
+      const permit = engine === 'Google' ? googleCooldown.acquire() : undefined;
+      if (permit && !permit.allowed) {
+        googleStopped = true;
+        notes.add(permit.reason === 'busy' ? 'Google 搜索正在处理，已继续其他公开渠道' : 'Google 搜索暂缓重试，已继续其他公开渠道');
+        return;
+      }
       try {
+        const url = engine === 'Google' ? googleQueryUrl(term, query.page) : bingQueryUrl(term, query.page, rss);
         signal?.throwIfAborted();
         const result = engine === 'Google' || !read ? await render(url, { signal, deadline: Math.min(searchDeadline, now() + 20000) }) : await read(url, { signal, deadline: Math.min(searchEnd, now() + 3000) });
         const state = quarkSearchPageState(result.html, result.url);
         if (state !== 'ready') {
           if (engine === 'Google') googleStopped = true;
-          notes.add(state === 'blocked' ? '搜索网页要求验证，已切换其他公开渠道' : '搜索网页需要 JavaScript，已切换其他公开渠道');
+          if (engine === 'Google' && state === 'blocked') googleCooldown.blocked();
+          notes.add(state === 'blocked' ? engine === 'Google' ? 'Google 搜索要求验证或限制访问，已暂缓重试并继续其他公开渠道' : '搜索网页要求验证，已切换其他公开渠道' : '搜索网页需要 JavaScript，已切换其他公开渠道');
           return;
         }
+        if (engine === 'Google' && result.html.trim()) googleCooldown.ready();
         if (collect(result, engine) && engine === 'Google') googleStopped = true;
-      } catch (cause) { report(cause); if (engine === 'Google') googleStopped = true; }
+      } catch (cause) {
+        if (engine === 'Google' && (cause?.quarkPoolReason === 'browserBlocked' || [403, 429].includes(cause?.httpStatus))) {
+          googleCooldown.blocked();
+          notes.add('Google 搜索要求验证或限制访问，已暂缓重试并继续其他公开渠道');
+        }
+        report(cause); if (engine === 'Google') googleStopped = true;
+      } finally { if (engine === 'Google') googleCooldown.release(); }
     };
     for (const term of quarkSearchQueries(query)) {
       if (now() >= searchEnd && (googleStopped || now() >= googleEnd)) break;

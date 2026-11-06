@@ -1,6 +1,22 @@
 import { validateUrl } from './network.mjs';
 
 const MAX_BODY = 512 * 1024;
+
+export function createGoogleSearchCooldown({ now = Date.now } = {}) {
+  const delays = [60_000, 120_000, 240_000, 480_000, 900_000];
+  let busy = false, retryAt = 0, failures = 0;
+  return {
+    acquire() {
+      if (busy) return { allowed: false, reason: 'busy', retryAt };
+      if (now() < retryAt) return { allowed: false, reason: 'cooldown', retryAt };
+      busy = true;
+      return { allowed: true };
+    },
+    blocked() { retryAt = now() + delays[failures]; failures = Math.min(failures + 1, delays.length - 1); },
+    ready() { retryAt = 0; failures = 0; },
+    release() { busy = false; },
+  };
+}
 export const quarkPasswordDate = Symbol('quarkPasswordDate');
 const googleHost = host => /(?:^|\.)google\.(?:com|[a-z]{2}|(?:com|co)\.[a-z]{2})$/i.test(host) || /(?:^|\.)(?:gstatic|googleusercontent|googleapis|googleadservices)\.com$/i.test(host);
 const bingHost = host => /(?:^|\.)bing\.com$/i.test(host);
@@ -342,7 +358,7 @@ export async function resolveQuarkArticle(result, query, { read, deadline, now =
   return { rows, matched: extracted.matched, ...(reason ? { reason } : {}) };
 }
 
-async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now, aliases = [], year, titleOnly = false, page = 0 } = {}) {
+async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now, aliases = [], year, titleOnly = false, page = 0, cooldown } = {}) {
   if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 1000 || typeof read !== 'function') return [];
   const title = titleOnly === true ? keyword.trim() : keyword.trim().replace(/\s+(?:19|20)\d{2}$/, ''), term = normalize(title);
   const end = Math.min(Number.isFinite(deadline) ? deadline : Infinity, now() + 10000);
@@ -360,7 +376,8 @@ async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now,
     if (preferPassword) passwordDates.set(key, publishedAt);
     rows.set(key, { ...old, url: !old || preferPassword ? url : old.url, name: !old || newer ? name.slice(0, 500) : old.name, ...(newer ? { publishedAt } : {}) });
   };
-  let readPages = 0, matchedPages = 0, lastPageError, shortReadReason, javascriptOnly = false;
+  const googleCooldown = engine === 'Google' ? cooldown || createGoogleSearchCooldown({ now }) : undefined;
+  let readPages = 0, matchedPages = 0, lastPageError, shortReadReason, googleReason, javascriptOnly = false;
   const load = async (url, duration, required = false, signal) => {
     if (end <= now()) return { html: '', url };
     try {
@@ -368,9 +385,9 @@ async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now,
       const html = typeof result === 'string' ? result : result?.html, finalUrl = typeof result?.url === 'string' ? result.url : url;
       if (now() > end) throw Object.assign(new Error(), { quarkPoolReason: '搜索请求超时' });
       if (typeof html !== 'string' || Buffer.byteLength(html) > MAX_BODY) throw Object.assign(new Error(), { quarkPoolReason: '搜索响应内容异常（超过大小限制或非网页响应）' });
-      if (quarkSearchPageState(html, finalUrl) === 'blocked') throw Object.assign(new Error(), { quarkPoolReason: '搜索页面要求登录或人机验证，已停止自动读取' });
+      if (quarkSearchPageState(html, finalUrl) === 'blocked') throw Object.assign(new Error(), { quarkSearchBlocked: true, quarkPoolReason: '搜索页面要求登录或人机验证，已停止自动读取' });
       return { html, url: finalUrl };
-    } catch (cause) { if (required) throw Object.assign(new Error(engine + ' 公开搜索暂不可用，请稍后重试', { cause }), cause?.quarkPoolReason ? { quarkPoolReason: cause.quarkPoolReason } : {}); lastPageError = cause?.quarkPoolReason || '资源网页暂不可访问'; return { html: '', url }; }
+    } catch (cause) { if (required) throw Object.assign(new Error(engine + ' 公开搜索暂不可用，请稍后重试', { cause }), cause?.quarkPoolReason ? { quarkPoolReason: cause.quarkPoolReason } : {}, cause?.quarkSearchBlocked ? { quarkSearchBlocked: true } : {}, Number.isInteger(cause?.httpStatus) ? { httpStatus: cause.httpStatus } : {}); lastPageError = cause?.quarkPoolReason || '资源网页暂不可访问'; return { html: '', url }; }
   };
   const search = new URL(engine === 'Google' ? 'https://www.google.com/search' : 'https://www.bing.com/search'), pages = new Map();
   const addResult = (value, name, publishedAt) => {
@@ -390,22 +407,33 @@ async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now,
   };
   const queries = quarkSearchQueries(query);
   for (const q of queries) {
-    search.href = engine === 'Google' ? googleQueryUrl(q, page) : bingQueryUrl(q, page);
+    if (end <= now()) break;
+    const permit = googleCooldown?.acquire();
+    if (permit && !permit.allowed) {
+      googleReason = permit.reason === 'busy' ? 'Google 搜索正在处理，已继续其他公开渠道' : 'Google 搜索暂缓重试，已继续其他公开渠道';
+      break;
+    }
     let result;
     try {
+      search.href = engine === 'Google' ? googleQueryUrl(q, page) : bingQueryUrl(q, page);
       result = await load(search.href, 1500, true);
       search.href = result.url;
       if (engine === 'Google' && quarkSearchPageState(result.html, search.href) === 'javascript') { javascriptOnly = true; break; }
+      if (engine === 'Google' && result.html.trim()) googleCooldown.ready();
       if (engine === 'Bing' && !extractQuarkSearchResults(result.html, { ...query, engine, url: search.href, now: now() }).length && end - now() >= 500) {
         search.href = bingQueryUrl(q, page, true);
         result = await load(search.href, 1000, true);
         search.href = result.url;
       }
     } catch (cause) {
+      if (engine === 'Google' && (cause.quarkSearchBlocked || [403, 429].includes(cause.httpStatus))) {
+        googleCooldown.blocked();
+        cause.quarkPoolReason = 'Google 搜索要求验证或限制访问，已暂缓重试并继续其他公开渠道';
+      }
       if (!rows.size && !pages.size) throw cause;
       lastPageError = cause.quarkPoolReason || '公开网页搜索暂不可用';
       break;
-    }
+    } finally { googleCooldown?.release(); }
     for (const row of extractQuarkSearchResults(result.html, { ...query, engine, url: search.href, now: now() })) addResult(row.url, row.name, row.publishedAt);
     if ([...rows.values()].some(row => relevant(row.name)) || [...pages.values()].some(row => hasQuarkResourceCue(row.name)) || end - now() < 250) break;
   }
@@ -427,7 +455,7 @@ async function searchWebQuark(engine, keyword, { read, deadline, now = Date.now,
     if (row.url.includes('?pwd=')) Object.defineProperty(row, quarkPasswordDate, { value: passwordDates.get(key) ?? 0 });
     return row;
   });
-  if (!output.some(row => relevant(row.name))) Object.defineProperty(output, 'reason', { value: shortReadReason || (output.length && lastPageError ? '部分公开搜索未完成：' + lastPageError : !pages.size ? javascriptOnly ? 'Google 搜索页面需要 JavaScript，当前未能读取搜索结果' : '未找到与片名相符的公开网页结果' : !readPages ? '资源网页读取未完成：' + (lastPageError || '已到搜索时间上限') : !matchedPages ? '搜索结果网页未通过片名核验' : '已读取相关网页，但未找到可核验的夸克分享链接') });
+  if (!output.some(row => relevant(row.name))) Object.defineProperty(output, 'reason', { value: shortReadReason || googleReason || (output.length && lastPageError ? '部分公开搜索未完成：' + lastPageError : !pages.size ? javascriptOnly ? 'Google 搜索页面需要 JavaScript，当前未能读取搜索结果' : '未找到与片名相符的公开网页结果' : !readPages ? '资源网页读取未完成：' + (lastPageError || '已到搜索时间上限') : !matchedPages ? '搜索结果网页未通过片名核验' : '已读取相关网页，但未找到可核验的夸克分享链接') });
   return output;
 }
 

@@ -342,6 +342,92 @@ function fixture({ request, discoveryRequest, webRequest, renderSearch, telegram
 const savedBackup = now => ({ candidates: [{ url: backup, automatic: true, status: 'healthy', addedAt: now - 100, checkedAt: now - 1, failures: 0, retryAt: 0 }] });
 const lookup = async (pool, url = 'https://manual.example/api/search?kw=电影') => JSON.parse(await readText(await pool.request(url, { headers: { Cookie: 'user-cookie', Authorization: 'user-token' } })));
 
+test('a real Google 429 pauses other films and more requests while Bing and public channels continue and polls stay read-only', async () => {
+  let clock = 1000, googleCalls = 0, bingCalls = 0, channelCalls = 0, limited = true;
+  const f = fixture({ now: () => clock, googleSearch: searchGoogleQuark,
+    telegramSearch: async title => { channelCalls++; return [{ name: title + ' (2026) 夸克网盘', url: 'https://pan.quark.cn/s/channel26' }]; },
+    request: url => {
+      if (url.includes('google.com/search')) {
+        googleCalls++;
+        return limited ? response('rate limited', 429) : response('<a href="https://pan.quark.cn/s/google26"><h3>希望 (2026) 夸克网盘</h3></a>');
+      }
+      if (url.includes('bing.com/search')) {
+        bingCalls++;
+        const other = new URL(url).searchParams.get('q').includes('八仙');
+        return response(rss('https://pan.quark.cn/s/' + (other ? 'bing0002' : 'bing0001'), (other ? '八仙！' : '希望') + ' (2026) 夸克网盘'));
+      }
+      return response('{"results":[]}');
+    },
+  });
+  const read = (title, options = {}) => f.pool.request('https://manual.example/api/search?kw=' + encodeURIComponent(title), { year: '2026', ...options }).then(readText).then(JSON.parse);
+  try {
+    await read('希望'); await flush();
+    const initial = await read('希望', { poll: true });
+    assert.deepEqual(new Set(initial.results.map(row => row.url)), new Set(['https://pan.quark.cn/s/bing0001', 'https://pan.quark.cn/s/channel26']));
+    assert.equal(googleCalls, 1);
+    const channelsBefore = channelCalls, bingBefore = bingCalls;
+    const other = await read('八仙！', { webSearch: true, forceRefresh: true }); await flush();
+    assert.ok(other.results.some(row => row.url.endsWith('bing0002')));
+    const more = await read('八仙！', { webSearch: true, forceRefresh: true }); await flush();
+    assert.ok(more.results.some(row => row.url.endsWith('channel26')));
+    assert.equal(googleCalls, 1, 'another film and explicit more cannot bypass the Google pause');
+    assert.ok(bingCalls > bingBefore); assert.ok(channelCalls > channelsBefore);
+    assert.match(more.reason || '', /Google.*暂缓重试/);
+    const beforePoll = [f.calls.length, googleCalls, bingCalls, channelCalls];
+    await read('八仙！', { webSearch: true, forceRefresh: true, poll: true }); await flush();
+    assert.deepEqual([f.calls.length, googleCalls, bingCalls, channelCalls], beforePoll);
+    clock += 60000; limited = false;
+    const recovered = await read('希望', { webSearch: true, forceRefresh: true }); await flush();
+    assert.ok(recovered.results.some(row => row.url.endsWith('google26'))); assert.equal(googleCalls, 2);
+  } finally { await f.pool.stop(); }
+});
+
+test('concurrent films share the static Google gate and a cancelled response releases it for the next request', async () => {
+  let googleCalls = 0, stalled;
+  const f = fixture({ googleSearch: searchGoogleQuark, request: url => {
+    if (url.includes('google.com/search')) {
+      googleCalls++;
+      if (googleCalls === 1) return stalled = Object.assign(new PassThrough(), { statusCode: 200, headers: {} });
+      return response('<a href="https://pan.quark.cn/s/ready026"><h3>希望 (2026) 夸克网盘</h3></a>');
+    }
+    if (url.includes('bing.com/search')) {
+      const other = new URL(url).searchParams.get('q').includes('八仙');
+      return response(rss('https://pan.quark.cn/s/' + (other ? 'bing0002' : 'bing0001'), (other ? '八仙！' : '希望') + ' (2026) 夸克网盘'));
+    }
+    return response('{"results":[]}');
+  } });
+  const read = (title, options = {}) => f.pool.request('https://manual.example/api/search?kw=' + encodeURIComponent(title), { year: '2026', ...options }).then(readText).then(JSON.parse);
+  const first = read('希望');
+  try {
+    await flush(); assert.equal(googleCalls, 1);
+    const second = await read('八仙！');
+    assert.ok(second.results.some(row => row.url.endsWith('bing0002'))); assert.equal(googleCalls, 1);
+    assert.match(second.reason || '', /Google.*正在处理/);
+    stalled.destroy(Object.assign(new Error('cancel fixture response'), { name: 'AbortError' }));
+    await first; await flush();
+    const recovered = await read('希望', { webSearch: true, forceRefresh: true });
+    assert.ok(recovered.results.some(row => row.url.endsWith('ready026'))); assert.equal(googleCalls, 2);
+  } finally { stalled?.destroy(); await first.catch(() => {}); await f.pool.stop(); }
+});
+
+test('an article HTTP 403 does not pause the next film Google SERP through the production pool adapter', async () => {
+  let googleCalls = 0, articleCalls = 0;
+  const f = fixture({ googleSearch: searchGoogleQuark, request: url => {
+    if (url.includes('google.com/search')) {
+      googleCalls++;
+      const title = new URL(url).searchParams.get('q').includes('八仙') ? '八仙！' : '希望';
+      return response(`<a href="https://public.example/denied"><h3>${title} (2026) 夸克网盘</h3></a>`);
+    }
+    if (url.includes('bing.com')) return response('<rss><channel></channel></rss>');
+    if (url.includes('public.example')) { articleCalls++; return response('private article text', 403); }
+    return response('{"results":[]}');
+  } });
+  try {
+    for (const title of ['希望', '八仙！']) await f.pool.request('https://manual.example/api/search?kw=' + encodeURIComponent(title), { year: '2026' }).then(readText);
+    assert.equal(googleCalls, 2); assert.equal(articleCalls, 2);
+  } finally { await f.pool.stop(); }
+});
+
 test('trailing title punctuation has a bounded API fallback without weakening film or year checks', async () => {
   const expected = 'https://pan.quark.cn/s/punctuation26';
   const f = fixture({ request: url => response(JSON.stringify({ results: new URL(url).searchParams.get('kw') === '八仙' ? [

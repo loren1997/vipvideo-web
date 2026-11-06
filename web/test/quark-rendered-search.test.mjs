@@ -10,6 +10,89 @@ const article = (id, date, position = 0) => `<html><head><meta property="og:titl
 const serp = '<a href="https://public.example/older"><h3>希望 HOPE (2026) 夸克</h3></a><a href="https://public.example/newer"><h3>2026韩国电影希望Hope！夸克网盘分享</h3></a><a href="https://public.example/wrong"><h3>希望 (2013) 夸克网盘</h3></a>';
 const bingSerp = '<ol><li class="b_algo"><h2><a href="https://public.example/older">希望 HOPE (2026) 夸克网盘</a></h2></li><li class="b_algo"><h2><a href="https://public.example/newer">2026韩国电影希望Hope！夸克网盘分享</a></h2></li></ol>';
 
+test('Google verification cools down across films and pages while Bing continues, then a ready search resets backoff', async () => {
+  let clock = 1000, googleCalls = 0, bingCalls = 0, verified = false;
+  const search = createQuarkRenderedSearch({ now: () => clock,
+    render: async url => {
+      assert.ok(url.includes('google.com/search')); googleCalls++;
+      return { url, html: verified ? '<a href="https://pan.quark.cn/s/google26"><h3>希望 (2026) 夸克网盘</h3></a>' : '<title>安全验证</title><div class="g-recaptcha"></div>' };
+    },
+    read: async url => {
+      assert.ok(url.includes('bing.com/search')); bingCalls++;
+      const other = new URL(url).searchParams.get('q').includes('八仙');
+      return { url, html: `<rss><channel><item><title>${other ? '八仙！' : '希望'} (2026) 夸克网盘</title><link>https://pan.quark.cn/s/${other ? 'bing0002' : 'bing0001'}</link></item></channel></rss>` };
+    },
+  });
+  assert.ok((await search(query)).some(row => row.url.endsWith('bing0001')));
+  const initialBingCalls = bingCalls;
+  assert.ok((await search({ title: '八仙！', year: '2026', page: 1 })).some(row => row.url.endsWith('bing0002')));
+  assert.equal(googleCalls, 1); assert.ok(bingCalls > initialBingCalls);
+  clock += 59999;
+  await search({ ...query, page: 2 }); assert.equal(googleCalls, 1);
+  clock++; verified = true;
+  assert.ok((await search(query)).some(row => row.url.endsWith('google26'))); assert.equal(googleCalls, 2);
+  verified = false;
+  await search(query); assert.equal(googleCalls, 3);
+  clock += 60000;
+  await search(query); assert.equal(googleCalls, 4, 'a ready SERP resets the next pause to one minute');
+});
+
+test('a concurrent film skips busy Google and continues Bing, and cancellation releases the Google slot', async () => {
+  let googleCalls = 0;
+  const controller = new AbortController();
+  const search = createQuarkRenderedSearch({
+    render: async (url, { signal }) => {
+      assert.ok(url.includes('google.com/search')); googleCalls++;
+      if (googleCalls === 1) return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+      return { url, html: '<a href="https://pan.quark.cn/s/ready026"><h3>希望 (2026) 夸克网盘</h3></a>' };
+    },
+    read: async url => ({ url, html: '<rss><channel><item><title>八仙！ (2026) 夸克网盘</title><link>https://pan.quark.cn/s/busy0026</link></item></channel></rss>' }),
+  });
+  const first = search(query, { signal: controller.signal });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    const second = await search({ title: '八仙！', year: '2026' });
+    assert.deepEqual(second.map(row => row.url), ['https://pan.quark.cn/s/busy0026']); assert.equal(googleCalls, 1);
+    controller.abort(new Error('cancel first Google search'));
+    await assert.rejects(first, /cancel first Google search/);
+    assert.ok((await search(query)).some(row => row.url.endsWith('ready026'))); assert.equal(googleCalls, 2);
+  } finally { controller.abort(); await first.catch(() => {}); }
+});
+
+test('article verification and Google JavaScript, timeout or browser-busy responses never create rate-limit cooldown', async t => {
+  for (const kind of ['article403', 'javascript', 'timeout', 'busy']) await t.test(kind, async () => {
+    let googleCalls = 0, articleCalls = 0;
+    const search = createQuarkRenderedSearch({
+      render: async url => {
+        if (!url.includes('google.com/search')) throw Object.assign(new Error('article HTTP 403'), { quarkPoolReason: 'browserBlocked' });
+        googleCalls++;
+        if (kind === 'timeout' || kind === 'busy') throw Object.assign(new Error('temporary failure'), { quarkPoolReason: kind === 'timeout' ? 'browserTimeout' : 'browserBusy' });
+        return { url, html: kind === 'javascript' ? '<title>Google Search</title><a href="/httpservice/retry/enablejs">Please enable JavaScript to use Google Search.</a>' : '<a href="https://public.example/denied"><h3>希望 (2026) 夸克网盘</h3></a>' };
+      },
+      read: async url => {
+        if (url.includes('bing.com')) return { url, html: '<rss><channel></channel></rss>' };
+        articleCalls++; throw Object.assign(new Error('article HTTP 403'), { status: 403 });
+      },
+    });
+    await search(query); await search(query);
+    assert.equal(googleCalls, 2, 'only a blocked Google SERP may pause the next search');
+    if (kind === 'article403') assert.equal(articleCalls, 2);
+  });
+});
+
+test('Google SERP browser-blocked and HTTP 403 or 429 failures pause later films without exposing upstream details', async t => {
+  for (const fields of [{ quarkPoolReason: 'browserBlocked' }, { httpStatus: 403 }, { httpStatus: 429 }]) await t.test(JSON.stringify(fields), async () => {
+    let googleCalls = 0;
+    const search = createQuarkRenderedSearch({
+      render: async url => { assert.ok(url.includes('google.com/search')); googleCalls++; throw Object.assign(new Error('private upstream detail'), fields); },
+      read: async url => ({ url, html: '<rss><channel></channel></rss>' }),
+    });
+    const first = await search(query), second = await search({ title: '八仙！', year: '2026' });
+    assert.equal(googleCalls, 1); assert.match(first.reason, /暂缓重试/); assert.match(second.reason, /暂缓重试/);
+    assert.doesNotMatch(first.reason + second.reason, /private upstream detail/);
+  });
+});
+
 test('rendered search resolves a matching roundup block without borrowing neighbouring films or Baidu passwords', async () => {
   const articleUrl = 'https://www.sina.cn/news/detail/1234567890123456.html', calls = [];
   const html = '<title>多部影片合集</title><article>🔥其他影片 (2026)<br/>夸克：http://t.cn/Other001<br/><br/>🔥八仙！ (2026)（1080P）<br/>百度：http://t.cn/Baidu001 提取码:8888<br/>夸克：http://t.cn/Quark001<br/><br/>🔥奥德赛<br/>夸克：http://t.cn/Other002<br/><br/></article>';
