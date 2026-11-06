@@ -14,6 +14,12 @@ const episode = { url, type: 'hls' };
 const manifest = '#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment000000.ts\n';
 const inputManifest = '#EXTM3U\n#EXTINF:2,\nsegment.ts?token=neutral\n#EXT-X-ENDLIST\n';
 const statusError = status => error => error.status === status;
+function assertRawInput(args) {
+  const input = args.slice(0, args.indexOf('-i'));
+  assert.equal(input.includes('-f'), false);
+  assert.equal(input[input.indexOf('-format_whitelist') + 1], 'mov,matroska,webm,mpegts,avi');
+  assert.equal(input[input.indexOf('-protocol_whitelist') + 1], 'http,tcp,crypto');
+}
 async function fixture(options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'vipvideo-transcode-test-'));
   const device = options.gpu ? join(root, 'gpu') : options.device || join(root, 'missing-gpu');
@@ -98,6 +104,226 @@ function probeRangeMedia(mode = 'valid', size = 4 * 1024 * 1024 + 17) {
   return { media, calls, streams, setMode: value => { mode = value; } };
 }
 const rawDolby = { url: 'https://movies.example/original.mkv', type: 'mkv', colorSpace: 'dolby-vision' };
+const trustedDolbyProof = { colorSpace: 'dolby-vision', codec: 'hevc', dolbyVisionProfile: 5, dolbyVisionCompatibilityId: 0, rpuPresent: true, rpuSeen: true, blPresent: true, elPresent: false };
+
+test('trusted original Dolby proof avoids duplicate inspection and keeps encoder range limits', async () => {
+  const source = probeRangeMedia('valid', 9 * 1024 * 1024);
+  const f = await fixture({ media: source.media, hungColorProbe: true, run: async ({ input, args, write }) => {
+    assert.ok(args.some(value => value.includes('apply_dolbyvision=1')));
+    const response = await fetch(input, { headers: { Range: 'bytes=0-' } });
+    assert.equal(response.status, 206); assert.equal((await response.arrayBuffer()).byteLength, 8 * 1024 * 1024);
+    await write();
+  } });
+  try {
+    await start(f.service, { episode: { ...rawDolby, sourceColorSpace: 'dolby-vision' }, trustedColorProbe: trustedDolbyProof });
+    assert.equal(f.calls.filter(call => call.args.includes('-show_entries')).length, 0);
+    assert.deepEqual(source.calls, ['bytes=0-8388607']);
+  } finally { await f.close(); }
+});
+
+test('trusted original Dolby proof never substitutes missing RPU or a different stream kind', async () => {
+  for (const [episode, proof] of [
+    [{ ...rawDolby, sourceColorSpace: 'dolby-vision' }, { ...trustedDolbyProof, rpuSeen: false }],
+    [{ ...rawDolby, sourceColorSpace: 'dolby-vision' }, { ...trustedDolbyProof, rpuPresent: false }],
+    [{ ...rawDolby, sourceColorSpace: 'dolby-vision' }, { ...trustedDolbyProof, colorSpace: 'pq' }],
+    [{ ...rawDolby, sourceColorSpace: 'dolby-vision' }, { ...trustedDolbyProof, dolbyVisionProfile: 7 }],
+    [{ ...rawDolby, sourceColorSpace: 'unknown' }, trustedDolbyProof],
+    [{ ...rawDolby, url, type: 'hls', sourceColorSpace: 'dolby-vision' }, trustedDolbyProof],
+  ]) {
+    const colorProbe = dolbyProbe(); colorProbe.frames[0].side_data_list = [];
+    const f = await fixture({ colorProbe });
+    try {
+      await assert.rejects(start(f.service, { episode, trustedColorProbe: proof }), error => error.status === 409 && /RPU/.test(error.message));
+      assert.equal(f.calls.filter(call => call.args.includes('-show_entries')).length, 1);
+      assert.equal(f.calls.filter(call => call.args.includes('-c:v')).length, 0);
+    } finally { await f.close(); }
+  }
+});
+
+test('trusted original Dolby proof does not authorize an expired lease', async () => {
+  const f = await fixture();
+  try {
+    await assert.rejects(start(f.service, { episode: { ...rawDolby, sourceColorSpace: 'dolby-vision' }, trustedColorProbe: trustedDolbyProof, valid: () => false }), statusError(409));
+    assert.equal(f.calls.length, 0);
+  } finally { await f.close(); }
+});
+
+test('real MP4 color inspection skips chapter reads and finds tail metadata across many mdat boxes', { timeout: 20000 }, async t => {
+  const { spawn, execFile } = await import('node:child_process'), { promisify } = await import('node:util');
+  const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg', ffprobe = process.env.FFPROBE_PATH || (process.env.FFMPEG_PATH ? join(ffmpeg, '..', process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe') : 'ffprobe');
+  const run = (command, args) => promisify(execFile)(command, args, { windowsHide: true, timeout: 10000, maxBuffer: 1024 * 1024 });
+  try { await run(ffmpeg, ['-version']); await run(ffprobe, ['-version']); }
+  catch (error) { if (error.code === 'ENOENT') return t.skip('Local FFmpeg and FFprobe are required for the native chapter fixture'); throw error; }
+  let data; const requests = [], bodies = new Set(), children = new Set();
+  const media = createMedia({ request: async (target, options) => {
+    assert.equal(String(target), 'https://fixtures.example/chapters.mp4');
+    const range = /^bytes=(\d+)-(\d+)$/.exec(options.headers.range), first = Number(range[1]), last = Math.min(Number(range[2]), data.size - 1);
+    assert.ok(last - first + 1 <= 2 * 1024 * 1024); requests.push(first);
+    const body = data.read(first, last), response = Readable.from((async function* () {
+      // Network-sized chunks let FFprobe cancel a seek without pre-counting a whole window.
+      for (let offset = 0; offset < body.length; offset += 8192) { yield body.subarray(offset, offset + 8192); await new Promise(done => setTimeout(done, 1)); }
+    })());
+    bodies.add(response); response.once('close', () => bodies.delete(response));
+    return Object.assign(response, { statusCode: 206, finalUrl: String(target), headers: { 'content-type': 'video/mp4', 'content-range': `bytes ${first}-${last}/${data.size}` } });
+  } });
+  const f = await fixture({ media, di: { env: { FFMPEG_PATH: ffmpeg, FFPROBE_PATH: ffprobe }, spawn: (command, args, options) => {
+    const child = spawn(command, args, options); children.add(child); child.once('close', () => children.delete(child)); return child;
+  } } });
+  try {
+    const metadata = ';FFMETADATA1\n' + Array.from({ length: 24 }, (_, i) => `[CHAPTER]\nTIMEBASE=1/1000\nSTART=${i * 80}\nEND=${(i + 1) * 80}\ntitle=Chapter ${i + 1}\n`).join('');
+    const meta = join(f.root, 'chapters.txt'), input = join(f.root, 'source.mp4'); await writeFile(meta, metadata);
+    await run(ffmpeg, ['-hide_banner', '-nostdin', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=size=16x16:rate=1', '-i', meta,
+      '-map', '0:v:0', '-map_metadata', '1', '-map_chapters', '1', '-frames:v', '1', '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',
+      '-x264-params', 'colorprim=bt709:transfer=bt709:colormatrix=bt709',
+      '-pix_fmt', 'yuv420p', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709', input]);
+    const source = await readFile(input);
+    for (const count of [1, 40]) await t.test(count === 1 ? 'sparse chapter titles do not consume probe reads' : 'forty mdat headers preserve the first video frame within the read budget', async () => {
+      data = sparseChapterMp4(source, count); requests.length = 0;
+      // The Dolby hint activates the original-file guard; this synthetic frame is SDR.
+      const proof = await f.service.inspectColor({ episode: { type: 'mp4', url: 'https://fixtures.example/chapters.mp4', colorSpace: 'dolby-vision' }, sourceColorSpace: 'dolby-vision', owner: 'native-chapter-test', valid: () => true, timeout: 10000 });
+      assert.equal(proof.codec, 'h264'); assert.equal(proof.colorSpace, 'sdr');
+      assert.equal(requests.filter(offset => data.chapterOffsets.includes(offset)).length, 0, 'color inspection must not fetch unrelated chapter samples');
+      assert.ok(count === 1 ? requests.length < 16 : requests.length > 16 && requests.length <= 64);
+      assert.equal(supportsDolbyMapping(proof), false, 'a synthetic SDR frame cannot pass Dolby mapping');
+    });
+  } finally { await f.close(); assert.equal(bodies.size, 0); assert.equal(children.size, 0); }
+});
+
+test('real raw input detection accepts renamed Matroska and rejects referenced playlists', { timeout: 30000 }, async t => {
+  const { spawn, execFile } = await import('node:child_process'), { promisify } = await import('node:util');
+  const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg', ffprobe = process.env.FFPROBE_PATH || (process.env.FFMPEG_PATH ? join(ffmpeg, '..', process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe') : 'ffprobe');
+  const run = (command, args) => promisify(execFile)(command, args, { windowsHide: true, timeout: 10000, maxBuffer: 1024 * 1024 });
+  try { await run(ffmpeg, ['-version']); await run(ffprobe, ['-version']); }
+  catch (error) { if (error.code === 'ENOENT') return t.skip('Local FFmpeg and FFprobe are required for native container detection'); throw error; }
+  let body = Buffer.alloc(0), referenceRequests = 0, hlsSuffix = false; const children = new Set(), streams = new Set();
+  const canary = createServer((_req, res) => { referenceRequests++; res.statusCode = 403; res.end(); });
+  await new Promise(done => canary.listen(0, '127.0.0.1', done));
+  const sourceUrl = 'https://fixtures.example/renamed.mp4', reference = `http://127.0.0.1:${canary.address().port}/forbidden.ts`;
+  const media = createMedia({ request: async (target, options) => {
+    assert.equal(String(target), sourceUrl);
+    const range = /^bytes=(\d+)-(\d*)$/.exec(options.headers.range || 'bytes=0-'); assert.ok(range);
+    const first = Number(range[1]), last = Math.min(range[2] ? Number(range[2]) : body.length - 1, body.length - 1);
+    assert.ok(first <= last);
+    const response = Readable.from([body.subarray(first, last + 1)]); streams.add(response); response.once('close', () => streams.delete(response));
+    return Object.assign(response, { statusCode: 206, finalUrl: String(target), headers: { 'content-type': 'video/mp4', 'content-length': String(last - first + 1), 'content-range': `bytes ${first}-${last}/${body.length}` } });
+  } });
+  const f = await fixture({ media, di: { env: { TRANSCODE_ACCEL: 'software', FFMPEG_PATH: ffmpeg, FFPROBE_PATH: ffprobe }, startupTimeout: 10000, probeTimeout: 6000,
+    spawn: (command, args, options) => {
+      if (args.includes('-i')) {
+        assert.equal(args[args.indexOf('-protocol_whitelist') + 1], 'http,tcp,crypto');
+        if (args.includes('-show_entries')) assert.equal(args[args.indexOf('-ignore_chapters') + 1], '1');
+        else assert.equal(args.includes('-ignore_chapters'), false);
+        // Let the HLS negative case reach the demuxer whitelist instead of
+        // stopping earlier at FFmpeg's filename-extension check.
+        if (hlsSuffix) { args = [...args]; const input = args.indexOf('-i') + 1; args[input] = args[input].replace('/asset.mp4?', '/asset.m3u8?'); }
+      }
+      const child = spawn(command, args, options); children.add(child); child.once('close', () => children.delete(child)); return child;
+    },
+  } });
+  const raw = { type: 'mp4', url: sourceUrl };
+  try {
+    const input = join(f.root, 'renamed.mp4');
+    await run(ffmpeg, ['-hide_banner', '-nostdin', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=blue:size=16x16:rate=2:duration=8',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-g', '4', '-pix_fmt', 'yuv420p',
+      '-x264-params', 'colorprim=bt709:transfer=bt709:colormatrix=bt709',
+      '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709', '-f', 'matroska', input]);
+    body = await readFile(input); assert.equal(body.readUInt32BE(0), 0x1a45dfa3);
+    await t.test('renamed Matroska is inspected from its bytes', async () => {
+      const proof = await f.service.inspectColor({ episode: { ...raw, colorSpace: 'dolby-vision' }, sourceColorSpace: 'dolby-vision', owner: 'native-container-test', valid: () => true, timeout: 6000 });
+      assert.equal(proof.codec, 'h264'); assert.equal(proof.colorSpace, 'sdr');
+    });
+    await t.test('renamed Matroska produces continuing playable HLS segments', async () => {
+      const result = await start(f.service, { episode: { ...raw, colorSpace: 'sdr' } });
+      assert.equal(result.duration, 8);
+      const dir = join(f.root, (await readdir(f.root)).find(name => name.startsWith('vipvideo-transcode-')));
+      const deadline = Date.now() + 6000; let playlist, segments = [];
+      do {
+        playlist = await readFile(join(dir, 'index.m3u8'), 'utf8');
+        segments = playlist.split(/\r?\n/).filter(line => /^segment\d+\.ts$/.test(line));
+        if (segments.length < 2) await new Promise(done => setTimeout(done, 25));
+      } while (segments.length < 2 && Date.now() < deadline);
+      assert.ok(segments.length >= 2, 'the real encoder must progress beyond its first segment');
+      for (const segment of segments.slice(0, 2)) {
+        const decoded = JSON.parse((await run(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'json', join(dir, segment)])).stdout);
+        assert.equal(decoded.streams[0]?.codec_name, 'h264');
+      }
+      await f.service.cancel(result.id, 'device-a');
+    });
+    for (const [name, text] of [
+      ['HLS', `#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n${reference}\n#EXT-X-ENDLIST\n`],
+      ['concat', `ffconcat version 1.0\nfile '${reference}'\n`],
+    ]) await t.test(`${name} disguised as MP4 cannot make probe or encoder fetch a referenced URL`, async () => {
+      body = Buffer.from(text); hlsSuffix = name === 'HLS'; const logStart = f.logs.length;
+      await assert.rejects(f.service.inspectColor({ episode: { ...raw, colorSpace: 'dolby-vision' }, sourceColorSpace: 'dolby-vision', owner: 'native-container-test', valid: () => true, timeout: 6000 }), error => error.code === 'QUARK_COLOR_UNCONFIRMED');
+      await assert.rejects(start(f.service, { episode: { ...raw, colorSpace: 'sdr' } }), statusError(502));
+      assert.equal(f.logs.slice(logStart).filter(line => /not on whitelist/i.test(line)).length, 2, 'both native readers must reject the playlist demuxer');
+      assert.equal(referenceRequests, 0);
+      assert.equal((await f.service.status()).running, false);
+    });
+  } finally {
+    await f.close(); await new Promise(done => canary.close(done));
+    assert.equal(referenceRequests, 0); assert.equal(streams.size, 0); assert.equal(children.size, 0);
+  }
+});
+
+function sparseChapterMp4(source, mdatCount = 1) {
+  const containers = new Set(['moov', 'trak', 'mdia', 'minf', 'stbl', 'edts', 'dinf', 'udta']);
+  function boxes(buffer) {
+    const result = [];
+    for (let at = 0; at < buffer.length;) {
+      const size = buffer.readUInt32BE(at), type = buffer.toString('ascii', at + 4, at + 8); assert.ok(size >= 8 && at + size <= buffer.length);
+      result.push({ type, at, size, body: buffer.subarray(at + 8, at + size) }); at += size;
+    }
+    return result;
+  }
+  function find(buffer, type) {
+    for (const box of boxes(buffer)) { if (box.type === type) return box; if (containers.has(box.type)) { const result = find(box.body, type); if (result) return result; } }
+  }
+  const isChapter = buffer => find(buffer, 'stsd')?.body.toString('ascii', 12, 16) === 'text';
+  const top = boxes(source), moov = top.find(box => box.type === 'moov'), mdat = top.find(box => box.type === 'mdat'); assert.ok(moov && mdat);
+  const chapter = boxes(moov.body).find(box => box.type === 'trak' && isChapter(box.body)); assert.ok(chapter);
+  const stsz = find(chapter.body, 'stsz').body, stsc = find(chapter.body, 'stsc').body, stco = find(chapter.body, 'stco').body;
+  const count = stsz.readUInt32BE(8), samples = [], entries = Array.from({ length: stsc.readUInt32BE(4) }, (_, i) => [stsc.readUInt32BE(8 + 12 * i), stsc.readUInt32BE(12 + 12 * i)]);
+  for (let chunk = 0, index = 0; chunk < stco.readUInt32BE(4); chunk++) {
+    let offset = stco.readUInt32BE(8 + 4 * chunk); const [, perChunk] = entries.filter(([first]) => first <= chunk + 1).at(-1);
+    for (let i = 0; i < perChunk; i++, index++) { const size = stsz.readUInt32BE(4) || stsz.readUInt32BE(12 + index * 4); samples.push(source.subarray(offset, offset + size)); offset += size; }
+  }
+  assert.equal(count, 24); assert.equal(samples.length, count);
+  const chapterOffsets = samples.map((_, i) => 4 * 1024 * 1024 + i * 96 * 1024), pieces = []; let position = 0, delta;
+  for (const box of top.filter(box => box !== moov)) {
+    if (box === mdat) {
+      const size = 16 + box.body.length + 32 * 1024 * 1024;
+      for (let i = 0; i < mdatCount; i++) {
+        const start = Math.floor(size * i / mdatCount), end = Math.floor(size * (i + 1) / mdatCount), header = Buffer.alloc(16);
+        header.writeUInt32BE(1); header.write('mdat', 4); header.writeBigUInt64BE(BigInt(end - start), 8); pieces.push([position + start, header]);
+      }
+      pieces.push([position + 16, box.body]); delta = position + 16 - (box.at + 8); position += size;
+    } else { pieces.push([position, source.subarray(box.at, box.at + box.size)]); position += box.size; }
+  }
+  samples.forEach((body, i) => pieces.push([chapterOffsets[i], body]));
+  function atom(type, body) { const value = Buffer.alloc(body.length + 8); value.writeUInt32BE(value.length); value.write(type, 4); body.copy(value, 8); return value; }
+  function rebuild(buffer, chapterTrack = false) {
+    return Buffer.concat(boxes(buffer).map(box => {
+      const chapter = chapterTrack || box.type === 'trak' && isChapter(box.body);
+      if (chapter && box.type === 'stco') {
+        const body = Buffer.alloc(8 + count * 4); body.writeUInt32BE(count, 4); chapterOffsets.forEach((value, i) => body.writeUInt32BE(value, 8 + i * 4)); return atom(box.type, body);
+      }
+      if (chapter && box.type === 'stsc') {
+        const body = Buffer.alloc(20); [1, 1, 1, 1].forEach((value, i) => body.writeUInt32BE(value, 4 + i * 4)); return atom(box.type, body);
+      }
+      if (box.type === 'stco') {
+        const body = Buffer.from(box.body); for (let i = 0; i < body.readUInt32BE(4); i++) body.writeUInt32BE(body.readUInt32BE(8 + i * 4) + delta, 8 + i * 4); return atom(box.type, body);
+      }
+      return atom(box.type, containers.has(box.type) ? rebuild(box.body, chapter) : box.body);
+    }));
+  }
+  const tail = atom('moov', rebuild(moov.body)); pieces.push([position, tail]);
+  return { size: position + tail.length, chapterOffsets, read(first, last) {
+    const result = Buffer.alloc(last - first + 1);
+    for (const [start, body] of pieces) { const from = Math.max(first, start), to = Math.min(last + 1, start + body.length); if (to > from) body.copy(result, from - first, from - start, to - start); }
+    return result;
+  } };
+}
 
 test('Dolby color inspection uses two MiB ranges and its encoder uses separate eight MiB windows', async () => {
   const source = probeRangeMedia();
@@ -235,8 +461,9 @@ test('chunked Dolby range truncation cannot be hidden by decoded frame metadata'
   } finally { await f.close(); }
 });
 
-test('one Dolby probe shares its sixteen MiB and sixteen HTTP request limits across all seeks', async () => {
-  for (const [range, accepted] of [['bytes=0-', 8], ['bytes=0-0', 16]]) {
+test('original Dolby probes keep sixteen MiB while MP4 allows sixty-four seeks and other formats sixteen', async () => {
+  for (const type of ['mkv', 'mp4']) for (const range of ['bytes=0-', 'bytes=0-0']) {
+    const accepted = range === 'bytes=0-' ? 8 : type === 'mp4' ? 64 : 16;
     const source = probeRangeMedia();
     const f = await fixture({ media: source.media, colorProbe: dolbyProbe(), di: { probeTimeout: 5500 },
       inspect: async ({ input }) => {
@@ -246,7 +473,7 @@ test('one Dolby probe shares its sixteen MiB and sixteen HTTP request limits acr
       },
     });
     try {
-      await assert.rejects(f.service.inspectColor({ episode: rawDolby, owner: 'probe', valid: () => true, timeout: 5500 }), error => error.status === 502);
+      await assert.rejects(f.service.inspectColor({ episode: { ...rawDolby, type }, owner: 'probe', valid: () => true, timeout: 5500 }), error => error.status === 502 && error.code === 'QUARK_COLOR_PROBE_READ_FAILED');
       assert.equal(source.calls.length, accepted, 'the rejected request never reaches the underlying account media transport');
     } finally { await f.close(); }
   }
@@ -432,7 +659,7 @@ test('ordinary SDR playback keeps the existing path without a color probe or ton
   try {
     await start(f.service, { episode: { ...episode, colorSpace: 'sdr' } });
     assert.equal(f.calls.filter(call => call.args.includes('-show_entries')).length, 0);
-    assert.doesNotMatch(f.calls.find(call => call.args.includes('-c:v')).args.join(' '), /tonemap|zscale|-color_trc/);
+    assert.doesNotMatch(f.calls.find(call => call.args.includes('-c:v')).args.join(' '), /fps=|tonemap|zscale|-color_trc/);
     assert.equal(f.calls.find(call => call.args.includes('-c:v')).args.includes('-reconnect'), false);
   } finally { await f.close(); }
 });
@@ -449,6 +676,8 @@ test('confirmed PQ and HLG alternatives from a known Dolby source tone-map in li
       assert.ok(probe.args[probe.args.indexOf('-i') + 1].startsWith('http://127.0.0.1:'));
       assert.equal(probe.args[probe.args.indexOf('-read_intervals') + 1], '%+#1');
       assert.equal(probe.args[probe.args.indexOf('-probesize') + 1], '1048576');
+      assert.equal(probe.args[probe.args.indexOf('-f') + 1], 'hls');
+      assert.equal(probe.args[probe.args.indexOf('-allowed_extensions') + 1], 'ALL');
       const filter = encoder.args[encoder.args.indexOf('-vf') + 1];
       assert.match(filter, /min\(1280,iw\).*min\(720,ih\)/);
       assert.match(filter, /zscale=transfer=linear.*format=gbrpf32le.*tonemap=.*zscale=transfer=bt709/);
@@ -469,7 +698,7 @@ test('ordinary HDR Vivid, PQ, HLG and unknown MP4 or MKV compatibility never pro
       assert.equal(f.calls.filter(call => call.args.includes('-show_entries')).length, 0);
       const args = f.calls.find(call => call.args.includes('-c:v')).args;
       assert.doesNotMatch(args.join(' '), /tonemap|zscale|libplacebo|-color_trc|-color_primaries|-colorspace|sidedata=/);
-      assert.equal(args[args.indexOf('-f') + 1], type === 'mp4' ? 'mov' : 'matroska');
+      assertRawInput(args);
       assert.equal(args[args.indexOf('-c:v') + 1], 'libx264');
     } finally { await f.close(); }
   }
@@ -525,15 +754,17 @@ test('supported original Dolby RPU uses libplacebo and BT709 output in both exis
       assert.equal(args[args.indexOf('-threads') + 1], gpu ? '1' : '4', 'only software Dolby decode uses four threads');
       assert.equal(args[args.lastIndexOf('-threads') + 1], '1', 'encoding remains bounded to one thread');
       assert.equal(args[args.indexOf('-filter_threads') + 1], '1');
+      assert.equal(args[args.indexOf('-r') + 1], '30', 'the existing output frame rate remains unchanged');
+      assert.equal(args[args.indexOf('-readrate') + 1], '1');
       if (gpu) {
         assert.match(args[args.indexOf('-init_hw_device') + 1], /^vaapi=va:/);
         assert.equal(args[args.indexOf('-hwaccel') + 1], 'vaapi');
-        assert.match(filter, /^hwmap=derive_device=vulkan,format=vulkan/);
+        assert.ok(filter.startsWith("fps='if(gt(source_fps,0),min(source_fps,30),30)',hwmap=derive_device=vulkan,format=vulkan"));
         assert.match(filter, /hwdownload,format=yuv420p,format=nv12,hwupload$/);
         assert.ok(args.includes('h264_vaapi')); assert.ok(!args.includes('libx264'));
       } else {
         assert.equal(args[args.indexOf('-init_hw_device') + 1], 'vulkan=vk:0');
-        assert.match(filter, /^hwupload,libplacebo=/);
+        assert.ok(filter.startsWith("fps='if(gt(source_fps,0),min(source_fps,30),30)',hwupload,libplacebo="));
         assert.ok(args.includes('libx264'));
       }
     } finally { await f.close(); }
@@ -688,7 +919,7 @@ test('closing during a color probe kills its owned process and leaves no bridge 
   } finally { await f.close(); }
 });
 
-test('cloud media override stays inside signed bridge and MKV uses the Matroska demuxer', async () => {
+test('cloud media override stays inside signed bridge and MKV uses bounded container detection', async () => {
   const f = await fixture({ run: async ({ input, write }) => {
     const response = await fetch(input); assert.equal(response.status, 200); assert.equal(await response.text(), 'cloud-video'); await write();
   } });
@@ -699,21 +930,21 @@ test('cloud media override stays inside signed bridge and MKV uses the Matroska 
   try {
     await start(f.service, { episode: { type: 'mkv', url: 'https://cloud.quark.cn/file.mkv' }, mediaOverride: cloudMedia, proxyPath: '/api/quark/media/test-lease' });
     const args = f.calls.find(call => call.args.includes('-i'))?.args;
-    assert.equal(args[args.indexOf('-f') + 1], 'matroska');
+    assertRawInput(args);
     assert.ok(upstreamCalls > 0);
     assert.ok(args[args.indexOf('-i') + 1].startsWith('http://127.0.0.1:'));
     assert.ok(!args.some(arg => arg.includes('cloud.quark.cn')));
   } finally { await f.close(); }
 });
 
-test('cloud AVI and transport-stream files use fixed demuxers through the signed bridge', async () => {
+test('cloud AVI and transport-stream files use bounded container detection through the signed bridge', async () => {
   for (const type of ['avi', 'mpegts']) {
     const f = await fixture({ run: async ({ input, write }) => { assert.equal((await fetch(input)).status, 200); await write(); } });
     const cloudMedia = createMedia({ proxyPath: '/api/quark/media/test-lease', request: async () => Object.assign(Readable.from([Buffer.from('video')]), { statusCode: 200, headers: { 'content-type': 'application/octet-stream' } }) });
     try {
       await start(f.service, { episode: { type, url: 'https://cloud.quark.cn/file.bin' }, mediaOverride: cloudMedia, proxyPath: '/api/quark/media/test-lease' });
       const args = f.calls.find(call => call.args.includes('-i')).args;
-      assert.equal(args[args.indexOf('-f') + 1], type);
+      assertRawInput(args);
       assert.ok(args[args.indexOf('-i') + 1].startsWith('http://127.0.0.1:'));
     } finally { await f.close(); }
   }
@@ -869,6 +1100,7 @@ test('software output uses a private bridge, bounded HLS window, one thread and 
     const result = await start(f.service, { position: 12.5, speed: 1.5 });
     assert.equal(result.duration, 90.5); assert.equal(result.startPosition, 12.5); assert.equal(result.acceleration, 'software'); assert.equal(result.transcoded, true); assert.match(result.url, /^\/api\/transcode\/[a-f0-9]{32}\/index\.m3u8$/);
     const { command, args } = f.calls[1]; assert.equal(command, 'custom-ffmpeg'); assert.equal(args[args.indexOf('-readrate') + 1], '1.5'); assert.equal(args[args.indexOf('-ss') + 1], '12.5'); assert.equal(args[args.indexOf('-protocol_whitelist') + 1], 'http,tcp,crypto'); assert.match(args[args.indexOf('-i') + 1], /^http:\/\/127\.0\.0\.1:\d+\/api\/media\/asset\.m3u8\?token=/); assert.equal(args.includes(url), false);
+    assert.equal(args[args.indexOf('-f') + 1], 'hls'); assert.equal(args[args.indexOf('-allowed_extensions') + 1], 'ALL'); assert.equal(args.includes('-format_whitelist'), false);
     assert.equal(args[args.indexOf('-hls_time') + 1], '2'); assert.equal(args[args.indexOf('-hls_list_size') + 1], '30'); assert.equal(args[args.indexOf('-hls_flags') + 1], 'delete_segments+temp_file'); assert.ok(args.includes('libx264')); assert.ok(args.includes('aac')); assert.equal(args.includes('-atempo'), false); assert.equal(args.some(value => value.includes('setpts')), false); assert.equal((await f.service.status()).running, true);
     assert.equal(args[args.indexOf('-r') + 1], '30'); assert.equal(args[args.indexOf('-maxrate') + 1], '3500k'); assert.equal(args[args.indexOf('-bufsize') + 1], '7000k');
     assert.ok(args.every((value, index) => !['-threads', '-filter_threads'].includes(value) || args[index + 1] === '1'));
@@ -1068,8 +1300,19 @@ test('asset serving validates identity and paths, supports segment ranges and cl
   } finally { await app?.close(); await f.close(); }
 });
 
-test('MP4 input forces the mov demuxer and compatibility assets do not expose stale task IDs', async () => {
+test('MP4 input uses bounded container detection and compatibility assets do not expose stale task IDs', async () => {
   const f = await fixture(); let app;
-  try { const result = await start(f.service, { episode: { url: 'https://movies.example/a.mp4?token=x', type: 'mp4' } }); assert.equal(f.calls[1].args[f.calls[1].args.indexOf('-f') + 1], 'mov'); assert.match(f.calls[1].args[f.calls[1].args.indexOf('-i') + 1], /asset\.mp4\?token=/); await f.service.cancel(result.id, 'device-a'); app = await assetServer(f.service, result.id); assert.equal((await fetch(app.origin + '/index.m3u8')).status, 404); }
+  try { const result = await start(f.service, { episode: { url: 'https://movies.example/a.mp4?token=x', type: 'mp4' } }); assertRawInput(f.calls[1].args); assert.match(f.calls[1].args[f.calls[1].args.indexOf('-i') + 1], /asset\.mp4\?token=/); await f.service.cancel(result.id, 'device-a'); app = await assetServer(f.service, result.id); assert.equal((await fetch(app.origin + '/index.m3u8')).status, 404); }
   finally { await app?.close(); await f.close(); }
+});
+
+test('original Dolby probe can finish after six seconds within its caller deadline', async () => {
+  const f = await fixture({ colorProbe: dolbyProbe(), colorProbeDelay: 6200, di: { probeTimeout: 6000 } });
+  try {
+    const proof = await f.service.inspectColor({ episode: { ...episode, type: 'mp4', colorSpace: 'dolby-vision' }, sourceColorSpace: 'dolby-vision', owner: 'probe', valid: () => true, timeout: 14000 });
+    assert.equal(supportsDolbyMapping(proof), true);
+    assert.ok(f.children.every(child => child.finished));
+    assert.equal(f.calls.some(call => call.args.includes('-c:v')), false);
+    assert.deepEqual(await readdir(f.root), []);
+  } finally { await f.close(); }
 });

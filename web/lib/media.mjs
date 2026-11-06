@@ -81,7 +81,10 @@ export function createMedia({ request = networkRequest, secret = randomBytes(32)
         if (req.aborted || res.destroyed) { cancel(); return; }
         upstream = await request(data.url, { headers, method: req.method || 'GET', timeout: 8000, signal: controller.signal });
         if (req.aborted || res.destroyed) { cancel(); return; }
-        if (![200, 206, 304, 416].includes(upstream.statusCode)) throw failure(`媒体源返回 HTTP ${upstream.statusCode}`);
+        if (![200, 206, 304, 416].includes(upstream.statusCode)) {
+          const status = Number.isInteger(upstream.statusCode) && upstream.statusCode >= 400 && upstream.statusCode <= 599 ? upstream.statusCode : 502;
+          throw failure(`媒体源返回 HTTP ${status}`, status);
+        }
         const finalUrl = upstream.finalUrl || data.url;
         const manifest = data.type === 'hls' || /mpegurl/i.test(String(upstream.headers['content-type'] || '')) || /\.m3u8$/i.test(new URL(finalUrl).pathname);
         if (manifest && upstream.statusCode === 206) throw failure('HLS 清单必须完整返回，请重新加载', 502);

@@ -17,7 +17,7 @@ import { createDanmaku } from './lib/danmaku.mjs';
 import { createPlayability } from './lib/playability.mjs';
 import { createSourceDiscovery } from './lib/source-discovery.mjs';
 import { repairImport } from './lib/import-repair.mjs';
-import { createTranscoder } from './lib/transcode.mjs';
+import { createTranscoder, supportsDolbyMapping } from './lib/transcode.mjs';
 import { createAdMarkers } from './lib/ad-markers.mjs';
 import { createQuark } from './lib/quark.mjs';
 import { createQuarkCatalog } from './lib/quark-catalog.mjs';
@@ -310,11 +310,13 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
               typeof position !== 'number' || !Number.isFinite(position) || position < 0 || position > 86400 ||
               ![0.5, 0.75, 1, 1.25, 1.5, 2, 3].includes(speed)) throw badRequest('转码线路、进度或倍速不正确');
           const snapshot = store.config(), owner = hashToken(token);
-          let selected, category, unchanged, mediaOverride, proxyPath;
+          let selected, category, unchanged, mediaOverride, proxyPath, trustedColorProbe;
           if (body?.quarkAsset !== undefined) {
             const lease = await cloudMedia.playback(text(body.quarkAsset, '夸克影片标识', 200), { owner, valid: () => store.authenticated(owner) });
             selected = lease.episode; category = lease.category; ensureVisible(category);
             mediaOverride = lease.media; proxyPath = lease.proxyPath; unchanged = lease.valid;
+            if (lease.originalDolby && selected.type !== 'hls' && selected.colorSpace === 'dolby-vision' && selected.sourceColorSpace === 'dolby-vision' &&
+                lease.colorProbe?.colorSpace === 'dolby-vision' && supportsDolbyMapping(lease.colorProbe)) trustedColorProbe = { ...lease.colorProbe };
           } else if (body?.liveId !== undefined) {
             const result = await liveService.list(snapshot);
             const channel = result.channels.find(item => item.id === text(body.liveId, '频道标识', 200));
@@ -333,7 +335,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           if (!selected || !['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'].includes(selected.type)) throw badRequest('请选择有效的媒体');
           if (!unchanged()) throw Object.assign(new Error('播放源已修改，请刷新后重试'), { status: 409 });
           const valid = () => store.authenticated(owner) && unchanged() && (category !== 'adult' || store.config().showAdult === true);
-          const result = await transcodeService.start({ episode: selected, position, speed, owner, valid, ...(mediaOverride ? { mediaOverride, proxyPath } : {}) });
+          const result = await transcodeService.start({ episode: selected, position, speed, owner, valid, ...(mediaOverride ? { mediaOverride, proxyPath } : {}), ...(trustedColorProbe ? { trustedColorProbe } : {}) });
           if (!valid()) {
             await transcodeService.cancel(result.id, owner);
             ensureVisible(category);

@@ -219,6 +219,33 @@ test('upstream stream errors remain observable after pipeline destroys the respo
   await assert.rejects(media.serve(req, res, tokenOf(playback.proxyUrl)), error => error.status === 502 && error.cause.message === 'fixture upstream failure');
 });
 
+test('ordinary HLS and direct media preserve upstream HTTP failures without forwarding private bodies or credentials', async t => {
+  for (const type of ['hls', 'mp4']) for (const status of [401, 403, 410, 412, 429, 500, 502, 503, 504]) await t.test(`${type} ${status}`, async t => {
+    let upstream; const calls = [];
+    const media = createMedia({ request: async (url, options) => {
+      calls.push({ url, options });
+      return upstream = response('private upstream Cookie=synthetic-secret <script>unsafe()</script>', status, { 'content-type': 'text/html', 'set-cookie': 'private=synthetic-secret', 'retry-after': '180' });
+    } });
+    const base = await serverFor(t, media), playback = media.playback(detail(`https://cdn.example/film.${type === 'hls' ? 'm3u8' : 'mp4'}`, type), 0, 0);
+    const result = await fetch(base + playback.proxyUrl, { headers: { cookie: 'browser=synthetic-private', authorization: 'Bearer synthetic-private' } });
+    assert.equal(result.status, status);
+    assert.equal(await result.text(), `媒体源返回 HTTP ${status}`);
+    assert.equal(result.headers.get('set-cookie'), null); assert.equal(result.headers.get('retry-after'), null);
+    assert.equal(calls.length, 1, 'the proxy does not invisibly retry or replace an upstream error');
+    assert.equal(calls[0].options.headers.cookie, undefined); assert.equal(calls[0].options.headers.authorization, undefined);
+    assert.equal(upstream.destroyed, true);
+  });
+});
+
+test('invalid upstream status and unhandled redirect responses remain gateway failures', async t => {
+  for (const status of [undefined, 302, 999]) await t.test(String(status), async t => {
+    const media = createMedia({ request: async () => Object.assign(response('private upstream'), { statusCode: status }) });
+    const base = await serverFor(t, media), playback = media.playback(detail('https://cdn.example/film.mp4', 'mp4'), 0, 0);
+    const result = await fetch(base + playback.proxyUrl); assert.equal(result.status, 502);
+    assert.equal((await result.text()).includes('private upstream'), false);
+  });
+});
+
 test('HEAD and unsatisfied ranges retain status and release upstream', async t => {
   let last;
   const media = createMedia({ request: async (_url, options) => { last = response('', options.headers.range ? 416 : 200, { 'content-type': 'video/mp4', 'content-length': options.headers.range ? '0' : '1000', 'content-range': 'bytes */1000' }); return last; } });

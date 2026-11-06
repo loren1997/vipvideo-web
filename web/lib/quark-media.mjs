@@ -47,7 +47,8 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
         if (!proof && probes < 3 && now() < deadline) {
           probes++;
           try {
-            const budget = originalDolby ? 5500 : 6000;
+            // A raw file needs sequential head, tail and frame reads within the shared 15s deadline.
+            const budget = originalDolby ? 14000 : 6000;
             proof = colorProof(await probeColor({ episode: row, sourceColorSpace: 'dolby-vision', owner: lease.owner || lease.id, valid: () => valid(lease), signal: controller.signal, mediaOverride: lease.media, proxyPath: lease.proxyPath, timeout: Math.min(budget, deadline - now()) }));
             if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409);
             if (controller.signal.aborted) break;

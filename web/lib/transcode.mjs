@@ -10,6 +10,7 @@ import { validateUrl } from './network.mjs';
 
 const speeds = new Set([0.5, 0.75, 1, 1.25, 1.5, 2, 3]);
 const inputFormats = { hls: 'hls', mp4: 'mov', mkv: 'matroska', webm: 'matroska', avi: 'avi', mpegts: 'mpegts' };
+const rawInputFormats = 'mov,matroska,webm,mpegts,avi';
 const colorSpaces = new Set(['sdr', 'pq', 'hlg', 'dolby-vision', 'hdr', 'unknown', 'browser-default']);
 const assetName = /^(?:index\.m3u8|segment\d{6,12}\.ts)$/;
 const failure = (message, status = 502, cause) => Object.assign(new Error(message, cause ? { cause } : undefined), { status });
@@ -163,7 +164,9 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
       for (const response of scope.responses) response.destroy();
       return scope.error;
     };
-    if (scope.closed || scope.error || !encoder && scope.requests >= 16) throw reject();
+    // MP4 may seek across many top-level mdat headers before reaching its moov.
+    const requestLimit = task.type === 'mp4' ? 64 : 16;
+    if (scope.closed || scope.error || !encoder && scope.requests >= requestLimit) throw reject();
     const match = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || 'bytes=0-');
     if (!match) throw reject();
     const start = Number(match[1]), wantedEnd = match[2] ? Number(match[2]) : undefined;
@@ -294,12 +297,14 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     if (scope) scope.promise = new Promise(done => { scope.failed = done; });
     try {
       attempt = task.probeAttempt = runProcess(['-v', 'error', '-threads', '1', '-protocol_whitelist', 'http,tcp,crypto',
-        '-analyzeduration', '1000000', '-probesize', '1048576', '-f', inputFormats[task.type],
+        '-analyzeduration', '1000000', '-probesize', '1048576',
+        ...(task.type === 'hls' ? ['-f', 'hls'] : ['-format_whitelist', rawInputFormats]),
+        ...(task.type === 'mp4' ? ['-ignore_chapters', '1'] : []),
         ...(task.type === 'hls' ? ['-allowed_extensions', 'ALL'] : []), '-read_intervals', '%+#1', '-i', task.input,
         '-select_streams', 'v:0', '-show_streams', '-show_frames', '-show_entries',
         'stream=codec_name,codec_tag_string,pix_fmt,bits_per_raw_sample,color_space,color_transfer,color_primaries:stream_side_data:frame=pix_fmt,color_space,color_transfer,color_primaries:frame_side_data', '-of', 'json'], undefined, { command: probeExecutable, capture: true });
-      const colorBudget = sourceRisk ? 6000 : 3000;
-      await Promise.race([attempt.promise, ...(scope ? [scope.promise] : []), new Promise(done => { timer = setTimeout(done, Math.max(1, Math.min(probeTimeout, colorBudget, deadline - now()))); })]);
+      const colorBudget = scope ? 15000 : sourceRisk ? 6000 : 3000;
+      await Promise.race([attempt.promise, ...(scope ? [scope.promise] : []), new Promise(done => { timer = setTimeout(done, Math.max(1, Math.min(scope ? colorBudget : probeTimeout, colorBudget, deadline - now()))); })]);
       assertValid(task);
       if (scope?.error) throw scope.error;
       if (!attempt.done) throw Object.assign(failure('原文件色彩信息读取超时，请稍后重试或选择其他版本', 504), { code: 'QUARK_COLOR_PROBE_TIMEOUT', colorProbe: { colorSpace: 'unknown' } });
@@ -355,11 +360,12 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     const toneMapped = dolby || task.sourceColorSpace === 'dolby-vision' && ['pq', 'hlg'].includes(task.colorSpace);
     const toneMap = `${scale},zscale=transfer=linear:npl=100,format=gbrpf32le,zscale=primaries=bt709,tonemap=tonemap=hable:desat=2,zscale=transfer=bt709:matrix=bt709:range=limited,format=yuv420p,sidedata=mode=delete:type=MASTERING_DISPLAY_METADATA,sidedata=mode=delete:type=CONTENT_LIGHT_LEVEL`;
     // The original HEVC RPU must reach libplacebo; an already miscoloured AVC stream cannot be repaired here.
-    const dolbyMap = `${hardware ? 'hwmap=derive_device=vulkan,format=vulkan' : 'hwupload'},libplacebo=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:format=yuv420p:apply_dolbyvision=1:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:tonemapping=hable:peak_detect=false:upscaler=none:downscaler=none,hwdownload,format=yuv420p${hardware ? ',format=nv12,hwupload' : ''}`;
+    const dolbyMap = `fps='if(gt(source_fps,0),min(source_fps,30),30)',${hardware ? 'hwmap=derive_device=vulkan,format=vulkan' : 'hwupload'},libplacebo=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:format=yuv420p:apply_dolbyvision=1:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:tonemapping=hable:peak_detect=false:upscaler=none:downscaler=none,hwdownload,format=yuv420p${hardware ? ',format=nv12,hwupload' : ''}`;
     return ['-hide_banner', '-loglevel', 'info', '-nostats', '-nostdin', '-threads', dolby && !hardware ? '4' : '1', '-filter_threads', '1',
       ...(dolby ? ['-init_hw_device', hardware ? `vaapi=va:${device}` : 'vulkan=vk:0', '-filter_hw_device', hardware ? 'va' : 'vk'] : []),
       ...(hardware ? ['-hwaccel', 'vaapi', '-hwaccel_device', dolby ? 'va' : device, '-hwaccel_output_format', 'vaapi'] : []),
-      '-protocol_whitelist', 'http,tcp,crypto', '-readrate', String(task.speed), ...(task.position > 0 ? ['-ss', String(task.position)] : []), '-f', inputFormats[task.type],
+      '-protocol_whitelist', 'http,tcp,crypto', '-readrate', String(task.speed), ...(task.position > 0 ? ['-ss', String(task.position)] : []),
+      ...(task.type === 'hls' ? ['-f', 'hls'] : ['-format_whitelist', rawInputFormats]),
       ...(task.type === 'hls' ? ['-allowed_extensions', 'ALL'] : []), ...(task.encoderReads ? ['-reconnect', '1'] : []), '-i', task.input,
       '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn', '-vf', dolby ? dolbyMap : toneMapped ? toneMap : hardware ? "scale_vaapi=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12" : `${scale},format=yuv420p`,
       ...(toneMapped ? ['-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709'] : []),
@@ -411,7 +417,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         return { ...task.colorProbe };
       } finally { signal?.removeEventListener('abort', abort); await cleanup(task); }
     },
-    async start({ episode, position = 0, speed = 1, owner, valid: isValid, mediaOverride, proxyPath = '/api/media' } = {}) {
+    async start({ episode, position = 0, speed = 1, owner, valid: isValid, mediaOverride, proxyPath = '/api/media', trustedColorProbe } = {}) {
       if (!enabled || closed) throw failure('兼容播放已关闭', 503);
       const selectedMedia = mediaOverride ?? media;
       if (!selectedMedia?.playback || !selectedMedia?.serve) throw failure('兼容播放需要签名媒体转发模块', 503);
@@ -436,7 +442,11 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         if (acceleration === 'software' && !allowSoftware) throw failure('软件兼容编码已关闭，请使用可用的核显或切换播放线路', 503);
         const deadline = now() + startupTimeout;
         await checkResumeRange(task, deadline); assertValid(task);
-        await checkColor(task, deadline); assertValid(task);
+        // Only the server's current original-file lease supplies this proof.
+        if (task.type !== 'hls' && task.colorSpace === 'dolby-vision' && task.sourceColorSpace === 'dolby-vision' &&
+            trustedColorProbe?.colorSpace === 'dolby-vision' && supportsDolbyMapping(trustedColorProbe)) task.colorProbe = { ...trustedColorProbe };
+        else await checkColor(task, deadline);
+        assertValid(task);
         if (task.sourceColorSpace === 'dolby-vision' && ['pq', 'hlg'].includes(task.colorSpace)) {
           if (preference === 'vaapi' || !allowSoftware) throw failure('HDR 转为普通色彩需要软件色调映射，当前设置不允许，请改用夸克官方 SDR 线路', 503);
           acceleration = 'software';

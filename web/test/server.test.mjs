@@ -445,6 +445,33 @@ test('live playback and compatible playback use the verified quality variant whi
   assert.equal(reported, stream.url);
 });
 
+test('transcode receives original Dolby proof only from its current authorized server lease', async t => {
+  const proof = { colorSpace: 'dolby-vision', codec: 'hevc', dolbyVisionProfile: 8, dolbyVisionCompatibilityId: 1, rpuPresent: true, rpuSeen: true, blPresent: true, elPresent: false };
+  let type = 'mp4', expired = false, incomplete = false, lease;
+  const starts = [], quark = { playback: async () => ({ episode: { type, url: `https://video.quark.cn/original.${type}`, colorSpace: 'dolby-vision' }, metadata: { mode: 'download', sourceColorSpace: 'dolby-vision' } }) };
+  const cloud = createQuarkMedia({ quark, probeColor: async () => ({ ...proof, ...(incomplete ? { rpuSeen: false } : {}) }) });
+  const playback = cloud.playback.bind(cloud);
+  cloud.playback = async (...args) => { lease = await playback(...args); if (expired) cloud.invalidate(); return lease; };
+  const transcoder = { async start(options) { starts.push(options); return { id: 'test' }; }, async stop() {} };
+  const { call, login } = await running(t, { quark, quarkMedia: cloud, transcoder }), cookie = await login();
+  const body = { quarkAsset: 'asset', trustedColorProbe: { ...proof, dolbyVisionProfile: 5 }, colorProbe: proof };
+  assert.equal((await call('/api/transcode/start', body, cookie)).status, 200);
+  const first = starts.at(-1);
+  assert.deepEqual(first.trustedColorProbe, proof, 'request-body proof cannot override the current server proof');
+  assert.notEqual(first.trustedColorProbe, lease.colorProbe, 'the task receives a private proof snapshot');
+  assert.equal(first.episode, lease.episode); assert.equal(first.mediaOverride, lease.media); assert.equal(first.proxyPath, lease.proxyPath);
+  assert.equal(first.valid(), true); cloud.invalidate(); assert.equal(first.valid(), false);
+  type = 'hls';
+  assert.equal((await call('/api/transcode/start', body, cookie)).status, 200);
+  assert.equal(starts.at(-1).trustedColorProbe, undefined, 'a raw-file proof never skips HLS stream inspection');
+  const accepted = starts.length; type = 'mp4'; expired = true;
+  assert.equal((await call('/api/transcode/start', body, cookie)).status, 409);
+  assert.equal(starts.length, accepted, 'an expired lease cannot reach the transcoder');
+  expired = false; incomplete = true;
+  assert.equal((await call('/api/transcode/start', body, cookie)).status, 409);
+  assert.equal(starts.length, accepted, 'forged request proof cannot rescue missing server RPU');
+});
+
 test('builtin source presets can be merged without deleting customized sources', async (t) => {
   const builtin = { id: 'builtin', name: '内置样例', api: 'https://example.com/builtin' };
   const custom = { id: 'custom', name: '自定义样例', api: 'https://example.com/custom' };

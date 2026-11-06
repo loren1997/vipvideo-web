@@ -55,9 +55,10 @@ export function validateUrl(value) {
 }
 
 export function createRequest({ lookup = dnsLookup, httpRequest = http.request, httpsRequest = https.request } = {}) {
-  const agents = { 'http:': new http.Agent({ keepAlive: true, maxSockets: 6, maxTotalSockets: 24, maxFreeSockets: 2, timeout: 15000 }),
-    'https:': new https.Agent({ keepAlive: true, maxSockets: 6, maxTotalSockets: 24, maxFreeSockets: 2, timeout: 15000 }) };
-  for (const agent of Object.values(agents)) {
+  const pools = keepAlive => ({ 'http:': new http.Agent({ keepAlive, maxSockets: 6, maxTotalSockets: 24, maxFreeSockets: 2, timeout: 15000 }),
+    'https:': new https.Agent({ keepAlive, maxSockets: 6, maxTotalSockets: 24, maxFreeSockets: 2, timeout: 15000 }) });
+  const agents = pools(true), retryAgents = pools(false);
+  for (const agent of [...Object.values(agents), ...Object.values(retryAgents)]) {
     const getName = agent.getName;
     // 仅复用同一已验证公网 IP 的连接，DNS 变化仍需重新校验并建连。
     agent.getName = function (options) { return `${getName.call(this, options)}:${options.validatedAddress}`; };
@@ -69,6 +70,7 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
     const deadline = Date.now() + timeout;
     let url = validateUrl(value);
     let requestHeaders = { ...headers };
+    let retried = false;
     try {
       for (let redirects = 0; redirects <= 3; redirects++) {
         signal?.throwIfAborted();
@@ -87,20 +89,35 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
           throw failure('不允许访问内网或保留地址', 403);
         }
         const selected = publicRecords.find(record => record.family === 4) || publicRecords[0];
-        const response = await new Promise((resolve, reject) => {
+        const send = (fresh = false) => new Promise((resolve, reject) => {
+          signal?.throwIfAborted();
+          if (deadline <= Date.now()) throw failure('影视源请求超时');
           const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
+          const attemptHeaders = { 'accept-encoding': 'identity', ...requestHeaders };
+          if (fresh) {
+            for (const key of Object.keys(attemptHeaders)) if (key.toLowerCase() === 'connection') delete attemptHeaders[key];
+            // A bounded nonpersistent pool must not hand a completed retry socket to queued requests.
+            attemptHeaders.connection = 'close';
+          }
+          let received = false;
           const outgoing = transport(url, {
-            method, agent: agents[url.protocol], validatedAddress: selected.address, signal,
-            headers: { 'accept-encoding': 'identity', ...requestHeaders },
+            method, agent: (fresh ? retryAgents : agents)[url.protocol], validatedAddress: selected.address, signal,
+            headers: attemptHeaders,
             // 固定已验证的地址，避免校验后再次 DNS 解析产生重绑定。
             lookup: (_host, options, callback) => options.all
               ? callback(null, [selected]) : callback(null, selected.address, selected.family),
-          }, resolve);
+          }, response => { received = true; resolve(response); });
           const headerTimer = setTimeout(() => outgoing.destroy(failure('影视源请求超时')), Math.max(1, deadline - Date.now()));
           outgoing.once('response', () => clearTimeout(headerTimer));
-          outgoing.once('error', error => { clearTimeout(headerTimer); reject(error); });
+          outgoing.once('error', error => {
+            clearTimeout(headerTimer);
+            if (!retried && !received && ['GET', 'HEAD'].includes(method) && outgoing.reusedSocket === true && error.code === 'ECONNRESET' && !signal?.aborted && Date.now() < deadline) {
+              retried = true; resolve(send(true));
+            } else reject(error);
+          });
           outgoing.end(body);
         });
+        const response = await send();
         response.finalUrl = url.href;
         response.setTimeout?.(timeout, () => response.destroy(failure('影视源读取超时')));
         if (![301, 302, 303, 307, 308].includes(response.statusCode)) return response;

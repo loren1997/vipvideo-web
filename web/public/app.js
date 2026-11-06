@@ -700,6 +700,7 @@ function selectionFor(data, reference = {}) {
 
 function playPosition(current) {
   if (Number.isFinite(current?.quarkRestartPosition)) return current.quarkRestartPosition;
+  if (current?.seekPreview) return current.seekPreview.from;
   if (current?.transcodeLoading || (current?.transcoded && !current.transcodeReady)) return current.position || 0;
   return current?.video?.readyState >= 1 ? (current.transcoded ? current.startPosition || 0 : 0) + current.video.currentTime : current?.position || 0;
 }
@@ -713,19 +714,54 @@ function historyRecord(current) {
   return { ...fieldsOf(current.detail), line: current.line || 0, episode: current.episode || 0, url: current.quarkOnly ? '' : current.originalUrl || current.url, mode: current.mode, ...(current.quarkOnly && current.quarkAsset ? { quarkAsset: current.quarkAsset, episodeName: current.episodeName || '' } : {}), ...(current.mode === 'parser' ? { parser: current.parser || '' } : { position: playPosition(current), duration: playDuration(current) }) };
 }
 
-function stopTranscode(id, keepalive = false) {
+function stopTranscode(id, keepalive = false, strict = false) {
   if (!id) return Promise.resolve();
-  return api('/api/transcode/stop', { method: 'POST', body: { id }, keepalive }).catch(error => console.warn('兼容播放任务停止失败', error.message));
+  const stopped = api('/api/transcode/stop', { method: 'POST', body: { id }, keepalive });
+  return strict ? stopped : stopped.catch(error => console.warn('兼容播放任务停止失败', error.message));
+}
+
+function pauseCompatibility(current, job) {
+  if (player !== current || current.transcodePause || !job && (!current.transcoded || !current.transcodeReady || current.transcodeLoading || current.failed || !current.video.paused || current.video.ended || current.video.error)) return;
+  const paused = current.transcodePause = { position: job?.position ?? playPosition(current), id: job?.id ?? current.transcodeId, released: false };
+  current.position = paused.position; current.transcodeReady = false; clearTimeout(current.loadTimer);
+  delete current.seekPreview; current.quarkPaused = true; current.recovering = false;
+  if (hls) hls.stopLoad?.();
+  else { current.video.removeAttribute('src'); current.video.load(); }
+  current.note.textContent = '已暂停'; current.note.className = 'player-note';
+  paused.promise = stopTranscode(paused.id, true, true).then(result => {
+    if (typeof result?.stopped !== 'boolean') throw new Error('停止兼容播放未得到确认。');
+    paused.released = true;
+    if (player === current && current.transcodePause === paused && current.transcodeId === paused.id) current.transcodeId = null;
+    return true;
+  }).catch(error => {
+    paused.error = error; console.warn('暂停后兼容任务停止失败', error.message);
+    if (player === current && current.transcodePause === paused && !current.transcodeLoading) { current.note.textContent = '已暂停，但后台任务停止失败，可点击播放重试。'; current.note.className = 'player-note error-message'; }
+    return false;
+  });
+  current.updateClock?.();
+}
+
+function resumeVideo(current) {
+  if (player !== current) return;
+  if (current.transcodeLoading) { current.transcodeResumeCancelled = false; current.quarkPaused = false; return; }
+  if (current.transcodePause) void startCompatibility(current, current.seekPreview?.position ?? current.transcodePause.position);
+  else void current.video.play().catch(error => notify(error.message, true));
+}
+
+function pauseVideo(current) {
+  if (player !== current) return;
+  if (current.transcodeLoading) { current.transcodeResumeCancelled = true; current.quarkPaused = true; current.note.textContent = '已暂停'; current.note.className = 'player-note'; }
+  current.video.pause();
 }
 
 function compatibilityLabel(current) {
   return current.acceleration === 'vaapi' ? '硬件兼容播放' : '软件兼容播放';
 }
 
-async function startCompatibility(current, position = playPosition(current), automatic = false) {
+async function startCompatibility(current, position = current.seekPreview?.position ?? playPosition(current), automatic = false) {
   if (player !== current || !(current.catalog || current.live) || !(current.quarkAsset ? ['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'] : ['hls', 'mp4']).includes(current.originalType || current.type)) return;
-  if (automatic && (current.flow?.transcodeTried || current.quarkPaused)) return;
-  if (!automatic) current.quarkPaused = false;
+  if (automatic && (current.flow?.transcodeTried || current.quarkPaused || current.transcodePause)) return;
+  if (!automatic) { current.quarkPaused = false; current.transcodeResumeCancelled = false; }
   if (automatic) current.flow.transcodeTried = true;
   if (!current.transcodePromise) current.request = ++playVersion;
   if (current.catalog && !current.preferences) {
@@ -738,6 +774,7 @@ async function startCompatibility(current, position = playPosition(current), aut
   current.preferences ||= { ...defaultPreferences };
   if (current.catalog && target === 0 && !current.introHandled) target = Math.max(target, current.preferences.introSeconds);
   if (duration > 0) target = Math.min(target, Math.max(0, duration - 1));
+  if (current.transcoded) current.seekPreview = { position: target, from: current.seekPreview?.from ?? playPosition(current) };
   current.pendingTranscodePosition = target;
   if (current.transcodePromise) return current.transcodePromise;
   current.transcodePromise = (async () => {
@@ -753,13 +790,23 @@ async function startCompatibility(current, position = playPosition(current), aut
       setQuarkPlaybackStatus(current, 'loading');
       if (current.compatibilityButton) current.compatibilityButton.disabled = true;
       try {
+        const paused = current.transcodePause;
+        if (paused) {
+          await paused.promise;
+          if (!valid()) return;
+          if (current.transcodeResumeCancelled) { current.position = current.seekPreview?.from ?? paused.position; delete current.seekPreview; delete current.pendingTranscodePosition; return; }
+          if (current.pendingTranscodePosition !== undefined) continue;
+          if (current.transcodePause === paused) delete current.transcodePause;
+        }
         const body = current.live ? { liveId: current.channel.id, line: current.line, position: 0, speed: 1 } : current.quarkAsset ? { quarkAsset: current.quarkAsset, position: requested, speed: current.preferences.speed } : { ...playbackSelection(current.detail, current.line, current.episode), id: String(current.detail.id), position: requested, speed: current.preferences.speed };
         const job = await api('/api/transcode/start', { method: 'POST', body, timeoutMs: 35000 });
         if (!valid()) { await stopTranscode(job.id, true); return; }
         if (!job.id || !mediaUrl(job.url) || job.type !== 'hls') { await stopTranscode(job.id, true); throw new Error('兼容播放服务返回了无效的播放任务。'); }
         current.originalUrl ||= current.url; current.originalType ||= current.type;
+        const pausedPosition = current.seekPreview?.from ?? current.position;
         Object.assign(current, { transcodeId: job.id, transcoded: true, transcodeReady: false, startPosition: Number(job.startPosition) || 0, originalDuration: Number.isFinite(job.duration) && job.duration > 0 ? job.duration : 0, acceleration: job.acceleration, url: job.url, type: 'hls', usedProxy: false, started: true, position: Number(job.startPosition) || 0, introHandled: true, failed: false, recovering: false });
         current.transcodeLoading = false;
+        if (current.transcodeResumeCancelled) { delete current.pendingTranscodePosition; pauseCompatibility(current, { id: job.id, position: pausedPosition }); return; }
         if (current.pendingTranscodePosition !== undefined) continue;
         if (current.video) { resetDanmaku(current); loadMedia(current, `正在连接${compatibilityLabel(current)}…`); }
         else mountPlayer(current);
@@ -768,6 +815,7 @@ async function startCompatibility(current, position = playPosition(current), aut
       } catch (error) {
         if (!valid()) { console.warn('离开播放器后兼容任务启动失败', error.message); return; }
         delete current.pendingTranscodePosition; current.failed = true; current.recovering = false;
+        if (current.seekPreview) { current.position = current.seekPreview.from; delete current.seekPreview; }
         if (Number.isFinite(current.quarkRestartPosition)) { current.position = current.quarkRestartPosition; delete current.quarkRestartPosition; }
         current.compatibilityErrorCode = error.code;
         current.note.textContent = error.status === 409 && error.code !== 'TRANSCODE_INPUT_NOT_SEEKABLE' ? '兼容播放正被另一台设备使用，请稍后再试。' : `兼容播放未启动：${error.message}`;
@@ -1872,7 +1920,7 @@ function playerAds(current, host) {
 function seekVideo(current, seconds) {
   if (player !== current || !current.video || current.live) return;
   const duration = playDuration(current);
-  const position = Math.max(0, playPosition(current) + seconds);
+  const position = Math.max(0, (current.seekPreview?.position ?? playPosition(current)) + seconds);
   if (current.transcoded) { void startCompatibility(current, duration ? Math.min(duration - 1, position) : position); return; }
   if (!duration) return;
   current.video.currentTime = Math.min(duration, position);
@@ -2071,7 +2119,7 @@ function mountPlayer(current) {
   speed.value = String(current.preferences.speed); video.playbackRate = current.preferences.speed;
   speed.disabled = Boolean(current.live);
   speed.addEventListener('change', () => {
-    const position = playPosition(current); current.preferences.speed = Number(speed.value); video.playbackRate = current.preferences.speed;
+    const position = current.seekPreview?.position ?? playPosition(current); current.preferences.speed = Number(speed.value); video.playbackRate = current.preferences.speed;
     if (current.transcoded) void startCompatibility(current, position);
   });
   const full = button('全屏', async () => {
@@ -2108,7 +2156,7 @@ function mountPlayer(current) {
   clock.append(clockText, timeline); host.insertBefore(clock, current.note);
   const filmControls = node('div', undefined, 'player-film-controls'); filmControls.id = 'full-film-controls'; filmControls.setAttribute('aria-label', '影片播放控制'); filmControls.hidden = true; frame.append(filmControls);
   const transport = node('div', undefined, 'player-toolbar');
-  const play = button('播放', () => { if (player !== current) return; if (video.paused) void video.play().catch(error => notify(error.message, true)); else video.pause(); });
+  const play = button('播放', () => { if (player !== current) return; if (video.paused) resumeVideo(current); else pauseVideo(current); });
   const mute = button('静音', () => { video.muted = !video.muted; });
   const volumeLabel = node('label', '音量'); const volume = node('input'); volume.type = 'range'; volume.min = '0'; volume.max = '1'; volume.step = '0.05'; volume.value = String(video.volume); volume.setAttribute('aria-label', '音量'); volumeLabel.append(volume);
   volume.addEventListener('input', () => { video.volume = Number(volume.value); if (video.volume > 0) video.muted = false; });
@@ -2161,10 +2209,13 @@ function mountPlayer(current) {
   current.showFilmControls = showControls;
   current.clearFilmControls = () => { clearTimeout(controlsTimer); controlEvents.abort(); };
   const updateClock = () => {
-    const duration = playDuration(current), position = playPosition(current);
+    if (player !== current) return;
+    if (current.seekPreview && !current.transcodeLoading && current.transcodeReady && hasVideoFrame(video) && current.startPosition === current.seekPreview.position) delete current.seekPreview;
+    const duration = playDuration(current), position = playPosition(current), preview = pendingTimelinePosition ?? current.seekPreview?.position;
+    const shownPosition = preview ?? position;
     const previousControls = current.fullFilmControls;
     current.fullFilmControls = Boolean(current.transcoded && !current.live && duration > 0);
-    clockText.textContent = `${current.transcoded && !current.fullFilmControls ? `${compatibilityLabel(current)} · ` : ''}${formatTime(position)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
+    clockText.textContent = `${preview !== undefined ? '跳转至 ' : current.transcoded && !current.fullFilmControls ? `${compatibilityLabel(current)} · ` : ''}${formatTime(shownPosition)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
     filmControls.hidden = !current.fullFilmControls;
     // Rewriting controls on every progress update resets the browser's auto-hide timer.
     if (video.controls !== !current.fullFilmControls) video.controls = !current.fullFilmControls;
@@ -2172,14 +2223,14 @@ function mountPlayer(current) {
     else { if (clock.parentNode !== host) host.insertBefore(clock, current.note); if (full.parentNode !== toolbar) toolbar.append(full); }
     updateTransport();
     timeline.hidden = !current.transcoded || current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
-    if (pendingTimelinePosition === undefined) { timeline.max = String(duration); timeline.value = String(position); }
-    timeline.setAttribute('aria-valuetext', `${formatTime(position)} / ${formatTime(duration)}`);
+    if (pendingTimelinePosition === undefined) { timeline.max = String(duration); timeline.value = String(shownPosition); }
+    timeline.setAttribute('aria-valuetext', `${preview !== undefined ? '跳转至 ' : ''}${formatTime(shownPosition)} / ${formatTime(duration)}`);
     // Progress updates must not restart the controls' idle timer.
     if (previousControls !== current.fullFilmControls || controlsLoading !== Boolean(current.transcodeLoading)) {
       controlsLoading = Boolean(current.transcodeLoading); showControls();
     }
   };
-  timeline.addEventListener('input', () => { pendingTimelinePosition = Number(timeline.value); });
+  timeline.addEventListener('input', () => { if (player !== current) return; pendingTimelinePosition = Math.max(0, Math.min(playDuration(current), Number(timeline.value) || 0)); updateClock(); });
   timeline.addEventListener('change', () => {
     const position = pendingTimelinePosition ?? Number(timeline.value); pendingTimelinePosition = undefined;
     if (player === current && current.transcoded) void startCompatibility(current, position);
@@ -2200,21 +2251,18 @@ function mountPlayer(current) {
       if (current.preferences.introSeconds > 0) video.currentTime = Math.min(current.preferences.introSeconds, Math.max(0, video.duration - 1));
     }
   });
-  video.addEventListener('pause', () => { if (player === current) { clearQuarkStall(); if (current.quarkAsset && !current.transcodeLoading && !video.error) current.quarkPaused = true; if (current.quarkRefreshing) { current.quarkRefreshCancelled = true; note.textContent = '已暂停自动恢复，可点击“重试夸克播放”继续。'; note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); } if (current.transcoded && !current.transcodeLoading) current.pausedAt = Date.now(); void saveHistory(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
+  video.addEventListener('pause', () => { if (player === current) { clearQuarkStall(); if (current.quarkAsset && !current.transcodeLoading && !video.error) current.quarkPaused = true; if (current.quarkRefreshing) { current.quarkRefreshCancelled = true; note.textContent = '已暂停自动恢复，可点击“重试夸克播放”继续。'; note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); } void saveHistory(current); pauseCompatibility(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
   video.addEventListener('seeked', () => { if (player === current && current.quarkAsset) void saveHistory(current); });
+  for (const event of ['seeking', 'seeked']) video.addEventListener(event, () => { if (player === current) updateClock(); });
   video.addEventListener('play', () => {
     if (player !== current) return;
+    if (current.transcodePause) { if (!video.paused) resumeVideo(current); return; }
     current.quarkPaused = false;
-    if (!current.transcoded || current.transcodeLoading) return;
-    if (current.pausedAt && Date.now() - current.pausedAt >= 120000 && !current.expiryRecovered) {
-      current.expiryRecovered = true; void startCompatibility(current, playPosition(current));
-    }
-    current.pausedAt = 0;
   });
   video.addEventListener('ended', () => { if (player === current) { void saveHistory(current, true); if (current.catalog && !current.quarkOnly && current.preferences.autoNext && !current.nextPending) { current.nextPending = true; void nextEpisode(current); } } });
-  video.addEventListener('loadeddata', () => { if (player === current) { if (!current.quarkAsset || hasVideoFrame(video)) { clearTimeout(current.loadTimer); if (current.transcoded) current.transcodeReady = true; if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); } updateClock(); resetDanmaku(current); } });
+  video.addEventListener('loadeddata', () => { if (player === current && !current.transcodePause && !current.transcodeLoading) { if (!current.quarkAsset || hasVideoFrame(video)) { clearTimeout(current.loadTimer); if (current.transcoded) current.transcodeReady = true; if (current.live) reportLive(current, 'ok'); else if (current.catalog) reportPlayback(current, 'ok'); } updateClock(); resetDanmaku(current); } });
   const markPlaying = () => {
-    if (player !== current || current.transcodeLoading || current.quarkRefreshing || current.quarkAsset && (video.paused || !hasVideoFrame(video))) return;
+    if (player !== current || current.transcodePause || current.transcodeLoading || current.quarkRefreshing || current.quarkAsset && (video.paused || !hasVideoFrame(video))) return;
     if (current.quarkAsset) current.failed = false;
     clearQuarkStall();
     if (current.quarkAsset && current.transcoded) current.transcodeReady = true;
@@ -2227,7 +2275,7 @@ function mountPlayer(current) {
     if (current.stallTimer && video.currentTime > current.stallPosition + 0.25) clearQuarkStall();
     if (current.quarkAsset && current.quarkPlaybackStatus === 'loading') markPlaying();
     updateClock();
-    if (!current.catalog) return;
+    if (!current.catalog || current.seekPreview) return;
     if (skipMarkedAd(current)) return;
     drawDanmaku(current);
     const outro = current.preferences.outroSeconds;
@@ -2262,11 +2310,12 @@ function mountPlayer(current) {
 }
 
 function playbackError(current, hlsError) {
-  if (player !== current || current.failed || current.quarkRefreshing) return;
+  if (player !== current || current.failed || current.quarkRefreshing || current.transcodePause) return;
   clearTimeout(current.loadTimer); clearTimeout(current.stallTimer); current.stallTimer = null;
   if (current.transcodeLoading) return;
   if (current.transcoded) {
     current.position = playPosition(current); current.failed = true;
+    delete current.seekPreview; current.updateClock?.();
     current.note.textContent = '兼容播放中断，请点击“重新兼容播放”重试。'; current.note.className = 'player-note error-message';
     setQuarkPlaybackStatus(current, 'error');
     void stopTranscode(current.transcodeId); current.transcodeId = null; return;
@@ -2277,7 +2326,7 @@ function playbackError(current, hlsError) {
     const decodeError = status < 400 && (noFrame || (hlsError
       ? hlsError.type === 'mediaError' && ['manifestIncompatibleCodecsError', 'bufferAddCodecError', 'bufferIncompatibleCodecsError', 'bufferAppendError', 'bufferAppendingError'].includes(hlsError.details)
       : [3, 4].includes(current.video?.error?.code)));
-    const networkError = hlsError ? hlsError.type === 'networkError' && (!status || status === 408 || status >= 500) : current.video?.error?.code === 2;
+    const networkError = hlsError ? hlsError.type === 'networkError' && (!status || [401, 403, 408, 410, 412].includes(status) || status >= 500) : current.video?.error?.code === 2;
     if (decodeError && !current.quarkPaused && !current.requiresCompatibility && !current.flow.transcodeTried) { void startCompatibility(current, playPosition(current), true); return; }
     if (networkError && !current.quarkPaused && !current.flow.quarkRefreshTried) {
       current.flow.quarkRefreshTried = true; current.quarkRefreshing = true; current.quarkRefreshCancelled = false;
@@ -2285,8 +2334,8 @@ function playbackError(current, hlsError) {
       void playQuark(current, current.quarkAsset, () => current.quarkRefreshing && !current.quarkRefreshCancelled && !current.quarkPaused, current.flow).finally(() => { current.quarkRefreshing = false; });
       return;
     }
-    const reason = status ? `媒体请求返回 HTTP ${status}` : hlsError?.details === 'startupTimeout' ? '视频加载超时' : hlsError?.details === 'playbackStall' ? '持续缓冲，暂时无法继续播放' : networkError ? '播放连接中断' : decodeError ? '浏览器无法解码当前视频' : '当前视频暂时无法播放';
-    current.failed = true; current.note.textContent = noFrame ? '播放源没有可解码的视频画面，请尝试兼容播放或选择其他官方在线版本。' : `夸克播放中断：${reason}。可重试夸克播放，或${current.quarkOnly ? '返回夸克资源' : '返回原线路；原影视源不会因此停用'}。`; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); return;
+    const reason = status === 429 ? '媒体请求返回 HTTP 429，请求过于频繁，请稍后重试' : status ? `媒体请求返回 HTTP ${status}` : hlsError?.details === 'startupTimeout' ? '视频加载超时' : hlsError?.details === 'playbackStall' ? '持续缓冲，暂时无法继续播放' : networkError ? '播放连接中断' : decodeError ? '浏览器无法解码当前视频' : '当前视频暂时无法播放';
+    current.failed = true; current.note.textContent = noFrame && !status ? '播放源没有可解码的视频画面，请尝试兼容播放或选择其他官方在线版本。' : `夸克播放中断：${reason}。可重试夸克播放，或${current.quarkOnly ? '返回夸克资源' : '返回原线路；原影视源不会因此停用'}。`; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); return;
   }
   if (current.catalog) void recoverPlayback(current);
   else if (current.live) void recoverLive(current);
@@ -2315,7 +2364,7 @@ async function recoverPlayback(current) {
 }
 
 function attemptPlay(current, generation) {
-  if (player !== current || generation !== current.mediaVersion || current.quarkPaused) return;
+  if (player !== current || generation !== current.mediaVersion || current.quarkPaused || current.transcodePause) return;
   void current.video.play().catch(error => {
     if (player !== current || generation !== current.mediaVersion) return;
     if (error.name === 'NotAllowedError') { clearTimeout(current.loadTimer); current.note.textContent = '视频已准备好，浏览器需要你点击播放器的播放按钮开始。'; }
@@ -2338,7 +2387,10 @@ async function loadMedia(current, message = '正在连接播放地址…') {
   if (current.type === 'hls') {
     try { await ensureHls(); }
     catch (error) {
-      if (player === current && generation === current.mediaVersion) { current.failed = true; current.note.textContent = error.message; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); }
+      if (player === current && generation === current.mediaVersion) {
+        if (current.seekPreview) { current.position = current.seekPreview.from; delete current.seekPreview; }
+        current.failed = true; current.updateClock?.(); current.note.textContent = error.message; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error');
+      }
       return;
     }
     if (player !== current || generation !== current.mediaVersion) return;
@@ -2408,7 +2460,7 @@ function stopPlayer(invalidate = true) {
   if (hls) { hls.destroy(); hls = null; }
   if (current.video) { current.video.pause(); current.video.removeAttribute('src'); current.video.load(); }
   if (current.frame) current.frame.src = 'about:blank';
-  return Promise.all([save, stopTranscode(current.transcodeId, true)]);
+  return Promise.all([save, current.transcodePause && !current.transcodePause.error ? current.transcodePause.promise : stopTranscode(current.transcodeId, true)]);
 }
 
 function openLink(url, resume = false) {
@@ -2741,7 +2793,7 @@ window.addEventListener('keydown', event => {
     if (target.isContentEditable || textEntry && ['ArrowLeft', 'ArrowRight', 'Enter', ' ', 'Escape', 'Backspace'].includes(event.key) || target.matches('input[type="number"]') && ['ArrowUp', 'ArrowDown'].includes(event.key) || target.matches('select') && ['ArrowUp', 'ArrowDown', 'Enter', ' ', 'Escape'].includes(event.key) || target.matches('input[type="range"]') && ['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
     if (current?.video && (target === current.video || /^Media(?:Play|Pause|PlayPause|FastForward|Rewind)$/.test(event.key))) {
       if (['Enter', ' ', 'MediaPlay', 'MediaPause', 'MediaPlayPause'].includes(event.key)) {
-        event.preventDefault(); event.stopPropagation(); if (event.key === 'MediaPause' || event.key !== 'MediaPlay' && !current.video.paused) current.video.pause(); else void current.video.play().catch(error => notify(error.message, true)); return;
+        event.preventDefault(); event.stopPropagation(); if (event.key === 'MediaPause' || event.key !== 'MediaPlay' && !current.video.paused) pauseVideo(current); else resumeVideo(current); return;
       }
       if (['ArrowLeft', 'ArrowRight', 'MediaFastForward', 'MediaRewind'].includes(event.key)) { event.preventDefault(); event.stopPropagation(); seekVideo(current, ['ArrowRight', 'MediaFastForward'].includes(event.key) ? 10 : -10); return; }
     }
@@ -2752,7 +2804,7 @@ window.addEventListener('keydown', event => {
   }
   if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || !current?.video || !(target instanceof Element) || !$('#player-host')?.contains(target) || target.matches('input,textarea,select') || target.closest('[contenteditable="true"]')) return;
   if (current.fullFilmControls && target === current.video && [' ', 'Enter', 'MediaPlayPause', 'MediaPlay', 'MediaPause'].includes(event.key)) {
-    event.preventDefault(); if (event.key === 'MediaPause' || event.key !== 'MediaPlay' && !current.video.paused) current.video.pause(); else void current.video.play().catch(error => notify(error.message, true));
+    event.preventDefault(); if (event.key === 'MediaPause' || event.key !== 'MediaPlay' && !current.video.paused) pauseVideo(current); else resumeVideo(current);
   } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); seekVideo(current, event.key === 'ArrowRight' ? 10 : -10); }
   else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
     const controls = [...$('#player-host').querySelectorAll('button,a[href],video[controls],select,input')].filter(element => !element.disabled && element.getClientRects().length);
@@ -2779,7 +2831,7 @@ window.addEventListener('pagehide', () => {
   clearInterval(current.timer); clearInterval(current.danmakuTimer); clearTimeout(current.loadTimer); clearTimeout(current.stallTimer); clearDanmaku(current);
   if (hls) { hls.destroy(); hls = null; }
   current.video?.pause();
-  void stopTranscode(current.transcodeId, true); current.transcodeId = null;
+  if (!current.transcodePause || current.transcodePause.error) void stopTranscode(current.transcodeId, true); current.transcodeId = null;
   if (current.live || current.started === false) return;
   const record = historyRecord(current);
   void queueQuarkProgress(current, false, true);

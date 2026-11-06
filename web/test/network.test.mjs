@@ -158,3 +158,151 @@ test('limits decoded response size and reads gzip JSON', async () => {
   const compressed = Object.assign(Readable.from([gzipSync('a'.repeat(1000))]), { headers: { 'content-encoding': 'gzip' } });
   await assert.rejects(readText(compressed, 100), /响应过大/);
 });
+
+function resetTransport(steps, calls) {
+  return (url, options, callback) => {
+    const step = steps[calls.length]; assert.ok(step, 'unexpected network attempt');
+    const outgoing = new EventEmitter(); outgoing.reusedSocket = step.reused === true;
+    outgoing.destroy = error => { if (outgoing.destroyed) return; outgoing.destroyed = true; queueMicrotask(() => outgoing.emit('error', error)); };
+    const abort = () => outgoing.destroy(Object.assign(new Error('aborted'), { code: 'ABORT_ERR' }));
+    const cleanup = () => options.signal?.removeEventListener('abort', abort);
+    options.signal?.addEventListener('abort', abort, { once: true });
+    outgoing.once('error', cleanup); outgoing.once('response', cleanup);
+    outgoing.end = () => queueMicrotask(() => {
+      step.before?.();
+      if (outgoing.destroyed || step.stall) return;
+      if (step.error) return outgoing.emit('error', Object.assign(new Error('fixture reset'), { code: step.error }));
+      const incoming = step.incoming || response('ok', step.status || 200, step.headers);
+      outgoing.emit('response', incoming); callback(incoming);
+    });
+    calls.push({ url: url.href, options, outgoing }); return outgoing;
+  };
+}
+
+test('reused GET and HEAD resets retry once on a fresh bounded agent with the same pinned address and Range', async () => {
+  for (const method of ['GET', 'HEAD']) {
+    const calls = []; let lookups = 0;
+    const request = createRequest({ lookup: async () => { lookups++; return [{ address: '8.8.8.8', family: 4 }]; },
+      httpsRequest: resetTransport([{ reused: true, error: 'ECONNRESET' }, {}], calls) });
+    assert.equal(await readText(await request('https://cdn.example/video.mp4', { method, headers: { Range: 'bytes=100-199', Cookie: 'fixture=only' } })), 'ok');
+    assert.equal(calls.length, 2); assert.equal(lookups, 1);
+    const [first, retry] = calls.map(call => call.options);
+    assert.equal(retry.method, method); assert.equal(retry.validatedAddress, first.validatedAddress);
+    assert.equal(retry.headers.Range, first.headers.Range); assert.equal(retry.headers.Cookie, first.headers.Cookie);
+    assert.notEqual(retry.agent, first.agent); assert.equal(retry.agent.keepAlive, false);
+    assert.equal(retry.agent.maxSockets, 6); assert.equal(retry.agent.maxTotalSockets, 24);
+    assert.equal(retry.headers.connection, 'close');
+    for (const options of [first, retry]) options.lookup('cdn.example', {}, (error, address) => { assert.equal(error, null); assert.equal(address, '8.8.8.8'); });
+  }
+});
+
+test('stale-socket recovery never retries POST, new sockets, unrelated errors or upstream HTTP statuses', async () => {
+  for (const step of [
+    { reused: true, error: 'ECONNRESET', method: 'POST' }, { error: 'ECONNRESET' },
+    ...['EPIPE', 'ETIMEDOUT', 'ABORT_ERR', 'CERT_HAS_EXPIRED'].map(error => ({ reused: true, error })),
+    { reused: true, status: 429 }, { reused: true, status: 502 },
+  ]) {
+    const calls = [], request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpsRequest: resetTransport([step], calls) });
+    const pending = request('https://cdn.example/video.mp4', { method: step.method || 'GET' });
+    if (step.error) await assert.rejects(pending, error => error.cause?.code === step.error);
+    else { const incoming = await pending; assert.equal(incoming.statusCode, step.status); incoming.destroy(); }
+    assert.equal(calls.length, 1);
+  }
+});
+
+test('a fresh reset gets no second retry and redirects do not renew the recovery allowance or credentials', async () => {
+  for (const redirect of [false, true]) {
+    const calls = [], steps = [{ reused: true, error: 'ECONNRESET' }, redirect
+      ? { status: 302, headers: { location: 'https://other.example/video.mp4' } } : { error: 'ECONNRESET' }];
+    if (redirect) steps.push({ reused: true, error: 'ECONNRESET' });
+    const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpsRequest: resetTransport(steps, calls) });
+    await assert.rejects(request('https://cdn.example/video.mp4', { headers: { Cookie: 'fixture=only', Authorization: 'fixture' } }), error => error.cause?.code === 'ECONNRESET');
+    assert.equal(calls.length, redirect ? 3 : 2);
+    if (redirect) { assert.equal(calls[2].options.headers.Cookie, undefined); assert.equal(calls[2].options.headers.Authorization, undefined); }
+  }
+});
+
+test('stale-socket retry respects cancellation, the original deadline and aborts a pending fresh connection', async () => {
+  for (const expired of [false, true]) {
+    const calls = [], controller = new AbortController(), originalNow = Date.now; let clock = originalNow();
+    const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpsRequest: resetTransport([
+      { reused: true, error: 'ECONNRESET', before: () => { if (expired) clock += 101; else controller.abort(); } },
+    ], calls) });
+    try {
+      Date.now = () => clock;
+      await assert.rejects(request('https://cdn.example/video.mp4', { signal: controller.signal, timeout: 100 }));
+      assert.equal(calls.length, 1);
+    } finally { Date.now = originalNow; }
+  }
+  const calls = [], controller = new AbortController();
+  const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpsRequest: resetTransport([
+    { reused: true, error: 'ECONNRESET' }, { stall: true, before: () => controller.abort() },
+  ], calls) });
+  await assert.rejects(request('https://cdn.example/video.mp4', { signal: controller.signal }), error => error.cause?.code === 'ABORT_ERR');
+  assert.equal(calls.length, 2); assert.equal(calls[1].outgoing.destroyed, true);
+});
+
+test('a reset after response headers is reported as a body failure without replaying the request', async () => {
+  const calls = [], incoming = Object.assign(Readable.from((async function* () { yield 'part'; throw Object.assign(new Error('reset body'), { code: 'ECONNRESET' }); })()), { statusCode: 200, headers: {} });
+  const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpsRequest: resetTransport([{ reused: true, incoming }], calls) });
+  await assert.rejects(readText(await request('https://cdn.example/video.mp4')), error => error.cause?.code === 'ECONNRESET');
+  assert.equal(calls.length, 1);
+});
+
+test('an owned HTTP server resetting a reused Range GET recovers on one new connection without Cookie', async t => {
+  const sockets = new Set(), agents = new Set(), calls = []; let hits = 0;
+  const server = http.createServer((req, res) => {
+    assert.equal(req.headers.cookie, undefined); assert.equal(req.headers.range, 'bytes=0-1');
+    if (++hits === 2) return req.socket.destroy();
+    res.writeHead(206, { 'Content-Length': '2', 'Content-Range': 'bytes 0-1/200' }); res.end('ok');
+  });
+  server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
+  t.after(async () => {
+    const closed = [...sockets].map(socket => new Promise(resolve => socket.once('close', resolve)));
+    for (const agent of agents) agent.destroy(); server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve)); await Promise.all(closed); assert.equal(sockets.size, 0);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpRequest: (url, options, callback) => {
+    agents.add(options.agent);
+    const outgoing = http.request({ ...options, hostname: '127.0.0.1', port: server.address().port, path: url.pathname }, callback);
+    calls.push(outgoing); return outgoing;
+  } });
+  for (let index = 0; index < 2; index++) {
+    const incoming = await request('http://cdn.example/video.mp4', { headers: { range: 'bytes=0-1' }, timeout: 1000 });
+    assert.equal(incoming.statusCode, 206); assert.equal(await readText(incoming), 'ok');
+  }
+  assert.deepEqual(calls.map(call => call.reusedSocket), [false, true, false]); assert.equal(hits, 3);
+});
+
+test('the shared fresh retry pool queues its seventh connection and does not reuse completed retry sockets', async t => {
+  const agents = new Set(), sockets = new Set(), outgoing = [], pending = [], held = [], controller = new AbortController();
+  let entered, hits = 0, released = false, connections = 0;
+  const sixEntered = new Promise(resolve => { entered = resolve; });
+  const reply = res => { res.writeHead(200, { 'Content-Length': '2' }); res.end('ok'); };
+  const server = http.createServer((req, res) => {
+    assert.equal(req.headers.cookie, undefined); assert.equal(req.headers.connection, 'close');
+    if (++hits === 6) entered();
+    if (released) reply(res); else held.push(res);
+  });
+  server.on('connection', socket => { connections++; sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
+  t.after(async () => {
+    controller.abort(); await Promise.allSettled(pending);
+    const closed = [...sockets].map(socket => new Promise(resolve => socket.once('close', resolve)));
+    for (const agent of agents) agent.destroy(); server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve)); await Promise.all(closed); assert.equal(sockets.size, 0);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpRequest: (url, options, callback) => {
+    if (options.agent.keepAlive) return resetTransport([{ reused: true, error: 'ECONNRESET' }], [])(url, options, callback);
+    agents.add(options.agent);
+    const req = http.request({ ...options, hostname: '127.0.0.1', port: server.address().port, path: url.pathname }, callback); outgoing.push(req); return req;
+  } });
+  for (let index = 0; index < 7; index++) pending.push(request('http://cdn.example/video.mp4', { timeout: 1000, signal: controller.signal }).then(readText));
+  await sixEntered;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(hits, 6); assert.equal(connections, 6); assert.equal(agents.size, 1);
+  released = true; for (const res of held) reply(res);
+  assert.deepEqual(await Promise.all(pending), Array(7).fill('ok'));
+  assert.equal(connections, 7); assert.ok(outgoing.every(req => req.reusedSocket === false));
+});
