@@ -345,14 +345,20 @@ test('failed channels are isolated while normal empty searches retain their alia
   assert.equal(more.pending, false);
 });
 
-test('read timeout aborts only the slow channel and preserves already found results for more', async () => {
-  const search = createTelegramSearch({ channels: ['Alpha_Channel', 'Bravo_Channel'] }); let readSignal;
+test('read timeout aborts only the slow channel and preserves already found results for more', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now });
+  const search = createTelegramSearch({ channels: ['Alpha_Channel', 'Bravo_Channel'] }); let readSignal, notified;
+  const partial = new Promise(resolve => { notified = resolve; });
   const started = Date.now();
-  const result = await search('希望', { year: 2026, deadline: started + 50, read: async (url, duration, bytes, end, signal) => {
+  const pending = search('希望', { year: 2026, deadline: started + 50, onResults: notified, read: async (url, duration, bytes, end, signal) => {
     const channel = new URL(url).pathname.split('/').at(-1);
     if (channel === 'Alpha_Channel') { readSignal = signal; return new Promise(() => {}); }
     return channelPost(channel, 30, '希望 (2026)', link);
   } });
+  assert.equal((await partial).length, 1);
+  t.mock.timers.tick(49); assert.equal(readSignal.aborted, false);
+  t.mock.timers.tick(1);
+  const result = await pending;
   assert.equal(result.length, 1); assert.equal(readSignal.aborted, true); assert.equal(result.pending, true);
   assert.equal(result.reason, '公开频道搜索超时'); assert.ok(Date.now() - started < 1000);
 });
