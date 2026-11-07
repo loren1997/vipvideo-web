@@ -139,7 +139,6 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
   }
   async function stopReadScope(task, scope) {
     if (!scope) return;
-    if (task.probeReads === scope) delete task.probeReads;
     if (task.encoderReads === scope) delete task.encoderReads;
     scope.closed = true;
     const closing = [...scope.responses].filter(response => !response.closed).map(response => new Promise(done => response.once('close', done)));
@@ -193,9 +192,10 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
       const total = Number(range[2]);
       if (scope.total !== undefined && scope.total !== total) { reject(); return false; }
       scope.total = total; checked = true;
+      const actual = Number(range[1]) - start + 1;
+      // Older FFmpeg needs a finite response length to resume the next bounded range.
+      if (res.getHeader('content-length') === undefined) res.setHeader('Content-Length', actual);
       if (req.method !== 'HEAD') {
-        // Chunked 206 responses have no Content-Length; the validated range still fixes the exact byte count.
-        const actual = Number(range[1]) - start + 1;
         scope.reserved -= reserved - actual; reserved = left = actual;
       }
       return true;
@@ -206,6 +206,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
       const size = typeof chunk === 'string' ? Buffer.byteLength(chunk, typeof encoding === 'string' ? encoding : undefined) : chunk?.byteLength || 0;
       if (size > left || !encoder && scope.bytes + size > 16 * 1024 * 1024) { reject(); return false; }
       left -= size; reserved -= size; scope.reserved -= size; scope.bytes += size;
+      if (size > 0) scope.lastReadAt = now();
       return true;
     };
     const writeHead = res.writeHead.bind(res), write = res.write.bind(res), endResponse = res.end.bind(res), destroy = res.destroy.bind(res);
@@ -293,12 +294,14 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     if (!task.inspectOnly && (task.colorSpace === 'sdr' || task.colorSpace !== 'dolby-vision' && task.sourceColorSpace !== 'dolby-vision')) return;
     const sourceRisk = ['pq', 'hlg', 'hdr', 'dolby-vision'].some(value => [task.sourceColorSpace, task.colorSpace].includes(value));
     let attempt, timer;
+    const startedAt = now();
     const scope = task.type !== 'hls' && (task.colorSpace === 'dolby-vision' || task.sourceColorSpace === 'dolby-vision')
       ? task.probeReads = { bytes: 0, reserved: 0, requests: 0, responses: new Set(), promise: undefined } : undefined;
     if (scope) scope.promise = new Promise(done => { scope.failed = done; });
     try {
       attempt = task.probeAttempt = runProcess(['-v', 'error', '-threads', '1', '-protocol_whitelist', 'http,tcp,crypto',
         '-analyzeduration', '1000000', '-probesize', '1048576',
+        ...(scope ? ['-reconnect', '1', '-reconnect_delay_max', '0'] : []),
         ...(task.type === 'hls' ? ['-f', 'hls'] : ['-format_whitelist', rawInputFormats]),
         ...(task.type === 'mp4' ? ['-ignore_chapters', '1'] : []),
         ...(task.type === 'hls' ? ['-allowed_extensions', 'ALL'] : []), '-read_intervals', '%+#1', '-i', task.input,
@@ -347,11 +350,23 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
       task.colorProbe.colorSpace = task.colorSpace;
     } catch (error) {
       assertValid(task);
+      const stderr = attempt?.stderr || '', stderrCategory = [
+        ['not on whitelist', /not on whitelist/i], ['partial-input', /Stream ends prematurely|partial file|End of file/i],
+        ['http-error', /HTTP error|Server returned [45]\d\d/i], ['invalid-option', /Option .*not found|Unrecognized option/i],
+        ['missing-metadata', /moov atom not found|Could not find codec parameters/i], ['decode-error', /Error while decoding|Invalid data found/i],
+      ].find(([, pattern]) => pattern.test(stderr))?.[0] || (stderr ? 'other' : 'none');
+      logger.error('HDR 色彩检查失败', JSON.stringify({
+        phase: error.code === 'QUARK_COLOR_PROBE_TIMEOUT' ? 'probe-timeout' : error.code === 'QUARK_COLOR_PROBE_READ_FAILED' ? 'probe-read-failed' : 'probe-metadata-invalid',
+        elapsedMs: Math.max(0, now() - startedAt), rangeGuard: !!scope, requests: scope?.requests || 0, bytes: scope?.bytes || 0,
+        reserved: scope?.reserved || 0, openResponses: scope?.responses.size || 0,
+        lastReadAgoMs: scope?.lastReadAt === undefined ? null : Math.max(0, now() - scope.lastReadAt),
+        processClosed: attempt?.done === true, exitCode: attempt?.code ?? null, stderrCategory,
+      }));
       if (error.status) throw error;
-      if (attempt?.stderr) logger.error('HDR 色彩检查失败', diagnostics(attempt.stderr));
       throw Object.assign(failure('无法确认此视频的色彩信息，已停止兼容播放以避免偏色，请改用夸克官方 SDR 线路或其他 SDR 版本', 409), { code: 'QUARK_COLOR_UNCONFIRMED', colorProbe: { ...task.colorProbe, colorSpace: 'unknown' } });
     } finally {
       clearTimeout(timer); await stopReadScope(task, scope); await terminate(attempt);
+      if (task.probeReads === scope) delete task.probeReads;
       if (task.probeAttempt === attempt) delete task.probeAttempt;
     }
   }

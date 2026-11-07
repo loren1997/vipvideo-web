@@ -189,6 +189,63 @@ test('real MP4 color inspection skips chapter reads and finds tail metadata acro
   } finally { await f.close(); assert.equal(bodies.size, 0); assert.equal(children.size, 0); }
 });
 
+test('real color inspection decodes a first frame spanning bounded HTTP ranges', { timeout: 20000 }, async t => {
+  const { spawn, execFile } = await import('node:child_process'), { promisify } = await import('node:util');
+  const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg', ffprobe = process.env.FFPROBE_PATH || (process.env.FFMPEG_PATH ? join(ffmpeg, '..', process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe') : 'ffprobe');
+  const run = (command, args) => promisify(execFile)(command, args, { windowsHide: true, timeout: 10000, maxBuffer: 1024 * 1024 });
+  try { await run(ffmpeg, ['-version']); await run(ffprobe, ['-version']); }
+  catch (error) { if (error.code === 'ENOENT') return t.skip('Local FFmpeg and FFprobe are required for the native range fixture'); throw error; }
+  let data, contentLength = true; const requests = [], frames = [], bodies = new Set(), children = new Set();
+  const media = createMedia({ request: async (target, options) => {
+    assert.equal(String(target), 'https://fixtures.example/large-first-frame.mp4');
+    const range = /^bytes=(\d+)-(\d+)$/.exec(options.headers.range); assert.ok(range);
+    const first = Number(range[1]), last = Math.min(Number(range[2]), data.length - 1); requests.push(first);
+    assert.ok(last >= first && last - first + 1 <= 2 * 1024 * 1024);
+    const response = Readable.from((async function* () {
+      for (let at = first; at <= last; at += 8192) { yield data.subarray(at, Math.min(at + 8192, last + 1)); await new Promise(done => setImmediate(done)); }
+    })());
+    bodies.add(response); response.once('close', () => bodies.delete(response));
+    return Object.assign(response, { statusCode: 206, finalUrl: String(target), headers: { 'content-type': 'video/mp4', 'content-range': `bytes ${first}-${last}/${data.length}`, ...(contentLength ? { 'content-length': String(last - first + 1) } : {}) } });
+  } });
+  const f = await fixture({ media, di: { env: { FFMPEG_PATH: ffmpeg, FFPROBE_PATH: ffprobe }, spawn: (command, args, options) => {
+    const child = spawn(command, args, options); children.add(child); let stdout = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.once('close', () => { children.delete(child); if (args.includes('-show_entries')) { let result; try { result = JSON.parse(stdout); } catch {} frames.push(result?.frames?.length || 0); } });
+    return child;
+  } } });
+  try {
+    const input = join(f.root, 'single-frame.mp4');
+    await run(ffmpeg, ['-hide_banner', '-nostdin', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=size=16x16:rate=1', '-frames:v', '1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-pix_fmt', 'yuv420p', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
+      '-x264-params', 'colorprim=bt709:transfer=bt709:colormatrix=bt709', input]);
+    const decoded = JSON.parse((await run(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_frames', '-show_entries', 'frame=color_space,color_transfer,color_primaries', '-of', 'json', input])).stdout);
+    assert.equal(decoded.frames.length, 1, 'the generated fixture must decode before testing HTTP');
+    for (const key of ['color_space', 'color_transfer', 'color_primaries']) assert.equal(decoded.frames[0][key], 'bt709');
+    const source = await readFile(input), atoms = [];
+    function scan(first, last) {
+      for (let at = first; at < last;) {
+        const size = source.readUInt32BE(at), type = source.toString('ascii', at + 4, at + 8); assert.ok(size >= 8 && at + size <= last); atoms.push({ at, size, type });
+        if (['moov', 'trak', 'mdia', 'minf', 'stbl'].includes(type)) scan(at + 8, at + size); at += size;
+      }
+    }
+    scan(0, source.length); const mdat = atoms.find(atom => atom.type === 'mdat'), moov = atoms.find(atom => atom.type === 'moov'), stsz = atoms.find(atom => atom.type === 'stsz');
+    assert.ok(moov.at > mdat.at); assert.equal(source.readUInt32BE(stsz.at + 16), 1); assert.equal(source.readUInt32BE(stsz.at + 12), mdat.size - 8);
+    // A valid filler NAL keeps the frame tiny while placing its IDR beyond the first two MiB.
+    const filler = Buffer.alloc(2 * 1024 * 1024 + 65542, 0xff); filler.writeUInt32BE(filler.length - 4); filler[4] = 12; filler[filler.length - 1] = 0x80;
+    source.writeUInt32BE(mdat.size - 8 + filler.length, stsz.at + 12); source.writeUInt32BE(mdat.size + filler.length, mdat.at);
+    data = Buffer.concat([source.subarray(0, mdat.at + 8), filler, source.subarray(mdat.at + 8)]);
+    for (contentLength of [true, false]) await t.test(contentLength ? 'upstream supplies Content-Length' : 'upstream has no Content-Length', async () => {
+      requests.length = 0;
+      const proof = await f.service.inspectColor({ episode: { type: 'mp4', url: 'https://fixtures.example/large-first-frame.mp4', colorSpace: 'dolby-vision' }, sourceColorSpace: 'dolby-vision', owner: 'native-range-test', valid: () => true, timeout: 6000 });
+      t.diagnostic(JSON.stringify({ contentLength, ranges: requests, decodedFrames: frames.at(-1), codec: proof.codec, colorSpace: proof.colorSpace }));
+      assert.equal(frames.at(-1), 1, 'the probe must receive and decode the entire first packet');
+      assert.equal(proof.codec, 'h264'); assert.equal(proof.colorSpace, 'sdr'); assert.equal(supportsDolbyMapping(proof), false);
+      assert.ok(requests.includes(mdat.at + 8 + 2 * 1024 * 1024), 'the next bounded read resumes exactly where the first window ended');
+      assert.ok(requests.length <= 8, 'reconnect cannot loop at the real end of the file');
+    });
+  } finally { await f.close(); assert.equal(bodies.size, 0); assert.equal(children.size, 0); }
+});
+
 test('real raw input detection accepts renamed Matroska and rejects referenced playlists', { timeout: 30000 }, async t => {
   const { spawn, execFile } = await import('node:child_process'), { promisify } = await import('node:util');
   const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg', ffprobe = process.env.FFPROBE_PATH || (process.env.FFMPEG_PATH ? join(ffmpeg, '..', process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe') : 'ffprobe');
@@ -399,10 +456,17 @@ test('chunked Dolby range responses keep probe and encoder windows bounded acros
   const size = 32 * 1024 * 1024 * 1024 + 17, source = probeRangeMedia('missing-length', size);
   const largeDolby = { ...rawDolby, url: 'https://movies.example/large-original.mp4', type: 'mp4' };
   const inspect = async ({ input }) => {
+    const head = await fetch(input, { method: 'HEAD', headers: { Range: 'bytes=0-' } });
+    assert.equal(head.status, 206);
+    assert.equal(head.headers.get('content-length'), String(2 * 1024 * 1024));
+    assert.equal(head.headers.get('transfer-encoding'), null);
+    assert.equal(head.headers.get('content-range'), `bytes 0-2097151/${size}`);
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
     for (const [start, expected] of [[0, 2 * 1024 * 1024], [size - 1024, 1024]]) {
       const response = await fetch(input, { headers: { Range: `bytes=${start}-` } });
       assert.equal(response.status, 206);
-      assert.equal(response.headers.get('content-length'), null);
+      assert.equal(response.headers.get('content-length'), String(expected));
+      assert.equal(response.headers.get('transfer-encoding'), null);
       assert.equal(response.headers.get('content-range'), `bytes ${start}-${start + expected - 1}/${size}`);
       assert.equal((await response.arrayBuffer()).byteLength, expected);
     }
@@ -411,7 +475,8 @@ test('chunked Dolby range responses keep probe and encoder windows bounded acros
     run: async ({ input, write }) => {
       const response = await fetch(input, { headers: { Range: 'bytes=0-' } });
       assert.equal(response.status, 206);
-      assert.equal(response.headers.get('content-length'), null);
+      assert.equal(response.headers.get('content-length'), String(8 * 1024 * 1024));
+      assert.equal(response.headers.get('transfer-encoding'), null);
       assert.equal((await response.arrayBuffer()).byteLength, 8 * 1024 * 1024);
       await write();
     },
@@ -420,7 +485,7 @@ test('chunked Dolby range responses keep probe and encoder windows bounded acros
     const proof = await f.service.inspectColor({ episode: largeDolby, sourceColorSpace: 'dolby-vision', owner: 'probe', valid: () => true });
     assert.equal(proof.rpuSeen, true);
     await start(f.service, { episode: largeDolby });
-    assert.deepEqual(source.calls, ['bytes=0-2097151', `bytes=${size - 1024}-${size - 1}`, 'bytes=0-2097151', `bytes=${size - 1024}-${size - 1}`, 'bytes=0-8388607']);
+    assert.deepEqual(source.calls, ['bytes=0-2097151', 'bytes=0-2097151', `bytes=${size - 1024}-${size - 1}`, 'bytes=0-2097151', 'bytes=0-2097151', `bytes=${size - 1024}-${size - 1}`, 'bytes=0-8388607']);
   } finally { await f.close(); }
 });
 
@@ -651,6 +716,7 @@ test('aborting a signed color inspection stops its process and leaves no encodin
     controller.abort(); await assert.rejects(pending);
     assert.ok(f.children[0].signals.includes('SIGTERM')); assert.equal(f.calls.filter(call => call.args.includes('-c:v')).length, 0);
     assert.deepEqual(await readdir(f.root), []);
+    assert.equal(f.logs.some(line => line.includes('HDR 色彩检查失败')), false, 'explicit cancellation is not a probe failure');
   } finally { await f.close(); }
 });
 
@@ -1405,4 +1471,74 @@ test('raw Dolby decoding may outlast 15 seconds without changing the single-thre
     const args = f.calls[0].args; assert.equal(args[args.indexOf('-threads') + 1], '1');
     assert.equal(f.calls.some(call => call.args.includes('-c:v')), false);
   } finally { await f.close(); }
+});
+
+test('probe timeout diagnostics distinguish unread and completed input without exposing stderr data', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const read of [false, true]) {
+    let entered; const ready = new Promise(resolve => { entered = resolve; });
+    const source = probeRangeMedia('valid', 3), f = await fixture({ media: source.media, hungColorProbe: true, inspect: async ({ child, input }) => {
+      child.stderr.write('Stream ends prematurely https://private.example/secret-film.mp4?sign=signature-secret Cookie: __puus=cookie-secret token=bare-secret C:\\private\\private-film.mkv');
+      if (read) assert.equal((await (await fetch(input)).arrayBuffer()).byteLength, 3);
+      entered();
+    } });
+    try {
+      const pending = f.service.inspectColor({ episode: rawDolby, owner: 'probe', valid: () => true, timeout: 5000 });
+      await ready; t.mock.timers.tick(5000);
+      await assert.rejects(pending, error => error.code === 'QUARK_COLOR_PROBE_TIMEOUT');
+      assert.equal(f.logs.length, 1);
+      const summary = JSON.parse(f.logs[0].slice('HDR 色彩检查失败 '.length));
+      assert.equal(summary.phase, 'probe-timeout'); assert.equal(summary.rangeGuard, true);
+      assert.equal(summary.requests, Number(read)); assert.equal(summary.bytes, read ? 3 : 0);
+      assert.equal(summary.reserved, 0); assert.equal(summary.openResponses, 0);
+      assert.equal(summary.processClosed, false); assert.equal(summary.exitCode, null); assert.equal(summary.stderrCategory, 'partial-input');
+      assert.ok(Number.isFinite(summary.elapsedMs) && summary.elapsedMs >= 0);
+      assert.ok(read ? Number.isFinite(summary.lastReadAgoMs) && summary.lastReadAgoMs >= 0 : summary.lastReadAgoMs === null);
+      assert.doesNotMatch(f.logs[0], /private|secret|signature|cookie|token|https?:|mp4|mkv/i);
+      assert.ok(f.logs[0].length < 512); assert.ok(f.children.every(child => child.finished));
+      assert.deepEqual(await readdir(f.root), []);
+    } finally { await f.close(); }
+  }
+});
+
+test('a probe reconnect during termination cannot reopen an unguarded source read', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let entered, reconnectStatus; const ready = new Promise(resolve => { entered = resolve; });
+  const source = probeRangeMedia('valid', 3), f = await fixture({ media: source.media, hungColorProbe: true, inspect: async ({ child, input }) => {
+    child.kill = signal => {
+      child.signals.push(signal);
+      if (signal === 'SIGTERM') {
+        void fetch(input, { headers: { Range: 'bytes=0-' } }).then(async response => {
+          reconnectStatus = response.status; await response.arrayBuffer();
+        }).catch(() => { reconnectStatus = 0; }).finally(() => child.exit(0));
+      } else child.exit(0);
+      return true;
+    };
+    entered();
+  } });
+  try {
+    const pending = f.service.inspectColor({ episode: rawDolby, owner: 'probe', valid: () => true, timeout: 5000 });
+    await ready; t.mock.timers.tick(5000);
+    await assert.rejects(pending, error => error.code === 'QUARK_COLOR_PROBE_TIMEOUT');
+    assert.deepEqual(source.calls, []);
+    assert.notEqual(reconnectStatus, undefined); assert.notEqual(reconnectStatus, 206);
+    assert.ok(f.children.every(child => child.finished)); assert.deepEqual(await readdir(f.root), []);
+  } finally { await f.close(); }
+});
+
+test('probe diagnostics preserve range failures and distinguish a closed malformed probe', async () => {
+  for (const mode of ['mismatch', 'malformed']) {
+    const source = probeRangeMedia(mode === 'mismatch' ? mode : 'valid', 3);
+    const f = await fixture({ media: source.media, colorProbeBody: '{malformed', inspect: async ({ input }) => {
+      if (mode === 'mismatch') await assert.rejects(fetch(input));
+    } });
+    try {
+      await assert.rejects(f.service.inspectColor({ episode: rawDolby, owner: 'probe', valid: () => true }), error => error.code === (mode === 'mismatch' ? 'QUARK_COLOR_PROBE_READ_FAILED' : 'QUARK_COLOR_UNCONFIRMED'));
+      assert.equal(f.logs.length, 1);
+      const summary = JSON.parse(f.logs[0].slice('HDR 色彩检查失败 '.length));
+      assert.equal(summary.phase, mode === 'mismatch' ? 'probe-read-failed' : 'probe-metadata-invalid');
+      assert.equal(summary.requests, mode === 'mismatch' ? 1 : 0); assert.equal(summary.bytes, 0); assert.equal(summary.stderrCategory, 'none');
+      if (mode === 'malformed') { assert.equal(summary.processClosed, true); assert.equal(summary.exitCode, 0); }
+    } finally { await f.close(); }
+  }
 });
