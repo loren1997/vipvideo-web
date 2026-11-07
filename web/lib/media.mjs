@@ -83,7 +83,7 @@ export function createMedia({ request = networkRequest, secret = randomBytes(32)
         if (req.aborted || res.destroyed) { cancel(); return; }
         if (![200, 206, 304, 416].includes(upstream.statusCode)) {
           const status = Number.isInteger(upstream.statusCode) && upstream.statusCode >= 400 && upstream.statusCode <= 599 ? upstream.statusCode : 502;
-          throw failure(`媒体源返回 HTTP ${status}`, status);
+          throw Object.assign(failure(`媒体源返回 HTTP ${status}`, status), { code: 'MEDIA_SOURCE_HTTP_ERROR' });
         }
         const finalUrl = upstream.finalUrl || data.url;
         const manifest = data.type === 'hls' || /mpegurl/i.test(String(upstream.headers['content-type'] || '')) || /\.m3u8$/i.test(new URL(finalUrl).pathname);

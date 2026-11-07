@@ -1733,14 +1733,20 @@ function mountQuark(current) {
   const savedRefresh = button('刷新已转存文件', () => void loadSaved(), 'button subtle small');
   async function loadSaved() {
     if (!valid()) return;
+    const focused = document.activeElement, preserveFocus = savedPanel.contains(focused) || result.contains(focused); let focusTarget;
     const version = ++savedVersion; savedRefresh.disabled = true;
     if (!canTransfer) { savedPanel.hidden = true; savedRefresh.disabled = false; return 0; }
     try {
       const data = await api(`/api/quark/saved?${new URLSearchParams(playbackSelection(current.detail, current.line, current.episode))}`);
       if (!valid() || version !== savedVersion) return;
-      const files = Array.isArray(data.files) ? data.files : [], playable = files.filter(file => file.available).length;
+      if (!Array.isArray(data.files)) throw new Error('已转存文件列表格式无效');
+      const files = data.files, playable = files.filter(file => file.available).length;
+      if (state.ready?.status === 'ready' && state.ready.assetId && !files.some(file => file.assetId === state.ready.assetId)) {
+        delete state.ready; result.replaceChildren(); clearPreparedSubtitles();
+        feedback.textContent = playable ? '可播放已转存文件，也可继续搜索其他版本。' : '未找到可播放的已转存文件，请搜索其他资源。';
+      }
       savedPanel.hidden = files.length === 0; discoverySummary.textContent = files.length ? '搜索其他版本' : '搜索资源';
-      if (!savedLoaded && !discovery.contains(document.activeElement)) discovery.open = playable === 0;
+      if (!playable || !savedLoaded && !discovery.contains(document.activeElement)) discovery.open = playable === 0;
       savedLoaded = true;
       savedSummary.textContent = `已转存文件（${files.length}）`; savedBody.replaceChildren();
       if (!files.length) savedBody.append(node('p', '这部影片还没有已登记的转存文件。', 'muted'));
@@ -1757,9 +1763,10 @@ function mountQuark(current) {
         play.disabled = !file.available || active; row.append(info, play); savedBody.append(row);
       }
       savedBody.append(savedRefresh);
+      focusTarget = files.length ? savedRefresh : discoverySummary;
       return playable;
-    } catch (error) { if (valid() && version === savedVersion) { savedPanel.hidden = false; savedBody.replaceChildren(node('p', `已转存文件读取失败：${error.message}`, 'muted'), savedRefresh); } }
-    finally { if (valid() && version === savedVersion) savedRefresh.disabled = false; }
+    } catch (error) { if (valid() && version === savedVersion) { savedPanel.hidden = false; savedBody.replaceChildren(node('p', `已转存文件读取失败：${error.message}`, 'muted'), savedRefresh); focusTarget = savedRefresh; } }
+    finally { if (valid() && version === savedVersion) { savedRefresh.disabled = false; if (preserveFocus && focusTarget && (focused === savedRefresh || !focused.isConnected) && [focused, document.body].includes(document.activeElement)) focusTarget.focus(); } }
   }
   function ready(data) {
     state.ready = data; result.replaceChildren(node('p', `${data.name || '当前集'}：${data.status === 'ready' ? '已准备好' : data.status === 'pending' ? '正在准备' : '准备未完成'}${data.saved ? ' · 已转存' : ''}`, 'muted'));

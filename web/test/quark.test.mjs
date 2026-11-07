@@ -34,7 +34,8 @@ test('saved file inventory lists this film versions and sidecars without transfe
   assert.deepEqual((await service.savedFiles({ ...detail, id: 'other', title: '另一影片' })).files, []);
   const registry = JSON.parse(metadata.get('quark-registry-v1')), first = registry.assets.find(asset => asset.id === saved.files[0].assetId);
   state.files = state.files.filter(file => file.fid !== first.fid);
-  assert.equal((await service.savedFiles(detail)).files.find(file => file.assetId === first.id).available, false);
+  assert.equal((await service.savedFiles(detail)).files.some(file => file.assetId === first.id), false);
+  assert.equal(JSON.parse(metadata.get('quark-registry-v1')).assets.find(asset => asset.id === first.id).status, 'ready');
   await assert.rejects(service.savedFiles(detail, { visible: () => { throw Object.assign(new Error('hidden'), { status: 403 }); } }), { status: 403 });
   await connect({ cookie: COOKIE_B }); assert.deepEqual((await service.savedFiles(detail)).files, []);
 });
@@ -54,6 +55,68 @@ test('saved inventory rechecks asset visibility after awaiting the directory', a
   state.beforeRequest = call => { if (call.path === '/file/sort') visible = false; };
   await assert.rejects(service.savedFiles(detail, { visible: category => { if (category === 'adult' && !visible) throw Object.assign(new Error('hidden'), { status: 403 }); } }), { status: 403 });
 });
+
+test('saved inventory hides all confirmed missing videos across refreshes and restarts without changing registration', async t => {
+  const { service, options, state, metadata, connect, save } = await fixture(t); await connect();
+  const saved = await save(), files = state.files, registration = metadata.get('quark-registry-v1'), start = state.calls.length;
+  state.files = [];
+  const refreshed = await Promise.all([service.savedFiles(detail), service.savedFiles(detail)]);
+  assert.ok(refreshed.every(result => result.files.length === 0));
+  assert.equal(metadata.get('quark-registry-v1'), registration);
+  await service.stop(); const restored = createQuark(options); t.after(() => restored.stop());
+  assert.deepEqual((await restored.savedFiles(detail)).files, []);
+  state.files = files;
+  const returned = await restored.savedFiles(detail);
+  assert.equal(returned.files[0].assetId, saved.assetId); assert.equal(returned.files[0].available, true);
+  assert.equal(metadata.get('quark-registry-v1'), registration);
+  assert.ok(state.calls.slice(start).every(call => call.options.method === 'GET'));
+  assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+});
+
+test('saved inventory keeps registration after incomplete listings and temporary directory failures', async t => {
+  for (const mode of ['incomplete', 'network', 'login', 'malformed', 'missing-folder']) await t.test(mode, async t => {
+    const { service, state, metadata, connect, save } = await fixture(t); await connect();
+    const saved = await save(), files = state.files, registration = metadata.get('quark-registry-v1'), start = state.calls.length;
+    state.files = [];
+    state.beforeRequest = call => {
+      if (call.path !== '/file/sort') return;
+      const query = new URL(call.value).searchParams;
+      if (query.get('pdir_fid') === '0') return mode === 'missing-folder' ? reply({ list: [] }) : undefined;
+      if (mode === 'network') throw new Error('synthetic temporary network failure');
+      if (mode === 'login') return reply(null, { code: 401, status: 401, http: 401 });
+      if (mode === 'malformed') return reply({ list: null });
+      const page = query.get('_page');
+      return reply({ list: Array.from({ length: 100 }, (_, index) => ({ ...sourceVideo(`unrelated-${page}-${index}`), pdir_fid: query.get('pdir_fid') })) });
+    };
+    if (mode === 'incomplete') {
+      const inventory = await service.savedFiles(detail);
+      assert.equal(inventory.files.length, 1); assert.equal(inventory.files[0].assetId, saved.assetId); assert.equal(inventory.files[0].available, false);
+      assert.equal(state.calls.slice(start).filter(call => call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') !== '0').length, 6);
+    } else await assert.rejects(service.savedFiles(detail));
+    assert.equal(metadata.get('quark-registry-v1'), registration);
+    state.beforeRequest = null; state.files = files;
+    assert.equal((await service.savedFiles(detail)).files[0].available, true);
+    assert.equal(metadata.get('quark-registry-v1'), registration);
+    assert.ok(state.calls.slice(start).every(call => call.options.method === 'GET'));
+    assert.deepEqual(state.deletes, []); assert.deepEqual(state.purges, []);
+  });
+});
+
+test('saved inventory retains pending videos and changed files whose registered fid is still present', async t => {
+  for (const mode of ['pending', 'renamed', 'resized', 'moved']) await t.test(mode, async t => {
+    const { service, state, metadata, connect, save } = await fixture(t); await connect();
+    state.pending = mode === 'pending'; const saved = await save();
+    if (mode === 'pending') state.files = [];
+    else if (mode === 'renamed') state.files[0].file_name = 'renamed.mp4';
+    else if (mode === 'resized') state.files[0].size++;
+    else state.beforeRequest = call => call.path === '/file/sort' && new URL(call.value).searchParams.get('pdir_fid') !== '0' ? reply({ list: [{ ...state.files[0], pdir_fid: 'user-folder' }] }) : undefined;
+    const registration = metadata.get('quark-registry-v1'), inventory = await service.savedFiles(detail);
+    assert.equal(inventory.files.length, 1); assert.equal(inventory.files[0].assetId, saved.assetId); assert.equal(inventory.files[0].available, false);
+    assert.equal(inventory.files[0].status, mode === 'pending' ? 'pending' : 'ready');
+    assert.equal(metadata.get('quark-registry-v1'), registration);
+  });
+});
+
 async function fixture(t, extra = {}) {
   const dataDir = await mkdtemp(resolve(tmpdir(), 'vipvideo-quark-test-'));
   t.after(async () => { const target = resolve(dataDir); assert.ok(target.startsWith(resolve(tmpdir()) + sep)); assert.ok(basename(target).startsWith('vipvideo-quark-test-')); await rm(target, { recursive: true, force: true }); });
@@ -2200,6 +2263,56 @@ test('a normal official download fallback uses desktop credentials and returns t
   assert.equal(state.calls.filter(call => call.path === '/file/download').length, 1);
 });
 
+test('official playback response Cookies follow their own lease without changing the account', async t => {
+  const { service, state, connect, save, metadata } = await fixture(t); await connect(); const saved = await save();
+  const previous = metadata.get('quark-settings-v1'); let revision = 0;
+  state.beforeRequest = call => {
+    if (call.path !== '/file/v2/play') return;
+    assert.equal(call.options.headers.cookie, COOKIE);
+    const fresh = 'synthetic-play-session-' + ++revision;
+    return reply({ video_list: [{ video_info: { url: state.playUrl, color_transfer: 'bt709' } }] }, { headers: { 'set-cookie': `__puus=${fresh}; Domain=.quark.cn; Path=/; Secure` } });
+  };
+  const first = await service.playback(saved.assetId), second = await service.playback(saved.assetId);
+  assert.equal(first.headers.cookie, COOKIE.replace('synthetic-session', 'synthetic-play-session-1'));
+  assert.equal(second.headers.cookie, COOKIE.replace('synthetic-session', 'synthetic-play-session-2'));
+  assert.equal(first.metadata.mode, 'official'); assert.equal(second.metadata.mode, 'official');
+  assert.equal(metadata.get('quark-settings-v1'), previous);
+  assert.doesNotMatch(JSON.stringify([...metadata.values()]), /synthetic-play-session/);
+});
+
+test('official playback response Cookie updates cover every credential origin or retain the account Cookie', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
+  for (const [header, targets, fresh] of [
+    ['Domain=.quark.cn; Path=/', ['https://video.quark.cn/main.m3u8', 'https://other.quark.cn/low.m3u8'], true],
+    ['Domain=.quark.cn; Path=/', ['https://video.quark.cn/main.m3u8', 'https://video.uc.cn/low.m3u8'], false],
+    ['Domain=.drive.quark.cn; Path=/', ['https://drive.quark.cn/main.m3u8', 'https://video.quark.cn/low.m3u8'], false],
+    ['Path=/', ['https://video.quark.cn/main.m3u8'], false],
+    ['Domain=.quark.cn; Path=/private', ['https://video.quark.cn/main.m3u8'], false],
+    ['Domain=.quark.cn; Path=/; Max-Age=0', ['https://video.quark.cn/main.m3u8'], false],
+  ]) {
+    state.beforeRequest = call => call.path === '/file/v2/play' ? reply({ video_list: targets.map((url, index) => ({ video_info: { url, width: index ? 1280 : 1920, height: index ? 720 : 1080, color_transfer: 'bt709' } })) }, { headers: { 'set-cookie': '__puus=fresh-play; ' + header } }) : undefined;
+    const descriptor = await service.playback(saved.assetId);
+    assert.equal(descriptor.headers.cookie, fresh ? COOKIE.replace('synthetic-session', 'fresh-play') : COOKIE);
+    assert.deepEqual(new Set(descriptor.allowCookieOrigins), new Set(targets.map(target => new URL(target).origin)));
+  }
+});
+
+test('download fallback never inherits the official playback response Cookie', async t => {
+  const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
+  for (const fresh of [undefined, 'synthetic-download-session']) {
+    state.beforeRequest = call => {
+      if (call.path === '/file/v2/play') return reply({ video_list: [] }, { headers: { 'set-cookie': '__puus=synthetic-play-session; Domain=.quark.cn; Path=/' } });
+      if (call.path === '/file/download') {
+        assert.equal(call.options.headers.cookie, COOKIE);
+        return reply([{ fid: 'saved-1', download_url: state.downloadUrl }], { headers: fresh ? { 'set-cookie': `__puus=${fresh}; Domain=.quark.cn; Path=/` } : {} });
+      }
+    };
+    const descriptor = await service.playback(saved.assetId);
+    assert.equal(descriptor.metadata.mode, 'download');
+    assert.equal(descriptor.headers.cookie, fresh ? COOKIE.replace('synthetic-session', fresh) : COOKIE);
+  }
+});
+
 test('a download response refreshes only the signed media Cookie while the account and public response stay unchanged', async t => {
   const { service, state, connect, save, metadata } = await fixture(t); await connect(); const saved = await save();
   const previous = metadata.get('quark-settings-v1'), fresh = 'synthetic-fresh-download-session';
@@ -2282,19 +2395,21 @@ test('download Cookie refresh stays within the original total size cap and never
   state.downloadUrl = 'https://external.example/file'; assert.equal((await service.playback(saved.assetId)).headers.cookie, undefined);
 });
 
-test('a changed account rejects a download response before its refreshed Cookie can be captured', async t => {
+test('a changed account rejects a playback response before its refreshed Cookie can be captured', async t => {
+  for (const path of ['/file/v2/play', '/file/download']) await t.test(path, async t => {
   const { service, state, connect, save } = await fixture(t); await connect(); const saved = await save();
   let enter, release, reads = 0; const entered = new Promise(done => { enter = done; });
   state.beforeRequest = async call => {
-    if (call.path === '/file/v2/play') return reply({ video_list: [] });
-    if (call.path === '/file/download') {
+    if (call.path === '/file/v2/play' && path === '/file/download') return reply({ video_list: [] });
+    if (call.path === path) {
       enter(); await new Promise(done => { release = done; });
       const headers = {}; Object.defineProperty(headers, 'set-cookie', { get() { reads++; return ['__puus=fresh; Domain=.quark.cn; Path=/']; } });
-      return reply([{ fid: 'saved-1', download_url: state.downloadUrl }], { headers });
+      return reply(path === '/file/v2/play' ? { video_list: [{ video_info: { url: state.playUrl } }] } : [{ fid: 'saved-1', download_url: state.downloadUrl }], { headers });
     }
   };
   const playback = service.playback(saved.assetId); await entered; await service.clearAccount(); release();
   await assert.rejects(playback, error => error.status === 409); assert.equal(reads, 0);
+  });
 });
 
 test('subtitle downloads use their own fresh response Cookie and the same desktop User-Agent without persisting either', async t => {

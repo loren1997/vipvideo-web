@@ -273,6 +273,11 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         if (res.destroyed) return;
         if (!valid(task) || req.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') { res.destroy(); return; }
         if (sourceFailed?.(error)) return;
+        if (error.code === 'MEDIA_SOURCE_HTTP_ERROR') {
+          // Upstream 401/500 must not become a site logout or a masked internal error.
+          task.inputError = Object.assign(failure(`媒体源返回 HTTP ${error.status}，请重试播放以刷新地址，或选择其他版本`, [401, 500].includes(error.status) ? 502 : error.status), { code: 'TRANSCODE_SOURCE_HTTP_ERROR' });
+          if (task.encoderReads) { res.destroy(); return; }
+        }
         if (!res.headersSent) { res.statusCode = error.status || 502; res.removeHeader('Content-Length'); res.setHeader('Content-Type', 'text/plain; charset=utf-8'); res.end('兼容播放媒体转发失败'); }
         else res.destroy(error);
       }
@@ -508,7 +513,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
           try { await ready(task, deadline); break; }
           catch (error) {
             const files = await readdir(task.dir).catch(() => []);
-            if (preference === 'vaapi' || !allowSoftware || acceleration !== 'vaapi' || files.some(file => /^segment\d{6,12}\.ts$/.test(file)) || !valid(task) || now() >= deadline) throw error;
+            if (task.inputError || preference === 'vaapi' || !allowSoftware || acceleration !== 'vaapi' || files.some(file => /^segment\d{6,12}\.ts$/.test(file)) || !valid(task) || now() >= deadline) throw error;
             await terminate(task.attempt); await removeOutput(task); await mkdir(task.dir, { mode: 0o700 }); acceleration = 'software';
           }
         }

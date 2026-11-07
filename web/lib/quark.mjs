@@ -85,7 +85,7 @@ function cookieInput(value) {
   return parts.join('; ');
 }
 
-function downloadMediaCookie(cookie, setCookies, target, timestamp) {
+function mediaResponseCookie(cookie, setCookies, target, timestamp) {
   const source = new URL(API), media = new URL(target);
   if (media.protocol !== 'https:' || media.username || media.password) return cookie;
   const rows = typeof setCookies === 'string' ? [setCookies] : setCookies;
@@ -298,7 +298,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
           const json = JSON.parse(await readText(response, 1024 * 1024));
           signal?.throwIfAborted(); guard?.();
           if (json.code !== 0 || Number(json.status || 200) >= 400) throw responseFailure(Number(json.status || 200), json.code, response.statusCode);
-          if (path === '/file/download' && credentials) { onResponseHeaders?.(response.headers); guard?.(); }
+          if (['/file/download', '/file/v2/play'].includes(path) && credentials) { onResponseHeaders?.(response.headers); guard?.(); }
           return json;
         })();
         return await Promise.race([task, new Promise((_, reject) => {
@@ -832,7 +832,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     let target; try { target = validateUrl(rows[0].download_url); } catch { throw failure('字幕下载地址不符合安全限制'); }
     if (target.protocol !== 'https:') throw failure('字幕下载地址必须使用 HTTPS');
     const official = /(?:^|\.)(?:quark|uc)\.cn$/.test(target.hostname);
-    const mediaCookie = downloadMediaCookie(context.cookie, downloadCookies, target, now());
+    const mediaCookie = mediaResponseCookie(context.cookie, downloadCookies, target, now());
     const bytes = await limited(async () => {
       current(context); let response, timer, expired = false;
       try {
@@ -930,7 +930,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       if (record.status !== 'ready') return false;
       try { registeredFile(asset, record, folder.fid, listing.list); return true; } catch { return false; }
     };
-    return { files: rows.sort((a, b) => b.createdAt - a.createdAt).map(asset => ({
+    return { files: rows.filter(asset => !listing.complete || asset.status !== 'ready' || !validFid(asset.fid) || listing.list.some(row => row.fid === asset.fid)).sort((a, b) => b.createdAt - a.createdAt).map(asset => ({
       ...publicAsset(asset, true), size: asset.size, sourceName: name(asset.sourceName), available: available(asset),
       ...(!available(asset) && asset.status === 'ready' ? { reason: '文件已移动、删除或信息发生变化，暂不能播放' } : {}),
       subtitles: (asset.subtitles || []).filter(row => row.status !== 'deleted').map(row => ({ name: name(row.name), type: row.type, size: row.size, available: available(asset, row), status: row.status === 'ready' ? 'ready' : 'pending' }))
@@ -944,10 +944,10 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     const file = await ownedFile(context, asset); current(context);
     const sourceColors = [fileColorRisk(asset.sourceName || asset.name), streamColor(file), streamColor(file.video_info || {})];
     const sourceColorSpace = ['dolby-vision', 'pq', 'hlg', 'hdr', 'sdr'].find(value => sourceColors.includes(value)) || 'unknown';
-    let target, type, mode = 'official', quality, variants, candidates, qualityOptions, officialError, colorSpace, downloadCookies;
+    let target, type, mode = 'official', quality, variants, candidates, qualityOptions, officialError, colorSpace, playCookies, downloadCookies;
     const diagnostic = cause => [Number.isInteger(cause?.quarkUpstreamStatus) ? 'HTTP ' + cause.quarkUpstreamStatus : '', Number.isSafeInteger(cause?.quarkUpstreamCode) ? 'API ' + cause.quarkUpstreamCode : ''].filter(Boolean).join('，');
     try {
-      const result = await auth(context, '/file/v2/play', { method: 'POST', userAgent: PLAYBACK_UA, body: { fid: asset.fid, resolutions: 'normal,low,high,super,2k,4k', supports: 'fmp4,m3u8' } }); current(context);
+      const result = await auth(context, '/file/v2/play', { method: 'POST', userAgent: PLAYBACK_UA, body: { fid: asset.fid, resolutions: 'normal,low,high,super,2k,4k', supports: 'fmp4,m3u8' }, onResponseHeaders: headers => { playCookies = headers?.['set-cookie']; } }); current(context);
       const list = (Array.isArray(result.data?.video_list) ? result.data.video_list : []).slice(0, 64).filter(row => row?.accessable !== false && row?.accessable !== 0 && !['transcoding', 'fail'].includes(row?.trans_status)).map(row => row?.video_info && { ...row.video_info, resolution: row.resolution ?? row.video_info.resolution }).filter(info => typeof info?.url === 'string' && info.success !== false && info.finish !== false).sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
       const streams = [];
       for (const info of list) {
@@ -1011,8 +1011,12 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
       type = /\.mkv$/i.test(asset.name) ? 'mkv' : /\.webm$/i.test(asset.name) ? 'webm' : /\.avi$/i.test(asset.name) ? 'avi' : /\.(?:ts|m2ts)$/i.test(asset.name) ? 'mpegts' : 'mp4';
     }
     const origins = [...new Set([target, ...(qualityOptions || []).map(row => row.url), ...(variants || []).map(row => row.url), ...(candidates || []).map(row => row.url)].map(value => new URL(value)).filter(parsed => parsed.protocol === 'https:' && (parsed.hostname === 'quark.cn' || parsed.hostname.endsWith('.quark.cn') || parsed.hostname === 'uc.cn' || parsed.hostname.endsWith('.uc.cn'))).map(parsed => parsed.origin))];
+    const mediaCookies = mode === 'official' ? playCookies : downloadCookies;
+    let mediaCookie = mediaResponseCookie(context.cookie, mediaCookies, target, now());
+    // One descriptor shares headers across its origins; a response Cookie must cover all of them.
+    if (origins.some(origin => mediaResponseCookie(context.cookie, mediaCookies, origin, now()) !== mediaCookie)) mediaCookie = context.cookie;
     current(context);
-    return { episode: { url: target, type, colorSpace }, ...(variants ? { variants } : {}), ...(candidates ? { candidates } : {}), ...(qualityOptions?.length ? { qualityOptions } : {}), headers: { referer: REFERER, 'user-agent': PLAYBACK_UA, ...(origins.length ? { cookie: downloadMediaCookie(context.cookie, downloadCookies, target, now()) } : {}) }, allowCookieOrigins: origins, metadata: { assetId: asset.id, name: asset.name, size: asset.size, category: asset.category || '', mode, sourceColorSpace, version: hash(JSON.stringify([asset.fid, mode, target, quality || null, colorSpace, sourceColorSpace, ...(variants ? [variants.map(({ width, height }) => [width, height])] : []), ...(candidates ? [candidates] : []), ...(qualityOptions?.length ? [qualityOptions] : [])])).slice(0, 24), ...(quality ? { quality } : {}), colorSpace, requiresCompatibility: !['hls', 'mp4', 'webm'].includes(type) || colorSpace !== 'sdr' } };
+    return { episode: { url: target, type, colorSpace }, ...(variants ? { variants } : {}), ...(candidates ? { candidates } : {}), ...(qualityOptions?.length ? { qualityOptions } : {}), headers: { referer: REFERER, 'user-agent': PLAYBACK_UA, ...(origins.length ? { cookie: mediaCookie } : {}) }, allowCookieOrigins: origins, metadata: { assetId: asset.id, name: asset.name, size: asset.size, category: asset.category || '', mode, sourceColorSpace, version: hash(JSON.stringify([asset.fid, mode, target, quality || null, colorSpace, sourceColorSpace, ...(variants ? [variants.map(({ width, height }) => [width, height])] : []), ...(candidates ? [candidates] : []), ...(qualityOptions?.length ? [qualityOptions] : [])])).slice(0, 24), ...(quality ? { quality } : {}), colorSpace, requiresCompatibility: !['hls', 'mp4', 'webm'].includes(type) || colorSpace !== 'sdr' } };
   }
   async function progress(assetId, input) {
     const context = await snapshot(), asset = findAsset(assetId, context);

@@ -1301,6 +1301,50 @@ test('unsafe or unquoted manifest links and upstream Location headers cannot esc
   try { await start(f.service); assert.equal(status, 502); } finally { await f.close(); }
 });
 
+test('encoder startup preserves upstream HTTP refusal without blaming hardware or retrying software', async t => {
+  for (const type of ['hls', 'mp4']) for (const status of [401, 403, 412, 429, 500, 503]) await t.test(`${type} ${status}`, async () => {
+    const upstream = [], media = createMedia({ request: async target => {
+      const manifest = String(target).includes('feature.m3u8');
+      const response = Object.assign(Readable.from([manifest ? inputManifest : 'private-upstream-cookie-secret']), {
+        statusCode: manifest ? 200 : status,
+        headers: { 'content-type': manifest ? 'application/vnd.apple.mpegurl' : 'text/plain' },
+      });
+      upstream.push(response); return response;
+    } });
+    const f = await fixture({ media, gpu: true, env: { TRANSCODE_ACCEL: 'auto' }, run: async ({ input, child }) => {
+      let response = await fetch(input), body = await response.text();
+      if (type === 'hls') { response = await fetch(body.split('\n').find(line => line.startsWith('http:'))); body = await response.text(); }
+      assert.equal(response.status, status); assert.doesNotMatch(body, /private-upstream-cookie-secret/);
+      child.exit(1);
+    } });
+    try {
+      await assert.rejects(start(f.service, { episode: { url: type === 'hls' ? url : 'https://movies.example/raw.mp4', type, colorSpace: 'sdr' } }), error => {
+        assert.equal(error.status, [401, 500].includes(status) ? 502 : status, 'upstream errors must not become site login or internal errors'); assert.equal(error.code, 'TRANSCODE_SOURCE_HTTP_ERROR');
+        assert.match(error.message, new RegExp(`HTTP ${status}`)); assert.doesNotMatch(error.message, /硬件|private-upstream/); return true;
+      });
+      assert.equal(f.calls.filter(call => call.args.includes('-c:v')).length, 1, 'HTTP refusal must not start a software fallback');
+      assert.ok(upstream.every(response => response.destroyed)); assert.equal((await f.service.status()).running, false);
+      assert.deepEqual((await readdir(f.root)).filter(name => name.startsWith('vipvideo-transcode-')), []);
+    } finally { await f.close(); }
+  });
+});
+
+test('original Dolby encoder keeps HTTP refusal instead of replacing it with a range error', async () => {
+  const media = createMedia({ request: async () => Object.assign(Readable.from(['private-upstream-secret']), { statusCode: 412, headers: { 'content-type': 'text/plain' } }) });
+  const f = await fixture({ media, gpu: true, env: { TRANSCODE_ACCEL: 'auto' }, run: async ({ input, child }) => {
+    await assert.rejects(fetch(input)); child.exit(1);
+  } });
+  try {
+    await assert.rejects(start(f.service, { episode: { ...rawDolby, sourceColorSpace: 'dolby-vision' }, trustedColorProbe: trustedDolbyProof }), error => {
+      assert.equal(error.status, 412); assert.equal(error.code, 'TRANSCODE_SOURCE_HTTP_ERROR');
+      assert.match(error.message, /HTTP 412/); assert.doesNotMatch(error.message, /范围|失效|private-upstream/); return true;
+    });
+    assert.equal(f.calls.filter(call => call.args.includes('-c:v')).length, 1);
+    assert.equal((await f.service.status()).running, false);
+    assert.deepEqual((await readdir(f.root)).filter(name => name.startsWith('vipvideo-transcode-')), []);
+  } finally { await f.close(); }
+});
+
 test('private inputs, unsupported formats, invalid speed/position/owner and stale validity never spawn FFmpeg', async () => {
   const f = await fixture();
   try {
