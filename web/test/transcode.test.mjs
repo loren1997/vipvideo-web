@@ -1391,3 +1391,18 @@ test('original Dolby probe can finish after six seconds within its caller deadli
     assert.deepEqual(await readdir(f.root), []);
   } finally { await f.close(); }
 });
+
+test('raw Dolby decoding may outlast 15 seconds without changing the single-thread or byte limits', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let entered, release;
+  const ready = new Promise(done => { entered = done; });
+  const f = await fixture({ colorProbe: dolbyProbe(), inspect: async () => { entered(); await new Promise(done => { release = done; }); } });
+  try {
+    const pending = f.service.inspectColor({ episode: { type: 'mp4', url: 'https://fixtures.example/slow-dolby.mp4', colorSpace: 'dolby-vision' }, sourceColorSpace: 'dolby-vision', owner: 'probe', valid: () => true, timeout: 30000 });
+    await ready; t.mock.timers.tick(16000);
+    assert.equal(f.children[0].finished, undefined);
+    release(); assert.equal(supportsDolbyMapping(await pending), true);
+    const args = f.calls[0].args; assert.equal(args[args.indexOf('-threads') + 1], '1');
+    assert.equal(f.calls.some(call => call.args.includes('-c:v')), false);
+  } finally { await f.close(); }
+});

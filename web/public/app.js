@@ -176,28 +176,34 @@ function notify(message, error = false) {
 
 async function api(path, options = {}) {
   const sourcesAtRequest = /^\/api\/(?:search|browse)\?/.test(path) ? JSON.stringify(config.sources) : null;
-  const response = await fetch(path, {
-    method: options.method || 'GET', credentials: 'same-origin', signal: AbortSignal.timeout(options.timeoutMs || 45000),
-    headers: { Accept: 'application/json', ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
-    ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
-    ...(options.keepalive ? { keepalive: true } : {}),
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    if (response.status === 401 && data.quarkAuth !== true && !path.includes('/auth/login')) showLogin();
-    const error = new Error(data.error || data.message || `请求失败（${response.status}）`);
-    error.status = response.status;
-    if (data.code === 'TRANSCODE_INPUT_NOT_SEEKABLE') error.code = data.code;
-    error.adultHidden = response.status === 403 && error.message.includes('三级内容已隐藏');
-    if (error.adultHidden) applyConfig(await api('/api/config'));
-    throw error;
-  }
-  if (sourcesAtRequest !== null && sourcesAtRequest === JSON.stringify(config.sources)) {
-    const failed = new Set((data.failedSources || []).map(source => source.source));
-    for (const source of failed) sourceSuccess.delete(source);
-    for (const group of data.groups || []) for (const item of group.items || []) if (!failed.has(item.source)) sourceSuccess.set(item.source, Date.now());
-  }
-  return data;
+  const controller = new AbortController(), abort = () => controller.abort(options.signal.reason);
+  const timer = setTimeout(() => controller.abort(new DOMException('请求超时', 'TimeoutError')), options.timeoutMs || 45000);
+  options.signal?.addEventListener('abort', abort, { once: true });
+  if (options.signal?.aborted) abort();
+  try {
+    const response = await fetch(path, {
+      method: options.method || 'GET', credentials: 'same-origin', signal: controller.signal,
+      headers: { Accept: 'application/json', ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
+      ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+      ...(options.keepalive ? { keepalive: true } : {}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      if (response.status === 401 && data.quarkAuth !== true && !path.includes('/auth/login')) showLogin();
+      const error = new Error(data.error || data.message || `请求失败（${response.status}）`);
+      error.status = response.status;
+      if (data.code === 'TRANSCODE_INPUT_NOT_SEEKABLE') error.code = data.code;
+      error.adultHidden = response.status === 403 && error.message.includes('三级内容已隐藏');
+      if (error.adultHidden) applyConfig(await api('/api/config'));
+      throw error;
+    }
+    if (sourcesAtRequest !== null && sourcesAtRequest === JSON.stringify(config.sources)) {
+      const failed = new Set((data.failedSources || []).map(source => source.source));
+      for (const source of failed) sourceSuccess.delete(source);
+      for (const group of data.groups || []) for (const item of group.items || []) if (!failed.has(item.source)) sourceSuccess.set(item.source, Date.now());
+    }
+    return data;
+  } finally { clearTimeout(timer); options.signal?.removeEventListener('abort', abort); }
 }
 
 function goto(view, params = {}) {
@@ -810,10 +816,11 @@ async function startCompatibility(current, position = current.seekPreview?.posit
       const request = current.request, stamp = current.stamp;
       const valid = () => player === current && current.request === request && playVersion === request && routeVersion === stamp;
       current.position = requested; current.transcodeLoading = true; current.recovering = true; current.failed = false; current.compatibilityErrorCode = null;
+      const controller = current.transcodeRequest = new AbortController();
       current.updateClock?.();
       clearTimeout(current.loadTimer); clearInterval(current.danmakuTimer); current.danmakuTimer = null;
       if (current.video) current.video.pause();
-      current.note.textContent = '正在准备兼容播放，首次启动可能需要约 20 秒…'; current.note.className = 'player-note';
+      current.note.textContent = '正在准备兼容播放，杜比原片需先检查色彩，请稍候…'; current.note.className = 'player-note';
       setQuarkPlaybackStatus(current, 'loading');
       if (current.compatibilityButton) current.compatibilityButton.disabled = true;
       try {
@@ -828,13 +835,13 @@ async function startCompatibility(current, position = current.seekPreview?.posit
         const body = current.live ? { liveId: current.channel.id, line: current.line, position: 0, speed: 1 } : current.quarkAsset ? { quarkAsset: current.quarkAsset, position: requested, speed: current.preferences.speed } : { ...playbackSelection(current.detail, current.line, current.episode), id: String(current.detail.id), position: requested, speed: current.preferences.speed };
         if (current.transcodeQuality) body.quality = current.transcodeQuality;
         let job;
-        try { job = await api('/api/transcode/start', { method: 'POST', body, timeoutMs: 35000 }); }
+        try { job = await api('/api/transcode/start', { method: 'POST', body, timeoutMs: 90000, signal: controller.signal }); }
         catch (error) {
           if (!valid() || current.transcodeResumeCancelled || !([502, 503, 504].includes(error.status) || ['TimeoutError', 'TypeError'].includes(error.name))) throw error;
           current.note.textContent = '兼容播放启动暂时失败，正在重试一次…';
           await new Promise(resolve => setTimeout(resolve, 700));
           if (!valid() || current.transcodeResumeCancelled) throw error;
-          job = await api('/api/transcode/start', { method: 'POST', body, timeoutMs: 35000 });
+          job = await api('/api/transcode/start', { method: 'POST', body, timeoutMs: 90000, signal: controller.signal });
         }
         if (!valid()) { await stopTranscode(job.id, true); return; }
         if (!job.id || !mediaUrl(job.url) || job.type !== 'hls') { await stopTranscode(job.id, true); throw new Error('兼容播放服务返回了无效的播放任务。'); }
@@ -855,11 +862,12 @@ async function startCompatibility(current, position = current.seekPreview?.posit
         if (current.seekPreview) { current.position = current.seekPreview.from; delete current.seekPreview; }
         if (Number.isFinite(current.quarkRestartPosition)) { current.position = current.quarkRestartPosition; delete current.quarkRestartPosition; }
         current.compatibilityErrorCode = error.code;
-        current.note.textContent = current.transcodeResumeCancelled ? '已暂停' : error.status === 409 && error.code !== 'TRANSCODE_INPUT_NOT_SEEKABLE' ? '兼容播放正被另一台设备使用，请稍后再试。' : `兼容播放未启动：${error.message}`;
+        current.note.textContent = current.transcodeResumeCancelled ? '已暂停' : `兼容播放未启动：${error.message}`;
         current.note.className = current.transcodeResumeCancelled ? 'player-note' : 'player-note error-message'; console.warn('兼容播放启动失败', error.message);
         if (!current.transcodeResumeCancelled) setQuarkPlaybackStatus(current, 'error');
         if (current.catalog) { renderSources(current.detail, current.detail.candidates || []); renderEpisodes(current.detail); }
       } finally {
+        if (current.transcodeRequest === controller) delete current.transcodeRequest;
         current.transcodeLoading = false;
         if (player === current) current.updateClock?.();
         if (player === current && current.compatibilityButton) current.compatibilityButton.disabled = false;
@@ -1649,9 +1657,11 @@ async function playQuark(current, assetId, valid = () => true, flow) {
   if (player !== current || !current.catalog || !valid()) return;
   const stamp = routeVersion, scope = adScope(current);
   if (current.quarkOnly || current.quarkAsset === assetId) setQuarkPlaybackStatus(current, 'loading');
+  current.quarkPlaybackRequest?.abort();
+  const controller = current.quarkPlaybackRequest = new AbortController();
   try {
-    const [data, preferences] = await Promise.all([api('/api/quark/playback', { method: 'POST', body: { assetId }, timeoutMs: 35000 }), current.preferences ? Promise.resolve(current.preferences) : (current.detail.preferencesPromise ||= api(`/api/player/preferences?${new URLSearchParams({ key: current.detail.key })}`).catch(error => { console.warn('网盘播放偏好读取失败', error.message); return defaultPreferences; }))]);
-    if (player !== current || stamp !== routeVersion || scope !== adScope(current) || !valid()) return;
+    const [data, preferences] = await Promise.all([api('/api/quark/playback', { method: 'POST', body: { assetId }, timeoutMs: 35000, signal: controller.signal }), current.preferences ? Promise.resolve(current.preferences) : (current.detail.preferencesPromise ||= api(`/api/player/preferences?${new URLSearchParams({ key: current.detail.key })}`).catch(error => { console.warn('网盘播放偏好读取失败', error.message); return defaultPreferences; }))]);
+    if (controller.signal.aborted || player !== current || stamp !== routeVersion || scope !== adScope(current) || !valid()) return;
     const qualities = officialQualityOptions(data.qualityOptions), defaultQuality = { url: new URL(data.url, location.origin).href, type: data.type, quality: data.quality }, manualQuality = current.manualOfficialQuality && !current.transcoded && current.quarkQualities?.find(option => option.id === current.quarkQuality);
     if (manualQuality) {
       const identity = row => JSON.stringify([row.type, row.width, row.height, row.label, row.videoCodec, row.audioCodec]);
@@ -1669,12 +1679,12 @@ async function playQuark(current, assetId, valid = () => true, flow) {
     player.quarkQuality = player.quarkQualities.find(option => option.url === url.href)?.id || '-1';
     mountPlayer(player);
   } catch (error) {
-    if (player !== current || stamp !== routeVersion || !valid()) return;
+    if (controller.signal.aborted || player !== current || stamp !== routeVersion || !valid()) return;
     if (flow?.quarkRefreshTried && current.quarkAsset === assetId && !current.quarkPaused && !flow.transcodeTried && (!error.status || error.status >= 500 || error.status === 408)) {
       current.quarkRefreshing = false; void startCompatibility(current, playPosition(current), true); return;
     }
     current.failed = true; current.note.textContent = `夸克播放未启动：${error.message}`; current.note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); notify(current.note.textContent, true);
-  }
+  } finally { if (current.quarkPlaybackRequest === controller) delete current.quarkPlaybackRequest; }
 }
 
 function mountQuark(current) {
@@ -2635,6 +2645,7 @@ function stopPlayer(invalidate = true) {
   const current = player; player = null;
   if (!current) return Promise.resolve();
   const save = saveHistory(current);
+  current.quarkPlaybackRequest?.abort(); current.transcodeRequest?.abort();
   current.clearFilmControls?.();
   clearInterval(current.timer);
   clearInterval(current.danmakuTimer); clearDanmaku(current);

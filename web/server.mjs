@@ -266,7 +266,10 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         if (path === '/api/quark/playback' && method === 'POST') {
           const input = await readBody(req), owner = hashToken(token);
           requireSession(owner);
-          const lease = await cloudMedia.playback(text(input?.assetId, '夸克影片标识', 200), { owner, valid: () => store.authenticated(owner) });
+          const controller = new AbortController(), cancel = () => { if (!res.writableEnded) controller.abort(Object.assign(new Error('播放请求已取消'), { status: 499 })); };
+          res.once('close', cancel); res.once('finish', () => res.removeListener('close', cancel));
+          const lease = await cloudMedia.playback(text(input?.assetId, '夸克影片标识', 200), { owner, deferOriginalColor: true, signal: controller.signal, valid: () => !controller.signal.aborted && store.authenticated(owner) });
+          if (controller.signal.aborted) return;
           requireSession(owner);
           return json(res, 200, lease.response);
         }
@@ -316,9 +319,11 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
               typeof position !== 'number' || !Number.isFinite(position) || position < 0 || position > 86400 ||
               ![0.5, 0.75, 1, 1.25, 1.5, 2, 3].includes(speed) || ![720, 1080, 2160].includes(quality)) throw badRequest('转码线路、进度、倍速或清晰度不正确');
           const snapshot = store.config(), owner = hashToken(token);
+          const controller = new AbortController(), cancel = () => { if (!res.writableEnded) controller.abort(Object.assign(new Error('播放请求已取消'), { status: 499 })); };
+          res.once('close', cancel); res.once('finish', () => res.removeListener('close', cancel));
           let selected, category, unchanged, mediaOverride, proxyPath, trustedColorProbe;
           if (body?.quarkAsset !== undefined) {
-            const lease = await cloudMedia.playback(text(body.quarkAsset, '夸克影片标识', 200), { owner, quality, valid: () => store.authenticated(owner) });
+            const lease = await cloudMedia.playback(text(body.quarkAsset, '夸克影片标识', 200), { owner, quality, signal: controller.signal, valid: () => !controller.signal.aborted && store.authenticated(owner) });
             selected = lease.episode; category = lease.category; ensureVisible(category);
             mediaOverride = lease.media; proxyPath = lease.proxyPath; unchanged = lease.valid;
             if (lease.originalDolby && selected.type !== 'hls' && selected.colorSpace === 'dolby-vision' && selected.sourceColorSpace === 'dolby-vision' &&
@@ -340,7 +345,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           }
           if (!selected || !['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'].includes(selected.type)) throw badRequest('请选择有效的媒体');
           if (!unchanged()) throw Object.assign(new Error('播放源已修改，请刷新后重试'), { status: 409 });
-          const valid = () => store.authenticated(owner) && unchanged() && (category !== 'adult' || store.config().showAdult === true);
+          const valid = () => !controller.signal.aborted && store.authenticated(owner) && unchanged() && (category !== 'adult' || store.config().showAdult === true);
           const result = await transcodeService.start({ episode: selected, position, speed, quality, owner, valid, ...(mediaOverride ? { mediaOverride, proxyPath } : {}), ...(trustedColorProbe ? { trustedColorProbe } : {}) });
           if (!valid()) {
             await transcodeService.cancel(result.id, owner);

@@ -30,11 +30,11 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
     const sdr = !lease.originalDolby && candidates.find(row => row.colorSpace === 'sdr');
     if (sdr) return { episode: sdr };
     if (queued >= 8) throw failure('官方流色彩检查繁忙，请稍后重试', 429);
-    const deadline = now() + 15000, controller = new AbortController();
+    const timeout = lease.originalDolby ? 35000 : 15000, deadline = now() + timeout, controller = new AbortController();
     const abort = () => controller.abort();
     lease.controller.signal.addEventListener('abort', abort, { once: true });
     queued++; let timer, fallback, lastError;
-    const timeoutError = () => lastError || Object.assign(failure('官方流色彩检查超时，已停止播放以避免偏色，请稍后重试', 504), { code: 'QUARK_COLOR_PROBE_TIMEOUT', colorProbe: { colorSpace: 'unknown' } });
+    const timeoutError = () => lastError || Object.assign(failure(lease.originalDolby ? '杜比原片色彩检查超时，请重试兼容播放或选择其他版本' : '官方流色彩检查超时，已停止播放以避免偏色，请稍后重试', 504), { code: 'QUARK_COLOR_PROBE_TIMEOUT', colorProbe: { colorSpace: 'unknown' } });
     const job = colorTail.then(async () => {
       let lastProbe, dolby = lease.dolbyRisk, probes = 0;
       for (const row of candidates) {
@@ -47,8 +47,8 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
         if (!proof && probes < 3 && now() < deadline) {
           probes++;
           try {
-            // A raw file needs sequential head, tail and frame reads within the shared 15s deadline.
-            const budget = originalDolby ? 14000 : 6000;
+            // Raw 4K decoding on a limited CPU needs its own budget plus process cleanup time.
+            const budget = originalDolby ? 30000 : 6000;
             proof = colorProof(await probeColor({ episode: row, sourceColorSpace: 'dolby-vision', owner: lease.owner || lease.id, valid: () => valid(lease), signal: controller.signal, mediaOverride: lease.media, proxyPath: lease.proxyPath, timeout: Math.min(budget, deadline - now()) }));
             if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409);
             if (controller.signal.aborted) break;
@@ -81,15 +81,17 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
       if (!valid(lease)) reject(failure('夸克账号或播放会话已变更', 409));
       else if (fallback) resolve(fallback);
       else reject(timeoutError());
-    }, 15000); })]); }
+    }, timeout); })]); }
     finally { clearTimeout(timer); }
   }
   return {
-    async playback(assetId, { valid: authorized = () => true, owner, quality } = {}) {
+    async playback(assetId, { valid: authorized = () => true, owner, quality, deferOriginalColor = false, signal } = {}) {
       if (quality !== undefined && ![720, 1080, 2160].includes(quality)) throw failure('兼容播放清晰度不正确', 400);
       if (!authorized()) throw failure('登录会话已结束，请重新登录', 401);
       const before = generation;
-      const descriptor = await quark.playback(assetId, { valid: authorized });
+      if (signal?.aborted) throw failure('播放准备已取消', 499);
+      const descriptor = await quark.playback(assetId, { valid: () => authorized() && !signal?.aborted });
+      if (signal?.aborted) throw failure('播放准备已取消', 499);
       if (!authorized()) throw failure('登录会话已结束，请重新登录', 401);
       if (before !== generation) throw failure('夸克账号已变更，请重新播放', 409);
       let episode = descriptor.episode;
@@ -184,8 +186,16 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
         const chosen = sized.filter(row => row.height <= quality).at(-1) || sized[0];
         if (chosen) colorCandidates = [chosen, ...colorCandidates.filter(row => row.url !== chosen.url)];
       }
-      try { selected = await selectColor(lease, colorCandidates, version); if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409); visible(lease.category); }
-      catch (error) { close(lease); leases.delete(id); throw error; }
+      const abort = () => close(lease); signal?.addEventListener('abort', abort, { once: true });
+      try {
+        if (signal?.aborted) throw failure('播放准备已取消', 499);
+        selected = deferOriginalColor && lease.originalDolby
+          ? { episode: { ...episode, colorSpace: 'dolby-vision' } }
+          : await selectColor(lease, colorCandidates, version);
+        if (signal?.aborted) throw failure('播放准备已取消', 499);
+        if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409); visible(lease.category);
+      } catch (error) { close(lease); leases.delete(id); throw error; }
+      finally { signal?.removeEventListener('abort', abort); }
       episode = lease.episode = { ...selected.episode, sourceColorSpace: lease.dolbyRisk ? 'dolby-vision' : lease.sourceColorSpace }; lease.colorProbe = selected.proof;
       const result = lease.media.playback({ lines: [{ episodes: [episode] }] }, 0, 0);
       const qualityOptions = [], qualityUrls = new Map(); lease.qualityTokens = new Map();
@@ -219,6 +229,7 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
       const lease = leases.get(id);
       if (!lease || !valid(lease)) throw failure('夸克播放会话已过期，请重新播放');
       visible(lease.category);
+      if (lease.originalDolby) throw failure('杜比原片需要兼容播放，不能直接输出', 409);
       if (token === 'master' && lease.master) {
         if (!['GET', 'HEAD'].includes(req.method || 'GET')) throw failure('不支持的媒体请求方法', 400);
         res.statusCode = 200;

@@ -472,17 +472,26 @@ test('live playback and compatible playback use the verified quality variant whi
   assert.equal(reported, stream.url);
 });
 
-test('transcode receives original Dolby proof only from its current authorized server lease', async t => {
+test('original Dolby startup defers inspection until compatibility and trusts only its current server lease', async t => {
   const proof = { colorSpace: 'dolby-vision', codec: 'hevc', dolbyVisionProfile: 8, dolbyVisionCompatibilityId: 1, rpuPresent: true, rpuSeen: true, blPresent: true, elPresent: false };
-  let type = 'mp4', expired = false, incomplete = false, lease;
-  const starts = [], quark = { playback: async () => ({ episode: { type, url: `https://video.quark.cn/original.${type}`, colorSpace: 'dolby-vision' }, metadata: { mode: 'download', sourceColorSpace: 'dolby-vision' } }) };
-  const cloud = createQuarkMedia({ quark, probeColor: async () => ({ ...proof, ...(incomplete ? { rpuSeen: false } : {}) }) });
+  let type = 'mp4', expired = false, incomplete = false, lease, probes = 0, lookups = 0;
+  const starts = [], selections = [], quark = { playback: async () => { lookups++; return { episode: { type, url: `https://video.quark.cn/original.${type}`, colorSpace: 'dolby-vision' }, metadata: { mode: 'download', sourceColorSpace: 'dolby-vision' } }; } };
+  const cloud = createQuarkMedia({ quark, probeColor: async () => { probes++; return { ...proof, ...(incomplete ? { rpuSeen: false } : {}) }; } });
   const playback = cloud.playback.bind(cloud);
-  cloud.playback = async (...args) => { lease = await playback(...args); if (expired) cloud.invalidate(); return lease; };
+  cloud.playback = async (...args) => { selections.push(args[1]); lease = await playback(...args); if (expired) cloud.invalidate(); return lease; };
   const transcoder = { async start(options) { starts.push(options); return { id: 'test' }; }, async stop() {} };
   const { call, login } = await running(t, { quark, quarkMedia: cloud, transcoder }), cookie = await login();
-  const body = { quarkAsset: 'asset', trustedColorProbe: { ...proof, dolbyVisionProfile: 5 }, colorProbe: proof };
+  const initial = await call('/api/quark/playback', { assetId: 'asset', deferOriginalColor: false }, cookie);
+  assert.equal(initial.status, 200);
+  const direct = await initial.json();
+  assert.equal(direct.requiresCompatibility, true); assert.equal(probes, 0); assert.equal(starts.length, 0);
+  assert.equal(lease.valid(), true); assert.equal(selections[0].signal.aborted, false, 'a completed HTTP response keeps its lease authorized');
+  assert.equal(selections[0].deferOriginalColor, true); assert.equal(lease.colorProbe, undefined);
+  assert.ok([403, 409].includes((await call(direct.url, undefined, cookie)).status), 'the deferred raw Dolby URL cannot be played directly');
+  const body = { quarkAsset: 'asset', deferOriginalColor: true, trustedColorProbe: { ...proof, dolbyVisionProfile: 5 }, colorProbe: proof };
   assert.equal((await call('/api/transcode/start', body, cookie)).status, 200);
+  assert.equal(probes, 1); assert.equal(lookups, 2, 'compatibility revalidates the selected account file');
+  assert.equal(selections[1].deferOriginalColor, undefined, 'the client cannot defer the compatibility color check');
   const first = starts.at(-1);
   assert.deepEqual(first.trustedColorProbe, proof, 'request-body proof cannot override the current server proof');
   assert.notEqual(first.trustedColorProbe, lease.colorProbe, 'the task receives a private proof snapshot');
@@ -497,6 +506,50 @@ test('transcode receives original Dolby proof only from its current authorized s
   expired = false; incomplete = true;
   assert.equal((await call('/api/transcode/start', body, cookie)).status, 409);
   assert.equal(starts.length, accepted, 'forged request proof cannot rescue missing server RPU');
+});
+
+test('disconnecting either Quark startup route cancels only its pending inspection', { timeout: 10000 }, async t => {
+  for (const path of ['/api/quark/playback', '/api/transcode/start']) {
+    let entered, cancelled, signal, pendingValid, stableLease;
+    const started = new Promise(resolve => { entered = resolve; }), stopped = new Promise(resolve => { cancelled = resolve; });
+    const quark = { playback: async asset => ({ episode: { type: 'mp4', url: `https://video.quark.cn/${asset}.mp4`, colorSpace: asset === 'stable' ? 'sdr' : 'unknown' }, metadata: { mode: 'official', sourceColorSpace: asset === 'stable' ? 'sdr' : 'dolby-vision' } }) };
+    const cloud = createQuarkMedia({ quark, request: async () => Object.assign(Readable.from(['safe-video']), { statusCode: 200, headers: { 'content-type': 'video/mp4' } }), probeColor: async input => {
+      signal = input.signal; pendingValid = input.valid; entered();
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => { cancelled(); reject(signal.reason); }, { once: true }));
+    } });
+    const playback = cloud.playback.bind(cloud);
+    cloud.playback = async (...args) => { const lease = await playback(...args); if (args[0] === 'stable') stableLease = lease; return lease; };
+    const { call, login, base } = await running(t, { quark, quarkMedia: cloud, transcoder: { async start() { assert.fail('cancelled inspection must not encode'); } } });
+    const cookie = await login(), otherCookie = await login();
+    const stable = await (await call('/api/quark/playback', { assetId: 'stable' }, otherCookie)).json();
+    assert.equal(stableLease.valid(), true);
+    const controller = new AbortController(), request = fetch(base + path, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(path.endsWith('/start') ? { quarkAsset: 'pending' } : { assetId: 'pending' }), signal: controller.signal });
+    await started; controller.abort(); await assert.rejects(request, { name: 'AbortError' });
+    let timer;
+    try { await Promise.race([stopped, new Promise((_resolve, reject) => { timer = setTimeout(() => reject(Error('Playback inspection did not stop after disconnect')), 1000); })]); }
+    finally { clearTimeout(timer); }
+    assert.equal(signal.aborted, true); assert.equal(pendingValid(), false); assert.equal(stableLease.valid(), true);
+    assert.equal(await (await call(stable.url, undefined, otherCookie)).text(), 'safe-video');
+    for (const session of [cookie, otherCookie]) assert.equal((await (await call('/api/auth', undefined, session)).json()).authenticated, true);
+  }
+});
+
+test('a disconnected compatibility start cannot publish its late task', { timeout: 5000 }, async t => {
+  let entered, cancelled, release, options;
+  const started = new Promise(resolve => { entered = resolve; }), stopped = new Promise(resolve => { cancelled = resolve; }), pending = new Promise(resolve => { release = resolve; });
+  const cancelledTasks = [], quark = { playback: async () => ({ episode: { type: 'mp4', url: 'https://video.quark.cn/safe.mp4', colorSpace: 'sdr' }, metadata: { sourceColorSpace: 'sdr' } }) };
+  const cloud = createQuarkMedia({ quark }), playback = cloud.playback.bind(cloud);
+  cloud.playback = async (...args) => { args[1].signal.addEventListener('abort', cancelled, { once: true }); return playback(...args); };
+  const { base, login } = await running(t, { quark, quarkMedia: cloud, transcoder: {
+    async start(input) { options = input; entered(); await pending; return { id: 'late-task' }; },
+    async cancel(id, owner) { cancelledTasks.push({ id, owner }); },
+  } });
+  const cookie = await login(), controller = new AbortController();
+  const request = fetch(base + '/api/transcode/start', { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ quarkAsset: 'asset' }), signal: controller.signal });
+  await started; assert.equal(options.valid(), true); controller.abort(); await assert.rejects(request, { name: 'AbortError' });
+  await stopped; assert.equal(options.valid(), false); release();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(cancelledTasks, [{ id: 'late-task', owner: options.owner }]);
 });
 
 test('builtin source presets can be merged without deleting customized sources', async (t) => {

@@ -320,7 +320,7 @@ test('only decoded single-layer original HEVC Dolby P5 and P8.1 enter compatibil
     const proof = { colorSpace: 'dolby-vision', codec: 'hevc', pixFmt: 'yuv420p10le', bitDepth: 10, dolbyVisionProfile: profile, dolbyVisionCompatibilityId: compatibilityId, rpuPresent: true, rpuSeen: true, blPresent: true, elPresent: false };
     let probes = 0;
     const { cloud, calls } = await fixture(t, { quark: { playback: async () => descriptor({ episode: raw, metadata: { mode: 'download', sourceColorSpace: 'dolby-vision', version: 'raw-' + profile } }) }, probeColor: async input => {
-      probes++; assert.equal(input.sourceColorSpace, 'dolby-vision'); assert.equal(input.episode.url, raw.url); assert.ok(input.timeout > 6000 && input.timeout <= 14000); return proof;
+      probes++; assert.equal(input.sourceColorSpace, 'dolby-vision'); assert.equal(input.episode.url, raw.url); assert.ok(input.timeout > 6000 && input.timeout <= 30000); return proof;
     } });
     const lease = await cloud.playback('asset');
     assert.equal(lease.episode.url, raw.url); assert.equal(lease.episode.colorSpace, 'dolby-vision'); assert.equal(lease.response.requiresCompatibility, true);
@@ -335,7 +335,7 @@ test('original Dolby probe timeout and range failures stay retryable without rep
   for (const [status, code] of [[504, 'QUARK_COLOR_PROBE_TIMEOUT'], [502, 'QUARK_COLOR_PROBE_READ_FAILED']]) {
     let probes = 0;
     const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: raw, metadata: { mode: 'download', sourceColorSpace: 'dolby-vision' } }) }, probeColor: async input => {
-      probes++; assert.ok(input.timeout <= 14000);
+      probes++; assert.ok(input.timeout <= 30000);
       throw Object.assign(new Error('原文件色彩信息读取失败'), { status, code, colorProbe: { colorSpace: 'unknown' } });
     } });
     for (let attempt = 0; attempt < 2; attempt++) await assert.rejects(cloud.playback('asset'), error => error.status === status && error.code === code && !error.message.includes(raw.url));
@@ -547,4 +547,22 @@ test('disconnect aborts an already streaming original download', async t => {
   assert.equal((await reader.read()).done, false);
   cloud.invalidate(); assert.equal(upstream.destroyed, true);
   await assert.rejects(reader.read());
+});
+
+test('a slow original Dolby inspection survives the online deadline and still has a finite raw deadline', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const proof = { colorSpace: 'dolby-vision', codec: 'hevc', dolbyVisionProfile: 5, dolbyVisionCompatibilityId: 0, rpuPresent: true, rpuSeen: true, blPresent: true, elPresent: false };
+  for (const finish of [true, false]) {
+    let entered, release, signal;
+    const ready = new Promise(done => { entered = done; });
+    const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: { type: 'mp4', colorSpace: 'dolby-vision' }, metadata: { mode: 'download', sourceColorSpace: 'dolby-vision' } }) }, probeColor: async input => {
+      signal = input.signal; assert.ok(input.timeout > 15000 && input.timeout <= 30000);
+      await new Promise(done => { release = done; signal.addEventListener('abort', done, { once: true }); entered(); });
+      return proof;
+    } });
+    const pending = cloud.playback('asset'); await ready;
+    t.mock.timers.tick(16000); assert.equal(signal.aborted, false);
+    if (finish) { release(); assert.equal((await pending).response.requiresCompatibility, true); }
+    else { t.mock.timers.tick(19000); await assert.rejects(pending, error => error.code === 'QUARK_COLOR_PROBE_TIMEOUT' && error.status === 504 && /杜比原片/.test(error.message)); assert.equal(signal.aborted, true); }
+  }
 });

@@ -242,7 +242,7 @@ try {
       if (parsed.origin === base && parsed.pathname === '/api/transcode/stop') { transcodeStops.push(route.request().postDataJSON()); if (holdTranscodeStop) await new Promise(resolve => { releaseTranscodeStop = resolve; }); return route.fulfill(failTranscodeStop ? { status: 503, json: { error: '停止兼容任务失败' } } : { json: { stopped: true } }); }
       if (parsed.origin === base && parsed.pathname === '/api/transcode/start') {
         const body = route.request().postDataJSON(); transcodeStarts.push(body);
-        if (transcodeMode === 'busy') return route.fulfill({ status: 409, json: { error: '兼容任务已被另一会话占用' } });
+        if (['busy', 'unsupported-dolby'].includes(transcodeMode)) return route.fulfill({ status: 409, json: { error: transcodeMode === 'busy' ? '兼容任务已被另一会话占用' : '此杜比版本无法安全转换，请选择其他版本' } });
         if (transcodeMode === 'disabled') return route.fulfill({ status: 503, json: { error: '自动尝试已结束；兼容转码未启用' } });
         if (holdTranscode) await new Promise(ok => { releaseTranscode = ok; });
         if (transcodeMode === 'timeout') return route.fulfill({ status: 504, json: { error: '兼容播放启动超时' } });
@@ -345,11 +345,11 @@ try {
         if (parsed.pathname === '/api/quark/playback') {
           if (holdQuarkPlayback) await new Promise(ok => { releaseQuarkPlayback = ok; });
           if (quarkMode === 'playback-error') return route.fulfill({ status: 502, json: { error: '固定夸克播放链接错误' } });
-          assert.ok(quarkAssets.has(body.assetId)); const type = quarkMode === 'requires' ? 'mkv' : ['webm', 'avi', 'mpegts'].includes(quarkMode) ? quarkMode : 'hls';
+          assert.ok(quarkAssets.has(body.assetId)); const type = quarkMode === 'requires' ? 'mkv' : quarkMode === 'requires-dolby' ? 'mp4' : ['webm', 'avi', 'mpegts'].includes(quarkMode) ? quarkMode : 'hls';
           const qualityOptions = [2160, 1080, 720].slice(quarkQualityFixture === 'single' ? 2 : 0).map((height, index) => ({ id: `q${index}`, label: height === 2160 ? '4K' : `${height}p`, type: quarkQualityFixture === 'master' || height === 720 ? 'hls' : 'mp4', width: Math.round(height * 16 / 9), height, url: `/api/quark/media/${body.assetId}?token=q${index}` }));
           const selectedQuality = qualityOptions[quarkQualityFixture === 'single' ? 0 : 1];
           if (quarkQualityFixture) qualityOptions.push({ id: 'unsafe', label: '伪造8K', type: 'mp4', url: 'https://example.invalid/private.mp4' });
-          return route.fulfill({ json: { assetId: body.assetId, name: quarkAssets.get(body.assetId).name, url: quarkQualityFixture === 'master' ? `/api/quark/media/${body.assetId}?token=master` : quarkQualityFixture ? selectedQuality.url : `/api/quark/media/${body.assetId}/index.${type === 'hls' ? 'm3u8' : type}`, type: quarkQualityFixture ? selectedQuality.type : type, ...(quarkQualityFixture ? { qualityOptions, quality: quarkQualityFixture === 'master' ? '自动画质' : selectedQuality.label } : {}), size: 10485760, version: 'official-fixture-h264-v1', requiresCompatibility: ['requires', 'avi', 'mpegts'].includes(quarkMode), duration: 30 } });
+          return route.fulfill({ json: { assetId: body.assetId, name: quarkAssets.get(body.assetId).name, url: quarkQualityFixture === 'master' ? `/api/quark/media/${body.assetId}?token=master` : quarkQualityFixture ? selectedQuality.url : `/api/quark/media/${body.assetId}/index.${type === 'hls' ? 'm3u8' : type}`, type: quarkQualityFixture ? selectedQuality.type : type, ...(quarkQualityFixture ? { qualityOptions, quality: quarkQualityFixture === 'master' ? '自动画质' : selectedQuality.label } : {}), size: 10485760, version: 'official-fixture-h264-v1', requiresCompatibility: ['requires', 'requires-dolby', 'avi', 'mpegts'].includes(quarkMode), duration: 30 } });
         }
         if (parsed.pathname === '/api/quark/progress') { assert.ok(quarkAssets.has(body.assetId), `未知测试资产 ${body.assetId} / ${[...quarkAssets.keys()].join(',')}`); assert.ok(Number.isFinite(body.position) && Number.isFinite(body.duration) && typeof body.ended === 'boolean'); assert.ok(body.position >= 0 && body.duration > 0 && body.duration <= 86400 && body.position <= body.duration + 2, '观看进度遵守服务端时长及范围校验'); quarkProgress.push(body); return route.fulfill({ json: { ok: true } }); }
         if (parsed.pathname.startsWith('/api/quark/media/')) return route.fulfill({ contentType: quarkMode === 'audio-only' ? 'audio/wav' : 'video/mp4', body: quarkMode === 'audio-only' ? media : videoMedia, headers: { 'Accept-Ranges': 'bytes' } });
@@ -1575,11 +1575,15 @@ try {
       await until(playing, '停止失败后的新播放成功');
       await verifyCompatibilityPauseCycles(p, playing, pressPlay, true);
 
-      holdTranscode = true; const leavingStops = transcodeStops.length;
+      holdTranscode = true; const leavingStops = transcodeStops.length, leavingStarts = transcodeStarts.length;
+      const leavingJob = await video.evaluate(v => new URL(v.currentSrc).pathname.split('/')[3]);
+      const cancelledStart = p.waitForEvent('requestfailed', { predicate: request => new URL(request.url()).pathname === '/api/transcode/start' });
       await timeline.evaluate(input => { input.value = '5000'; input.dispatchEvent(new Event('input')); input.dispatchEvent(new Event('change')); });
       await until(() => typeof releaseTranscode === 'function', '离开前启动在途');
       await p.locator('nav a[href="#home"]').click(); holdTranscode = false; releaseTranscode(); releaseTranscode = null;
-      await until(() => transcodeStops.length > leavingStops, '离开后停止已知和迟到任务');
+      assert.match((await cancelledStart).failure()?.errorText || '', /ABORTED/, '离开后取消定位中的兼容启动请求');
+      await until(() => transcodeStops.slice(leavingStops).some(value => value.id === leavingJob), '离开后停止已知的旧兼容任务');
+      assert.equal(transcodeStarts.length, leavingStarts + 1, '取消定位后不再创建兼容任务');
       assert.equal(await p.locator('video').count(), 0, '旧响应不能重建已离开的播放器');
     });
     console.log('PASS 兼容播放暂停停止HLS及旧转码、长暂停原片位置单次恢复、迟到事件隔离、停止延迟快速play/seek合并、旧stop/新start在途暂停后播放以最新意图单次恢复、暂停取消迟到启动、停止失败保真和路由清理（桌面/TV）');
@@ -2175,6 +2179,67 @@ try {
   }
 
   async function verifyQuarkStartupFailure() {
+    await withCloudFixture(async open => {
+      quarkMode = 'requires-dolby'; quarkAssetPosition = 281; transcodeMode = 'enabled'; transcodeDuration = 1200; holdTranscode = true;
+      const { page: p } = await open({ clock: true }); await prepareCloudFile(p);
+      const panel = p.locator('#quark-resources'), jobs = transcodeStarts.length, plays = quarkCount('/api/quark/playback'), progress = quarkProgress.length, mediaReads = quarkRequests.filter(request => request.path.startsWith('/api/quark/media/')).length, failed = [];
+      p.on('requestfailed', request => { if (new URL(request.url()).pathname === '/api/transcode/start') failed.push(request.failure()?.errorText); });
+      await panel.getByRole('button', { name: '夸克播放', exact: true }).click();
+      await until(() => typeof releaseTranscode === 'function', '杜比原片首次自动进入兼容启动');
+      assert.equal(transcodeStarts.length, jobs + 1); assert.equal(transcodeStarts.at(-1).position, 281);
+      await p.clock.fastForward(36000);
+      assert.equal(transcodeStarts.length, jobs + 1, '色彩检查和兼容准备超过旧35秒窗口时继续等待，不重复建任务');
+      assert.deepEqual(failed, [], '准备中的兼容请求不在35秒被前端取消');
+      assert.equal(quarkCount('/api/quark/playback'), plays + 1, '原片只获取一次播放描述');
+      assert.equal(quarkProgress.length, progress, '兼容输出就绪前不保存虚假的播放进度');
+      assert.equal(await panel.getByRole('button', { name: '正在夸克播放', exact: true }).count(), 0, '等待色彩检查不能显示已播放');
+      assert.doesNotMatch(await p.locator('.player-note').textContent(), /未启动|请求超时/);
+      holdTranscode = false; releaseTranscode(); releaseTranscode = null;
+      const video = p.locator('video');
+      await until(() => video.evaluate(v => v.readyState >= 2 && !v.paused).catch(() => false), '超过35秒后兼容响应仍能开始真实播放');
+      await assertVideoFrames(video, '延迟色彩检查后的兼容视频');
+      await panel.getByRole('button', { name: '正在夸克播放', exact: true }).waitFor();
+      assert.equal(transcodeStarts.length, jobs + 1);
+      assert.equal(quarkRequests.filter(request => request.path.startsWith('/api/quark/media/')).length, mediaReads, '需要兼容的原片MP4不能被浏览器直接读取播放');
+      await video.evaluate(v => { v.currentTime = 2; v.pause(); });
+      await until(() => quarkProgress.slice(progress).some(body => body.position === 283 && body.duration === 1200), '慢启动后仍按281秒偏移和完整时长保存进度');
+    });
+    for (const phase of ['playback', 'transcode']) await withCloudFixture(async open => {
+      quarkMode = 'requires-dolby'; transcodeMode = 'enabled'; holdQuarkPlayback = phase === 'playback'; holdTranscode = phase === 'transcode';
+      const { page: p } = await open({ clock: true }); await prepareCloudFile(p);
+      const path = phase === 'playback' ? '/api/quark/playback' : '/api/transcode/start', failed = [], jobs = transcodeStarts.length, progress = quarkProgress.length;
+      p.on('requestfailed', request => { if (new URL(request.url()).pathname === path) failed.push(request.failure()?.errorText); });
+      await p.locator('#quark-resources').getByRole('button', { name: '夸克播放', exact: true }).click();
+      await until(() => typeof (phase === 'playback' ? releaseQuarkPlayback : releaseTranscode) === 'function', `${phase}启动请求在途`);
+      const historySaved = phase === 'transcode' ? p.waitForResponse(response => new URL(response.url()).pathname === '/api/history' && response.request().method() === 'POST') : null;
+      await p.evaluate(() => { location.hash = '#quark'; });
+      await until(() => p.locator('#quark-resources').count().then(count => count === 0), '离开待启动的影片');
+      holdQuarkPlayback = holdTranscode = false;
+      if (phase === 'playback') { releaseQuarkPlayback(); releaseQuarkPlayback = null; }
+      else { releaseTranscode(); releaseTranscode = null; }
+      await until(() => failed.some(message => /ABORTED/i.test(message || '')), `${phase}离开页面实际取消浏览器请求`);
+      if (historySaved) {
+        const response = await historySaved; assert.equal(response.ok(), true, '推进虚拟时间前先完成导航保存');
+        assert.equal(await response.finished(), null);
+      }
+      await p.waitForLoadState('networkidle'); await p.evaluate(() => Promise.resolve());
+      await p.clock.fastForward(120000);
+      assert.equal(transcodeStarts.length, jobs + (phase === 'transcode' ? 1 : 0), `${phase}取消后不重试或创建新任务`);
+      assert.equal(await p.locator('video').count(), 0, '迟到响应不能重新挂载旧播放器');
+      assert.equal(quarkProgress.length, progress, '取消未播放任务不写观看进度');
+      assert.doesNotMatch(await p.locator('#toast').textContent(), /未启动|请求超时|AbortError/);
+    });
+    await withCloudFixture(async open => {
+      quarkMode = 'requires-dolby'; transcodeMode = 'unsupported-dolby';
+      const { page: p } = await open({ clock: true }); await prepareCloudFile(p); const jobs = transcodeStarts.length;
+      await p.locator('#quark-resources').getByRole('button', { name: '夸克播放', exact: true }).click();
+      await p.locator('.player-note').getByText('兼容播放未启动：此杜比版本无法安全转换，请选择其他版本', { exact: true }).waitFor();
+      await p.clock.fastForward(1500);
+      assert.equal(transcodeStarts.length, jobs + 1, '不支持的杜比409不能被当作暂时失败自动重试');
+      assert.doesNotMatch(await p.locator('.player-note').textContent(), /另一台设备|另一会话/);
+      assert.equal(await p.getByRole('button', { name: '正在夸克播放', exact: true }).count(), 0);
+    });
+    console.log('PASS 杜比原片首次自动兼容、36秒准备不提前超时或重复启动、真实画面和281秒续播；导航取消初始播放与兼容请求，无迟到重启或误报；不支持的杜比409保留原因且不重试');
     await withCloudFixture(async open => {
       quarkMode = 'requires'; quarkAssetPosition = 281; transcodeMode = 'enabled'; transcodeDuration = 1200; holdTranscode = true;
       const ordinary = playerRequests.length, reports = playabilityReports.length, progress = quarkProgress.length, jobs = transcodeStarts.length;
@@ -3058,12 +3123,15 @@ try {
 
   await cp.locator('video').evaluate(video => video.pause());
   transcodeMode = 'busy'; const busyCount = transcodeStarts.length;
-  await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await cp.getByText('兼容播放正被另一台设备使用，请稍后再试。', { exact: true }).waitFor();
+  await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await cp.getByText('兼容播放未启动：兼容任务已被另一会话占用', { exact: true }).waitFor();
   await cp.waitForTimeout(150); assert.equal(transcodeStarts.length, busyCount + 1, '409不自动重复任务');
   transcodeMode = 'enabled'; holdTranscode = true; const pendingStart = transcodeStarts.length;
+  const cancelledStart = cp.waitForEvent('requestfailed', { predicate: request => new URL(request.url()).pathname === '/api/transcode/start' });
   await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await until(() => transcodeStarts.length > pendingStart && releaseTranscode, '兼容启动请求在途');
   await cp.locator('nav a[href="#home"]').click(); holdTranscode = false; releaseTranscode(); releaseTranscode = null;
-  await until(() => transcodeStops.some(value => value.id === `fixture-${transcodeStarts.length}`), '取消旧启动响应也停止任务');
+  assert.match((await cancelledStart).failure()?.errorText || '', /ABORTED/, '离开页面实际断开尚未返回任务id的兼容请求');
+  // 断连后迟到任务的清理由 server.test.mjs 验证，前端已收不到该任务id。
+  assert.equal(transcodeStarts.length, pendingStart + 1, '取消启动后不能自动创建另一个任务');
   assert.equal(await cp.locator('video').count(), 0, '旧转码请求不能接管首页');
   await searchCompat(movie.title); await until(() => cp.locator('video').evaluate(video => video.readyState >= 1).catch(() => false), 'pagehide兼容样例');
   await cp.getByRole('button', { name: '兼容播放', exact: true }).click(); await until(decodedCompat, 'pagehide前任务');

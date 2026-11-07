@@ -304,7 +304,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         ...(task.type === 'hls' ? ['-allowed_extensions', 'ALL'] : []), '-read_intervals', '%+#1', '-i', task.input,
         '-select_streams', 'v:0', '-show_streams', '-show_frames', '-show_entries',
         'stream=codec_name,codec_tag_string,pix_fmt,bits_per_raw_sample,color_space,color_transfer,color_primaries:stream_side_data:frame=pix_fmt,color_space,color_transfer,color_primaries:frame_side_data', '-of', 'json'], undefined, { command: probeExecutable, capture: true });
-      const colorBudget = scope ? 15000 : sourceRisk ? 6000 : 3000;
+      const colorBudget = scope ? 30000 : sourceRisk ? 6000 : 3000;
       await Promise.race([attempt.promise, ...(scope ? [scope.promise] : []), new Promise(done => { timer = setTimeout(done, Math.max(1, Math.min(scope ? colorBudget : probeTimeout, colorBudget, deadline - now()))); })]);
       assertValid(task);
       if (scope?.error) throw scope.error;
