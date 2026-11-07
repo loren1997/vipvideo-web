@@ -778,8 +778,8 @@ function pauseVideo(current) {
   if (current.quarkRefreshing) { current.quarkRefreshCancelled = true; current.failed = true; }
   if (current.qualitySwitch) { current.qualitySwitch.paused = true; current.quarkPaused = true; clearTimeout(current.loadTimer); current.note.textContent = '已暂停'; }
   if (current.transcodeLoading) { current.transcodeResumeCancelled = true; current.quarkPaused = true; current.note.textContent = '已暂停'; current.note.className = 'player-note'; }
-  current.video.pause();
-  if (current.transcoded && !current.transcodeLoading && !current.transcodeReady && current.transcodeId) pauseCompatibility(current, { id: current.transcodeId, position: playPosition(current) });
+  const alreadyPaused = current.video.paused; current.video.pause();
+  if (current.transcoded && !current.transcodeLoading && (!current.transcodeReady || alreadyPaused) && current.transcodeId) pauseCompatibility(current, { id: current.transcodeId, position: playPosition(current) });
   current.updateClock?.();
 }
 
@@ -2354,10 +2354,12 @@ function mountPlayer(current) {
   if (!current.live) mountSubtitles(current, host);
   const clock = node('div', undefined, 'player-clock');
   const clockText = node('span'); clockText.id = 'full-film-time'; const timeline = node('input'); timeline.id = 'full-film-progress'; timeline.type = 'range'; timeline.min = '0'; timeline.step = '1'; timeline.setAttribute('aria-label', '原片进度');
-  clock.append(clockText, timeline); host.insertBefore(clock, current.note);
+  const timelineTrack = node('div', undefined, 'player-timeline'), seekBadge = node('span', undefined, 'player-seek-preview'); seekBadge.id = 'full-film-preview'; seekBadge.hidden = true; seekBadge.setAttribute('aria-hidden', 'true');
+  timelineTrack.append(timeline, seekBadge); clock.append(clockText, timelineTrack); host.insertBefore(clock, current.note);
   const filmControls = node('div', undefined, 'player-film-controls'); filmControls.id = 'full-film-controls'; filmControls.setAttribute('aria-label', '影片播放控制'); filmControls.hidden = true; frame.append(filmControls);
   const transport = node('div', undefined, 'player-toolbar');
   const togglePlayback = () => { if (player !== current) return; if (playbackPaused(current)) resumeVideo(current); else pauseVideo(current); };
+  const actionFeedback = node('span', undefined, 'player-action-feedback'); actionFeedback.hidden = true; actionFeedback.setAttribute('role', 'img'); surface.append(actionFeedback);
   const play = button('播放', togglePlayback);
   const mute = button('静音', () => { video.muted = !video.muted; });
   const volumeLabel = node('label', '音量'); const volume = node('input'); volume.type = 'range'; volume.min = '0'; volume.max = '1'; volume.step = '0.05'; volume.value = String(video.volume); volume.setAttribute('aria-label', '音量'); volumeLabel.append(volume);
@@ -2370,7 +2372,7 @@ function mountPlayer(current) {
   };
   for (const event of ['play', 'pause', 'volumechange']) video.addEventListener(event, updateTransport);
   frame.addEventListener('fullscreenchange', () => { full.textContent = document.fullscreenElement === frame ? '退出全屏' : '全屏'; });
-  let pendingTimelinePosition, controlsTimer, controlsPointer = null, controlsHovered = false, keyboardControls = false, controlsBuffering = false, controlsLoading = false;
+  let pendingTimelinePosition, controlsTimer, feedbackTimer, controlsPointer = null, pointerInside = null, controlsHovered = false, keyboardControls = false, controlsBuffering = false, controlsLoading = false;
   const controlEvents = new AbortController(), controlOptions = { signal: controlEvents.signal };
   const canHideControls = () => !playbackPaused(current) && !video.ended && !video.error && !current.transcodeLoading && !controlsBuffering && !controlsHovered && controlsPointer === null && !(keyboardControls && filmControls.contains(document.activeElement));
   const hideControls = () => {
@@ -2390,18 +2392,20 @@ function mountPlayer(current) {
     frame.classList.remove('player-controls-idle');
     scheduleControls();
   };
+  const refreshControls = () => { if (pointerInside === false && !keyboardControls && canHideControls()) hideControls(); else showControls(); };
   const releaseControls = event => {
     if (controlsPointer !== event.pointerId) return;
     controlsPointer = null; showControls(false);
   };
   const pointerActivity = event => {
+    pointerInside = true;
     controlsHovered = event.pointerType !== 'touch' && filmControls.contains(event.target);
     showControls(false);
   };
-  for (const event of ['pointermove', 'pointerenter', 'mousemove', 'mouseenter']) frame.addEventListener(event, pointerActivity, controlOptions);
+  for (const event of ['pointermove', 'pointerenter', 'mousemove', 'mouseenter']) frame.addEventListener(event, pointerActivity, { ...controlOptions, capture: true });
   frame.addEventListener('focus', () => showControls(), controlOptions);
   window.addEventListener('focus', () => showControls(), controlOptions);
-  frame.addEventListener('pointerleave', () => { controlsHovered = false; hideControls(); }, controlOptions);
+  for (const event of ['pointerleave', 'mouseleave']) frame.addEventListener(event, () => { pointerInside = false; controlsHovered = false; hideControls(); }, controlOptions);
   filmControls.addEventListener('pointerenter', pointerActivity, controlOptions);
   filmControls.addEventListener('pointerleave', () => { controlsHovered = false; scheduleControls(); }, controlOptions);
   frame.addEventListener('pointerdown', event => {
@@ -2410,10 +2414,13 @@ function mountPlayer(current) {
   }, controlOptions);
   frame.addEventListener('click', event => {
     if (event.button !== 0 || !(event.target instanceof Element) || event.target.closest('button,a,input,select,textarea,label,summary,[role=button],[role=slider]')) return;
+    const resume = playbackPaused(current);
     togglePlayback(); showControls(false);
+    clearTimeout(feedbackTimer); actionFeedback.dataset.action = resume ? 'play' : 'pause'; actionFeedback.textContent = resume ? '▶' : 'Ⅱ'; actionFeedback.setAttribute('aria-label', resume ? '继续播放' : '暂停播放'); actionFeedback.hidden = false;
+    feedbackTimer = setTimeout(() => { actionFeedback.hidden = true; }, 800);
   }, controlOptions);
   for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) window.addEventListener(event, releaseControls, controlOptions);
-  window.addEventListener('blur', () => { controlsPointer = null; controlsHovered = false; keyboardControls = false; hideControls(); }, controlOptions);
+  window.addEventListener('blur', () => { pointerInside = false; controlsPointer = null; controlsHovered = false; keyboardControls = false; hideControls(); }, controlOptions);
   filmControls.addEventListener('focusin', () => showControls(), controlOptions);
   filmControls.addEventListener('focusout', scheduleControls, controlOptions);
   filmControls.addEventListener('click', () => showControls(false), controlOptions);
@@ -2421,10 +2428,10 @@ function mountPlayer(current) {
   for (const event of ['play', 'pause', 'playing', 'canplay', 'waiting', 'loadstart', 'ended', 'error']) video.addEventListener(event, () => {
     if (event === 'waiting' || event === 'loadstart') controlsBuffering = true;
     else if (event === 'playing' || event === 'canplay' || event === 'ended' || event === 'error') controlsBuffering = false;
-    showControls();
+    refreshControls();
   }, controlOptions);
   current.showFilmControls = showControls;
-  current.clearFilmControls = () => { clearTimeout(controlsTimer); controlEvents.abort(); };
+  current.clearFilmControls = () => { clearTimeout(controlsTimer); clearTimeout(feedbackTimer); controlEvents.abort(); };
   const updateClock = () => {
     if (player !== current) return;
     if (current.seekPreview && !current.transcodeLoading && current.transcodeReady && hasVideoFrame(video) && current.startPosition === current.seekPreview.position) delete current.seekPreview;
@@ -2432,18 +2439,22 @@ function mountPlayer(current) {
     const shownPosition = preview ?? position;
     const previousControls = current.fullFilmControls;
     current.fullFilmControls = true;
-    clockText.textContent = `${preview !== undefined ? '跳转至 ' : current.transcoded && !current.fullFilmControls ? `${compatibilityLabel(current)} · ` : ''}${formatTime(shownPosition)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
+    clockText.textContent = `${formatTime(position)}${duration ? ` / ${formatTime(duration)}` : current.transcoded ? ' / 总时长未知' : ''}`;
+    clockText.style.minWidth = duration ? `${formatTime(duration).length * 2 + 3}ch` : '';
+    seekBadge.hidden = preview === undefined || current.live || !duration;
+    seekBadge.textContent = preview !== undefined ? `跳转至 ${formatTime(shownPosition)}` : '';
+    timelineTrack.style.setProperty('--seek-position', `${duration ? Math.max(0, Math.min(1, shownPosition / duration)) * 100 : 0}%`);
     filmControls.hidden = false;
     if (clock.parentNode !== filmControls) filmControls.prepend(clock);
     qualitySelect.disabled = Boolean(current.transcodeLoading);
     current.updatePlaybackMode?.();
     updateTransport();
-    timeline.hidden = current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
+    timelineTrack.hidden = timeline.hidden = current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
     if (pendingTimelinePosition === undefined) { timeline.max = String(duration); timeline.value = String(shownPosition); }
     timeline.setAttribute('aria-valuetext', `${preview !== undefined ? '跳转至 ' : ''}${formatTime(shownPosition)} / ${formatTime(duration)}`);
     // Progress updates must not restart the controls' idle timer.
     if (previousControls !== current.fullFilmControls || controlsLoading !== Boolean(current.transcodeLoading)) {
-      controlsLoading = Boolean(current.transcodeLoading); showControls();
+      controlsLoading = Boolean(current.transcodeLoading); refreshControls();
     }
   };
   timeline.addEventListener('input', () => { if (player !== current) return; pendingTimelinePosition = Math.max(0, Math.min(playDuration(current), Number(timeline.value) || 0)); updateClock(); });
@@ -2469,7 +2480,7 @@ function mountPlayer(current) {
       if (current.preferences.introSeconds > 0) video.currentTime = Math.min(current.preferences.introSeconds, Math.max(0, video.duration - 1));
     }
   });
-  video.addEventListener('pause', () => { if (player === current && video.paused && video.readyState >= 1 && (!current.transcoded || current.transcodeReady || current.quarkPaused)) { clearQuarkStall(); if (current.quarkAsset && !current.transcodeLoading && !video.error && !current.qualityPausing) current.quarkPaused = true; if (current.quarkRefreshing) { current.quarkRefreshCancelled = true; current.failed = true; note.textContent = '已暂停自动恢复，可点击“重试夸克播放”继续。'; note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); } void saveHistory(current); pauseCompatibility(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
+  video.addEventListener('pause', () => { if (player === current && video.paused && video.readyState >= 1 && (!current.transcoded || current.transcodeReady && current.mediaPlayed || current.quarkPaused)) { clearQuarkStall(); if (current.quarkAsset && !current.transcodeLoading && !video.error && !current.qualityPausing) current.quarkPaused = true; if (current.quarkRefreshing) { current.quarkRefreshCancelled = true; current.failed = true; note.textContent = '已暂停自动恢复，可点击“重试夸克播放”继续。'; note.className = 'player-note error-message'; setQuarkPlaybackStatus(current, 'error'); } void saveHistory(current); pauseCompatibility(current); clearInterval(current.danmakuTimer); current.danmakuTimer = null; current.overlay?.classList.add('paused'); } });
   video.addEventListener('seeked', () => { if (player === current && current.quarkAsset) void saveHistory(current); });
   for (const event of ['seeking', 'seeked']) video.addEventListener(event, () => { if (player === current) updateClock(); });
   video.addEventListener('play', () => {
@@ -2487,7 +2498,7 @@ function mountPlayer(current) {
     if (current.transcoded && !current.transcodeReady) return;
     delete current.quarkRestartPosition; clearTimeout(current.loadTimer); note.textContent = `${current.quarkAsset ? '夸克播放 · ' : ''}${current.transcoded ? `${compatibilityLabel(current)} · ` : ''}${current.live ? `正在直播 · ${current.detail.title}` : `${current.episodeName || current.detail.title} · 进度每 10 秒自动保存`}`; note.className = 'player-note'; setQuarkPlaybackStatus(current, 'playing'); current.overlay?.classList.remove('paused'); if (current.catalog) { startDanmakuSync(current); drawDanmaku(current); }
   };
-  video.addEventListener('playing', markPlaying);
+  video.addEventListener('playing', () => { if (player === current && !video.paused) current.mediaPlayed = true; markPlaying(); });
   video.addEventListener('timeupdate', () => {
     if (player !== current) return;
     if (current.stallTimer && video.currentTime > current.stallPosition + 0.25) clearQuarkStall();
@@ -2592,6 +2603,8 @@ function attemptPlay(current, generation) {
 }
 
 async function loadMedia(current, message = '正在连接播放地址…') {
+  // Ignore queued pause events from the previous media until this load actually plays.
+  current.mediaPlayed = false;
   if (!current.transcoded) delete current.compatibilityPhase;
   if (hls) { hls.destroy(); hls = null; }
   clearTimeout(current.loadTimer);
