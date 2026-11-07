@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import { createRequest } from '../lib/network.mjs';
 import { Readable, PassThrough } from 'node:stream';
 import { createQuarkMedia } from '../lib/quark-media.mjs';
 
@@ -332,7 +333,7 @@ test('only decoded single-layer original HEVC Dolby P5 and P8.1 enter compatibil
 
 test('original Dolby probe timeout and range failures stay retryable without reporting an unsupported profile', async t => {
   const raw = { type: 'mkv', url: 'https://video.quark.cn/original.mkv?sign=synthetic', colorSpace: 'dolby-vision' };
-  for (const [status, code] of [[504, 'QUARK_COLOR_PROBE_TIMEOUT'], [502, 'QUARK_COLOR_PROBE_READ_FAILED']]) {
+  for (const [status, code] of [[504, 'QUARK_COLOR_PROBE_TIMEOUT'], [502, 'QUARK_COLOR_PROBE_READ_FAILED'], [504, 'QUARK_COLOR_SOURCE_TIMEOUT'], [403, 'QUARK_COLOR_SOURCE_FAILED'], [502, 'QUARK_COLOR_SOURCE_FAILED']]) {
     let probes = 0;
     const { cloud } = await fixture(t, { quark: { playback: async () => descriptor({ episode: raw, metadata: { mode: 'download', sourceColorSpace: 'dolby-vision' } }) }, probeColor: async input => {
       probes++; assert.ok(input.timeout <= 30000);
@@ -565,4 +566,76 @@ test('a slow original Dolby inspection survives the online deadline and still ha
     if (finish) { release(); assert.equal((await pending).response.requiresCompatibility, true); }
     else { t.mock.timers.tick(19000); await assert.rejects(pending, error => error.code === 'QUARK_COLOR_PROBE_TIMEOUT' && error.status === 504 && /杜比原片/.test(error.message)); assert.equal(signal.aborted, true); }
   }
+});
+
+
+test('original Dolby first headers can arrive after the ordinary eight-second media deadline', { timeout: 15000 }, async t => {
+  let requests = 0, delayed;
+  const upstream = createServer((req, res) => {
+    requests++; assert.equal(req.headers.range, 'bytes=0-0');
+    delayed = setTimeout(() => { res.writeHead(206, { 'content-range': 'bytes 0-0/10', 'content-length': '1' }); res.end('v'); }, 8500);
+  });
+  await new Promise(done => upstream.listen(0, '127.0.0.1', done));
+  t.after(async () => { clearTimeout(delayed); upstream.closeAllConnections(); await new Promise(done => upstream.close(done)); });
+  const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }],
+    httpsRequest: (_url, options, callback) => httpRequest({ hostname: '127.0.0.1', port: upstream.address().port, path: '/', method: options.method, headers: options.headers, signal: options.signal, agent: false }, callback) });
+  const cloud = createQuarkMedia({ request, quark: { playback: async () => descriptor({ episode: { type: 'mp4', url: 'https://video.quark.cn/raw.mp4', colorSpace: 'dolby-vision' }, metadata: { mode: 'download', sourceColorSpace: 'dolby-vision' } }) } });
+  t.after(() => cloud.invalidate());
+  const lease = await cloud.playback('asset', { deferOriginalColor: true });
+  const bridge = createServer(async (req, res) => {
+    try { await lease.media.serve(req, res, new URL(lease.response.url, 'http://localhost').searchParams.get('token')); }
+    catch (error) { if (!res.destroyed) { res.statusCode = error.status || 502; res.end('upstream failed'); } }
+  });
+  await new Promise(done => bridge.listen(0, '127.0.0.1', done));
+  t.after(async () => { bridge.closeAllConnections(); await new Promise(done => bridge.close(done)); });
+  const response = await fetch('http://127.0.0.1:' + bridge.address().port, { headers: { Range: 'bytes=0-0' } });
+  assert.equal(response.status, 206); assert.equal(await response.text(), 'v');
+  assert.equal(requests, 1, 'waiting for the first byte must not add parallel downloads or retries');
+});
+
+
+test('only original Dolby gets a longer range request deadline and revocation still cancels its pending request', async t => {
+  for (const [mode, sourceColorSpace, timeout] of [['download', 'dolby-vision', 20000], ['official', 'sdr', 8000], ['download', 'hdr', 8000]]) {
+    let entered, signal;
+    const ready = new Promise(done => { entered = done; });
+    const cloud = createQuarkMedia({ quark: { playback: async () => descriptor({ episode: { type: 'mp4', url: 'https://video.quark.cn/raw.mp4', colorSpace: sourceColorSpace }, metadata: { mode, sourceColorSpace } }) }, request: async (_url, options) => {
+      assert.equal(options.timeout, timeout); assert.equal(options.headers.range, 'bytes=0-0'); signal = options.signal; entered();
+      return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    } });
+    t.after(() => cloud.invalidate());
+    const lease = await cloud.playback('asset', { deferOriginalColor: true });
+    const bridge = createServer(async (req, res) => {
+      try { await lease.media.serve(req, res, new URL(lease.response.url, 'http://localhost').searchParams.get('token')); }
+      catch (error) { if (!res.destroyed) { res.statusCode = error.status || 502; res.end('cancelled'); } }
+    });
+    await new Promise(done => bridge.listen(0, '127.0.0.1', done));
+    t.after(async () => { bridge.closeAllConnections(); await new Promise(done => bridge.close(done)); });
+    const pending = fetch('http://127.0.0.1:' + bridge.address().port, { headers: { Range: 'bytes=0-0' } });
+    await ready; cloud.invalidate(); assert.equal(signal.aborted, true);
+    const response = await pending; assert.equal(response.status, 403); await response.text();
+  }
+});
+
+
+test('the longer original timeout uses a fixed normalized URL, not an alternate in the same lease', async t => {
+  const requests = [], raw = 'https://VIDEO.quark.cn:443/raw.mp4', alternate = 'https://video.quark.cn/alternate.mp4';
+  const cloud = createQuarkMedia({ quark: { playback: async () => descriptor({ episode: { type: 'mp4', url: raw, colorSpace: 'dolby-vision' }, metadata: { mode: 'download', sourceColorSpace: 'dolby-vision' } }) }, request: async (url, options) => {
+    requests.push({ url: url.href, timeout: options.timeout });
+    return Object.assign(Readable.from(['v']), { statusCode: 206, headers: { 'content-range': 'bytes 0-0/10', 'content-length': '1' } });
+  } });
+  t.after(() => cloud.invalidate());
+  const lease = await cloud.playback('asset', { deferOriginalColor: true });
+  lease.episode = { ...lease.episode, url: alternate };
+  const bridge = createServer(async (req, res) => {
+    try { await lease.media.serve(req, res, new URL(req.url, 'http://localhost').searchParams.get('token')); }
+    catch (error) { res.statusCode = error.status || 502; res.end('failed'); }
+  });
+  await new Promise(done => bridge.listen(0, '127.0.0.1', done));
+  t.after(async () => { bridge.closeAllConnections(); await new Promise(done => bridge.close(done)); });
+  for (const url of [raw, alternate]) {
+    const playback = lease.media.playback({ lines: [{ episodes: [{ type: 'mp4', url }] }] }, 0, 0);
+    const response = await fetch('http://127.0.0.1:' + bridge.address().port + playback.proxyUrl, { headers: { Range: 'bytes=0-0' } });
+    assert.equal(response.status, 206); assert.equal(await response.text(), 'v');
+  }
+  assert.deepEqual(requests, [{ url: new URL(raw).href, timeout: 20000 }, { url: alternate, timeout: 8000 }]);
 });

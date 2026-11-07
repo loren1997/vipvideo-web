@@ -7,6 +7,7 @@ import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
 function failure(message, status = 502, cause) {
   return Object.assign(new Error(message, cause ? { cause } : undefined), { status });
 }
+const sourceTimeout = stage => Object.assign(failure(stage === 'body' ? '影视源读取超时' : '影视源请求超时'), { code: 'MEDIA_SOURCE_TIMEOUT', stage });
 
 export function isPublicAddress(value) {
   const address = String(value).replace(/^\[|\]$/g, '').toLowerCase();
@@ -75,13 +76,13 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
       for (let redirects = 0; redirects <= 3; redirects++) {
         signal?.throwIfAborted();
         const remaining = deadline - Date.now();
-        if (remaining <= 0) throw failure('影视源请求超时');
+        if (remaining <= 0) throw sourceTimeout('dns');
         let timer;
         const hostname = url.hostname.replace(/^\[|\]$/g, '');
         const literalFamily = isIP(hostname);
         const records = await Promise.race([
           literalFamily ? [{ address: hostname, family: literalFamily }] : lookup(hostname, { all: true, verbatim: true }),
-          new Promise((_, reject) => { timer = setTimeout(() => reject(failure('影视源请求超时')), remaining); }),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(sourceTimeout('dns')), remaining); }),
         ]).finally(() => clearTimeout(timer));
         signal?.throwIfAborted();
         const publicRecords = records.filter(record => isPublicAddress(record.address));
@@ -91,7 +92,7 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
         const selected = publicRecords.find(record => record.family === 4) || publicRecords[0];
         const send = (fresh = false) => new Promise((resolve, reject) => {
           signal?.throwIfAborted();
-          if (deadline <= Date.now()) throw failure('影视源请求超时');
+          if (deadline <= Date.now()) throw sourceTimeout('headers');
           const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
           const attemptHeaders = { 'accept-encoding': 'identity', ...requestHeaders };
           if (fresh) {
@@ -107,7 +108,7 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
             lookup: (_host, options, callback) => options.all
               ? callback(null, [selected]) : callback(null, selected.address, selected.family),
           }, response => { received = true; resolve(response); });
-          const headerTimer = setTimeout(() => outgoing.destroy(failure('影视源请求超时')), Math.max(1, deadline - Date.now()));
+          const headerTimer = setTimeout(() => outgoing.destroy(sourceTimeout('headers')), Math.max(1, deadline - Date.now()));
           outgoing.once('response', () => clearTimeout(headerTimer));
           outgoing.once('error', error => {
             clearTimeout(headerTimer);
@@ -119,7 +120,7 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
         });
         const response = await send();
         response.finalUrl = url.href;
-        response.setTimeout?.(timeout, () => response.destroy(failure('影视源读取超时')));
+        response.setTimeout?.(timeout, () => response.destroy(sourceTimeout('body')));
         if (![301, 302, 303, 307, 308].includes(response.statusCode)) return response;
         const location = response.headers.location;
         response.destroy();

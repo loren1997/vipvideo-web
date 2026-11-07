@@ -139,7 +139,33 @@ test('limits redirect loops and reports DNS timeout', async () => {
   await assert.rejects(looping('https://source.example/'), /重定向次数过多/);
   assert.equal(calls.length, 4);
   const hanging = createRequest({ lookup: () => new Promise(() => {}) });
-  await assert.rejects(hanging('https://source.example/', { timeout: 10 }), /超时/);
+  await assert.rejects(hanging('https://source.example/', { timeout: 10 }), { status: 502, code: 'MEDIA_SOURCE_TIMEOUT', stage: 'dns', message: '影视源请求超时' });
+});
+
+test('media timeouts distinguish waiting for headers from an idle body and close the socket', { timeout: 2000 }, async t => {
+  const sockets = new Set(), agents = new Set(); let hits = 0;
+  const server = http.createServer((req, res) => {
+    hits++;
+    if (req.url === '/body') { res.writeHead(206, { 'Content-Length': '2', 'Content-Range': 'bytes 0-1/20' }); res.flushHeaders(); }
+  });
+  server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], httpRequest: (url, options, callback) => {
+    agents.add(options.agent);
+    return http.request({ ...options, hostname: '127.0.0.1', port: server.address().port, path: url.pathname }, callback);
+  } });
+  t.after(async () => {
+    const closed = [...sockets].map(socket => new Promise(resolve => socket.once('close', resolve)));
+    for (const agent of agents) agent.destroy(); server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve)); await Promise.all(closed); assert.equal(sockets.size, 0);
+  });
+  await assert.rejects(request('http://cdn.example/headers', { timeout: 80 }),
+    { status: 502, code: 'MEDIA_SOURCE_TIMEOUT', stage: 'headers', message: '影视源请求超时' });
+  const incoming = await request('http://cdn.example/body', { timeout: 80 });
+  assert.equal(incoming.statusCode, 206);
+  await assert.rejects(readText(incoming),
+    { status: 502, code: 'MEDIA_SOURCE_TIMEOUT', stage: 'body', message: '影视源读取超时' });
+  assert.equal(incoming.destroyed, true); assert.equal(hits, 2, 'timeouts must not automatically replay media requests');
 });
 
 test('bounded byte reads preserve non-UTF8 subtitle encodings through compression', async () => {

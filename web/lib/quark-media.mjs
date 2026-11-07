@@ -57,8 +57,8 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
           } catch (error) {
             if (!valid(lease)) throw failure('夸克账号或播放会话已变更', 409);
             if (controller.signal.aborted) break;
-            if (originalDolby && ['QUARK_COLOR_PROBE_TIMEOUT', 'QUARK_COLOR_PROBE_READ_FAILED'].includes(error.code)) throw error;
-            if (['QUARK_COLOR_PROBE_TIMEOUT', 'QUARK_COLOR_PROBE_READ_FAILED'].includes(error.code)) lastError = error;
+            if (originalDolby && ['QUARK_COLOR_PROBE_TIMEOUT', 'QUARK_COLOR_PROBE_READ_FAILED', 'QUARK_COLOR_SOURCE_TIMEOUT', 'QUARK_COLOR_SOURCE_FAILED'].includes(error.code)) throw error;
+            if (['QUARK_COLOR_PROBE_TIMEOUT', 'QUARK_COLOR_PROBE_READ_FAILED', 'QUARK_COLOR_SOURCE_TIMEOUT', 'QUARK_COLOR_SOURCE_FAILED'].includes(error.code)) lastError = error;
             lastProbe = colorProof(error.colorProbe || { colorSpace: 'unknown' }, true); continue;
           }
         }
@@ -97,7 +97,7 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
       let episode = descriptor.episode;
       if (!['hls', 'mp4', 'mkv', 'webm', 'avi', 'mpegts'].includes(episode?.type)) throw failure('夸克没有返回可支持的媒体', 502);
       if (episode.colorSpace !== undefined && !colors.has(episode.colorSpace)) throw failure('夸克播放色彩信息无效', 502);
-      validateUrl(episode.url);
+      const originalUrl = validateUrl(episode.url).href;
       if (descriptor.variants !== undefined && (!Array.isArray(descriptor.variants) || descriptor.variants.length > 8)) throw failure('夸克播放清晰度列表无效', 502);
       const variants = new Map();
       for (const variant of descriptor.variants || []) {
@@ -163,7 +163,9 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
         }
         let response;
         try {
+          // Original-file CDNs may take longer to return their first range; the probe still has its total deadline.
           response = await request(url, { ...options, headers,
+            timeout: lease.originalDolby && url.href === originalUrl ? 20000 : options.timeout,
             signal: options.signal ? AbortSignal.any([lease.controller.signal, options.signal]) : lease.controller.signal });
         } catch (error) {
           if (!valid(lease)) throw failure('夸克账号或播放会话已变更');

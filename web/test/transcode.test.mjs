@@ -520,7 +520,7 @@ test('chunked Dolby range truncation cannot be hidden by decoded frame metadata'
   });
   try {
     await assert.rejects(f.service.inspectColor({ episode: rawDolby, owner: 'probe', valid: () => true }),
-      error => error.code === 'QUARK_COLOR_PROBE_READ_FAILED');
+      error => error.code === 'QUARK_COLOR_SOURCE_FAILED' && error.colorProbe.colorSpace === 'unknown');
     assert.equal(f.calls.filter(call => call.args.includes('-c:v')).length, 0);
     assert.ok(source.streams.every(stream => stream.destroyed));
   } finally { await f.close(); }
@@ -1471,6 +1471,43 @@ test('raw Dolby decoding may outlast 15 seconds without changing the single-thre
     const args = f.calls[0].args; assert.equal(args[args.indexOf('-threads') + 1], '1');
     assert.equal(f.calls.some(call => call.args.includes('-c:v')), false);
   } finally { await f.close(); }
+});
+
+test('probe preserves upstream timeout, HTTP rejection and network failures before a readable body', async () => {
+  for (const mode of ['dns', 'headers', 'body', 403, 412, 'network']) {
+    const timeout = ['dns', 'headers', 'body'].includes(mode), upstream = [];
+    const cause = Object.assign(new Error('https://private.example/secret-film.mp4?sign=signature-secret Cookie: cookie-secret'),
+      timeout ? { code: 'MEDIA_SOURCE_TIMEOUT', stage: mode } : { code: 'ECONNRESET' });
+    const media = createMedia({ secret: Buffer.alloc(32, 19), request: async () => {
+      if (mode === 'body') {
+        const stream = Object.assign(new PassThrough(), { statusCode: 206,
+          headers: { 'content-type': 'video/mp4', 'content-length': '3', 'content-range': 'bytes 0-2/3' } });
+        upstream.push(stream); setImmediate(() => stream.destroy(cause)); return stream;
+      }
+      if (Number.isInteger(mode)) {
+        const stream = Object.assign(Readable.from(['denied']), { statusCode: mode, headers: { 'content-type': 'text/plain' } });
+        upstream.push(stream); return stream;
+      }
+      throw cause;
+    } });
+    const f = await fixture({ media, colorProbe: dolbyProbe(), inspect: async ({ input }) => {
+      await assert.rejects(async () => { const response = await fetch(input); await response.arrayBuffer(); });
+    } });
+    try {
+      await assert.rejects(f.service.inspectColor({ episode: rawDolby, owner: 'probe', valid: () => true }), error =>
+        error.code === (timeout ? 'QUARK_COLOR_SOURCE_TIMEOUT' : 'QUARK_COLOR_SOURCE_FAILED') &&
+        error.status === (timeout ? 504 : Number.isInteger(mode) ? mode : 502) && error.colorProbe.colorSpace === 'unknown');
+      const entries = f.logs.filter(line => line.startsWith('HDR 色彩检查失败 ')); assert.equal(entries.length, 1);
+      const summary = JSON.parse(entries[0].slice('HDR 色彩检查失败 '.length));
+      assert.equal(summary.phase, timeout ? 'source-timeout' : 'source-failed');
+      assert.equal(summary.upstreamStage, timeout ? mode : 'headers');
+      assert.equal(summary.upstreamStatus, mode === 'body' ? 206 : Number.isInteger(mode) ? mode : null);
+      assert.equal(summary.requests, 1); assert.equal(summary.bytes, 0);
+      assert.doesNotMatch(f.logs.join('\n'), /private|secret|signature|cookie|https?:|mp4/i);
+      assert.ok(upstream.every(stream => stream.destroyed)); assert.ok(f.children.every(child => child.finished));
+      assert.equal(f.calls.filter(call => call.args.includes('-c:v')).length, 0); assert.deepEqual(await readdir(f.root), []);
+    } finally { await f.close(); }
+  }
 });
 
 test('probe timeout diagnostics distinguish unread and completed input without exposing stderr data', async t => {

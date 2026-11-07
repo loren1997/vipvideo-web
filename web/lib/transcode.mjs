@@ -150,11 +150,11 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     const scope = task.probeReads || task.encoderReads;
     if (!scope) return;
     const encoder = scope.encoding === true, windowLimit = (encoder ? 8 : 2) * 1024 * 1024;
-    const reject = () => {
+    const reject = error => {
       if (!scope.error) {
-        scope.error = encoder
+        scope.error = error || (encoder
           ? Object.assign(failure('杜比原片的媒体范围响应无效，已停止兼容播放', 502), { code: 'TRANSCODE_INPUT_READ_FAILED' })
-          : Object.assign(failure('原片色彩检查的范围响应无效或超过读取限额，已停止读取', 502), { code: 'QUARK_COLOR_PROBE_READ_FAILED', colorProbe: { colorSpace: 'unknown' } });
+          : Object.assign(failure('原片色彩检查的范围响应无效或超过读取限额，已停止读取', 502), { code: 'QUARK_COLOR_PROBE_READ_FAILED', colorProbe: { colorSpace: 'unknown' } }));
         scope.failed?.();
         if (encoder) {
           task.inputError = scope.error; lastError = scope.error.message;
@@ -163,6 +163,19 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
       }
       for (const response of scope.responses) response.destroy();
       return scope.error;
+    };
+    const sourceFailed = error => {
+      if (encoder || scope.closed || !valid(task) || req.aborted || res.destroyed || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') return false;
+      const cause = error?.code === 'MEDIA_SOURCE_TIMEOUT' ? error : error?.cause || error, timeout = cause?.code === 'MEDIA_SOURCE_TIMEOUT';
+      const received = res.getHeader('content-range') !== undefined;
+      const upstreamStage = ['dns', 'headers', 'body'].includes(cause?.stage) ? cause.stage : received ? 'body' : 'headers';
+      const upstreamStatus = received ? res.statusCode : !timeout && !error?.cause && Number.isInteger(error?.status) ? error.status : null;
+      reject(Object.assign(failure(timeout ? '原文件读取超时，已停止色彩检查，请稍后重试或更换版本' : '原文件读取失败，已停止色彩检查，请稍后重试或更换版本',
+        timeout ? 504 : Number.isInteger(error?.status) && error.status >= 400 && error.status < 500 ? error.status : 502), {
+        code: timeout ? 'QUARK_COLOR_SOURCE_TIMEOUT' : 'QUARK_COLOR_SOURCE_FAILED', upstreamStage, upstreamStatus,
+        colorProbe: { colorSpace: 'unknown' },
+      }));
+      return true;
     };
     // MP4 may seek across many top-level mdat headers before reaching its moov.
     const requestLimit = task.type === 'mp4' ? 64 : 16;
@@ -213,7 +226,7 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
     res.destroy = error => {
       // Upstream failures must not turn partial reads into valid proof. A decoder
       // may intentionally close its socket after reading a frame; that is allowed.
-      if (!encoder && error && !res.destroyed && !scope.closed && left > 0) reject();
+      if (!encoder && error && !res.destroyed && !scope.closed && left > 0) sourceFailed(error);
       return destroy(error);
     };
     res.writeHead = (status, ...args) => headers(status) ? writeHead(status, ...args) : res;
@@ -224,9 +237,11 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
       if (req.method !== 'HEAD' && left !== 0) { reject(); return res; }
       return endResponse(chunk, encoding, callback);
     };
+    return sourceFailed;
   }
   async function bridge(task) {
     const server = task.bridge = createServer(async (req, res) => {
+      let sourceFailed;
       try {
         assertValid(task);
         const origin = task.origin, parsed = new URL(req.url, origin);
@@ -250,10 +265,12 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
           }
           return end(body, encoding, callback);
         };
-        guardSourceRead(task, req, res);
+        sourceFailed = guardSourceRead(task, req, res);
         await task.media.serve(req, res, parsed.searchParams.get('token'));
       } catch (error) {
         if (res.destroyed) return;
+        if (!valid(task) || req.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') { res.destroy(); return; }
+        if (sourceFailed?.(error)) return;
         if (!res.headersSent) { res.statusCode = error.status || 502; res.removeHeader('Content-Length'); res.setHeader('Content-Type', 'text/plain; charset=utf-8'); res.end('兼容播放媒体转发失败'); }
         else res.destroy(error);
       }
@@ -356,11 +373,13 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         ['missing-metadata', /moov atom not found|Could not find codec parameters/i], ['decode-error', /Error while decoding|Invalid data found/i],
       ].find(([, pattern]) => pattern.test(stderr))?.[0] || (stderr ? 'other' : 'none');
       logger.error('HDR 色彩检查失败', JSON.stringify({
-        phase: error.code === 'QUARK_COLOR_PROBE_TIMEOUT' ? 'probe-timeout' : error.code === 'QUARK_COLOR_PROBE_READ_FAILED' ? 'probe-read-failed' : 'probe-metadata-invalid',
+        phase: error.code === 'QUARK_COLOR_SOURCE_TIMEOUT' ? 'source-timeout' : error.code === 'QUARK_COLOR_SOURCE_FAILED' ? 'source-failed' : error.code === 'QUARK_COLOR_PROBE_TIMEOUT' ? 'probe-timeout' : error.code === 'QUARK_COLOR_PROBE_READ_FAILED' ? 'probe-read-failed' : 'probe-metadata-invalid',
         elapsedMs: Math.max(0, now() - startedAt), rangeGuard: !!scope, requests: scope?.requests || 0, bytes: scope?.bytes || 0,
         reserved: scope?.reserved || 0, openResponses: scope?.responses.size || 0,
         lastReadAgoMs: scope?.lastReadAt === undefined ? null : Math.max(0, now() - scope.lastReadAt),
         processClosed: attempt?.done === true, exitCode: attempt?.code ?? null, stderrCategory,
+        upstreamStage: ['dns', 'headers', 'body'].includes(error.upstreamStage) ? error.upstreamStage : null,
+        upstreamStatus: Number.isInteger(error.upstreamStatus) && error.upstreamStatus >= 100 && error.upstreamStatus <= 599 ? error.upstreamStatus : null,
       }));
       if (error.status) throw error;
       throw Object.assign(failure('无法确认此视频的色彩信息，已停止兼容播放以避免偏色，请改用夸克官方 SDR 线路或其他 SDR 版本', 409), { code: 'QUARK_COLOR_UNCONFIRMED', colorProbe: { ...task.colorProbe, colorSpace: 'unknown' } });
