@@ -599,7 +599,7 @@ test('only original Dolby gets a longer range request deadline and revocation st
     let entered, signal;
     const ready = new Promise(done => { entered = done; });
     const cloud = createQuarkMedia({ quark: { playback: async () => descriptor({ episode: { type: 'mp4', url: 'https://video.quark.cn/raw.mp4', colorSpace: sourceColorSpace }, metadata: { mode, sourceColorSpace } }) }, request: async (_url, options) => {
-      assert.equal(options.timeout, timeout); assert.equal(options.headers.range, 'bytes=0-0'); signal = options.signal; entered();
+      assert.equal(options.timeout, timeout); assert.equal(options.addressFallback, timeout === 20000); assert.equal(options.headers.range, 'bytes=0-0'); signal = options.signal; entered();
       return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
     } });
     t.after(() => cloud.invalidate());
@@ -620,7 +620,7 @@ test('only original Dolby gets a longer range request deadline and revocation st
 test('the longer original timeout uses a fixed normalized URL, not an alternate in the same lease', async t => {
   const requests = [], raw = 'https://VIDEO.quark.cn:443/raw.mp4', alternate = 'https://video.quark.cn/alternate.mp4';
   const cloud = createQuarkMedia({ quark: { playback: async () => descriptor({ episode: { type: 'mp4', url: raw, colorSpace: 'dolby-vision' }, metadata: { mode: 'download', sourceColorSpace: 'dolby-vision' } }) }, request: async (url, options) => {
-    requests.push({ url: url.href, timeout: options.timeout });
+    requests.push({ url: url.href, timeout: options.timeout, addressFallback: options.addressFallback });
     return Object.assign(Readable.from(['v']), { statusCode: 206, headers: { 'content-range': 'bytes 0-0/10', 'content-length': '1' } });
   } });
   t.after(() => cloud.invalidate());
@@ -637,5 +637,5 @@ test('the longer original timeout uses a fixed normalized URL, not an alternate 
     const response = await fetch('http://127.0.0.1:' + bridge.address().port + playback.proxyUrl, { headers: { Range: 'bytes=0-0' } });
     assert.equal(response.status, 206); assert.equal(await response.text(), 'v');
   }
-  assert.deepEqual(requests, [{ url: new URL(raw).href, timeout: 20000 }, { url: alternate, timeout: 8000 }]);
+  assert.deepEqual(requests, [{ url: new URL(raw).href, timeout: 20000, addressFallback: true }, { url: alternate, timeout: 8000, addressFallback: false }]);
 });

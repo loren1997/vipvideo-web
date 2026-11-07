@@ -1474,10 +1474,12 @@ test('raw Dolby decoding may outlast 15 seconds without changing the single-thre
 });
 
 test('probe preserves upstream timeout, HTTP rejection and network failures before a readable body', async () => {
-  for (const mode of ['dns', 'headers', 'body', 403, 412, 'network']) {
-    const timeout = ['dns', 'headers', 'body'].includes(mode), upstream = [];
+  for (const mode of ['dns', 'headers', 'body', 'queued', 'connect', 'tls', 403, 412, 'network']) {
+    const timeout = ['dns', 'headers', 'body', 'queued', 'connect', 'tls'].includes(mode), upstream = [];
+    const stage = ['queued', 'connect', 'tls'].includes(mode) ? 'headers' : mode;
     const cause = Object.assign(new Error('https://private.example/secret-film.mp4?sign=signature-secret Cookie: cookie-secret'),
-      timeout ? { code: 'MEDIA_SOURCE_TIMEOUT', stage: mode } : { code: 'ECONNRESET' });
+      timeout ? { code: 'MEDIA_SOURCE_TIMEOUT', stage, transportStage: mode, connectionAttempts: mode === 'dns' || mode === 'queued' ? 0 : 2 }
+        : { code: 'ECONNRESET', transportStage: 'private-secret', connectionAttempts: 9999 });
     const media = createMedia({ secret: Buffer.alloc(32, 19), request: async () => {
       if (mode === 'body') {
         const stream = Object.assign(new PassThrough(), { statusCode: 206,
@@ -1500,8 +1502,10 @@ test('probe preserves upstream timeout, HTTP rejection and network failures befo
       const entries = f.logs.filter(line => line.startsWith('HDR 色彩检查失败 ')); assert.equal(entries.length, 1);
       const summary = JSON.parse(entries[0].slice('HDR 色彩检查失败 '.length));
       assert.equal(summary.phase, timeout ? 'source-timeout' : 'source-failed');
-      assert.equal(summary.upstreamStage, timeout ? mode : 'headers');
+      assert.equal(summary.upstreamStage, timeout ? stage : 'headers');
       assert.equal(summary.upstreamStatus, mode === 'body' ? 206 : Number.isInteger(mode) ? mode : null);
+      assert.equal(summary.transportStage, timeout ? mode : null);
+      assert.equal(summary.connectionAttempts, timeout ? mode === 'dns' || mode === 'queued' ? 0 : 2 : null);
       assert.equal(summary.requests, 1); assert.equal(summary.bytes, 0);
       assert.doesNotMatch(f.logs.join('\n'), /private|secret|signature|cookie|https?:|mp4/i);
       assert.ok(upstream.every(stream => stream.destroyed)); assert.ok(f.children.every(child => child.finished));

@@ -173,6 +173,8 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
       reject(Object.assign(failure(timeout ? '原文件读取超时，已停止色彩检查，请稍后重试或更换版本' : '原文件读取失败，已停止色彩检查，请稍后重试或更换版本',
         timeout ? 504 : Number.isInteger(error?.status) && error.status >= 400 && error.status < 500 ? error.status : 502), {
         code: timeout ? 'QUARK_COLOR_SOURCE_TIMEOUT' : 'QUARK_COLOR_SOURCE_FAILED', upstreamStage, upstreamStatus,
+        transportStage: ['dns', 'queued', 'connect', 'tls', 'headers', 'body'].includes(cause?.transportStage) ? cause.transportStage : null,
+        connectionAttempts: Number.isSafeInteger(cause?.connectionAttempts) && cause.connectionAttempts >= 0 && cause.connectionAttempts <= 4 ? cause.connectionAttempts : null,
         colorProbe: { colorSpace: 'unknown' },
       }));
       return true;
@@ -380,6 +382,8 @@ export function createTranscoder({ media, spawn = nodeSpawn, setPriority = nodeS
         processClosed: attempt?.done === true, exitCode: attempt?.code ?? null, stderrCategory,
         upstreamStage: ['dns', 'headers', 'body'].includes(error.upstreamStage) ? error.upstreamStage : null,
         upstreamStatus: Number.isInteger(error.upstreamStatus) && error.upstreamStatus >= 100 && error.upstreamStatus <= 599 ? error.upstreamStatus : null,
+        transportStage: ['dns', 'queued', 'connect', 'tls', 'headers', 'body'].includes(error.transportStage) ? error.transportStage : null,
+        connectionAttempts: Number.isSafeInteger(error.connectionAttempts) && error.connectionAttempts >= 0 && error.connectionAttempts <= 4 ? error.connectionAttempts : null,
       }));
       if (error.status) throw error;
       throw Object.assign(failure('无法确认此视频的色彩信息，已停止兼容播放以避免偏色，请改用夸克官方 SDR 线路或其他 SDR 版本', 409), { code: 'QUARK_COLOR_UNCONFIRMED', colorProbe: { ...task.colorProbe, colorSpace: 'unknown' } });

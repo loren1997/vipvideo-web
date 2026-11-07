@@ -734,6 +734,7 @@ function pauseCompatibility(current, job) {
   const paused = current.transcodePause = { position: job?.position ?? playPosition(current), id: job?.id ?? current.transcodeId, released: false };
   current.position = paused.position; current.transcodeReady = false; clearTimeout(current.loadTimer);
   delete current.seekPreview; current.quarkPaused = true; current.recovering = false;
+  current.compatibilityPhase = 'paused';
   if (hls) hls.stopLoad?.();
   else { current.video.removeAttribute('src'); current.video.load(); }
   current.note.textContent = '已暂停'; current.note.className = 'player-note';
@@ -815,7 +816,7 @@ async function startCompatibility(current, position = current.seekPreview?.posit
       const requested = current.pendingTranscodePosition; delete current.pendingTranscodePosition;
       const request = current.request, stamp = current.stamp;
       const valid = () => player === current && current.request === request && playVersion === request && routeVersion === stamp;
-      current.position = requested; current.transcodeLoading = true; current.recovering = true; current.failed = false; current.compatibilityErrorCode = null;
+      current.position = requested; current.transcodeLoading = true; current.recovering = true; current.failed = false; current.compatibilityErrorCode = null; current.compatibilityPhase = 'preparing';
       const controller = current.transcodeRequest = new AbortController();
       current.updateClock?.();
       clearTimeout(current.loadTimer); clearInterval(current.danmakuTimer); current.danmakuTimer = null;
@@ -839,6 +840,7 @@ async function startCompatibility(current, position = current.seekPreview?.posit
         catch (error) {
           if (!valid() || current.transcodeResumeCancelled || !([502, 503, 504].includes(error.status) || ['TimeoutError', 'TypeError'].includes(error.name))) throw error;
           current.note.textContent = '兼容播放启动暂时失败，正在重试一次…';
+          current.compatibilityPhase = 'retrying'; current.updateClock?.();
           await new Promise(resolve => setTimeout(resolve, 700));
           if (!valid() || current.transcodeResumeCancelled) throw error;
           job = await api('/api/transcode/start', { method: 'POST', body, timeoutMs: 90000, signal: controller.signal });
@@ -849,6 +851,7 @@ async function startCompatibility(current, position = current.seekPreview?.posit
         const pausedPosition = current.seekPreview?.from ?? current.position;
         Object.assign(current, { transcodeId: job.id, transcoded: true, transcodeReady: false, startPosition: Number(job.startPosition) || 0, originalDuration: Number.isFinite(job.duration) && job.duration > 0 ? job.duration : 0, acceleration: job.acceleration, url: job.url, type: 'hls', usedProxy: false, started: true, position: Number(job.startPosition) || 0, introHandled: true, failed: false, recovering: false });
         current.transcodeLoading = false;
+        delete current.compatibilityPhase;
         if (current.transcodeResumeCancelled) { delete current.pendingTranscodePosition; pauseCompatibility(current, { id: job.id, position: pausedPosition }); return; }
         if (!current.live && body.speed !== current.preferences.speed) current.pendingTranscodePosition ??= requested;
         if (current.pendingTranscodePosition !== undefined) continue;
@@ -862,6 +865,7 @@ async function startCompatibility(current, position = current.seekPreview?.posit
         if (current.seekPreview) { current.position = current.seekPreview.from; delete current.seekPreview; }
         if (Number.isFinite(current.quarkRestartPosition)) { current.position = current.quarkRestartPosition; delete current.quarkRestartPosition; }
         current.compatibilityErrorCode = error.code;
+        current.compatibilityPhase = current.transcodeResumeCancelled ? 'paused' : 'failed';
         current.note.textContent = current.transcodeResumeCancelled ? '已暂停' : `兼容播放未启动：${error.message}`;
         current.note.className = current.transcodeResumeCancelled ? 'player-note' : 'player-note error-message'; console.warn('兼容播放启动失败', error.message);
         if (!current.transcodeResumeCancelled) setQuarkPlaybackStatus(current, 'error');
@@ -2313,8 +2317,11 @@ function mountPlayer(current) {
   });
   current.updatePlaybackMode = () => {
     if (player !== current) return;
-    const dimensions = video.videoWidth > 0 && video.videoHeight > 0 ? ` · ${video.videoWidth}×${video.videoHeight}` : '';
-    playbackMode.textContent = `${current.transcoded ? '兼容转码播放' : current.quarkAsset ? '夸克官方播放' : '直接播放'}${dimensions}`;
+    const phase = current.transcodeLoading && current.transcodeResumeCancelled ? 'paused' : current.compatibilityPhase;
+    const status = { preparing: '正在准备兼容播放', retrying: '正在重试兼容播放', failed: '兼容播放未启动', paused: '兼容播放已暂停' }[phase];
+    const dimensions = !status && (!current.transcoded || current.transcodeReady) && video.videoWidth > 0 && video.videoHeight > 0 ? ` · ${video.videoWidth}×${video.videoHeight}` : '';
+    const label = status || `${current.transcoded ? '兼容转码播放' : current.quarkAsset ? '夸克官方播放' : '直接播放'}${dimensions}`;
+    if (playbackMode.textContent !== label) playbackMode.textContent = label;
   };
   qualityBar.append(playbackMode, qualitySelect);
   if (current.catalog || current.live) {
@@ -2422,6 +2429,7 @@ function mountPlayer(current) {
     filmControls.hidden = false;
     if (clock.parentNode !== filmControls) filmControls.prepend(clock);
     qualitySelect.disabled = Boolean(current.transcodeLoading);
+    current.updatePlaybackMode?.();
     updateTransport();
     timeline.hidden = current.live || !duration; timeline.disabled = Boolean(current.transcodeLoading);
     if (pendingTimelinePosition === undefined) { timeline.max = String(duration); timeline.value = String(shownPosition); }
@@ -2577,6 +2585,7 @@ function attemptPlay(current, generation) {
 }
 
 async function loadMedia(current, message = '正在连接播放地址…') {
+  if (!current.transcoded) delete current.compatibilityPhase;
   if (hls) { hls.destroy(); hls = null; }
   clearTimeout(current.loadTimer);
   const generation = (current.mediaVersion || 0) + 1; current.mediaVersion = generation;
@@ -2646,6 +2655,7 @@ function stopPlayer(invalidate = true) {
   if (!current) return Promise.resolve();
   const save = saveHistory(current);
   current.quarkPlaybackRequest?.abort(); current.transcodeRequest?.abort();
+  delete current.compatibilityPhase;
   current.clearFilmControls?.();
   clearInterval(current.timer);
   clearInterval(current.danmakuTimer); clearDanmaku(current);

@@ -7,7 +7,7 @@ import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
 function failure(message, status = 502, cause) {
   return Object.assign(new Error(message, cause ? { cause } : undefined), { status });
 }
-const sourceTimeout = stage => Object.assign(failure(stage === 'body' ? '影视源读取超时' : '影视源请求超时'), { code: 'MEDIA_SOURCE_TIMEOUT', stage });
+const sourceTimeout = (stage, transportStage = stage, connectionAttempts = 0) => Object.assign(failure(stage === 'body' ? '影视源读取超时' : '影视源请求超时'), { code: 'MEDIA_SOURCE_TIMEOUT', stage, transportStage, connectionAttempts });
 
 export function isPublicAddress(value) {
   const address = String(value).replace(/^\[|\]$/g, '').toLowerCase();
@@ -61,12 +61,13 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
   const agents = pools(true), retryAgents = pools(false);
   for (const agent of [...Object.values(agents), ...Object.values(retryAgents)]) {
     const getName = agent.getName;
-    // 仅复用同一已验证公网 IP 的连接，DNS 变化仍需重新校验并建连。
+    // 仅复用同一组已验证公网 IP 的连接，DNS 候选变化仍需重新校验并建连。
     agent.getName = function (options) { return `${getName.call(this, options)}:${options.validatedAddress}`; };
   }
-  return async function safeRequest(value, { headers = {}, timeout = 8000, method = 'GET', body, followRedirects = true, signal } = {}) {
+  return async function safeRequest(value, { headers = {}, timeout = 8000, method = 'GET', body, followRedirects = true, signal, addressFallback = false } = {}) {
     if (!['GET', 'HEAD', 'POST'].includes(method)) throw failure('不支持的请求方法', 400);
     if (typeof followRedirects !== 'boolean') throw failure('重定向设置无效', 400);
+    if (typeof addressFallback !== 'boolean') throw failure('地址备选设置无效', 400);
     if (body !== undefined && (method !== 'POST' || !(typeof body === 'string' || Buffer.isBuffer(body)) || Buffer.byteLength(body) > 65536)) throw failure('请求正文无效或超过 64 KiB', 400);
     const deadline = Date.now() + timeout;
     let url = validateUrl(value);
@@ -90,6 +91,9 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
           throw failure('不允许访问内网或保留地址', 403);
         }
         const selected = publicRecords.find(record => record.family === 4) || publicRecords[0];
+        const candidates = [selected, ...publicRecords].filter((record, index, rows) => rows.findIndex(other => other.family === record.family && other.address === record.address) === index)
+          .slice(0, addressFallback && ['GET', 'HEAD'].includes(method) ? 2 : 1);
+        const addressKey = candidates.length === 1 ? selected.address : candidates.map(record => `${record.family}/${record.address}`).join(',');
         const send = (fresh = false) => new Promise((resolve, reject) => {
           signal?.throwIfAborted();
           if (deadline <= Date.now()) throw sourceTimeout('headers');
@@ -100,18 +104,33 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
             // A bounded nonpersistent pool must not hand a completed retry socket to queued requests.
             attemptHeaders.connection = 'close';
           }
-          let received = false;
+          let received = false, socket, transportStage = 'queued';
+          const connectionAttempts = () => outgoing.reusedSocket ? 0 : socket ? socket.autoSelectFamilyAttemptedAddresses?.length || 1 : 0;
+          const connected = () => { transportStage = socket.encrypted ? 'tls' : 'headers'; };
+          const secured = () => { transportStage = 'headers'; };
+          const assigned = current => {
+            socket = current;
+            transportStage = socket.connecting ? 'connect' : socket.encrypted && !socket.authorized && !outgoing.reusedSocket ? 'tls' : 'headers';
+            socket.once('connect', connected); socket.once('secureConnect', secured);
+          };
           const outgoing = transport(url, {
-            method, agent: (fresh ? retryAgents : agents)[url.protocol], validatedAddress: selected.address, signal,
+            method, agent: (fresh ? retryAgents : agents)[url.protocol], validatedAddress: addressKey, signal,
+            autoSelectFamily: candidates.length > 1,
             headers: attemptHeaders,
-            // 固定已验证的地址，避免校验后再次 DNS 解析产生重绑定。
+            // 只向原生拨号器提供已验证候选，避免再次 DNS 解析产生重绑定。
             lookup: (_host, options, callback) => options.all
-              ? callback(null, [selected]) : callback(null, selected.address, selected.family),
-          }, response => { received = true; resolve(response); });
-          const headerTimer = setTimeout(() => outgoing.destroy(sourceTimeout('headers')), Math.max(1, deadline - Date.now()));
-          outgoing.once('response', () => clearTimeout(headerTimer));
+              ? callback(null, candidates) : callback(null, selected.address, selected.family),
+          }, response => {
+            received = true;
+            response.setTimeout?.(timeout, () => response.destroy(sourceTimeout('body', 'body', connectionAttempts())));
+            resolve(response);
+          });
+          const headerTimer = setTimeout(() => outgoing.destroy(sourceTimeout('headers', transportStage, connectionAttempts())), Math.max(1, deadline - Date.now()));
+          const cleanup = () => { clearTimeout(headerTimer); outgoing.off('socket', assigned); socket?.off('connect', connected); socket?.off('secureConnect', secured); };
+          outgoing.once('socket', assigned);
+          outgoing.once('response', cleanup);
           outgoing.once('error', error => {
-            clearTimeout(headerTimer);
+            cleanup();
             if (!retried && !received && ['GET', 'HEAD'].includes(method) && outgoing.reusedSocket === true && error.code === 'ECONNRESET' && !signal?.aborted && Date.now() < deadline) {
               retried = true; resolve(send(true));
             } else reject(error);
@@ -120,7 +139,6 @@ export function createRequest({ lookup = dnsLookup, httpRequest = http.request, 
         });
         const response = await send();
         response.finalUrl = url.href;
-        response.setTimeout?.(timeout, () => response.destroy(sourceTimeout('body')));
         if (![301, 302, 303, 307, 308].includes(response.statusCode)) return response;
         const location = response.headers.location;
         response.destroy();

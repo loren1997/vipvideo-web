@@ -166,6 +166,7 @@ export function createQuarkMedia({ quark, request = networkRequest, now = Date.n
           // Original-file CDNs may take longer to return their first range; the probe still has its total deadline.
           response = await request(url, { ...options, headers,
             timeout: lease.originalDolby && url.href === originalUrl ? 20000 : options.timeout,
+            addressFallback: lease.originalDolby && url.href === originalUrl,
             signal: options.signal ? AbortSignal.any([lease.controller.signal, options.signal]) : lease.controller.signal });
         } catch (error) {
           if (!valid(lease)) throw failure('夸克账号或播放会话已变更');

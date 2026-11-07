@@ -27,6 +27,54 @@ function transport(routes, calls) {
   };
 }
 
+test('address fallback uses at most two distinct public candidates and isolates changed DNS sets', async () => {
+  let records = [{ address: '127.0.0.1', family: 4 }, { address: '8.8.8.8', family: 4 }, { address: '8.8.8.8', family: 4 }, { address: '1.1.1.1', family: 4 }, { address: '9.9.9.9', family: 4 }];
+  const calls = [], url = 'https://cdn.example/video', request = createRequest({ lookup: async () => records, httpsRequest: transport({ [url]: () => response('ok') }, calls) });
+  await readText(await request(url, { addressFallback: true }));
+  assert.deepEqual(calls[0].addresses, [{ address: '8.8.8.8', family: 4 }, { address: '1.1.1.1', family: 4 }]);
+  assert.equal(calls[0].options.autoSelectFamily, true);
+  const firstKey = calls[0].options.agent.getName(calls[0].options);
+  records = [{ address: '8.8.8.8', family: 4 }, { address: '9.9.9.9', family: 4 }];
+  await readText(await request(url, { addressFallback: true }));
+  assert.notEqual(calls[1].options.agent.getName(calls[1].options), firstKey);
+  assert.match(calls[1].options.validatedAddress, /4\/8\.8\.8\.8,4\/9\.9\.9\.9/);
+  for (const options of [{}, { method: 'POST', body: 'x', addressFallback: true }]) {
+    await readText(await request(url, options));
+    assert.deepEqual(calls.at(-1).addresses, [records[0]]); assert.equal(calls.at(-1).options.autoSelectFamily, false);
+  }
+  const before = calls.length; records = [{ address: '127.0.0.1', family: 4 }, { address: '10.0.0.1', family: 4 }];
+  await assert.rejects(request(url, { addressFallback: true }), { status: 403 }); assert.equal(calls.length, before);
+});
+
+test('native address fallback sends one HTTP request and never retries an already connected slow response', { timeout: 5000 }, async t => {
+  let hits = 0;
+  const server = http.createServer((_req, res) => { hits++; setTimeout(() => res.end('ok'), 60); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  for (const fallback of [true, false]) {
+    let attempts, nativeRequest, agent; const before = hits;
+    const request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }, { address: '1.1.1.1', family: 4 }],
+      httpRequest: (url, options, callback) => {
+        agent = options.agent;
+        // Only the injected transport maps the validated public fixture addresses to owned loopback endpoints.
+        nativeRequest = http.request({ ...options, hostname: url.hostname, port: server.address().port, autoSelectFamilyAttemptTimeout: 10,
+          lookup: (host, lookupOptions, done) => options.lookup(host, lookupOptions, (error, addresses) => {
+            assert.equal(error, null); assert.equal(addresses.length, 2);
+            const local = fallback ? [{ address: '::1', family: 6 }, { address: '127.0.0.1', family: 4 }]
+              : [{ address: '127.0.0.1', family: 4 }, { address: '::1', family: 6 }];
+            process.nextTick(done, null, local);
+          }),
+        }, incoming => { attempts = nativeRequest.socket.autoSelectFamilyAttemptedAddresses.length; callback(incoming); });
+        return nativeRequest;
+      },
+    });
+    try {
+      assert.equal(await readText(await request('http://cdn.example/video', { addressFallback: true, timeout: 2000 })), 'ok');
+      assert.equal(hits - before, 1); assert.equal(attempts, fallback ? 2 : 1);
+    } finally { agent?.destroy(); }
+  }
+});
+
 test('fixed-origin POST sends a bounded body and never follows redirects with credentials', async () => {
   const calls = [];
   const routes = { 'https://cloud.example/api': () => response('ok'), 'https://cloud.example/redirect': () => response('', 302, { location: 'https://other.example/capture' }) };
@@ -195,6 +243,7 @@ function resetTransport(steps, calls) {
     options.signal?.addEventListener('abort', abort, { once: true });
     outgoing.once('error', cleanup); outgoing.once('response', cleanup);
     outgoing.end = () => queueMicrotask(() => {
+      if (step.socket) outgoing.emit('socket', step.socket);
       step.before?.();
       if (outgoing.destroyed || step.stall) return;
       if (step.error) return outgoing.emit('error', Object.assign(new Error('fixture reset'), { code: step.error }));
@@ -204,6 +253,29 @@ function resetTransport(steps, calls) {
     calls.push({ url: url.href, options, outgoing }); return outgoing;
   };
 }
+
+test('header timeout diagnostics distinguish queued, TCP, TLS and connected waits without exposing addresses', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const stage of ['queued', 'connect', 'tls', 'headers']) {
+    const socket = stage === 'queued' ? undefined : Object.assign(new EventEmitter(), {
+      connecting: true, encrypted: true, authorized: false,
+      autoSelectFamilyAttemptedAddresses: stage === 'tls' ? ['private-first', 'private-second'] : ['private-first'],
+    });
+    const calls = [], request = createRequest({ lookup: async () => [{ address: '8.8.8.8', family: 4 }, { address: '1.1.1.1', family: 4 }],
+      httpsRequest: resetTransport([{ stall: true, socket, before: () => {
+        if (stage === 'tls' || stage === 'headers') { socket.connecting = false; socket.emit('connect'); }
+        if (stage === 'headers') { socket.authorized = true; socket.emit('secureConnect'); }
+      } }], calls) });
+    const pending = request('https://cdn.example/video?token=private-secret', { addressFallback: true, timeout: 1000 });
+    await new Promise(resolve => setImmediate(resolve)); t.mock.timers.tick(1000);
+    await assert.rejects(pending, error => {
+      assert.equal(error.code, 'MEDIA_SOURCE_TIMEOUT'); assert.equal(error.stage, 'headers'); assert.equal(error.transportStage, stage);
+      assert.equal(error.connectionAttempts, stage === 'queued' ? 0 : stage === 'tls' ? 2 : 1);
+      assert.doesNotMatch(JSON.stringify(error), /private|secret|cdn|8\.8|1\.1/); return true;
+    });
+    assert.equal(calls.length, 1); assert.equal(socket?.listenerCount('connect') || 0, 0); assert.equal(socket?.listenerCount('secureConnect') || 0, 0);
+  }
+});
 
 test('reused GET and HEAD resets retry once on a fresh bounded agent with the same pinned address and Range', async () => {
   for (const method of ['GET', 'HEAD']) {
