@@ -80,6 +80,7 @@ main { min-height:calc(100vh - 220px); }
 .browse-filter { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:12px; }
 .browse-filter > span { flex-shrink:0; }
 .browse-filter select { width:100%; min-width:0; padding:8px 10px; font-size:12px; }
+@media(min-width:1100px) { .browse-filters { grid-template-columns:repeat(5,minmax(0,1fr)); } .browse-filter { display:grid; gap:4px; } }
 .filter-note { font-size:12px; margin:-6px 0 16px; }
 .card-date { margin:4px 0 0; color:var(--muted); font-size:10px; }
 @media(max-width:640px) { .browse-filters { gap:10px; grid-template-columns:repeat(2,minmax(0,1fr)); } .browse-filter { display:block; } .browse-filter > span { display:block; margin-bottom:5px; } .browse-filter:last-child { grid-column:1/-1; } }

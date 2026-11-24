@@ -401,7 +401,47 @@ function failuresList(sources, label = '影视源') {
 const browseGenres = ['喜剧', '惊悚', '恐怖', '动作', '爱情', '科幻', '悬疑', '犯罪', '战争', '剧情', '动画', '冒险', '奇幻', '家庭', '历史', '纪录', '武侠', '古装', '音乐', '运动', '青春'];
 
 function browseParams(category, source = '', filters = {}) {
-  return { category, ...(source ? { source } : {}), ...(filters.genre ? { genre: filters.genre } : {}), ...(filters.year ? { year: filters.year } : {}), ...(filters.sort && filters.sort !== 'updated' ? { sort: filters.sort } : {}) };
+  return { category, ...(source ? { source } : {}), ...(filters.genre ? { genre: filters.genre } : {}), ...(filters.year ? { year: filters.year } : {}), ...(filters.country ? { country: filters.country } : {}), ...(filters.platform ? { platform: filters.platform } : {}), ...(filters.sort && filters.sort !== 'updated' ? { sort: filters.sort } : {}) };
+}
+
+function catalogFilterRow(filters, quark, onChange) {
+  const row = node('div', undefined, 'browse-filters');
+  function field(key, label, aria) {
+    const wrapper = node('label', undefined, 'browse-filter'), select = node('select');
+    select.setAttribute('aria-label', (quark ? '夸克' : '') + aria);
+    select.addEventListener('change', () => onChange({ ...filters, [key]: select.value }));
+    wrapper.append(node('span', label), select); row.append(wrapper);
+    return select;
+  }
+  const genre = field('genre', '类型', '影片类型'), year = field('year', '上映年份', '上映年份');
+  const country = field('country', '国家/地区', '制片国家/地区'), platform = field('platform', '平台', '影片平台'), sort = field('sort', '排列', '影片排序');
+  for (const [value, label] of [['', '全部平台'], ['netflix', '奈飞（Netflix）']]) platform.add(new Option(label, value));
+  platform.value = filters.platform;
+  const sorts = quark ? [['release', '热门片目 · 年份优先'], ['score', '豆瓣高分'], ['release-score', '热门片目 · 年份+评分']] : [['updated', '默认顺序'], ['release', '上映时间（已加载）'], ['year', '年份（已加载）']];
+  for (const [value, label] of sorts) sort.add(new Option(label, value));
+  sort.value = filters.sort;
+  const pages = new Map();
+  function choices(select, values, placeholder, selected) {
+    const unavailable = selected && !values.includes(selected);
+    const list = ['', ...values, ...(unavailable ? [selected] : [])];
+    if (select.options.length !== list.length || list.some((value, i) => select.options[i].value !== value || select.options[i].hidden !== Boolean(unavailable && value === selected))) {
+      select.replaceChildren(...list.map(value => {
+        const option = new Option(value || placeholder, value);
+        if (unavailable && value === selected) option.hidden = option.disabled = true;
+        return option;
+      }));
+    }
+    select.value = selected;
+  }
+  function update(facets = {}, page = 1) {
+    pages.set(page, facets);
+    const values = key => [...new Set([...pages.values()].flatMap(set => set[key] || []).map(String).filter(Boolean))];
+    choices(genre, facets.genres ? values('genres') : quark ? [] : browseGenres, '全部类型', filters.genre);
+    choices(year, values('years').sort((a, b) => Number(b) - Number(a)), '全部年份', filters.year);
+    choices(country, values('countries').sort((a, b) => a.localeCompare(b, 'zh')), '全部国家/地区', filters.country);
+  }
+  update();
+  return { row, update };
 }
 
 function browseReleaseDate(item) {
@@ -432,7 +472,7 @@ function categoryTabs(category, selectedSource = '', filters = {}) {
 }
 
 async function renderHome(category = 'movie', selectedSource = '', stamp = routeVersion, statePromise = null, filters = {}) {
-  filters = { genre: filters.genre || '', year: filters.year || '', sort: ['release', 'year'].includes(filters.sort) ? filters.sort : 'updated' };
+  filters = { genre: filters.genre || '', year: filters.year || '', country: filters.country || '', platform: filters.platform === 'netflix' ? 'netflix' : '', sort: ['release', 'year'].includes(filters.sort) ? filters.sort : 'updated' };
   const page = document.createDocumentFragment();
   const catalog = section('发现好故事', '选一部，直接开始看');
   const controls = node('div', undefined, 'browse-controls');
@@ -451,28 +491,8 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
   updateSourceChoices();
   select.addEventListener('change', () => goto('home', browseParams(category, select.value, filters)));
   controls.append(tabs, select); catalog.append(controls);
-  const filterRow = node('div', undefined, 'browse-filters');
-  function filterSelect(label, ariaLabel) {
-    const field = node('label', undefined, 'browse-filter'); field.append(node('span', label));
-    const input = node('select'); input.setAttribute('aria-label', ariaLabel); field.append(input); filterRow.append(field); return input;
-  }
-  const genreSelect = filterSelect('类型', '影片类型'), yearSelect = filterSelect('上映年份', '上映年份'), sortSelect = filterSelect('排列', '影片排序');
-  function choices(input, values, placeholder, selected) {
-    const list = ['', ...values.filter(value => value !== '')]; if (selected && !list.includes(selected)) list.push(selected);
-    if (input.options.length !== list.length || [...input.options].some((option, index) => option.value !== list[index])) {
-      input.replaceChildren(); for (const value of list) { const option = node('option', value || placeholder); option.value = value; input.append(option); }
-    }
-    input.value = selected;
-  }
-  function updateFacets(facets = {}) {
-    choices(genreSelect, Array.isArray(facets.genres) ? facets.genres.filter(value => typeof value === 'string') : browseGenres, '全部类型', filters.genre);
-    choices(yearSelect, Array.isArray(facets.years) ? facets.years.map(String) : Array.from({ length: new Date().getFullYear() - 1899 }, (_value, index) => String(new Date().getFullYear() - index)), '全部年份', filters.year);
-  }
-  updateFacets();
-  for (const [value, label] of [['updated', '默认顺序'], ['release', '上映时间（已加载）'], ['year', '年份（已加载）']]) { const option = node('option', label); option.value = value; sortSelect.append(option); }
-  sortSelect.value = filters.sort;
-  for (const [input, field] of [[genreSelect, 'genre'], [yearSelect, 'year'], [sortSelect, 'sort']]) input.addEventListener('change', () => goto('home', browseParams(category, selectedSource, { ...filters, [field]: input.value })));
-  catalog.append(filterRow);
+  const filterBar = catalogFilterRow(filters, false, next => goto('home', browseParams(category, selectedSource, next)));
+  catalog.append(filterBar.row);
   const sortNote = node('p', filters.sort === 'year' ? '排序仅针对已加载影片，按上映年份从新到旧排列。' : '排序仅针对已加载影片；没有完整上映日期的影片排在末尾。', 'filter-note muted'); sortNote.hidden = filters.sort === 'updated'; catalog.append(sortNote);
   const listing = node('div'); listing.id = 'browse-results'; catalog.append(listing);
   const more = button('加载更多', () => void loadPage(), 'button subtle'); more.hidden = true; more.classList.add('load-more'); catalog.append(more);
@@ -516,8 +536,9 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
     try {
       const path = `/api/browse?${new URLSearchParams({ ...browseParams(category, selectedSource, filters), page: nextPage, progressive: '1' })}`;
       const draw = result => {
-      updateSourceChoices(); updateFacets(result.facets);
-      const incoming = (result.groups || []).filter(group => category === 'adult' ? group.category === 'adult' : group.category !== 'adult').map(group => ({ ...group, items: group.items.filter(item => category === 'adult' ? item.category === 'adult' : item.category !== 'adult') }));
+      updateSourceChoices(); filterBar.update(result.facets, nextPage);
+      const rows = [...(result.groups || []), ...(result.cachedMatches || [])];
+      const incoming = rows.filter(group => category === 'adult' ? group.category === 'adult' : group.category !== 'adult').map(group => ({ ...group, items: group.items.filter(item => category === 'adult' ? item.category === 'adult' : item.category !== 'adult') }));
       groups = sortBrowseGroups(mergeGroups(groups, incoming.filter(group => group.items.length)), filters.sort); browseGroups = mergeGroups(browseGroups, groups);
       listing.replaceChildren(); const failures = failuresList(result.failedSources); if (failures) listing.append(failures);
       if (result.complete === false) listing.append(node('p', pendingSources(result), 'resource-progress muted'));
@@ -543,19 +564,13 @@ async function renderQuarkLibrary(params, stamp) {
   quarkLibraryHash = location.hash;
   const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺' };
   const category = Object.hasOwn(categories, params.get('category')) ? params.get('category') : 'movie';
-  const filters = { genre: params.get('genre') || '', year: params.get('year') || '', sort: ['release', 'score', 'release-score'].includes(params.get('sort')) ? params.get('sort') : 'release-score' };
+  const filters = { genre: params.get('genre') || '', year: params.get('year') || '', country: params.get('country') || '', platform: params.get('platform') === 'netflix' ? 'netflix' : '', sort: ['release', 'score', 'release-score'].includes(params.get('sort')) ? params.get('sort') : 'release-score' };
   const page = section('夸克影院', '发现影片，自动准备当前影片或剧集，选择版本后播放');
   const tabs = node('div', undefined, 'category-tabs');
   for (const [id, title] of Object.entries(categories)) { const tab = button(title, () => goto('quark', { category: id, ...filters, genre: '' }), `button${category === id ? ' selected' : ''}`); tab.setAttribute('aria-pressed', String(category === id)); tabs.append(tab); }
   const controls = node('div', undefined, 'browse-controls'); controls.append(tabs); page.append(controls);
-  const filterRow = node('div', undefined, 'browse-filters');
-  function filter(label, aria) { const field = node('label', undefined, 'browse-filter'); field.append(node('span', label)); const select = node('select'); select.setAttribute('aria-label', aria); field.append(select); filterRow.append(field); return select; }
-  const genre = filter('类型', '夸克影片类型'), year = filter('上映年份', '夸克上映年份'), sort = filter('排列', '夸克影片排序');
-  function options(select, values, label, selected) { select.replaceChildren(); for (const value of ['', ...values]) { const option = node('option', value || label); option.value = value; select.append(option); } if (selected && ![...select.options].some(option => option.value === selected)) { const option = node('option', selected); option.value = selected; select.append(option); } select.value = selected; }
-  function facets(value = {}) { options(genre, (value.genres || []).filter(value => typeof value === 'string'), '全部类型', filters.genre); options(year, (value.years || []).map(String), '全部年份', filters.year); }
-  facets(); for (const [value, title] of [['release', '热门片目 · 年份优先'], ['score', '豆瓣高分'], ['release-score', '热门片目 · 年份+评分']]) { const option = node('option', title); option.value = value; sort.append(option); } sort.value = filters.sort;
-  for (const [select, field] of [[genre, 'genre'], [year, 'year'], [sort, 'sort']]) select.addEventListener('change', () => goto('quark', { category, ...filters, [field]: select.value }));
-  page.append(filterRow);
+  const filterBar = catalogFilterRow(filters, true, next => goto('quark', { category, ...next }));
+  page.append(filterBar.row);
   const sortNote = node('p', undefined, 'filter-note muted'); page.append(sortNote);
   const listing = node('div'); listing.id = 'quark-library-results'; page.append(listing);
   const more = button('加载更多影片', () => void load(), 'button subtle load-more'); more.hidden = true; page.append(more); content.replaceChildren(page);
@@ -566,7 +581,7 @@ async function renderQuarkLibrary(params, stamp) {
     if (!items.length) listing.replaceChildren(node('p', '正在加载夸克影院…', 'loading'));
     try {
       const data = await api(`/api/quark/library?${new URLSearchParams({ category, ...filters, page: nextPage })}`); if (!valid()) return;
-      facets(data.facets);
+      filterBar.update(data.facets, nextPage);
       sortNote.textContent = `${data.sortLabel || (filters.sort === 'score' ? '已上映片目，豆瓣高分优先' : filters.sort === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先')}；排序针对当前已加载片目。`;
       items = [...new Map([...items, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
       listing.replaceChildren(items.length ? grid(items, { priorityCount: 6 }) : empty('这个分类暂时没有影片', '试试其他类型、年份或稍后重试。'));
@@ -2968,7 +2983,7 @@ async function renderRoute() {
     if (stamp !== routeVersion) return;
     if (selectedView !== 'home') { const latestState = await statePromise; if (stamp !== routeVersion) return; if (latestState) library = latestState; }
     if (selectedView === 'home' && params.get('category') === 'adult' && !config.showAdult) { leaveAdultScreen(); return; }
-    if (selectedView === 'home') await renderHome(params.get('category') || 'movie', params.get('source') || '', stamp, statePromise, { genre: params.get('genre'), year: params.get('year'), sort: params.get('sort') });
+    if (selectedView === 'home') await renderHome(params.get('category') || 'movie', params.get('source') || '', stamp, statePromise, { genre: params.get('genre'), year: params.get('year'), country: params.get('country'), platform: params.get('platform'), sort: params.get('sort') });
     else if (selectedView === 'quark') await renderQuarkLibrary(params, stamp);
     else if (selectedView === 'quark-detail') await openQuarkDetail(params.get('id') || '', stamp);
     else if (selectedView === 'favorites' || selectedView === 'history') renderLibrary(selectedView);

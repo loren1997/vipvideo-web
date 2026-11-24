@@ -1,4 +1,5 @@
 import { request as networkRequest, readText, validateUrl } from './network.mjs';
+import { hasNetflixLabel, normalizeCountries, validCountryFilter } from './catalog-filters.mjs';
 
 function failure(message, status = 502, cause) {
   return Object.assign(new Error(message, cause ? { cause } : undefined), { status });
@@ -148,7 +149,8 @@ function metadata(video, source, categoryHint) {
   const score = Number(video.vod_douban_score);
   if (String(video.vod_douban_score ?? '').trim() && Number.isFinite(score) && score > 0 && score <= 10) douban.score = score;
   return { key: JSON.stringify([normalizedTitle, year, type]), source: source.id, id: String(video.vod_id), title, year, type, poster, typeName, remarks,
-    genres: genres(video), releaseDate: releaseDate(video.vod_pubdate),
+    genres: genres(video), releaseDate: releaseDate(video.vod_pubdate), countries: normalizeCountries(video.vod_area),
+    netflix: hasNetflixLabel(video.vod_platform, video.vod_tv, video.vod_producer, video.vod_tag, video.vod_class, typeName),
     ...(category ? { category } : {}), ...(Object.keys(douban).length ? { douban } : {}), lines };
 }
 
@@ -168,6 +170,8 @@ function aggregate(results, category) {
       for (const field of ['poster', 'typeName', 'remarks']) if (!group[field] && item[field]) group[field] = item[field];
       if (item.releaseDate && (!group.releaseDate || item.releaseDate < group.releaseDate)) group.releaseDate = item.releaseDate;
       group.genres = [...new Set([...group.genres, ...item.genres])];
+      group.countries = [...new Set([...group.countries, ...item.countries])];
+      group.netflix ||= item.netflix;
       if (!group.douban?.score && item.douban?.score) group.douban = item.douban;
     }
   }
@@ -362,7 +366,7 @@ export function createCatalog({ request = networkRequest } = {}) {
         results => aggregate(results), progressive);
     },
 
-    async browse(config, { category = 'movie', page = 1, source: sourceId, progressive = false, genre = '', year = '', sort = 'updated' } = {}) {
+    async browse(config, { category = 'movie', page = 1, source: sourceId, progressive = false, genre = '', year = '', country = '', platform = '', sort = 'updated' } = {}) {
       if (typeof category !== 'string' || !Object.hasOwn(ROOT_NAMES, category)) throw failure('分类必须为 movie、tv、anime、variety 或 adult', 400);
       if (category === 'adult' && config.showAdult !== true) throw failure('三级内容已隐藏，请先在设置中开启显示', 403);
       if (!((typeof page === 'number' && Number.isInteger(page)) || (typeof page === 'string' && /^[1-9]\d{0,2}$/.test(page))) || Number(page) < 1 || Number(page) > 100) throw failure('页码必须为 1 到 100 的整数', 400);
@@ -371,20 +375,49 @@ export function createCatalog({ request = networkRequest } = {}) {
       const currentYear = new Date().getFullYear();
       if (typeof year !== 'string' || year && (!/^\d{4}$/.test(year) || Number(year) < 1900 || Number(year) > currentYear + 3)) throw failure('上映年份必须为 1900 至当前年份加 3 的四位年份', 400);
       if (!['updated', 'release', 'year'].includes(sort)) throw failure('排序方式无效', 400);
+      if (!validCountryFilter(country) || !['', 'netflix'].includes(platform)) throw failure('制片国家/地区或平台筛选无效', 400);
+      country = normalizeCountries(country)[0] || '';
       const sources = config.sources.filter(source => source.enabled !== false && (sourceId === undefined || source.id === sourceId));
       if (sourceId !== undefined && !sources.length) throw failure('影视源不存在或已停用', 400);
-      const filters = { genre, year, sort };
-      const key = JSON.stringify([signature(config), category, page, sourceId, filters]);
+      const filters = { genre, year, country, platform, sort };
+      const scope = JSON.stringify([signature(config), category, sourceId, genre]);
+      const key = JSON.stringify([scope, page, year]);
       return batch(browseCache, key, 180000, sources, source => sourceBrowse(source, category, page, filters), results => {
         const result = aggregate(results, category);
+        const entry = browseCache.get(key);
+        const observed = result.groups.map(({ year, countries, netflix }) => ({ year, countries, netflix }));
+        const facets = { genres: Object.keys(GENRES), years: new Set(), countries: new Set() };
+        const matches = item => (!year || item.year === year) && (!country || item.countries.includes(country)) && (!platform || item.netflix);
+        result.groups = result.groups.filter(matches);
+        const cachedResults = [];
+        const collect = rows => {
+          for (const item of rows) {
+            if (platform && !item.netflix) continue;
+            if ((!country || item.countries.includes(country)) && /^\d{4}$/.test(item.year) && +item.year >= 1900 && +item.year <= currentYear + 3) facets.years.add(item.year);
+            if (!year || year === item.year) for (const name of item.countries) facets.countries.add(name);
+          }
+        };
+        collect(observed);
+        // Keep options from loaded pages and other year selections for the lifetime of their source responses.
+        if (entry) {
+          entry.facetScope = scope;
+          entry.facetRows = observed;
+          for (const other of browseCache.values()) {
+            if (other === entry || other.facetScope !== scope || other.done && other.expires <= Date.now()) continue;
+            collect(other.facetRows);
+            if (page === 1 && !result.groups.length && !cachedResults.length && (country || platform || year) && other.facetRows.some(matches)) {
+              cachedResults.push(...other.results.filter(Boolean));
+            }
+          }
+        }
+        // The client merges these known matches by film key without skipping subsequent source pages.
+        if (cachedResults.length) result.cachedMatches = aggregate(cachedResults, category).groups.filter(matches);
         // 采集 API 按资源更新时间分页；上映顺序只适用于已加载的影片。
-        if (sort !== 'updated') result.groups.sort((a, b) => {
+        if (sort !== 'updated') (result.cachedMatches || result.groups).sort((a, b) => {
           const value = item => sort === 'release' ? item.releaseDate : /^\d{4}$/.test(item.year) ? item.year : '';
           return value(b).localeCompare(value(a)) || a.title.localeCompare(b.title, 'zh-CN');
         });
-        const years = new Set(Array.from({ length: Math.max(1, currentYear - 1899) }, (_, index) => String(currentYear - index)));
-        for (const item of result.groups) if (/^\d{4}$/.test(item.year) && Number(item.year) >= 1900 && Number(item.year) <= currentYear + 3) years.add(item.year);
-        return { category, page, ...result, filters, facets: { genres: Object.keys(GENRES), years: [...years].sort((a, b) => Number(b) - Number(a)) },
+        return { category, page, ...result, filters, facets: { genres: facets.genres, years: [...facets.years].sort().reverse(), countries: [...facets.countries].sort((a, b) => a.localeCompare(b, 'zh-CN')) },
           sortScope: 'loaded', hasMore: results.some(result => result.hasMore === true) };
       }, progressive);
     },

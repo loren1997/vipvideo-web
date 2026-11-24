@@ -195,7 +195,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         }
         if (path === '/api/quark/settings' && method === 'GET') return json(res, 200, { ...await quarkService.settings(), searchPool: searchPool.status() });
         if (path === '/api/quark/library' && method === 'GET') {
-          const result = await cloudCatalog.browse(Object.fromEntries(['category', 'genre', 'year', 'sort', 'page'].filter(key => url.searchParams.has(key)).map(key => [key, url.searchParams.get(key)])));
+          const result = await cloudCatalog.browse(Object.fromEntries(['category', 'genre', 'year', 'country', 'platform', 'sort', 'page'].filter(key => url.searchParams.has(key)).map(key => [key, url.searchParams.get(key)])));
           requireSession(hashToken(token));
           return json(res, 200, result);
         }
@@ -458,7 +458,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
             category,
             page: url.searchParams.get('page') ?? '1',
             source: url.searchParams.get('source') ?? undefined,
-            ...Object.fromEntries(['genre', 'year', 'sort'].filter(key => url.searchParams.has(key)).map(key => [key, url.searchParams.get(key)])),
+            ...Object.fromEntries(['genre', 'year', 'country', 'platform', 'sort'].filter(key => url.searchParams.has(key)).map(key => [key, url.searchParams.get(key)])),
             ...(url.searchParams.get('progressive') === '1' ? { progressive: true } : {}),
           });
           ensureVisible(category);

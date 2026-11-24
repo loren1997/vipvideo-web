@@ -57,8 +57,8 @@ test('official public catalog supplies posters, scores and metadata without sour
   assert.equal(result.stale, false);
   assert.equal(result.hasMore, false);
   assert.ok(result.facets.genres.includes('惊悚'));
-  assert.ok(result.facets.years.includes('2025'));
-  assert.ok(result.facets.years.includes('1888'));
+  assert.deepEqual(result.facets.years, ['2025']);
+  assert.deepEqual(result.facets.countries, ['中国大陆']);
   assert.equal(calls[0].url.origin, ORIGIN);
   assert.equal(calls[0].url.pathname, '/rexxar/api/v2/movie/recommend');
   assert.equal(calls[0].url.searchParams.get('sort'), 'U');
@@ -78,6 +78,39 @@ test('year and genre are sent to Douban and checked again when upstream ignores 
   assert.equal(calls[0].url.searchParams.get('count'), '20');
   assert.equal(calls[0].url.searchParams.get('sort'), 'S');
   assert.equal(result.hasMore, true);
+});
+
+test('facets follow released upstream pages, normalized co-productions and the cache refresh', async t => {
+  let at = Date.UTC(2026, 10, 24), firstYear = '2025';
+  const { catalog } = fixture(url => response({ total: 21, items: url.searchParams.get('start') === '20'
+    ? [film({ id: '2', year: '1990', countries: ['US', '法国'] })]
+    : [film({ year: undefined, card_subtitle: firstYear + ' / 中国大陆 / 喜剧' }), film({ id: '3', year: '2027', countries: ['日本'], is_released: false })] }, 200, url.href), { now: () => at });
+  t.after(() => catalog.stop());
+  assert.deepEqual((await catalog.browse()).facets.years, ['2025']);
+  const second = await catalog.browse({ page: 2 });
+  assert.deepEqual(second.facets.years, ['2025', '1990']);
+  assert.deepEqual(new Set(second.facets.countries), new Set(['中国大陆', '美国', '法国']));
+  assert.deepEqual((await catalog.browse({ page: 2, country: '美国' })).items.map(i => i.id), ['2']);
+  at += HOUR + 1; firstYear = '2024';
+  assert.deepEqual((await catalog.browse()).facets.years, ['2024']);
+});
+
+test('Netflix filter verifies provider metadata or an official title URL even when Douban ignores the tag', async t => {
+  const rows = [film({ id: '1', countries: ['美国', '法国'], tags: [{ name: 'Netflix' }] }),
+    film({ id: '2', countries: ['美国'], title: 'Netflix故事' }),
+    film({ id: '3', card_subtitle: '2025 / 美国 / 剧情' }),
+    film({ id: '4', countries: ['英国'], vendors: [{ title: 'Netflix' }] })];
+  const { catalog, calls } = fixture(url => {
+    if (url.pathname.endsWith('/recommend')) return response({ items: rows, total: 4 }, 200, url.href);
+    const id = url.pathname.split('/').at(-1);
+    return response({ ...rows.find(i => i.id === id), website: id === '3' ? 'https://www.netflix.com/title/80123456' : 'https://www.netflix.com.evil.test/title/80123456' }, 200, url.href);
+  });
+  t.after(() => catalog.stop());
+  const filtered = await catalog.browse({ platform: 'netflix', country: 'US' });
+  assert.equal(calls[0].url.searchParams.get('tags'), '美国,Netflix');
+  assert.deepEqual(new Set(filtered.items.map(i => i.id)), new Set(['1', '3']));
+  assert.ok(filtered.items.every(i => i.netflix && i.countries.includes('美国')));
+  assert.equal(calls.length, 3);
 });
 
 test('popular released candidates sort by year or real score without pretending popularity is premiere order', async t => {
@@ -361,7 +394,7 @@ test('old cached aliases refresh from the same official subject while poster IDs
   assert.equal(refreshed.id, item.id);
   assert.deepEqual(refreshed.aliases.slice(0, 2), ['Resident Evil', '生化危机9']);
   assert.equal(fresh.catalog.poster('37068446'), item.poster);
-  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 4);
+  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 5);
   for (const key of ['quark-settings-v1', 'history-marker', 'favorites-marker']) assert.equal(old.store.values.get(key), key + '-preserved');
 });
 
@@ -422,7 +455,7 @@ test('mismatched and adult official details cannot become playable metadata', as
 test('bad filters are rejected before any request and cannot turn the catalog into an arbitrary URL proxy', async t => {
   const { catalog, calls } = fixture();
   t.after(() => catalog.stop());
-  for (const options of [null, [], { category: 'adult' }, { category: 'https://attacker.test' }, { genre: '情色' }, { genre: '喜剧&url=http://localhost' }, { year: '2025,2026' }, { year: '1800' }, { page: 0 }, { page: 0.5 }, { page: 26 }, { page: -1 }, { sort: 'http://localhost/' }]) await assert.rejects(catalog.browse(options), { status: 400 });
+  for (const options of [null, [], { category: 'adult' }, { category: 'https://attacker.test' }, { genre: '情色' }, { genre: '喜剧&url=http://localhost' }, { year: '2025,2026' }, { year: '1800' }, { country: 'bad&url=http://localhost' }, { platform: 'unknown' }, { page: 0 }, { page: 0.5 }, { page: 26 }, { page: -1 }, { sort: 'http://localhost/' }]) await assert.rejects(catalog.browse(options), { status: 400 });
   assert.equal(calls.length, 0);
 });
 

@@ -46,7 +46,7 @@ test('genre uses each source category ID and enforces year even when the source 
   assert.equal(calls[1].searchParams.get('t'), '77'); assert.equal(calls[1].searchParams.get('year'), '2024');
   assert.equal(calls[1].searchParams.get('token'), 'keep'); assert.equal(calls[1].searchParams.has('class'), false);
   assert.equal(calls[1].searchParams.has('sort_direction'), false); assert.equal(calls[0].searchParams.has('year'), false);
-  assert.deepEqual(result.filters, { genre: '喜剧', year: '2024', sort: 'updated' });
+  assert.deepEqual(result.filters, { genre: '喜剧', year: '2024', country: '', platform: '', sort: 'updated' });
   result.facets.genres.length = 0;
   assert((await catalog.browse(single, options)).facets.genres.includes('恐怖')); assert.equal(calls.length, 2);
   await catalog.browse(single, { ...options, year: '2023' }); assert.equal(calls.length, 3);
@@ -87,7 +87,50 @@ test('validates browse filters before making an upstream request', async () => {
   for (const genre of ['任意', null, {}, ['喜剧']]) await assert.rejects(catalog.browse(config, { genre }), { status: 400 });
   for (const year of ['1899', '2024,2025', '2024<script>', '9999', 2024, null, []]) await assert.rejects(catalog.browse(config, { year }), { status: 400 });
   for (const sort of ['title', '', null, {}, ['release']]) await assert.rejects(catalog.browse(config, { sort }), { status: 400 });
+  for (const country of [null, [], {}, '未知', '<img>']) await assert.rejects(catalog.browse(config, { country }), { status: 400 });
+  for (const platform of [null, [], {}, 'Netfliix']) await assert.rejects(catalog.browse(config, { platform }), { status: 400 });
   assert.equal(calls, 0);
+});
+
+test('facets use currently cached source pages, merge co-productions, and require explicit Netflix metadata', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 0, 1) });
+  let calls = 0, replace = false;
+  const catalog = createCatalog({ request: async url => {
+    calls++;
+    if (url.searchParams.get('ac') === 'list') return response([], { class: [{ type_id: 1, type_name: '电影' }] });
+    if (replace) return response([video(4, '新收录影片', '2025', { type_id: 1, vod_area: '加拿大' })], { pagecount: 1 });
+    if (url.searchParams.get('pg') === '2') return response([video(3, '老片', '1974', { type_id: 1, vod_area: 'JP' })], { pagecount: 2 });
+    return response([
+      video(1, '合拍电影', '2024', { type_id: 1, ...(url.hostname === 'a.example' ? { vod_area: '韩国 / United States' } : { vod_tag: '剧情,Netflix Original', vod_area: '美国' }) }),
+      video(2, 'Netflix 工作纪实', '2019', { type_id: 1, vod_area: '英国', vod_play_from: 'Netflix', vod_pubdate: '2019-01-01(日本)' }),
+      video(9, '隐藏影片', '2027', { type_id: 1, vod_class: '限制级', vod_area: '瑞典' }),
+    ], { pagecount: 2 });
+  } });
+  const page = await catalog.browse(config);
+  assert.deepEqual(page.facets.years, ['2024', '2019']);
+  assert.deepEqual(new Set(page.facets.countries), new Set(['韩国', '美国', '英国']));
+  const count = calls;
+  const selected = await catalog.browse(config, { country: 'KR', platform: 'netflix' });
+  assert.deepEqual(selected.groups.map(group => group.title), ['合拍电影']);
+  assert.equal(selected.groups[0].items.length, 2);
+  assert.deepEqual(selected.facets.years, ['2024']);
+  assert.deepEqual(new Set(selected.facets.countries), new Set(['美国', '韩国']));
+  assert.equal(calls, count, 'changing local facets uses the same source results');
+  const second = await catalog.browse(config, { page: 2 });
+  assert.deepEqual(second.facets.years, ['2024', '2019', '1974']);
+  assert(second.facets.countries.includes('日本'));
+  const switched = await catalog.browse(config, { country: '日本' });
+  assert.deepEqual(switched.groups, []);
+  assert.deepEqual(switched.cachedMatches.map(group => group.title), ['老片']);
+  assert.equal(switched.cachedMatches[0].items.length, 2);
+  assert.equal(switched.hasMore, true);
+  assert.deepEqual((await catalog.browse(config, { country: '日本', platform: 'netflix' })).cachedMatches, undefined);
+  assert.deepEqual((await catalog.browse(config, { year: '1974', page: 2 })).facets.countries, ['日本']);
+  assert.deepEqual((await catalog.browse(config, { source: 'a', platform: 'netflix' })).groups, []);
+  replace = true; t.mock.timers.tick(180001);
+  const fresh = await catalog.browse(config);
+  assert.deepEqual(fresh.facets.years, ['2025']);
+  assert.deepEqual(fresh.facets.countries, ['加拿大']);
 });
 
 test('grouped films retain genre labels from all sources and use the earliest reported premiere', async () => {
@@ -426,7 +469,7 @@ test('validates browse category, strict page strings, and disabled or missing so
   assert.equal(calls, 0);
   const empty = await catalog.browse({ sources: [] });
   assert.deepEqual(empty.groups, []); assert.deepEqual(empty.failedSources, []); assert.equal(empty.hasMore, false);
-  assert.deepEqual(empty.filters, { genre: '', year: '', sort: 'updated' }); assert.equal(empty.sortScope, 'loaded');
+  assert.deepEqual(empty.filters, { genre: '', year: '', country: '', platform: '', sort: 'updated' }); assert.equal(empty.sortScope, 'loaded');
 });
 
 test('caches classifications and pages without leaking mutable results, then refreshes expiry and config changes', async t => {

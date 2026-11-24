@@ -248,9 +248,9 @@ test('standalone Quark library uses trusted public metadata without a VOD source
   const { app, call, login } = await running(t, { initialConfig: empty, catalog: ordinary, quarkCatalog, quark });
   for (const path of ['/api/quark/library', '/api/quark/library/detail?id=12345', '/api/quark/resources?source=quark-library&id=12345']) assert.equal((await call(path)).status, 401);
   assert.equal(browseCalls.length, 0); const cookie = await login();
-  const listing = await call('/api/quark/library?category=movie&genre=喜剧&year=2026&sort=release-score&page=2', undefined, cookie);
+  const listing = await call('/api/quark/library?category=movie&genre=喜剧&year=2026&country=韩国&platform=netflix&sort=release-score&page=2', undefined, cookie);
   assert.equal(listing.status, 200); assert.equal((await listing.json()).items[0].douban.score, 8.5);
-  assert.deepEqual(browseCalls[0], { category: 'movie', genre: '喜剧', year: '2026', sort: 'release-score', page: '2' });
+  assert.deepEqual(browseCalls[0], { category: 'movie', genre: '喜剧', year: '2026', country: '韩国', platform: 'netflix', sort: 'release-score', page: '2' });
   const ratings = await call('/api/ratings?source=quark-library&id=12345', undefined, cookie);
   assert.equal(ratings.status, 200); const rated = await ratings.json(); assert.equal(rated.douban.score, 8.5); assert.equal(rated.douban.url, 'https://movie.douban.com/subject/12345/'); assert.match(rated.douban.attribution, /豆瓣公开/);
   assert.equal((await call('/api/quark/library/detail?id=12345', undefined, cookie)).status, 200);
@@ -453,8 +453,8 @@ test('browse passes category, page and selected source to the configured catalog
   assert.equal(response.status, 200);
   assert.equal((await response.json()).page, 2);
   assert.deepEqual(received, { config: empty, options: { category: 'anime', page: '2', source: 'demo' } });
-  assert.equal((await call('/api/browse?category=tv&genre=%E5%96%9C%E5%89%A7&year=2024&sort=release', undefined, cookie)).status, 200);
-  assert.deepEqual(received.options, { category: 'tv', page: '1', source: undefined, genre: '喜剧', year: '2024', sort: 'release' });
+  assert.equal((await call('/api/browse?category=tv&genre=喜剧&year=2024&country=美国&platform=netflix&sort=release', undefined, cookie)).status, 200);
+  assert.deepEqual(received.options, { category: 'tv', page: '1', source: undefined, genre: '喜剧', year: '2024', country: '美国', platform: 'netflix', sort: 'release' });
 });
 
 test('live playback and compatible playback use the verified quality variant while reports keep the original line', async t => {

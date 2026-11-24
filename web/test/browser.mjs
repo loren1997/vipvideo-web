@@ -86,7 +86,7 @@ let holdState = false, releaseStates = [], progressiveBrowse = null, progressive
 let facetScenario = false, facetProgress = null;
 let metadataProgress = null;
 const fixtureGenres = ['喜剧', '惊悚', '恐怖', '动作', '爱情', '科幻', '悬疑', '犯罪', '战争', '剧情', '动画', '冒险', '奇幻', '家庭', '历史', '纪录', '武侠', '古装', '音乐', '运动', '青春'];
-const fixtureFacets = { genres: fixtureGenres, years: Array.from({ length: new Date().getFullYear() - 1899 }, (_value, index) => String(new Date().getFullYear() - index)) };
+const fixtureFacets = { genres: fixtureGenres, years: [...new Set(facetFilms.map(item => item.year))], countries: ['美国', '日本'] };
 const apiReads = [], vendorReads = [];
 let nextContextId = 0;
 let holdVendor = false, releaseVendor;
@@ -141,17 +141,21 @@ const catalog = {
   async search(config, query) {
     return { groups: config.sources.length ? groups.filter(group => group.title.includes(query) && (config.showAdult === true || group.category !== 'adult')) : [], failedSources: [] };
   },
-  async browse(config, { category, page, source, genre = '', year = '', sort = 'updated' }) {
-    catalogRequests.push({ kind: 'browse', category, page: Number(page), source, genre, year, sort });
+  async browse(config, { category, page, source, genre = '', year = '', country = '', platform = '', sort = 'updated' }) {
+    catalogRequests.push({ kind: 'browse', category, page: Number(page), source, genre, year, country, platform, sort });
     if (source === 'fourth') throw Object.assign(new Error('固定分类接口故障'), { status: 502 });
     if (category === 'adult' && config.showAdult !== true) throw Object.assign(new Error('三级内容已隐藏，请先在设置中开启显示。'), { status: 403 });
     if (facetScenario) {
       assert.ok(!genre || fixtureGenres.includes(genre), 'fixture严格接收规范genre标签');
       assert.ok(!year || /^\d{4}$/.test(year) && Number(year) >= 1900 && Number(year) <= new Date().getFullYear() + 3);
       assert.ok(['updated', 'release', 'year'].includes(sort));
-      const selected = facetFilms.filter(group => (!genre || group.genres.includes(genre)) && (!year || group.year === year));
+      const selected = facetFilms.filter(group => (!genre || group.genres.includes(genre)) && (!year || group.year === year)
+        && (!country || (group === facetClassic ? ['日本'] : group === facetNew ? ['美国', '韩国'] : ['美国']).includes(country)) && (!platform || platform === 'netflix' && [facetEarly, facetNew].includes(group)));
       const list = Number(page) === 1 ? selected.filter(group => group !== facetNew) : selected.filter(group => group === facetNew);
-      return { category, page: Number(page), groups: list.map(group => ({ ...group, category, items: group.items.filter(item => !source || item.source === source).map(item => ({ ...item, category })) })), failedSources: [], hasMore: Number(page) === 1 && selected.includes(facetNew), filters: { genre, year, sort }, facets: fixtureFacets, sortScope: 'loaded' };
+      const decorate = group => ({ ...group, category, items: group.items.filter(item => !source || item.source === source).map(item => ({ ...item, category })) });
+      const facets = Number(page) === 2 || country === '韩国' ? { ...fixtureFacets, countries: [...fixtureFacets.countries, '韩国'] } : fixtureFacets;
+      const cached = Number(page) === 1 && country === '韩国' ? { cachedMatches: selected.map(decorate) } : {};
+      return { category, page: Number(page), groups: list.map(decorate), ...cached, failedSources: [], hasMore: Number(page) === 1 && selected.includes(facetNew), filters: { genre, year, sort }, facets, sortScope: 'loaded' };
     }
     const list = category === 'adult' ? [adult] : category === 'movie' ? Number(page) === 1 ? [movie, badDetail, ...(config.showAdult === true ? [categoryBoundary] : [])] : [moviePage2, movie] : category === 'anime' ? [anime] : category === 'variety' ? [variety] : [{ ...summary, items }, broken, doomed, slow, controlsFilm, verifiedFilm];
     return { category, page: Number(page), groups: list.map(group => ({ ...group, items: group.items.filter(item => (!source || item.source === source) && config.sources.some(row => row.id === item.source)) })).filter(group => group.items.length), failedSources: category === 'anime' ? [{ source: 'third', name: '第三源', error: '固定测试超时' }] : [], hasMore: category === 'movie' && Number(page) === 1, filters: { genre, year, sort }, facets: fixtureFacets, sortScope: 'loaded' };
@@ -266,7 +270,9 @@ try {
           if (parsed.searchParams.get('sort') === 'release') rows = rows.sort((a, b) => Number(b.year) - Number(a.year));
           if (parsed.searchParams.get('sort') === 'release-score') rows = rows.sort((a, b) => Number(b.year) - Number(a.year) || b.douban.score - a.douban.score);
           if (parsed.searchParams.get('year')) rows = rows.filter(row => row.year === parsed.searchParams.get('year'));
-          return route.fulfill({ json: { items: rows, hasMore: category === 'movie' && page === 1, facets: { genres: ['剧情', '喜剧'], years: ['2026', '2025'] }, sortLabel: parsed.searchParams.get('sort') === 'score' ? '已上映片目，豆瓣高分优先' : parsed.searchParams.get('sort') === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先', errors: [] } });
+          if (parsed.searchParams.get('country')) rows = rows.filter(row => (row === newer ? ['美国', '日本'] : ['日本']).includes(parsed.searchParams.get('country')));
+          if (parsed.searchParams.get('platform') === 'netflix') rows = rows.filter(row => row === newer);
+          return route.fulfill({ json: { items: rows, hasMore: category === 'movie' && page === 1, facets: { genres: ['剧情', '喜剧'], years: page === 1 ? ['2026', '2025'] : ['2025'], countries: page === 1 ? ['美国', '日本'] : ['日本'] }, sortLabel: parsed.searchParams.get('sort') === 'score' ? '已上映片目，豆瓣高分优先' : parsed.searchParams.get('sort') === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先', errors: [] } });
         }
         if (parsed.pathname === '/api/quark/library/detail') return route.fulfill({ json: parsed.searchParams.get('id') === cloudMovie.id ? cloudMovie : cloudFilm });
         if (parsed.pathname === '/api/quark/library/poster') {
@@ -2611,7 +2617,59 @@ try {
     } finally { await isolated?.value.close(); app.store.setConfig(before); Object.assign(quarkSettings, savedQuark); channels.splice(channels.indexOf(tvChannel), 1); }
   }
 
-  if (process.argv.includes('--quark-library-only')) await verifyQuarkPublicSearch();
+  async function verifyCatalogFilters() {
+    const wasEnabled = facetScenario; facetScenario = true;
+    try {
+      await withCloudFixture(async open => {
+        app.store.setConfig({ ...app.store.config(), sources: ['first', 'second'].map(id => ({ id, name: id, api: 'https://api.example.com/' + id, enabled: true })) });
+        const { page: p } = await open({ hash: '#home' });
+        const year = p.getByLabel('上映年份', { exact: true }), country = p.getByLabel('制片国家/地区', { exact: true });
+        await p.getByRole('button', { name: '播放 喜剧老片样例', exact: true }).waitFor();
+        assert.equal(await year.locator('option[value="2027"]').count(), 0);
+        assert.equal(await country.locator('option[value="韩国"]').count(), 0);
+        await p.getByRole('button', { name: '加载更多', exact: true }).click();
+        await country.selectOption('韩国');
+        await until(() => p.locator('#browse-results .card-title').allTextContents().then(titles => titles.join() === '喜剧新片样例'), '新筛选第一页包含此前第二页发现的匹配影片');
+        await p.getByRole('button', { name: '加载更多', exact: true }).click();
+        await until(() => p.getByRole('button', { name: '加载更多', exact: true }).isHidden(), '正常读取筛选后的第二页');
+        assert.deepEqual(await p.locator('#browse-results .card-title').allTextContents(), ['喜剧新片样例'], '缓存和新页返回同一影片只显示一次');
+        await country.selectOption('美国'); await year.selectOption('2025');
+        await p.getByLabel('影片平台').selectOption('netflix');
+        await until(() => catalogRequests.at(-1)?.country === '美国' && catalogRequests.at(-1)?.platform === 'netflix' && catalogRequests.at(-1)?.year === '2025', '首页提交组合筛选');
+        await p.getByRole('button', { name: '加载更多', exact: true }).click();
+        await p.getByRole('button', { name: '播放 喜剧新片样例', exact: true }).waitFor();
+        assert.equal(catalogRequests.at(-1).page, 2); assert.equal(catalogRequests.at(-1).platform, 'netflix');
+        await p.getByLabel('浏览影视源').selectOption('second');
+        await until(() => catalogRequests.at(-1)?.source === 'second' && catalogRequests.at(-1)?.country === '美国' && catalogRequests.at(-1)?.platform === 'netflix' && catalogRequests.at(-1)?.page === 1, '换源保留组合筛选并重置分页');
+        await p.reload(); await p.getByRole('button', { name: '播放 喜剧春日样例', exact: true }).waitFor();
+        assert.equal(await p.getByLabel('影片平台').inputValue(), 'netflix'); assert.equal(await country.inputValue(), '美国');
+
+        await p.locator('nav a[href="#quark"]').click();
+        const cloudYear = p.getByLabel('夸克上映年份'), cloudCountry = p.getByLabel('夸克制片国家/地区');
+        await p.getByRole('button', { name: '加载更多影片', exact: true }).click();
+        await p.getByRole('button', { name: '查看 夸克下一页样例', exact: true }).waitFor();
+        assert.deepEqual(await cloudYear.locator('option').evaluateAll(options => options.map(option => option.value)), ['', '2026', '2025']);
+        await cloudCountry.selectOption('日本'); await p.getByLabel('夸克影片平台').selectOption('netflix');
+        await until(() => p.locator('#quark-library-results .card-title').allTextContents().then(titles => titles.join() === '夸克新片样例'), '夸克影院按合拍地区和Netflix取交集');
+        await cloudYear.selectOption('2026');
+        await until(() => quarkRequests.filter(r => r.path === '/api/quark/library').at(-1)?.query.year === '2026', '夸克组合筛选重置页码');
+        const query = quarkRequests.filter(r => r.path === '/api/quark/library').at(-1).query;
+        assert.deepEqual([query.country, query.platform, query.page], ['日本', 'netflix', '1']);
+        await p.setViewportSize({ width: 390, height: 844 });
+        assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '手机组合筛选不溢出');
+        const { page: tv } = await open({ hash: '#quark', tv: true, viewport: { width: 1280, height: 720 } });
+        await tv.getByRole('button', { name: '查看 夸克新片样例', exact: true }).waitFor();
+        const tvPlatform = tv.getByLabel('夸克影片平台');
+        await tv.getByLabel('夸克制片国家/地区').focus(); await tv.keyboard.press('ArrowRight');
+        assert.ok(await tvPlatform.evaluate(el => el === document.activeElement), '遥控右键从国家到平台');
+        await tv.keyboard.press('ArrowDown');
+        await until(() => tvPlatform.evaluate(el => el.value === 'netflix' && el === document.activeElement), '遥控切换Netflix后焦点留在平台');
+      });
+    } finally { facetScenario = wasEnabled; }
+    console.log('PASS 首页和夸克影院真实年份、国家/地区和Netflix组合筛选、换源分页与刷新');
+  }
+  if (process.argv.includes('--catalog-filters-only')) await verifyCatalogFilters();
+  else if (process.argv.includes('--quark-library-only')) await verifyQuarkPublicSearch();
   else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkAutomaticWebFallback, verifyQuarkPendingSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkPlaybackRecovery, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
   else if (process.argv.includes('--quark-web-fallback-only')) await verifyQuarkAutomaticWebFallback();
   else if (process.argv.includes('--quark-auto-transfer-only')) await verifyQuarkAutomaticTransfer();
@@ -3595,6 +3653,7 @@ try {
   await verifyQuarkProgressReadiness();
   await verifyQuarkPictureReadiness();
   await verifyQuarkPublicSearch();
+  await verifyCatalogFilters();
   await verifyQuarkSearchRetry();
   await verifyQuarkAutomaticWebFallback();
   await verifyQuarkPendingSearch();
