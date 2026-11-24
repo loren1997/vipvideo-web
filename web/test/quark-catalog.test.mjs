@@ -109,12 +109,70 @@ test('Netflix routes supported-market pages, posters and namespaced details to t
   assert.deepEqual(result.items, [item]);
   assert.deepEqual(result.coverageRegions, ['JP', 'US']);
   assert.equal(result.hasMore, true);
-  assert.deepEqual(reads, [{ category: 'movie', genre: '儿童', year: '', country: '日本', platform: 'netflix', sort: 'release', page: 26 }]);
+  assert.deepEqual(reads, [{ category: 'movie', genre: '儿童', year: '', country: '日本', platform: 'netflix', sort: 'release', page: 26, language: 'all' }]);
   assert.equal(catalog.poster(id), poster);
   assert.deepEqual(await catalog.detail(id), item);
   await assert.rejects(catalog.detail('tmdb:movie:../11'), { status: 400 });
   await assert.rejects(catalog.browse({ page: 26 }), { status: 400 });
   assert.equal(calls.length, 0);
+});
+
+test('audio language uses verified detail rather than translated titles, country or candidate tags', async t => {
+  const rows = [
+    film({ id: '1', title: '汉语片名', countries: ['CN'] }),
+    film({ id: '2', title: 'Cantonese film', countries: ['FR'] }),
+    film({ id: '3', title: 'Mixed languages' }),
+    film({ id: '4', title: '语言未知' }),
+  ];
+  const labels = { 1: ['英语'], 2: ['粤语'], 3: ['汉语普通话', '日语'] };
+  const { catalog, calls, store } = fixture(url => {
+    if (url.pathname.endsWith('/recommend')) return response({ items: rows, total: rows.length }, 200, url.href);
+    const id = url.pathname.split('/').at(-1);
+    return response({ ...rows.find(row => row.id === id), languages: labels[id] }, 200, url.href);
+  });
+  t.after(() => catalog.stop());
+  const chinese = await catalog.browse({ language: 'zh' });
+  assert.deepEqual(chinese.items.map(row => row.id).sort(), ['2', '3']);
+  assert.deepEqual(chinese.facets.languages, ['en', 'ja', 'zh']);
+  assert.equal(calls[0].url.searchParams.get('tags'), '华语');
+  assert.equal(calls.length, 5);
+  assert.deepEqual((await catalog.browse({ language: 'cn' })).items, chinese.items);
+  assert.equal(calls.length, 5);
+  const english = await catalog.browse({ language: 'en' });
+  assert.deepEqual(english.items.map(row => row.id), ['1']);
+  assert.equal(calls.length, 6);
+  assert.equal((await catalog.browse()).items.length, 4);
+  await assert.rejects(catalog.browse({ language: 'https://invalid.example/' }), { status: 400 });
+
+  const restored = fixture(undefined, { store });
+  t.after(() => restored.catalog.stop());
+  assert.deepEqual((await restored.catalog.browse({ language: 'zh' })).items.map(row => row.id).sort(), ['2', '3']);
+  assert.equal(restored.calls.length, 0);
+});
+
+test('unfinished language checks keep confirmed cards and allow the same page to be retried', async t => {
+  let at = Date.now(), working = false;
+  const rows = [film({ id: '1', languages: ['国语'] }), film({ id: '2' })];
+  const { catalog, calls } = fixture(url => url.pathname.endsWith('/recommend')
+    ? response({ items: rows, total: 40 }, 200, url.href)
+    : working ? response(film({ id: '2', languages: ['粤语'] }), 200, url.href) : response({}, 403, url.href), { now: () => at });
+  t.after(() => catalog.stop());
+  const first = await catalog.browse({ language: 'zh' });
+  assert.deepEqual(first.items.map(row => row.id), ['1']);
+  assert.equal(first.unavailable, true);
+  assert.match(first.errors.join(''), /核实原声语言/);
+  await catalog.browse({ language: 'zh' });
+  assert.equal(calls.length, 2);
+  at += 15001;
+  const partial = await catalog.browse({ language: 'zh' });
+  assert.equal(partial.unavailable, undefined);
+  assert.equal(partial.hasMore, true);
+  assert.deepEqual(partial.items.map(row => row.id), ['1']);
+  at += 60001; working = true;
+  const fresh = await catalog.browse({ language: 'zh' });
+  assert.deepEqual(fresh.items.map(row => row.id).sort(), ['1', '2']);
+  assert.equal(fresh.unavailable, undefined);
+  assert.equal(fresh.hasMore, true);
 });
 
 test('an upgrade keeps regular catalog pages and ignores old tag-only Netflix pages', async t => {

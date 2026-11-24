@@ -34,6 +34,44 @@ export function normalizeCountries(value) {
   return [...names];
 }
 
+const languageAliases = new Map(Object.entries({
+  zh: ['cn', 'cmn', 'yue', 'zho', 'chi', 'zh-cn', 'zh-tw', 'zh-hk', 'zh-mo', 'zh-sg', 'zh-hans', 'zh-hant',
+    '中文', '华语', '華語', '汉语', '漢語', '国语', '國語', '普通话', '普通話', '汉语普通话', '漢語普通話',
+    '粤语', '粵語', '广东话', '廣東話', '广州话', '廣州話', 'chinese', 'mandarin', 'cantonese', 'mandarin chinese', 'cantonese chinese'],
+  en: ['eng', '英语', '英語', '英文', 'english'],
+  ja: ['jpn', '日语', '日語', '日文', 'japanese'],
+  ko: ['kor', '韩语', '韓語', '韩文', '韓文', '朝鲜语', '朝鮮語', 'korean'],
+  fr: ['fra', 'fre', '法语', '法語', '法文', 'french'],
+  de: ['deu', 'ger', '德语', '德語', '德文', 'german'],
+  es: ['spa', '西班牙语', '西班牙語', 'spanish'],
+  it: ['ita', '意大利语', '意大利語', '義大利語', 'italian'],
+  pt: ['por', '葡萄牙语', '葡萄牙語', 'portuguese'],
+  ru: ['rus', '俄语', '俄語', '俄文', 'russian'],
+  ar: ['ara', '阿拉伯语', '阿拉伯語', 'arabic'],
+  hi: ['hin', '印地语', '印地語', 'hindi'],
+  th: ['tha', '泰语', '泰語', '泰文', 'thai'],
+  vi: ['vie', '越南语', '越南語', 'vietnamese'],
+  id: ['ind', '印度尼西亚语', '印度尼西亞語', '印尼语', '印尼語', 'indonesian'],
+  ms: ['msa', 'may', '马来语', '馬來語', 'malay'],
+  tr: ['tur', '土耳其语', '土耳其語', 'turkish'],
+  fa: ['fas', 'per', '波斯语', '波斯語', 'persian'],
+  he: ['heb', '希伯来语', '希伯來語', 'hebrew'],
+  nl: ['nld', 'dut', '荷兰语', '荷蘭語', 'dutch'],
+  sv: ['swe', '瑞典语', '瑞典語', 'swedish'],
+  da: ['dan', '丹麦语', '丹麥語', 'danish'],
+  no: ['nor', '挪威语', '挪威語', 'norwegian'],
+  fi: ['fin', '芬兰语', '芬蘭語', 'finnish'],
+  pl: ['pol', '波兰语', '波蘭語', 'polish'],
+  uk: ['ukr', '乌克兰语', '烏克蘭語', 'ukrainian'],
+}).flatMap(([code, aliases]) => aliases.map(alias => [alias, code])));
+const unknownLanguages = new Set(['all', 'und', 'mul', 'mis', 'zxx', 'unk', 'xx', 'zz']);
+
+export function catalogLanguage(value) {
+  if (typeof value !== 'string' || value.length > 80) return '';
+  const label = value.normalize('NFKC').trim().toLowerCase();
+  return languageAliases.get(label) || (/^[a-z]{2,3}$/.test(label) && !unknownLanguages.has(label) ? label : '');
+}
+
 export function hasNetflixLabel(...fields) {
   return fields.some(field => (Array.isArray(field) ? field : [field]).slice(0, 64).some(item => {
     const label = typeof item === 'string' ? item : item?.provider_name || item?.name;

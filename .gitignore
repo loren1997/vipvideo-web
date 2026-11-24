@@ -65,6 +65,7 @@ iOSInjectionProject/
 # VipVideo Web local state
 .env
 .tmdb.env
+.qas-telegram-token
 backup-*
 **/node_modules/
 web/data/

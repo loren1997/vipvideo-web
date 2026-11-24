@@ -248,9 +248,9 @@ test('standalone Quark library uses trusted public metadata without a VOD source
   const { app, call, login } = await running(t, { initialConfig: empty, catalog: ordinary, quarkCatalog, quark });
   for (const path of ['/api/quark/library', '/api/quark/library/detail?id=12345', '/api/quark/resources?source=quark-library&id=12345']) assert.equal((await call(path)).status, 401);
   assert.equal(browseCalls.length, 0); const cookie = await login();
-  const listing = await call('/api/quark/library?category=movie&genre=喜剧&year=2026&country=韩国&platform=netflix&sort=release-score&page=2', undefined, cookie);
+  const listing = await call('/api/quark/library?category=movie&genre=喜剧&year=2026&country=韩国&platform=netflix&sort=release-score&page=2&language=ko', undefined, cookie);
   assert.equal(listing.status, 200); assert.equal((await listing.json()).items[0].douban.score, 8.5);
-  assert.deepEqual(browseCalls[0], { category: 'movie', genre: '喜剧', year: '2026', country: '韩国', platform: 'netflix', sort: 'release-score', page: '2' });
+  assert.deepEqual(browseCalls[0], { category: 'movie', genre: '喜剧', year: '2026', country: '韩国', platform: 'netflix', sort: 'release-score', page: '2', language: 'ko' });
   const ratings = await call('/api/ratings?source=quark-library&id=12345', undefined, cookie);
   assert.equal(ratings.status, 200); const rated = await ratings.json(); assert.equal(rated.douban.score, 8.5); assert.equal(rated.douban.url, 'https://movie.douban.com/subject/12345/'); assert.match(rated.douban.attribution, /豆瓣公开/);
   assert.equal((await call('/api/quark/library/detail?id=12345', undefined, cookie)).status, 200);
@@ -303,6 +303,32 @@ test('TMDB Netflix titles keep their independent identity across the authenticat
   assert.deepEqual(scores, { douban: null, tmdb, configured: true, errors: [] });
   assert.equal((await call('/api/favorites', title, cookie)).status, 200);
   assert.equal(app.store.list('favorites')[0].id, id);
+});
+
+test('Telegram archive search requires an explicit authenticated same-origin POST with read-only GET polling', async t => {
+  const calls = [], id = '12345', film = { ...detail, source: 'quark-library', id, category: 'movie' };
+  const { call, login } = await running(t, {
+    quarkCatalog: { async detail(value) { assert.equal(value, id); return film; } },
+    qasTelegramSearch() {},
+    quark: { async settings() { return {}; }, async resources(row, options) {
+      assert.equal(row.id, id);
+      calls.push({ qas: options.qasTelegram === true, poll: options.poll === true });
+      return { resources: [] };
+    } },
+  });
+  const endpoint = '/api/quark/resources', query = `${endpoint}?source=quark-library&id=${id}`, body = { source: 'quark-library', id, qas: true };
+  assert.equal((await call(endpoint, body)).status, 401);
+  const cookie = await login();
+  const settings = await (await call('/api/quark/settings', undefined, cookie)).json();
+  assert.equal(settings.qasTelegramConfigured, true);
+  assert.equal((await call(endpoint, body, cookie, 'POST', { Origin: 'https://cross-site.example' })).status, 403);
+  assert.equal((await call(query + '&qas=1', undefined, cookie)).status, 400);
+  assert.equal((await call(endpoint, { ...body, poll: true }, cookie)).status, 400);
+  assert.deepEqual(calls, []);
+  assert.equal((await call(query, undefined, cookie)).status, 200);
+  assert.equal((await call(endpoint, body, cookie)).status, 200);
+  assert.equal((await call(query + '&qas=1&poll=1', undefined, cookie)).status, 200);
+  assert.deepEqual(calls, [{ qas: false, poll: false }, { qas: true, poll: false }, { qas: true, poll: true }]);
 });
 
 test('registered cloud posters require login, support private caching and never accept a target URL', async t => {

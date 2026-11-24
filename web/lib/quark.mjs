@@ -402,8 +402,10 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     return { id: row.id, name: row.name, url: row.url, ...(row.publishedAt === undefined ? {} : { publishedAt: row.publishedAt }) };
   }
   async function lookupResources(detail, options = {}) {
-    const info = detailInfo(detail, options), rows = new Map(), unverified = new Map(), generation = epoch, cacheKey = info.key + ':' + providedScope(detail);
-    const cached = searches.get(cacheKey), force = options.webSearch === true && options.poll !== true;
+    const info = detailInfo(detail, options), rows = new Map(), unverified = new Map(), generation = epoch;
+    const qasTelegram = options.qasTelegram === true;
+    const cacheKey = info.key + ':' + providedScope(detail) + (qasTelegram ? ':qas' : '');
+    const cached = searches.get(cacheKey), force = (options.webSearch === true || qasTelegram) && options.poll !== true;
     const roundPaths = new Set(cached?.expires > now() && !force ? cached.roundPaths || [] : []);
     if (force && cached?.expires > now()) cached.roundPaths = [];
     const provided = detail.quarkShares || detail.meta?.quarkShares || [];
@@ -421,7 +423,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     if (cached && cached.expires > now() && cached.pending === true) { pending = true; retryAfterMs = cached.retryAfterMs; }
     if (cached && cached.expires > now()) for (const row of cached.rows) { const existing = shares.get(row.id); if (existing) { const fresh = addShare(info, existing, existing.name); rows.set(fresh.id, fresh); } }
     if (cached && cached.expires > now()) for (const row of cached.unverified || []) { const target = new URL(row.url); unverified.set(target.pathname + target.hash, row); }
-    if (!cached || cached.expires <= now() || cached.pending === true || options.webSearch === true || options.poll === true) {
+    if (!cached || cached.expires <= now() || cached.pending === true || options.webSearch === true || options.poll === true || qasTelegram) {
       reason = undefined; pending = false;
       let response, timeout, expired = false;
       try {
@@ -430,7 +432,19 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
         if (configured) { target.searchParams.set('kw', info.searchTitle); target.searchParams.set('cloud_types', 'quark'); target.searchParams.set('res', 'results'); target.searchParams.set('conc', '2'); }
         else { target.searchParams.set('q', info.searchTitle + ' site:pan.quark.cn/s'); target.searchParams.set('format', 'rss'); }
         const knownShares = [...rows.values()].map(row => shares.get(row.id)).filter(row => row?.detail === info.key).slice(0, 128).map(row => { const url = new URL(row.url); url.search = ''; return url.href; });
-        const fetch = limited(async () => { if (expired) throw failure('公开夸克搜索超时', 504); response = await searchRequest(target.href, { method: 'GET', timeout: 8000, year: info.year, aliases: info.aliases, knownShares, webSearch: options.webSearch === true, forceRefresh: options.webSearch === true && options.poll !== true, ...(options.poll === true ? { poll: true } : {}), headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' } }); response.on('error', () => {}); if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); } if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用'); return readText(response, 2 * 1024 * 1024); });
+        const fetch = limited(async () => {
+          if (expired) throw failure('公开夸克搜索超时', 504);
+          if (qasTelegram) options.valid?.();
+          response = await searchRequest(target.href, {
+            method: 'GET', timeout: 8000, year: info.year, aliases: info.aliases, knownShares,
+            webSearch: options.webSearch === true, forceRefresh: force, ...(qasTelegram ? { qasTelegram: true } : {}),
+            ...(options.poll === true ? { poll: true } : {}), headers: { accept: configured ? 'application/json' : 'application/rss+xml, application/xml' },
+          });
+          response.on('error', () => {});
+          if (expired) { response.destroy(); throw failure('公开夸克搜索超时', 504); }
+          if (response.statusCode !== 200) throw failure('公开夸克搜索暂不可用');
+          return readText(response, 2 * 1024 * 1024);
+        });
         const body = await Promise.race([fetch, new Promise((_, reject) => { timeout = setTimeout(() => { expired = true; response?.destroy(); reject(failure('公开夸克搜索超时', 504)); }, 8000); })]);
         let visited = 0;
         const collect = (link, forceUnverified = false) => {
@@ -478,7 +492,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     return { resources: valid.sort((a, b) => (b.publishedAt ?? -1) - (a.publishedAt ?? -1)), resourceSnapshot: true, ...(validUnknown.length ? { unverified: validUnknown } : {}), ...(reason ? { reason } : {}), ...(validationPending ? { validationPending: true } : {}), ...(pending || validationPending ? { pending: true, retryAfterMs: retryAfterMs || 1500 } : {}) };
   }
   async function resources(detail, options = {}) {
-    const key = detailInfo(detail, options).key + ':' + providedScope(detail) + ':' + (config.searchApi || defaultSearchApi) + ':' + (options.webSearch === true ? 'web' : 'normal') + (options.poll === true ? ':poll' : '');
+    const key = detailInfo(detail, options).key + ':' + providedScope(detail) + ':' + (config.searchApi || defaultSearchApi) + ':' + (options.qasTelegram === true ? 'qas' : options.webSearch === true ? 'web' : 'normal') + (options.poll === true ? ':poll' : '');
     if (searchFlights.has(key)) return structuredClone(await searchFlights.get(key));
     if (searchFlights.size >= 64) return { resources: [], reason: '公开夸克搜索繁忙，请稍后重试' };
     const job = lookupResources(detail, options).finally(() => searchFlights.delete(key)); searchFlights.set(key, job);

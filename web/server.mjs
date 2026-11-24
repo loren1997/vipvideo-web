@@ -26,6 +26,7 @@ import { createQuarkPosters } from './lib/quark-posters.mjs';
 import { createQuarkSearchPool } from './lib/quark-search-pool.mjs';
 import { createQuarkBrowserSearch } from './lib/quark-browser-client.mjs';
 import { createQuarkTelegramSearch } from './lib/quark-telegram-search.mjs';
+import { createQuarkQasTelegramSearch } from './lib/quark-qas-telegram.mjs';
 import { createQuarkChannelCatalog } from './lib/quark-channel-catalog.mjs';
 import { createQuarkMedia } from './lib/quark-media.mjs';
 
@@ -66,7 +67,7 @@ function quarkTitleId(value) {
 export function createApp({ password = process.env.APP_PASSWORD, dataDir = process.env.DATA_DIR ?? resolve(root, 'data'),
   catalog = createCatalog(), media = createMedia(), initialConfig = defaults, cookieSecure = process.env.COOKIE_SECURE === 'true',
   logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder, adMarkers, quark, quarkMedia, quarkSearchPool, quarkCatalog, quarkPosters,
-  netflixCatalog, tmdbToken = process.env.TMDB_API_READ_TOKEN } = {}) {
+  netflixCatalog, tmdbToken = process.env.TMDB_API_READ_TOKEN, qasTelegramSearch = createQuarkQasTelegramSearch() } = {}) {
   if (typeof password !== 'string' || password.length < 8 || password.length > 1024) throw new Error('APP_PASSWORD 必须设置，且长度为 8–1024 个字符');
   const initial = validateConfig(initialConfig);
   const store = createStore(dataDir, initial);
@@ -89,7 +90,9 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const ratingService = ratings ?? createRatings({ store });
   const danmakuService = danmaku ?? createDanmaku({ store });
   const transcodeService = transcoder ?? createTranscoder({ media, logger });
-  const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store, getSearchApi: async () => (await quarkService.settings()).searchApi, telegramSearch: createQuarkTelegramSearch({ resolveChannels: createQuarkChannelCatalog({ store }).resolve }), ...(process.env.QUARK_BROWSER_URL === 'http://quark-browser:3020' ? { renderSearch: createQuarkBrowserSearch() } : {}) });
+  const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store, getSearchApi: async () => (await quarkService.settings()).searchApi, telegramSearch: createQuarkTelegramSearch({ resolveChannels: createQuarkChannelCatalog({ store }).resolve }), qasTelegramSearch, ...(process.env.QUARK_BROWSER_URL === 'http://quark-browser:3020' ? { renderSearch: createQuarkBrowserSearch() } : {}) });
+  const qasTelegramConfigured = typeof qasTelegramSearch === 'function';
+  const quarkStatus = result => ({ ...result, searchPool: searchPool.status(), ...(qasTelegramConfigured ? { qasTelegramConfigured: true } : {}) });
   const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: searchPool.request, defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
   const cloudCatalog = quarkCatalog ?? createQuarkCatalog({ store, netflix: netflixCatalog ?? createNetflixCatalog({ token: tmdbToken, dataDir }) });
   const cloudPosters = quarkPosters ?? createQuarkPosters({ catalog: cloudCatalog });
@@ -201,9 +204,9 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         if (path === '/api/config/presets' && method === 'GET') {
           return json(res, 200, { api_site: Object.fromEntries(initial.sources.map(({ id, name, api }) => [id, { name, api }])) });
         }
-        if (path === '/api/quark/settings' && method === 'GET') return json(res, 200, { ...await quarkService.settings(), searchPool: searchPool.status() });
+        if (path === '/api/quark/settings' && method === 'GET') return json(res, 200, quarkStatus(await quarkService.settings()));
         if (path === '/api/quark/library' && method === 'GET') {
-          const result = await cloudCatalog.browse(Object.fromEntries(['category', 'genre', 'year', 'country', 'platform', 'sort', 'page'].filter(key => url.searchParams.has(key)).map(key => [key, url.searchParams.get(key)])));
+          const result = await cloudCatalog.browse(Object.fromEntries(['category', 'genre', 'year', 'country', 'platform', 'sort', 'page', 'language'].filter(key => url.searchParams.has(key)).map(key => [key, url.searchParams.get(key)])));
           requireSession(hashToken(token));
           return json(res, 200, result);
         }
@@ -230,11 +233,11 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         }
         if (path === '/api/quark/settings' && method === 'PUT') {
           const result = await quarkService.configure(await readBody(req)); cloudMedia.invalidate();
-          return json(res, 200, { ...result, searchPool: searchPool.status() });
+          return json(res, 200, quarkStatus(result));
         }
         if (path === '/api/quark/account' && method === 'DELETE') {
           await readBody(req); const result = await quarkService.clearAccount(); cloudMedia.invalidate();
-          return json(res, 200, { ...result, searchPool: searchPool.status() });
+          return json(res, 200, quarkStatus(result));
         }
         if (path === '/api/quark/cleanup' && method === 'POST') {
           await readBody(req); return json(res, 200, await quarkService.cleanup());
@@ -244,20 +247,26 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           if (!input || Array.isArray(input) || typeof input !== 'object' || Object.keys(input).length) throw badRequest('恢复目录请求应为空对象');
           const valid = () => { requireSession(hashToken(token)); return true; };
           valid(); const result = await quarkService.repairFolder({ valid }); valid(); cloudMedia.invalidate();
-          return json(res, 200, { ...result, searchPool: searchPool.status() });
+          return json(res, 200, quarkStatus(result));
         }
         if (path === '/api/quark/saved' && method === 'GET') {
           const selected = await cloudSelection(Object.fromEntries(url.searchParams), hashToken(token));
           const result = await quarkService.savedFiles(selected.detail, { ...selected.options, valid: selected.valid, visible: ensureVisible });
           selected.valid(); return json(res, 200, result);
         }
-        if (['/api/quark/resources', '/api/quark/files'].includes(path) && method === 'GET') {
-          const input = Object.fromEntries(url.searchParams), selected = await cloudSelection(input, hashToken(token));
+        if (['/api/quark/resources', '/api/quark/files'].includes(path) && method === 'GET' || path === '/api/quark/resources' && method === 'POST') {
+          const explicit = method === 'POST';
+          const input = explicit ? await readBody(req) : Object.fromEntries(url.searchParams);
+          if (explicit && (input?.qas !== true || input.poll !== undefined || input.web !== undefined)) throw badRequest('Telegram 搜索选项无效');
           if (input.web !== undefined && input.web !== '1') throw badRequest('公开网页搜索选项无效');
           if (input.poll !== undefined && input.poll !== '1') throw badRequest('搜索状态查询选项无效');
+          if (!explicit && input.qas !== undefined && (path !== '/api/quark/resources' || input.qas !== '1' || input.poll !== '1' || input.web !== undefined)) throw badRequest('请通过 Telegram 搜索按钮启动新的检索');
+          const qasTelegram = explicit || input.qas === '1';
+          if (qasTelegram && !qasTelegramConfigured) return json(res, 503, { error: '未配置夸克自动转存的 Telegram 助手' });
+          const selected = await cloudSelection(input, hashToken(token));
           const result = path.endsWith('/files')
             ? await quarkService.files(selected.detail, { ...selected.options, valid: selected.valid, shareId: text(input.shareId, '夸克分享标识', 200) })
-            : await quarkService.resources(selected.detail, { ...selected.options, ...(input.web === '1' ? { webSearch: true } : {}), ...(input.poll === '1' ? { poll: true } : {}) });
+            : await quarkService.resources(selected.detail, { ...selected.options, ...(input.web === '1' ? { webSearch: true } : {}), ...(input.poll === '1' ? { poll: true } : {}), ...(qasTelegram ? { qasTelegram: true, valid: selected.valid } : {}) });
           selected.valid(); return json(res, 200, result);
         }
         if (path === '/api/quark/prepare' && method === 'POST') {

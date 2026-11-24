@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
+import { catalogLanguage } from '../lib/catalog-filters.mjs';
 import { createNetflixCatalog, isNetflixId } from '../lib/netflix-catalog.mjs';
 
 const TOKEN = 'fake.tmdb.read-token';
@@ -51,6 +52,12 @@ async function settled(catalog, values = query()) {
   }
   assert.fail('TMDB fixture sync did not settle');
 }
+
+test('catalog languages normalize Chinese audio aliases independently of production country and subtitles', () => {
+  for (const raw of ['zh', 'cn', 'cmn', 'yue', 'ＺＨ', '汉语普通话', '粵語', 'Cantonese', 'zh-Hant']) assert.equal(catalogLanguage(raw), 'zh');
+  for (const [raw, code] of [['英语', 'en'], ['jpn', 'ja'], ['韓文', 'ko'], ['por', 'pt'], ['fil', 'fil']]) assert.equal(catalogLanguage(raw), code);
+  for (const raw of ['中文字幕', '中国大陆', 'unknown', 'und', 'all', '']) assert.equal(catalogLanguage(raw), '');
+});
 
 test('Netflix library unions every discovered region, excludes non-Netflix providers and paginates beyond page 25', async t => {
   const source = mockRequest({
@@ -174,6 +181,64 @@ test('Netflix exposes the staged first load and resumes only failed markets acro
   assert.deepEqual(complete.errors, []);
   assert.deepEqual(restart.calls.map(url => url.searchParams.get('watch_region')).filter(Boolean), ['JP', 'JP']);
   await assert.rejects(access(join(dataDir, 'netflix-tmdb-v1.pending.json')), { code: 'ENOENT' });
+});
+
+test('Netflix resumes legacy stages and fills original language when a title is rediscovered', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vipvideo-netflix-language-resume-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  await writeFile(join(dataDir, 'netflix-tmdb-v1.pending.json'), JSON.stringify({ version: 1, at: NOW, startedAt: NOW,
+    targetRegions: ['JP', 'US'], coverageRegions: ['JP'], providers: '1796|459|8:1796|459|8',
+    rows: [movie(1), movie(2)].map(row => ({ ...row, kind: 'movie', regions: ['JP'] })),
+  }));
+  const source = mockRequest({ countries: ['JP', 'US'], discover(url) {
+    assert.equal(url.searchParams.get('watch_region'), 'US');
+    const rows = url.pathname.endsWith('/movie') ? [movie(1, { original_language: 'cn', genre_ids: [16] }),
+      movie(3, { original_language: 'cmn' }), movie(4, { title: '中文译名', original_title: 'An English movie', original_language: 'en', origin_country: ['CN'] })]
+      : [tv(1, { original_language: 'ja' })];
+    return response(url, list(rows, 1));
+  } });
+  const catalog = createNetflixCatalog({ token: TOKEN, request: source.request, dataDir, now: () => NOW });
+  t.after(() => catalog.stop());
+  const initial = catalog.browse(query({ language: 'zh' }));
+  assert.ok(initial.provisional && initial.syncing);
+  assert.deepEqual(initial.items, []);
+  assert.equal(catalog.browse(query()).total, 2);
+
+  const result = await settled(catalog, query({ language: 'zh' }));
+  assert.equal(result.provisional, false);
+  assert.deepEqual(result.items.map(row => [row.id, row.language]), [['tmdb:movie:1', 'zh'], ['tmdb:movie:3', 'zh']]);
+  assert.deepEqual(result.items[0].availabilityRegions, ['JP', 'US']);
+  assert.deepEqual(result.facets.languages, ['en', 'zh']);
+  assert.deepEqual(catalog.browse(query({ language: 'cn' })).items.map(row => row.id), ['tmdb:movie:1', 'tmdb:movie:3']);
+  assert.deepEqual(catalog.browse(query({ language: 'en', country: '中国大陆' })).items.map(row => row.id), ['tmdb:movie:4']);
+  assert.equal(catalog.browse(query({ language: 'all' })).total, 4);
+  assert.deepEqual(catalog.browse(query({ language: 'ja', category: 'tv' })).items.map(row => row.id), ['tmdb:tv:1']);
+  assert.deepEqual(source.calls.map(url => url.searchParams.get('watch_region')).filter(Boolean), ['US', 'US']);
+  await catalog.stop();
+  const reopened = createNetflixCatalog({ token: TOKEN, dataDir, now: () => NOW, request: () => assert.fail('fresh language-aware snapshot should not refresh') });
+  t.after(() => reopened.stop());
+  const stored = reopened.browse(query({ language: 'zh' }));
+  assert.equal(stored.syncing, false);
+  assert.deepEqual(stored.items.map(row => row.id), ['tmdb:movie:1', 'tmdb:movie:3']);
+});
+
+test('Netflix starts refreshing legacy complete snapshots before their ordinary expiry', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vipvideo-netflix-language-refresh-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  await writeFile(join(dataDir, 'netflix-tmdb-v1.json'), JSON.stringify({ version: 1, at: NOW, coverageRegions: ['US'],
+    rows: [{ ...movie(11), kind: 'movie', regions: ['US'] }],
+  }));
+  const source = mockRequest({ countries: ['US'], discover(url) {
+    return response(url, list(url.pathname.endsWith('/movie') ? [movie(11, { original_language: 'zh' })] : [], 1));
+  } });
+  const catalog = createNetflixCatalog({ token: TOKEN, now: () => NOW, request: source.request, dataDir });
+  t.after(() => catalog.stop());
+  const existing = catalog.browse(query({ language: 'all' }));
+  assert.ok(existing.syncing);
+  assert.equal(existing.provisional, false);
+  assert.deepEqual(existing.items.map(row => row.id), ['tmdb:movie:11']);
+  assert.equal(catalog.browse(query({ language: 'zh' })).total, 0);
+  assert.deepEqual((await settled(catalog, query({ language: 'zh' }))).items.map(row => row.id), ['tmdb:movie:11']);
 });
 
 test('Netflix partitions a capped TMDB result and retries a region whose pages shift', async t => {

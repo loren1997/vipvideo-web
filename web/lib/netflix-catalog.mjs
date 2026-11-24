@@ -3,7 +3,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { normalizeCountries } from './catalog-filters.mjs';
+import { catalogLanguage, normalizeCountries } from './catalog-filters.mjs';
 import { request as networkRequest, readText } from './network.mjs';
 
 const API = 'https://api.themoviedb.org/3/';
@@ -50,7 +50,8 @@ function summarize(raw, kind) {
   const score = votes && Number.isFinite(raw.vote_average) && raw.vote_average > 0 && raw.vote_average <= 10 ? raw.vote_average : null;
   const posterPath = typeof raw.poster_path === 'string' && POSTER.test(raw.poster_path) ? raw.poster_path : '';
   const countryCodes = regionCodes([...(Array.isArray(raw.origin_country) ? raw.origin_country : []), ...(Array.isArray(raw.production_countries) ? raw.production_countries.map(country => country?.iso_3166_1) : [])]);
-  return { kind, id: raw.id, title, original_title: originalTitle, genre_ids: genreIds, release_date: releaseDate, vote_count: votes, vote_average: score, poster_path: posterPath, origin_country: countryCodes };
+  return { kind, id: raw.id, title, original_title: originalTitle, original_language: catalogLanguage(raw.original_language),
+    genre_ids: genreIds, release_date: releaseDate, vote_count: votes, vote_average: score, poster_path: posterPath, origin_country: countryCodes };
 }
 
 function itemOf(summary, regions) {
@@ -59,7 +60,7 @@ function itemOf(summary, regions) {
   const category = genreIds.includes(16) ? 'anime' : kind === 'tv' && genreIds.some(genre => VARIETY.has(genre)) ? 'variety' : kind;
   const typeName = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺' }[category];
   return { source: 'quark-library', id, key: `quark-library:${id}`, title, originalTitle, aliases: originalTitle && originalTitle !== title ? [originalTitle] : [],
-    type, typeName, category, year: releaseDate.slice(0, 4), releaseDate, releaseStatus: 'released', countries: normalizeCountries(summary.origin_country),
+    type, typeName, category, language: summary.original_language, year: releaseDate.slice(0, 4), releaseDate, releaseStatus: 'released', countries: normalizeCountries(summary.origin_country),
     genres: [...new Set(genreIds.map(genre => GENRE[genre]))], netflix: true, availabilityRegions: regions,
     poster: summary.poster_path ? `https://image.tmdb.org/t/p/w342${summary.poster_path}` : '',
     tmdb: { id: externalId, score: summary.vote_average, votes: summary.vote_count, url: `https://www.themoviedb.org/${kind}/${externalId}`, attribution: 'TMDB' },
@@ -91,7 +92,8 @@ function restore(path, now, pending = false) {
       rows.push({ ...summary, regions });
     }
     const data = { at: saved.at, coverageRegions, rows };
-    return pending ? { ...data, startedAt: saved.startedAt, targetRegions, providers: saved.providers, view: viewOf(data) } : viewOf(data);
+    return pending ? { ...data, startedAt: saved.startedAt, targetRegions, providers: saved.providers, view: viewOf(data) }
+      : { ...viewOf(data), legacyLanguage: saved.rows.length > 0 && saved.rows.every(row => !Object.hasOwn(row, 'original_language')) };
   } catch (error) {
     if (error.code !== 'ENOENT') console.warn('奈飞片库缓存无法读取，将重新同步。');
   }
@@ -282,8 +284,11 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
         writing = writing.then(async () => {
           for (const row of next) {
             const key = `${row.kind}:${row.id}`;
-            if (rows.has(key)) rows.get(key).regions.add(region);
-            else rows.set(key, { ...row, regions: new Set([region]) });
+            const old = rows.get(key);
+            if (old) {
+              old.regions.add(region);
+              old.original_language ||= row.original_language;
+            } else rows.set(key, { ...row, regions: new Set([region]) });
           }
           completed.add(region);
           const stage = { at: now(), startedAt, providers, targetRegions: coverageRegions, coverageRegions: [...completed].sort(), rows: records() };
@@ -324,16 +329,18 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
       const at = snapshot?.at;
       const expired = at === undefined || now() - at >= DAY;
       if (!job && checkpoint && now() - checkpoint.startedAt > CHECKPOINT_AGE) checkpoint = undefined;
-      if (accessToken && expired && !job && now() >= nextAttempt) startSync();
+      if (accessToken && (expired || snapshot?.legacyLanguage) && !job && now() >= nextAttempt) startSync();
       const current = visible(), provisional = !snapshot && !!current;
       const syncProgress = progress || (checkpoint && { completed: checkpoint.coverageRegions.length, total: checkpoint.targetRegions.length });
-      const matching = [];
-      const genres = new Set(), years = new Set(), countries = new Set();
+      const matching = [], language = catalogLanguage(values.language);
+      const genres = new Set(), years = new Set(), countries = new Set(), languages = new Set();
       for (const item of current?.items.values() || []) {
         if (values.category === 'movie' ? item.type !== 'movie' : item.category !== values.category) continue;
         for (const genre of item.genres) genres.add(genre);
         if (values.genre && !item.genres.includes(values.genre)) continue;
         const inYear = !values.year || item.year === values.year, inCountry = !values.country || item.countries.includes(values.country);
+        if (inCountry && inYear && item.language) languages.add(item.language);
+        if (language && item.language !== language) continue;
         if (inCountry && item.year) years.add(item.year);
         if (inYear) for (const country of item.countries) countries.add(country);
         if (inCountry && inYear) matching.push(item);
@@ -345,7 +352,8 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
       const start = (values.page - 1) * PAGE_SIZE;
       const sortLabel = values.sort === 'score' ? 'TMDB 评分优先' : values.sort === 'release-score' ? '上映年份优先、同年 TMDB 评分优先' : '上映日期优先';
       return { ...values, items: structuredClone(matching.slice(start, start + PAGE_SIZE)), total: matching.length, hasMore: start + PAGE_SIZE < matching.length,
-        facets: { genres: [...genres].sort((a, b) => a.localeCompare(b, 'zh-CN')), years: [...years].sort().reverse(), countries: [...countries].sort((a, b) => a.localeCompare(b, 'zh-CN')) },
+        facets: { genres: [...genres].sort((a, b) => a.localeCompare(b, 'zh-CN')), years: [...years].sort().reverse(),
+          countries: [...countries].sort((a, b) => a.localeCompare(b, 'zh-CN')), languages: [...languages].sort() },
         errors: accessToken ? warning ? [warning] : [] : ['请先在 NAS 配置 TMDB API Read Access Token。'], unconfigured: !accessToken,
         unavailable: !!accessToken && !current && !job, syncing: !!job, ...(syncProgress ? { syncProgress: { ...syncProgress } } : {}),
         stale: !!snapshot && expired, provisional, coverageRegions: [...(current?.coverageRegions || [])], updatedAt: current?.at, attribution: ATTRIBUTION, sortLabel,
@@ -369,6 +377,7 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
         if (!summary) throw failure('此 TMDB 条目不在夸克影院展示范围。', 404);
         const listed = visible()?.items.get(id);
         const item = itemOf(summary, listed?.availabilityRegions || []);
+        item.language ||= listed?.language || '';
         const episodes = episodesOf(kind, raw);
         const overview = text(raw.overview, 1600), chinese = /\p{Script=Han}/u.test(overview);
         Object.assign(item, { netflix: !!listed, description: chinese ? overview : '暂无中文剧情简介。', descriptionLanguage: chinese ? 'zh' : 'unavailable',

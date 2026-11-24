@@ -1,0 +1,19 @@
+services:
+  web:
+    environment:
+      QAS_TELEGRAM_TOKEN_FILE: /run/secrets/qas-telegram-token
+    networks:
+      - default
+      - qas_telegram
+    volumes:
+      - type: bind
+        source: ./.qas-telegram-token
+        target: /run/secrets/qas-telegram-token
+        read_only: true
+        bind:
+          create_host_path: false
+
+networks:
+  qas_telegram:
+    external: true
+    name: ${QAS_TELEGRAM_NETWORK:-qas-maintained_default}

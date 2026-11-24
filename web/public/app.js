@@ -404,8 +404,8 @@ function failuresList(sources, label = '影视源') {
 function emptyCatalogPage(filters, hasMore, hasErrors, retry) {
   if (hasMore) return empty('本页暂无匹配影片', '可加载下一页继续查找。');
   if (hasErrors) return empty('暂未找到可确认的影片', '部分片目信息尚未取得，可以稍后重试。', retry);
-  const filtered = filters.genre || filters.year || filters.country || filters.platform;
-  return filtered ? empty('没有符合条件的影片', '可调整年份、国家或平台。')
+  const filtered = filters.genre || filters.year || filters.country || filters.platform || filters.language && filters.language !== 'all';
+  return filtered ? empty('没有符合条件的影片', filters.language ? '可调整原声语言、年份、制片国家或平台。' : '可调整年份、国家或平台。')
     : empty('这个分类暂时没有影片', '试试其他分类或稍后重新加载。', retry);
 }
 
@@ -416,7 +416,7 @@ function browseParams(category, source = '', filters = {}) {
 }
 
 function catalogFilterRow(filters, quark, onChange) {
-  const row = node('div', undefined, 'browse-filters');
+  const row = node('div', undefined, quark ? 'browse-filters quark-filters' : 'browse-filters');
   function field(key, label, aria) {
     const wrapper = node('label', undefined, 'browse-filter'), select = node('select');
     select.setAttribute('aria-label', (quark ? '夸克' : '') + aria);
@@ -426,7 +426,9 @@ function catalogFilterRow(filters, quark, onChange) {
     return select;
   }
   const genre = field('genre', '类型', '影片类型'), year = field('year', '上映年份', '上映年份');
-  const country = field('country', quark ? '制片国家/地区' : '国家/地区', '制片国家/地区'), platform = field('platform', '平台', '影片平台'), sort = field('sort', '排列', '影片排序');
+  const country = field('country', quark ? '制片国家/地区' : '国家/地区', '制片国家/地区'), platform = field('platform', '平台', '影片平台');
+  const language = quark ? field('language', '原声语言', '影片语言') : null, sort = field('sort', '排列', '影片排序');
+  const languageNames = language && new Intl.DisplayNames('zh-CN', { type: 'language' });
   for (const [value, label] of [['', '全部平台'], ['netflix', quark ? '奈飞（跨地区片库）' : '奈飞（Netflix）']]) platform.add(new Option(label, value));
   platform.value = filters.platform;
   const netflix = quark && filters.platform === 'netflix';
@@ -454,6 +456,14 @@ function catalogFilterRow(filters, quark, onChange) {
     const countries = values('countries');
     if (netflix) country.parentElement.hidden = !countries.length && !filters.country;
     choices(country, countries.sort((a, b) => a.localeCompare(b, 'zh')), '全部国家/地区', filters.country);
+    if (language) {
+      const observed = values('languages').filter(code => /^[a-z]{2,3}$/.test(code));
+      const codes = [...new Set(['all', 'zh', ...(observed.length ? observed : ['en', 'ja', 'ko']), filters.language])];
+      if (language.options.length !== codes.length || codes.some((code, index) => language.options[index].value !== code)) {
+        language.replaceChildren(...codes.map(code => new Option(code === 'all' ? '全部语言' : code === 'zh' ? '中文（国语、粤语）' : languageNames.of(code), code)));
+      }
+      language.value = filters.language;
+    }
   }
   update();
   return { row, update };
@@ -585,7 +595,9 @@ async function renderQuarkLibrary(params, stamp) {
   quarkLibraryHash = location.hash;
   const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺' };
   const category = Object.hasOwn(categories, params.get('category')) ? params.get('category') : 'movie';
-  const filters = { genre: params.get('genre') || '', year: params.get('year') || '', country: params.get('country') || '', platform: params.get('platform') === 'netflix' ? 'netflix' : '', sort: ['release', 'score', 'release-score'].includes(params.get('sort')) ? params.get('sort') : 'release-score' };
+  const requestedLanguage = params.get('language') || '';
+  const language = /^(?:all|[a-z]{2,3})$/.test(requestedLanguage) ? requestedLanguage : 'zh';
+  const filters = { genre: params.get('genre') || '', year: params.get('year') || '', country: params.get('country') || '', platform: params.get('platform') === 'netflix' ? 'netflix' : '', sort: ['release', 'score', 'release-score'].includes(params.get('sort')) ? params.get('sort') : 'release-score', language };
   const netflix = filters.platform === 'netflix';
   const page = section('夸克影院', '发现影片，自动准备当前影片或剧集，选择版本后播放');
   const tabs = node('div', undefined, 'category-tabs');
@@ -1824,17 +1836,20 @@ function mountQuark(current) {
   showUnverified(state.unverified);
   const valid = () => player === current && current.stamp === routeVersion && host.contains(panel);
   let searchVersion = 0, loading = false, canTransfer = false, autoTransfer = false;
-  const retry = button('重试搜索', () => void load(false, false), 'button small'); retry.hidden = true;
-  const more = button('查找更多公开资源', () => void load(true), 'button small'); more.disabled = true;
-  current.cancelQuarkSearch = () => { clearTimeout(current.quarkSearchTimer); delete current.quarkSearchTimer; searchVersion++; loading = false; more.disabled = retry.disabled = false; };
+  const retry = button('重试搜索', () => void load({ automatic: false }), 'button small'); retry.hidden = true;
+  const more = button('查找更多公开资源', () => void load({ webSearch: true }), 'button small'); more.disabled = true;
+  const telegram = button('查找 Telegram 资源', () => void load({ qas: true, automatic: false }), 'button small'); telegram.hidden = telegram.disabled = true;
+  const telegramNote = node('p', '点击查找 Telegram 资源后，可能向 Telegram 资源机器人发送 /start 消息。', 'muted');
+  telegramNote.id = 'qas-telegram-note'; telegramNote.hidden = true; telegram.setAttribute('aria-describedby', telegramNote.id);
+  current.cancelQuarkSearch = () => { clearTimeout(current.quarkSearchTimer); delete current.quarkSearchTimer; searchVersion++; loading = false; more.disabled = retry.disabled = telegram.disabled = false; };
   const googleQuery = new URLSearchParams({ q: [current.detail.title, current.detail.year, '夸克 网盘'].filter(Boolean).join(' '), hl: 'zh-CN', tbs: 'sbd:1' });
-  const searchActions = node('div', undefined, 'settings-actions'); searchActions.append(retry, more, externalLink('用浏览器查 Google ↗', `https://www.google.com/search?${googleQuery}`, 'button subtle small')); panel.append(searchActions);
+  const searchActions = node('div', undefined, 'settings-actions'); searchActions.append(retry, more, telegram, externalLink('用浏览器查 Google ↗', `https://www.google.com/search?${googleQuery}`, 'button subtle small')); panel.append(searchActions);
   const account = button('连接夸克账号', () => goto('settings'), 'button small'); account.hidden = true; searchActions.append(account);
   const accountNote = node('p', '公开分享可继续查找；转存和播放个人文件需要连接并启用夸克账号。', 'muted'); accountNote.hidden = true; panel.append(accountNote);
   panel.insertBefore(result, savedPanel);
   choices.setAttribute('aria-label', '查找并转存其他版本');
   const discovery = node('details', undefined, 'quark-discovery'), discoverySummary = node('summary', '搜索资源'); discovery.open = true;
-  discovery.append(discoverySummary, feedback, choices, searchActions, accountNote, unverified); panel.append(discovery);
+  discovery.append(discoverySummary, feedback, choices, searchActions, telegramNote, accountNote, unverified); panel.append(discovery);
   let savedVersion = 0, savedLoaded = false;
   const savedRefresh = button('刷新已转存文件', () => void loadSaved(), 'button subtle small');
   async function loadSaved() {
@@ -1980,45 +1995,61 @@ function mountQuark(current) {
     } catch (error) { if (valid() && version === state.version) { filePlaceholder('文件读取失败，请重试或切换分享'); feedback.textContent = `网盘文件暂时不可用：${error.message}`; result.replaceChildren(button('重试读取文件', () => { current.cancelQuarkSearch(); void loadFiles(); }, 'button small')); } }
   }
   shareSelect.addEventListener('change', () => { current.cancelQuarkSearch(); delete state.selectionRequired; void loadFiles(autoTransfer); }); fileSelect.addEventListener('change', () => { current.cancelQuarkSearch(); clearTimeout(current.quarkTimer); state.version++; delete state.ready; delete state.selection; result.replaceChildren(); clearPreparedSubtitles(); const file = state.files.find(value => value.id === fileSelect.value); transfer.disabled = !canTransfer || !file; fileSelect.title = file?.name || '请选择当前集视频'; const resource = state.resources.find(value => value.id === shareSelect.value); if (autoTransfer && resource && file) void prepare(resource, file); });
-  async function load(webSearch = false, automatic = true) {
+  async function load({ webSearch = false, automatic = true, qas = false } = {}) {
     if (loading) return;
-    if (webSearch) discovery.open = true;
+    if (webSearch || qas) discovery.open = true;
     current.cancelQuarkSearch(); loading = true;
-    const search = searchVersion; let configured = false, pendingSearch = false, searchLimitMs = 60000; more.disabled = retry.disabled = true;
+    const search = searchVersion; let configured = false, pendingSearch = false, searchLimitMs = 60000; more.disabled = retry.disabled = telegram.disabled = true;
     const startedAt = Date.now(), initialResourceIds = new Set(state.resources.map(resource => resource.id));
-    feedback.textContent = webSearch ? '正在查询 Google 和公开网页，按可确认的页面发布时间排序…' : '正在按作品名称查找夸克分享…';
+    feedback.textContent = qas ? '正在查找 Telegram 资源…' : webSearch ? '正在查询 Google 和公开网页，按可确认的页面发布时间排序…' : '正在按作品名称查找夸克分享…';
     const currentSearch = () => valid() && search === searchVersion;
+    function releaseSearchButtons() {
+      if (!currentSearch()) return;
+      loading = false; more.disabled = retry.disabled = !configured; telegram.disabled = !configured || qas && pendingSearch;
+    }
+    function stopPolling() {
+      pendingSearch = false;
+      feedback.textContent = qas ? '已暂停检查 Telegram 资源，可再次查找。' : '已暂停自动检查，可点击重试搜索继续查找公开资源。';
+      retry.hidden = qas;
+    }
     try {
       const settings = await api('/api/quark/settings'); if (!currentSearch()) return;
+      telegram.hidden = telegramNote.hidden = settings.qasTelegramConfigured !== true;
       canTransfer = settings.configured === true && settings.enabled === true; account.hidden = accountNote.hidden = canTransfer; transfer.disabled = !canTransfer || !state.files.some(file => file.id === fileSelect.value);
+      if (qas && telegram.hidden) { configured = current.quarkOnly || canTransfer; feedback.textContent = 'Telegram 资源搜索尚未配置。'; return; }
       const savedCount = await loadSaved(); if (!currentSearch()) return;
       autoTransfer = canTransfer && settings.autoSave === true;
       if (!canTransfer && !current.quarkOnly) { feedback.textContent = '连接并启用夸克后，可为当前单集准备网盘版本。'; choices.replaceChildren(button('设置夸克账号', () => goto('settings'), 'button small')); return; }
       configured = current.quarkOnly || canTransfer;
       if (savedCount > 0 && automatic && !webSearch && !state.ready?.assetId) { feedback.textContent = '可播放已转存文件，也可继续搜索其他版本。'; return; }
-      if (state.ready && !webSearch) { if (shareSelect.options.length) choices.replaceChildren(shareField, fileField, actions); ready(state.ready); feedback.textContent = current.quarkAsset === state.ready.assetId ? quarkPlaybackMessage(current) : '当前文件已准备，可点击夸克播放。'; if (!state.ready.resume || current.quarkAsset) return; }
-      let autoSaveAvailable = autoTransfer && automatic && !webSearch && !state.ready?.assetId && current.flow.quarkAutomatic !== false;
+      if (state.ready && !webSearch && !qas) { if (shareSelect.options.length) choices.replaceChildren(shareField, fileField, actions); ready(state.ready); feedback.textContent = current.quarkAsset === state.ready.assetId ? quarkPlaybackMessage(current) : '当前文件已准备，可点击夸克播放。'; if (!state.ready.resume || current.quarkAsset) return; }
+      let autoSaveAvailable = autoTransfer && automatic && !webSearch && !qas && !state.ready?.assetId && current.flow.quarkAutomatic !== false;
       async function update(poll = false) {
         if (!currentSearch()) return;
-        loading = true; more.disabled = retry.disabled = true;
+        loading = true; more.disabled = retry.disabled = telegram.disabled = true;
         try { for (;;) {
           if (!currentSearch()) return;
           const remainingMs = searchLimitMs - (Date.now() - startedAt);
-          if (remainingMs <= 0) { feedback.textContent = '已暂停自动检查，可点击重试搜索继续查找公开资源。'; retry.hidden = false; return; }
-          const query = new URLSearchParams(playbackSelection(current.detail, current.line, current.episode)); if (webSearch) query.set('web', '1'); if (poll) query.set('poll', '1');
-          const data = await api(`/api/quark/resources?${query}`, { timeoutMs: Math.min(35000, remainingMs) }); if (!currentSearch()) return;
+          if (remainingMs <= 0) { stopPolling(); return; }
+          const selection = playbackSelection(current.detail, current.line, current.episode);
+          const query = new URLSearchParams({ ...selection, ...(webSearch ? { web: '1' } : {}), ...(qas ? { qas: '1' } : {}), ...(poll ? { poll: '1' } : {}) });
+          const timeoutMs = Math.min(35000, remainingMs);
+          const data = qas && !poll ? await api('/api/quark/resources', { method: 'POST', body: { ...selection, qas: true }, timeoutMs })
+            : await api(`/api/quark/resources?${query}`, { timeoutMs });
+          if (!currentSearch()) return;
           if (data.validationPending === true) searchLimitMs = 100000;
           const selected = shareSelect.value || state.selection?.resource?.id || '', before = JSON.stringify(state.resources);
-          state.resources = [...new Map([...(data.resourceSnapshot === true ? [] : state.resources), ...(Array.isArray(data.resources) ? data.resources : [])].map(resource => [resource.id, resource])).values()].sort((a, b) => resourceDate(b) - resourceDate(a));
-          state.unverified = [...new Map([...(data.resourceSnapshot === true ? [] : state.unverified || []), ...(Array.isArray(data.unverified) ? data.unverified : [])].map(resource => [resource.url, resource])).values()];
-          if (data.resourceSnapshot === true && selected && !state.resources.some(resource => resource.id === selected)) {
+          const replace = data.resourceSnapshot === true && !qas;
+          state.resources = [...new Map([...(replace ? [] : state.resources), ...(Array.isArray(data.resources) ? data.resources : [])].map(resource => [resource.id, resource])).values()].sort((a, b) => resourceDate(b) - resourceDate(a));
+          state.unverified = [...new Map([...(replace ? [] : state.unverified || []), ...(Array.isArray(data.unverified) ? data.unverified : [])].map(resource => [resource.url, resource])).values()];
+          if (replace && selected && !state.resources.some(resource => resource.id === selected)) {
             clearTimeout(current.quarkTimer); state.version++; delete state.selection; state.selectionRequired = true;
             filePlaceholder('所选分享已不可用，请选择其他分享'); renderShareOptions();
           }
           const unverifiedCount = showUnverified(state.unverified), pending = data.pending === true || data.validationPending === true, wasPending = pendingSearch;
-          retry.hidden = !pending && (!!state.resources.length || !data.reason);
+          retry.hidden = qas || !pending && (!!state.resources.length || !data.reason);
           pendingSearch = pending;
-          if (!webSearch && !pending && !state.resources.length && Date.now() - startedAt < searchLimitMs) {
+          if (!qas && !webSearch && !pending && !state.resources.length && Date.now() - startedAt < searchLimitMs) {
             webSearch = true; poll = false; autoSaveAvailable = false;
             feedback.textContent = '暂未找到可用视频，正在继续查询 Google 和公开网页…';
             continue;
@@ -2031,28 +2062,29 @@ function mountQuark(current) {
           } else if (!pending) {
             feedback.textContent = data.reason || `暂未找到“${current.detail.title}”的夸克分享，普通播放不受影响。`; choices.replaceChildren();
           }
-          if (!pending && (webSearch || unverifiedCount || wasPending && state.resources.length)) {
+          if (!pending && (qas || webSearch || unverifiedCount || wasPending && state.resources.length)) {
             const notes = data.reason ? [data.reason] : [], added = state.resources.filter(resource => !initialResourceIds.has(resource.id)).length;
-            if (webSearch) notes.push(added ? `找到新增${added}条可用分享，请核对当前集。` : '本轮未发现新增可用资源。');
+            if (qas) notes.push(added ? `Telegram 找到 ${added} 条新增分享，请核对当前集。` : 'Telegram 未返回新增可用资源。');
+            else if (webSearch) notes.push(added ? `找到新增${added}条可用分享，请核对当前集。` : '本轮未发现新增可用资源。');
             else if (wasPending && state.resources.length) notes.push('公开资源查找完成，可选择分享和当前集。');
             if (unverifiedCount) notes.push(`找到${unverifiedCount}条待确认链接，请展开后自行核对片名。`);
             if (state.selectionRequired) notes.push('所选分享已不可用，请重新选择分享和视频文件。');
             feedback.textContent = notes.join('；');
           }
           if (pending) {
-            feedback.textContent = current.quarkOnly ? '正在继续查找公开资源…' : '正在继续查找公开资源，普通播放不受影响…';
+            feedback.textContent = qas ? '正在等待 Telegram 资源结果…' : current.quarkOnly ? '正在继续查找公开资源…' : '正在继续查找公开资源，普通播放不受影响…';
             if (Date.now() - startedAt < searchLimitMs) {
               const delay = Number.isFinite(data.retryAfterMs) ? Math.min(5000, Math.max(500, data.retryAfterMs)) : 1500;
               current.quarkSearchTimer = setTimeout(() => { if (currentSearch()) void update(true); }, Math.min(delay, searchLimitMs - (Date.now() - startedAt)));
-            } else { feedback.textContent = '已暂停自动检查，可点击重试搜索继续查找公开资源。'; retry.hidden = false; }
+            } else stopPolling();
           }
           break;
-        } } catch (error) { if (currentSearch()) { feedback.textContent = `夸克资源暂时不可用：${error.message}`; retry.hidden = false; } }
-        finally { if (currentSearch()) { loading = false; more.disabled = retry.disabled = !configured; } }
+        } } catch (error) { if (currentSearch()) { pendingSearch = false; feedback.textContent = `${qas ? 'Telegram' : '夸克'}资源暂时不可用：${error.message}`; retry.hidden = qas; } }
+        finally { releaseSearchButtons(); }
       }
       await update();
-    } catch (error) { if (currentSearch()) { feedback.textContent = `夸克资源暂时不可用：${error.message}`; retry.hidden = false; } }
-    finally { if (currentSearch()) { loading = false; more.disabled = retry.disabled = !configured; } }
+    } catch (error) { if (currentSearch()) { feedback.textContent = `${qas ? 'Telegram' : '夸克'}资源暂时不可用：${error.message}`; retry.hidden = qas; } }
+    finally { releaseSearchButtons(); }
   }
   current.refreshQuarkPlayback = () => { if (valid() && state.ready && (state.ready.assetId === current.quarkAsset || current.quarkOnly && !current.quarkAsset)) { ready(state.ready); feedback.textContent = quarkPlaybackMessage(current); } };
   void load();

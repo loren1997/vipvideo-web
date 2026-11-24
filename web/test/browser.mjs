@@ -113,7 +113,7 @@ const subtitleFixtures = {
 let holdQuarkPrepare = false, releaseQuarkPrepare, holdQuarkPlayback = false, releaseQuarkPlayback, quarkPendingChecks = 0;
 let quarkFolderRepairFails = false, holdQuarkFolderRepair = false, releaseQuarkFolderRepair;
 const heldQuarkFileReads = new Map();
-const quarkSettings = { configured: false, enabled: false, autoSave: true, cleanupEnabled: true, retentionDays: 7, maxDailyTransfers: 10, maxDailyBytes: 3_000_000_000_000, searchApi: '', account: { connected: false, label: '' }, managedFiles: 0, lastCleanup: 0, lastError: '', searchPool: { enabled: true, discovering: false, lastDiscovery: 0, lastHealth: 0, healthy: 2, pending: 1, suspended: 1, candidates: [] } };
+const quarkSettings = { configured: false, enabled: false, autoSave: true, cleanupEnabled: true, qasTelegramConfigured: false, retentionDays: 7, maxDailyTransfers: 10, maxDailyBytes: 3_000_000_000_000, searchApi: '', account: { connected: false, label: '' }, managedFiles: 0, lastCleanup: 0, lastError: '', searchPool: { enabled: true, discovering: false, lastDiscovery: 0, lastHealth: 0, healthy: 2, pending: 1, suspended: 1, candidates: [] } };
 const episodeKey = (film, episode) => JSON.stringify([film, episode]);
 function fixtureEpisode(value) {
   if (typeof value === 'string' && /^-?\d+(?:\.\d+)?$/.test(value.trim())) value = Number(value.trim());
@@ -265,20 +265,23 @@ try {
           const category = parsed.searchParams.get('category') || 'movie', page = Number(parsed.searchParams.get('page'));
           const newer = { ...cloudMovie, id: '7654322', title: '夸克新片样例', year: '2026', douban: { ...cloudMovie.douban, id: '7654322', score: 9.1 } };
           const peer = { ...cloudMovie, id: '7654324', title: '夸克同年样例', year: '2026', douban: { ...cloudMovie.douban, id: '7654324', score: 6.5 } };
-          let rows = category === 'movie' ? page === 1 ? [cloudMovie, peer, newer] : [{ ...cloudMovie, id: '7654323', title: '夸克下一页样例' }] : [{ ...cloudFilm, category }];
+          const english = { ...cloudMovie, id: '7654325', title: '英语电影样例', year: '2026' };
+          let rows = category === 'movie' ? page === 1 ? [cloudMovie, peer, newer, english] : [{ ...cloudMovie, id: '7654323', title: '夸克下一页样例' }] : [{ ...cloudFilm, category }];
           if (parsed.searchParams.get('sort') === 'score') rows = rows.sort((a, b) => b.douban.score - a.douban.score);
           if (parsed.searchParams.get('sort') === 'release') rows = rows.sort((a, b) => Number(b.year) - Number(a.year));
           if (parsed.searchParams.get('sort') === 'release-score') rows = rows.sort((a, b) => Number(b.year) - Number(a.year) || b.douban.score - a.douban.score);
           if (parsed.searchParams.get('year')) rows = rows.filter(row => row.year === parsed.searchParams.get('year'));
           if (parsed.searchParams.get('country')) rows = rows.filter(row => (row === newer ? ['美国', '日本'] : ['日本']).includes(parsed.searchParams.get('country')));
           const netflix = parsed.searchParams.get('platform') === 'netflix';
-          if (netflix) rows = rows.filter(row => row === newer);
-          return route.fulfill({ json: { items: rows, hasMore: category === 'movie' && page === 1, facets: { genres: ['剧情', '喜剧'], years: netflix || page === 1 ? ['2026', '2025'] : ['2025'], countries: netflix || page === 1 ? ['美国', '日本'] : ['日本'] }, sortLabel: parsed.searchParams.get('sort') === 'score' ? '已上映片目，豆瓣高分优先' : parsed.searchParams.get('sort') === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先', errors: [] } });
+          const language = parsed.searchParams.get('language');
+          if (netflix) rows = rows.filter(row => row === newer || row === english);
+          if (language && language !== 'all') rows = rows.filter(row => language === (row === english ? 'en' : 'zh'));
+          return route.fulfill({ json: { items: rows, hasMore: category === 'movie' && page === 1, facets: { genres: ['剧情', '喜剧'], years: netflix || page === 1 ? ['2026', '2025'] : ['2025'], countries: netflix || page === 1 ? ['美国', '日本'] : ['日本'], languages: ['zh', 'en', 'fr'] }, sortLabel: parsed.searchParams.get('sort') === 'score' ? '已上映片目，豆瓣高分优先' : parsed.searchParams.get('sort') === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先', errors: [] } });
         }
         if (parsed.pathname === '/api/quark/library/detail') return route.fulfill({ json: parsed.searchParams.get('id') === cloudMovie.id ? cloudMovie : cloudFilm });
         if (parsed.pathname === '/api/quark/library/poster') {
           assert.deepEqual([...parsed.searchParams.keys()], ['id']); const id = parsed.searchParams.get('id'); cloudPosterReads.push(id);
-          return route.fulfill({ status: [cloudFilm.id, cloudMovie.id, '7654322', '7654323', '7654324'].includes(id) || /^tmdb:movie:78000\d\d$/.test(id) ? 200 : 404, contentType: 'image/png', body: cloudPosterPng });
+          return route.fulfill({ status: [cloudFilm.id, cloudMovie.id, '7654322', '7654323', '7654324', '7654325'].includes(id) || /^tmdb:movie:78000\d\d$/.test(id) ? 200 : 404, contentType: 'image/png', body: cloudPosterPng });
         }
         if (parsed.pathname === '/api/quark/settings') {
           if (body) {
@@ -302,7 +305,7 @@ try {
           if (['unverified', 'unverified-mixed'].includes(quarkMode)) return route.fulfill({ json: { resources: quarkMode === 'unverified-mixed' ? [{ id: 'share-fixture', name: '已匹配片名的分享', url: 'https://pan.quark.cn/s/fixture123' }] : [], reason: '固定搜索服务连接失败', unverified: [{ name: '', url: 'https://pan.quark.cn/s/unknown123?pwd=A1b2&token=redacted#secret' }, { name: '<img src=x onerror=alert(1)>', url: 'https://pan.quark.cn/s/unknown456' }, { name: '危险链接', url: 'https://pan.quark.cn.evil.example/s/unknown789' }, { name: '非法提取码', url: 'https://pan.quark.cn/s/unknown999?pwd=invalid%3D' }] } });
           const resourceReply = quarkResourceReply;
           if (holdQuarkResources) await new Promise(ok => { releaseQuarkResources = ok; });
-          if (resourceReply) return route.fulfill({ json: typeof resourceReply === 'function' ? await resourceReply(parsed) : resourceReply });
+          if (resourceReply) return route.fulfill({ json: typeof resourceReply === 'function' ? await resourceReply(parsed, method, body) : resourceReply });
           if (quarkMode === 'search-empty') return route.fulfill({ json: { resources: [], reason: '搜索渠道暂不可用：API 返回非 JSON；Google 暂不可访问。' } });
           if (parsed.searchParams.get('web') === '1') return route.fulfill({ json: { resources: [
             { id: 'share-new', name: '当前片新增公开资源', url: 'https://pan.quark.cn/s/new123456', publishedAt: Date.UTC(2026, 8, 20) },
@@ -1448,6 +1451,55 @@ try {
       assert.ok(quarkRequests.filter(row => row.path === '/api/quark/resources' && row.query.poll).every(row => row.query.poll === '1')); assert.equal(quarkCount('/api/quark/prepare'), prepares + 1);
       console.log('PASS 独立夸克pending只读poll/60秒与验证100秒上限、后台命中仍手选、更多保留选择DOM、不重复准备；失效分享清旧文件但保留已存播放、切集取消迟到响应');
     });
+  }
+
+  async function verifyQuarkTelegramSearch() {
+    await withCloudFixture(async open => {
+      const normal = { id: 'share-fixture', name: '现有公开分享', url: 'https://pan.quark.cn/s/fixture123' };
+      const telegramShare = { id: 'share-telegram', name: 'Telegram 新分享', url: 'https://pan.quark.cn/s/telegram123' };
+      const action = p => p.getByRole('button', { name: '查找 Telegram 资源', exact: true });
+      const before = quarkRequests.length;
+      const telegramRequests = () => quarkRequests.slice(before).filter(row => row.path === '/api/quark/resources' && (row.body?.qas === true || row.query.qas));
+      quarkResourceReply = { resources: [normal] };
+      const unconfigured = await open();
+      await unconfigured.page.getByLabel('夸克分享资源', { exact: true }).waitFor();
+      assert.ok(await action(unconfigured.page).isHidden(), '未配置 Telegram 时不显示入口');
+
+      quarkSettings.qasTelegramConfigured = true;
+      quarkResourceReply = (url, method) => method === 'POST' ? { resources: [], pending: true, retryAfterMs: 1500 }
+        : url.searchParams.get('qas') ? { resourceSnapshot: true, resources: [telegramShare] } : { resources: [normal] };
+      const { page: p } = await open({ clock: true });
+      const panel = p.locator('#quark-resources'), telegram = action(p), shares = p.getByLabel('夸克分享资源', { exact: true }), files = p.getByLabel('夸克视频文件', { exact: true });
+      await chooseCloudFile(p);
+      assert.ok(await panel.getByText(/可能向 Telegram 资源机器人发送 \/start/).isVisible());
+      await panel.getByRole('button', { name: '查找更多公开资源', exact: true }).click();
+      await until(() => telegram.isEnabled(), '普通公开搜索结束');
+      assert.equal(telegramRequests().length, 0, '自动与手动普通公开搜索均不发起 Telegram 请求');
+      const prepares = quarkCount('/api/quark/prepare');
+      await telegram.click();
+      await panel.getByText('正在等待 Telegram 资源结果…', { exact: true }).waitFor();
+      const [first] = telegramRequests();
+      assert.equal(first.method, 'POST'); assert.equal(first.body.qas, true);
+      assert.deepEqual([first.body.source, first.body.id, first.body.line, first.body.episode], ['quark-library', cloudFilm.id, 0, 0]);
+      assert.equal(first.query.poll, undefined); assert.ok(await telegram.isDisabled());
+      await p.clock.fastForward(1500);
+      await panel.getByText(/Telegram 找到 1 条新增分享/).waitFor();
+      assert.deepEqual(telegramRequests().map(row => [row.method, row.query.poll]), [['POST', undefined], ['GET', '1']]);
+      assert.equal(telegramRequests()[1].query.qas, '1'); assert.equal(telegramRequests()[1].query.web, undefined);
+      assert.equal(await shares.inputValue(), normal.id); assert.equal(await files.inputValue(), 'file-1');
+      assert.deepEqual(await shares.locator(`option[value="${telegramShare.id}"]`).allTextContents(), [telegramShare.name]);
+      assert.equal(quarkCount('/api/quark/prepare'), prepares, '等待和合并 Telegram 结果时保持现有手选文件');
+
+      quarkSettings.autoSave = true;
+      quarkResourceReply = (url, method) => method === 'POST' ? { resources: [telegramShare] } : { resources: [], reason: '普通公开资源暂未找到' };
+      const { page: emptyPage } = await open();
+      await until(() => action(emptyPage).isEnabled(), '普通查找无结果后可选择 Telegram');
+      assert.equal(telegramRequests().length, 2, '普通搜索自动补查不会发起 Telegram 请求');
+      await action(emptyPage).click();
+      await emptyPage.getByLabel('夸克视频文件', { exact: true }).locator('option[value="file-1"]').waitFor({ state: 'attached' });
+      assert.equal(quarkCount('/api/quark/prepare'), prepares, '即使已启用自动转存，也不会自动转存 Telegram 查找结果');
+    });
+    console.log('PASS Telegram 资源按钮仅在已配置时显示、显式 POST 与只读轮询、追加资源保留当前选择且不自动转存');
   }
 
   async function verifyQuarkChoices() {
@@ -2667,6 +2719,7 @@ try {
     await p.route('**/api/quark/library?*', route => {
       const params = new URL(route.request().url()).searchParams;
       if (params.get('platform') !== 'netflix') return route.fallback();
+      assert.equal(params.get('language'), 'zh', '奈飞筛选和后续分页始终发送选定语言');
       const page = Number(params.get('page')), country = params.get('country') || '';
       if (params.get('sort') === 'score') {
         const state = syncState === 'unconfigured' ? { unconfigured: true }
@@ -2811,9 +2864,32 @@ try {
         await until(() => catalogRequests.at(-1)?.source === 'second' && catalogRequests.at(-1)?.country === '美国' && catalogRequests.at(-1)?.platform === 'netflix' && catalogRequests.at(-1)?.page === 1, '换源保留组合筛选并重置分页');
         await p.reload(); await p.getByRole('button', { name: '播放 喜剧春日样例', exact: true }).waitFor();
         assert.equal(await p.getByLabel('影片平台').inputValue(), 'netflix'); assert.equal(await country.inputValue(), '美国');
+        assert.equal(await p.getByLabel('影片语言', { exact: true }).count(), 0, '首页不显示夸克专用的语言筛选');
 
         await p.locator('nav a[href="#quark"]').click();
         const cloudYear = p.getByLabel('夸克上映年份'), cloudCountry = p.getByLabel('夸克制片国家/地区');
+        const language = p.getByLabel('夸克影片语言', { exact: true });
+        const english = p.getByRole('button', { name: '查看 英语电影样例', exact: true });
+        await p.getByRole('button', { name: '查看 夸克下一页样例', exact: true }).waitFor();
+        assert.equal(await language.inputValue(), 'zh');
+        assert.equal(await english.count(), 0, '默认仅显示中文片目');
+        assert.equal(await language.locator('option[value="fr"]').textContent(), '法语', '语言选项以中文展示目录发现的原声语言');
+        const languageStart = quarkRequests.length;
+        await language.selectOption('all');
+        await english.waitFor();
+        const quarkPages = () => quarkRequests.slice(languageStart).filter(r => r.path === '/api/quark/library');
+        await until(() => quarkPages().some(r => r.query.language === 'all' && r.query.page === '2'), '全部语言的后续分页');
+        assert.deepEqual([quarkPages()[0].query.language, quarkPages()[0].query.page], ['all', '1'], '切换语言从第一页重新读取');
+        await p.reload(); await english.waitFor();
+        assert.equal(await language.inputValue(), 'all', '重新加载显式全部语言地址时保留语言选择');
+        await language.selectOption('en');
+        await until(() => p.locator('#quark-library-results .card-title').allTextContents().then(titles => titles.join() === '英语电影样例'), '只显示英语影片');
+        await p.getByLabel('夸克影片平台').selectOption('netflix');
+        await until(() => quarkPages().some(r => r.query.platform === 'netflix' && r.query.language === 'en' && r.query.page === '1'), '切换奈飞保留英语');
+        await p.getByRole('button', { name: '电视剧', exact: true }).click();
+        await until(() => quarkPages().some(r => r.query.category === 'tv' && r.query.language === 'en' && r.query.page === '1'), '切换电视剧保留英语');
+        assert.equal(await language.inputValue(), 'en');
+        await p.locator('nav a[href="#quark"]').click();
         await p.getByRole('button', { name: '查看 夸克下一页样例', exact: true }).waitFor();
         assert.deepEqual(await cloudYear.locator('option').evaluateAll(options => options.map(option => option.value)), ['', '2026', '2025']);
         await cloudCountry.selectOption('日本'); await p.getByLabel('夸克影片平台').selectOption('netflix');
@@ -2834,6 +2910,11 @@ try {
         assert.ok(await tvPlatform.evaluate(el => el === document.activeElement), '遥控右键从国家到平台');
         await tv.keyboard.press('ArrowDown');
         await until(() => tvPlatform.evaluate(el => el.value === 'netflix' && el === document.activeElement), '遥控切换Netflix后焦点留在平台');
+        await tv.keyboard.press('ArrowRight');
+        const tvLanguage = tv.getByLabel('夸克影片语言', { exact: true });
+        assert.ok(await tvLanguage.evaluate(el => el.value === 'zh' && el === document.activeElement), '遥控右键从平台进入默认中文的语言列表');
+        await tv.keyboard.press('ArrowUp');
+        await until(() => tvLanguage.evaluate(el => el.value === 'all' && el === document.activeElement), '遥控切换全部语言后保留语言焦点');
         await verifyCatalogFilterStates(p);
       });
     } finally { facetScenario = wasEnabled; }
@@ -2841,7 +2922,8 @@ try {
   }
   if (process.argv.includes('--catalog-filters-only')) await verifyCatalogFilters();
   else if (process.argv.includes('--quark-library-only')) await verifyQuarkPublicSearch();
-  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkAutomaticWebFallback, verifyQuarkPendingSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkPlaybackRecovery, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
+  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkAutomaticWebFallback, verifyQuarkPendingSearch, verifyQuarkTelegramSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkPlaybackRecovery, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
+  else if (process.argv.includes('--quark-qas-only')) await verifyQuarkTelegramSearch();
   else if (process.argv.includes('--quark-web-fallback-only')) await verifyQuarkAutomaticWebFallback();
   else if (process.argv.includes('--quark-auto-transfer-only')) await verifyQuarkAutomaticTransfer();
   else if (process.argv.includes('--quark-playback-only')) { for (const verify of [verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkPlaybackRecovery, verifyQuarkStartupFailure]) await verify(); }
@@ -2858,7 +2940,7 @@ try {
   else if (process.argv.includes('--danmaku-rows-only')) await verifyAutomaticDanmaku();
   else if (process.argv.includes('--quark-search-only')) {
     app.store.setConfig({ ...app.store.config(), sources: ['first', 'second'].map((id, index) => ({ id, name: ['第一源', '第二源'][index], api: `https://api.example.com/${id}`, enabled: true })) });
-    for (const verify of [verifyQuarkPublicSearch, verifyQuarkPendingSearch, verifyQuarkAutoplay]) { app.store.remove('history', cloudFilm.key); await verify(); }
+    for (const verify of [verifyQuarkPublicSearch, verifyQuarkPendingSearch, verifyQuarkTelegramSearch, verifyQuarkAutoplay]) { app.store.remove('history', cloudFilm.key); await verify(); }
   }
   else if (process.argv.includes('--quark-startup-only')) { await verifyQuarkPlaybackRecovery(); await verifyQuarkPictureReadiness(); await verifyQuarkStartupFailure(); }
   else if (process.argv.includes('--quark-tail-only')) { for (const verify of [verifyQuarkStartupFailure, verifyQuarkSubtitles, verifyFullFilmTimeline, verifyCompatibilityPauseRelease, verifyNativeFullscreenControls, verifyQuarkCleanupFeedback, verifyAutomaticDanmaku]) await verify(); }
@@ -3830,6 +3912,7 @@ try {
   await verifyQuarkSearchRetry();
   await verifyQuarkAutomaticWebFallback();
   await verifyQuarkPendingSearch();
+  await verifyQuarkTelegramSearch();
   await verifyQuarkChoices();
   await verifyCompactSettings();
   await verifyLowLoadLive();

@@ -16,6 +16,37 @@ const response = (body, statusCode = 200) => Object.assign(Readable.from([body])
 const rss = (url, title = '电影') => `<rss><channel><item><title>${title}</title><link>${url || 'https://example.org'}</link></item></channel></rss>`;
 const flush = async () => { for (let index = 0; index < 5; index++) await new Promise(done => setImmediate(done)); };
 
+test('only explicit archived Telegram searches start QAS and its candidates stay in that search', async () => {
+  const address = 'https://manual.example/api/search?kw=希望';
+  const archived = 'https://pan.quark.cn/s/archived26';
+  let releasesQas, calls = 0;
+  const awaitingQas = new Promise(resolve => { releasesQas = resolve; });
+  const f = fixture({ qasTelegramSearch: async title => {
+    calls++;
+    assert.equal(title, '希望');
+    await awaitingQas;
+    return [{ name: '希望', url: archived }, { name: '希望', url: 'https://other.example/s/invalid01' }];
+  } });
+  const result = async options => JSON.parse(await readText(await f.pool.request(address, options)));
+  try {
+    await result({ qasTelegram: true, poll: true });
+    await result({});
+    assert.equal(calls, 0);
+    const manual = await result({ qasTelegram: true });
+    assert.equal(manual.pending, true);
+    await result({ qasTelegram: true, poll: true });
+    assert.equal(calls, 1);
+    releasesQas();
+    await flush();
+    const complete = await result({ qasTelegram: true, poll: true });
+    assert.deepEqual(new Set(complete.results.map(row => new URL(row.url).pathname)), new Set([new URL(quarkUrl).pathname, new URL(archived).pathname]));
+    assert.equal(complete.pending, undefined);
+    const normal = await result({ poll: true });
+    assert.deepEqual(normal.results.map(row => new URL(row.url).pathname), [new URL(quarkUrl).pathname]);
+    assert.equal(calls, 1);
+  } finally { releasesQas(); await f.pool.stop(); }
+});
+
 test('known registered shares reveal older buffered channel results without changing shared searches', async () => {
   const clock = Date.parse('2026-10-15T00:00:00Z'), address = 'https://manual.example/api/search?kw=%E5%B8%8C%E6%9C%9B';
   const rows = Array.from({ length: 40 }, (_, index) => ({ name: '希望 (2026)', url: 'https://pan.quark.cn/s/buffer' + String(index).padStart(4, '0'), publishedAt: clock - index * 1000 }));
@@ -323,11 +354,11 @@ test('channel cursors continue past the fourth page while Google page numbers wr
   } finally { await f.pool.stop(); }
 });
 
-function fixture({ request, discoveryRequest, webRequest, renderSearch, telegramSearch, getSearchApi, googleSearch = async () => { throw new Error('Fixture Google search unavailable'); }, saved, now = Date.now } = {}) {
+function fixture({ request, discoveryRequest, webRequest, renderSearch, telegramSearch, qasTelegramSearch, getSearchApi, googleSearch = async () => { throw new Error('Fixture Google search unavailable'); }, saved, now = Date.now } = {}) {
   const metadata = new Map(saved ? [[KEY, JSON.stringify(saved)]] : []), calls = [], discoveryCalls = [];
   const store = { meta: key => metadata.get(key), setMeta: (key, value) => metadata.set(key, value) };
   const transport = async (url, options) => { calls.push({ url, options }); return request ? request(url, options) : response(json(undefined, new URL(url).searchParams.get('kw') || '电影')); };
-  const pool = createQuarkSearchPool({ store, now, googleSearch, renderSearch, telegramSearch, getSearchApi, webRequest: webRequest || transport,
+  const pool = createQuarkSearchPool({ store, now, googleSearch, renderSearch, telegramSearch, qasTelegramSearch, getSearchApi, webRequest: webRequest || transport,
     request: transport,
     discoveryRequest: async (url, options) => {
       discoveryCalls.push({ url, options });

@@ -140,7 +140,7 @@ const result = (rows, query, reason, pending = false, known = new Set()) => {
   return Object.assign(Readable.from([body]), { statusCode: 200, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } });
 };
 
-export function createQuarkSearchPool({ store, request = createQuarkSearchRequest(), discoveryRequest = createQuarkPublicRequest(), webRequest = createQuarkPublicRequest(), googleSearch = searchGoogleQuark, renderSearch, telegramSearch, getSearchApi, now = Date.now } = {}) {
+export function createQuarkSearchPool({ store, request = createQuarkSearchRequest(), discoveryRequest = createQuarkPublicRequest(), webRequest = createQuarkPublicRequest(), googleSearch = searchGoogleQuark, renderSearch, telegramSearch, qasTelegramSearch, getSearchApi, now = Date.now } = {}) {
   if (!store?.meta || !store?.setMeta) throw new TypeError('Search pool requires store metadata');
   let state = { candidates: [], retired: [], lastDiscovery: 0, lastHealth: 0, healthCursor: 0, discoveryCursor: 0, discoveryError: '' };
   let active = 0, timer, started = false, stopping = false, discoveryJob, currentPrimary;
@@ -348,7 +348,7 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
     timer.unref?.();
   }
   function settle(entry) {
-    entry.pending = entry.apiPending || entry.renderPending || entry.telegramPending;
+    entry.pending = entry.apiPending || entry.renderPending || entry.telegramPending || entry.qasTelegramPending;
     entry.expires = now() + 2 * 60_000;
     if (!entry.pending) {
       clearTimeout(entry.timeout);
@@ -396,8 +396,9 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
         const webUrl = parsed.hostname === 'www.bing.com' && parsed.pathname === '/search', web = _options.webSearch === true;
         const keyword = (parsed.searchParams.get(webUrl ? 'q' : 'kw') || '').replace(/\s+site:pan\.quark\.cn\/s\b/gi, '').trim().slice(0, 1000);
         if (!keyword) throw failure('搜索关键词不能为空', 400);
-        const query = queryTerms(keyword, _options.aliases, _options.year), known = knownSharePaths(_options.knownShares), cacheKey = JSON.stringify([base, keyword, query.words, query.year, web]);
-        const activeKey = JSON.stringify([webUrl ? SIDECAR : base, keyword, query.words, query.year]), running = activeQueries.get(activeKey), cached = recent.get(cacheKey);
+        const qasTelegram = _options.qasTelegram === true;
+        const query = queryTerms(keyword, _options.aliases, _options.year), known = knownSharePaths(_options.knownShares), cacheKey = JSON.stringify([base, keyword, query.words, query.year, web, qasTelegram]);
+        const activeKey = JSON.stringify([webUrl ? SIDECAR : base, keyword, query.words, query.year, qasTelegram]), running = activeQueries.get(activeKey), cached = recent.get(cacheKey);
         if (_options.poll === true) { const snapshot = running || cached; return snapshot && snapshot.expires > now() ? result([...snapshot.rows.values()], query, snapshot.reason, snapshot.pending || !!snapshot.fast, known) : result([], query, '公开搜索检查已结束，请重试搜索'); }
         if (running) {
           running.webRequested ||= web; recent.set(cacheKey, running);
@@ -450,6 +451,17 @@ export function createQuarkSearchPool({ store, request = createQuarkSearchReques
           if (entry.webRequested) entry.startRender();
           resolve();
         }, 150); })]).finally(() => clearTimeout(foregroundTimer));
+        if (qasTelegram && typeof qasTelegramSearch === 'function') {
+          entry.qasTelegramPending = true;
+          track(async () => {
+            try {
+              const rows = await qasTelegramSearch(query.title, { signal: entry.controller.signal, deadline: entry.deadline });
+              merge(rows);
+              if (rows.reason) report('Telegram Web 归档：' + rows.reason);
+            } catch (cause) { if (!stopping && !entry.controller.signal.aborted) report('Telegram Web 归档：' + safeFailure(cause).quarkPoolReason); }
+            finally { entry.qasTelegramPending = false; settle(entry); }
+          });
+        }
         if (typeof telegramSearch === 'function') {
           entry.telegramPending = entry.pending = true;
           track(async () => {
