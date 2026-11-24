@@ -140,23 +140,41 @@ test('Netflix uses tags of the exact movie or TV subject and retains its release
   }
 });
 
+test('Netflix verifies later candidates and tags outside Douban’s default tag window', async t => {
+  const rows = Array.from({ length: 20 }, (_, i) => film({ id: String(i + 1) }));
+  const { catalog, calls } = fixture(url => {
+    if (url.pathname.endsWith('/recommend')) return response({ items: rows, total: null }, 200, url.href);
+    const [, id, tags] = url.pathname.match(/movie\/(\d+)(\/tags)?$/);
+    if (!tags) return response(rows[Number(id) - 1], 200, url.href);
+    const labels = Array(44).fill('剧情').concat(Number(id) > 4 ? 'Netflix' : 'Netflix幕后花絮');
+    return response({ tags: labels.slice(0, Number(url.searchParams.get('count') || 20)) }, 200, url.href);
+  });
+  t.after(() => catalog.stop());
+  const result = await catalog.browse({ platform: 'netflix' });
+  assert.deepEqual(result.items.map(item => Number(item.id)).sort((a, b) => a - b), Array.from({ length: 16 }, (_, i) => i + 5));
+  assert.equal(calls.filter(call => call.url.pathname.endsWith('/tags')).length, 20);
+  assert.equal(result.hasMore, true);
+  assert.deepEqual(result.errors, []);
+});
+
 test('an upgrade keeps regular catalog pages and rechecks old empty Netflix pages against subject tags', async t => {
   const { catalog, store } = fixture();
   t.after(() => catalog.stop());
   await catalog.browse();
   const saved = JSON.parse(store.values.get(CACHE_KEY));
   const [oldKey, entry] = saved.pages[0];
-  saved.version = 5;
   saved.pages.push([JSON.stringify({ ...JSON.parse(oldKey), platform: 'netflix' }), { ...entry, items: [] }]);
-  store.setMeta(CACHE_KEY, JSON.stringify(saved));
-  const restored = fixture(url => response(url.pathname.endsWith('/tags') ? { tags: ['Netflix'] } :
-    { items: [film({ is_released: undefined, rating: { count: 0 } })], total: 1 }, 200, url.href), { store });
-  t.after(() => restored.catalog.stop());
-  assert.equal((await restored.catalog.browse()).items.length, 1);
-  assert.equal(restored.calls.length, 0);
-  const updated = await restored.catalog.browse({ platform: 'netflix' });
-  assert.deepEqual(updated.items.map(item => item.id), ['123456']);
-  assert.deepEqual(restored.calls.map(call => call.url.pathname), ['/rexxar/api/v2/movie/recommend', '/rexxar/api/v2/movie/123456/tags']);
+  for (const version of [5, 6]) {
+    store.setMeta(CACHE_KEY, JSON.stringify({ ...saved, version }));
+    const restored = fixture(url => response(url.pathname.endsWith('/tags') ? { tags: ['Netflix'] } :
+      { items: [film({ is_released: undefined, rating: { count: 0 } })], total: 1 }, 200, url.href), { store });
+    t.after(() => restored.catalog.stop());
+    assert.equal((await restored.catalog.browse()).items.length, 1);
+    assert.equal(restored.calls.length, 0);
+    const updated = await restored.catalog.browse({ platform: 'netflix' });
+    assert.deepEqual(updated.items.map(item => item.id), ['123456']);
+    assert.deepEqual(restored.calls.map(call => call.url.pathname), ['/rexxar/api/v2/movie/recommend', '/rexxar/api/v2/movie/123456/tags']);
+  }
 });
 
 test('popular released candidates sort by year or real score without pretending popularity is premiere order', async t => {
@@ -440,7 +458,7 @@ test('old cached aliases refresh from the same official subject while poster IDs
   assert.equal(refreshed.id, item.id);
   assert.deepEqual(refreshed.aliases.slice(0, 2), ['Resident Evil', '生化危机9']);
   assert.equal(fresh.catalog.poster('37068446'), item.poster);
-  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 6);
+  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 7);
   for (const key of ['quark-settings-v1', 'history-marker', 'favorites-marker']) assert.equal(old.store.values.get(key), key + '-preserved');
 });
 
@@ -512,6 +530,7 @@ test('offline, verification, redirects, bad JSON and oversized responses report 
     t.after(() => catalog.stop());
     const result = await catalog.browse();
     assert.deepEqual(result.items, []);
+    assert.equal(result.unavailable, true);
     assert.ok(result.errors.length > 0);
     assert.ok(!JSON.stringify(result).includes('secret address'));
   }

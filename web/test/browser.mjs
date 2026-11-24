@@ -1281,18 +1281,18 @@ try {
       const nav = await p.locator('nav a').allTextContents(); assert.ok(nav.findIndex(text => text.includes('夸克影院')) === nav.findIndex(text => text.includes('我的收藏')) + 1);
       await p.getByRole('button', { name: '查看 夸克电影样例', exact: true }).waitFor();
       assert.equal(await p.getByLabel('夸克影片排序', { exact: true }).inputValue(), 'release-score');
-      assert.deepEqual(await p.locator('#quark-library-results .card-title').allTextContents(), ['夸克新片样例', '夸克同年样例', '夸克电影样例'], '默认年份优先且同年高分在前');
-      await until(() => p.locator('#quark-library-results .poster-link img').evaluateAll(images => images.length === 3 && images.every(image => image.complete && image.naturalWidth > 0)), '同源目录海报实际完成解码');
+      assert.deepEqual(await p.locator('#quark-library-results .card-title').allTextContents(), ['夸克新片样例', '夸克同年样例', '夸克电影样例', '夸克下一页样例'], '默认年份优先且同年高分在前');
+      await until(() => p.locator('#quark-library-results .poster-link img').evaluateAll(images => images.length === 4 && images.every(image => image.complete && image.naturalWidth > 0)), '同源目录海报实际完成解码');
       assert.ok((await p.locator('#quark-library-results .poster-link img').evaluateAll(images => images.map(image => image.src))).every(src => new URL(src).origin === base && new URL(src).pathname === '/api/quark/library/poster'));
       await p.locator('.filter-note').getByText(/热门已上映片目.*年份优先、同年高分优先.*当前已加载/).waitFor();
       assert.match(await p.locator('#quark-library-results').textContent(), /豆瓣 7.2/);
       await p.getByLabel('夸克影片排序', { exact: true }).selectOption('release'); await until(() => p.locator('#quark-library-results .card-title').first().textContent().then(text => text === '夸克同年样例'), '热门候选按上映年份排列');
-      assert.deepEqual(await p.locator('#quark-library-results .card-title').allTextContents(), ['夸克同年样例', '夸克新片样例', '夸克电影样例'], '无精确日期时同年保留热门候选原顺序');
+      assert.deepEqual(await p.locator('#quark-library-results .card-title').allTextContents(), ['夸克同年样例', '夸克新片样例', '夸克电影样例', '夸克下一页样例'], '无精确日期时同年保留热门候选原顺序');
       await p.getByLabel('夸克影片排序', { exact: true }).selectOption('score'); await until(() => p.locator('#quark-library-results .card-title').first().textContent().then(text => text === '夸克新片样例'), '评分排序交给公开目录');
-      assert.deepEqual(await p.locator('#quark-library-results .card-title').allTextContents(), ['夸克新片样例', '夸克电影样例', '夸克同年样例'], '纯评分顺序独立于年份');
+      assert.deepEqual(await p.locator('#quark-library-results .card-title').allTextContents(), ['夸克新片样例', '夸克电影样例', '夸克同年样例', '夸克下一页样例'], '纯评分顺序独立于年份');
       await p.getByLabel('夸克影片类型', { exact: true }).selectOption('剧情'); await until(() => quarkRequests.filter(row => row.path === '/api/quark/library').at(-1).query.genre === '剧情', '类型筛选传给目录');
       await p.getByLabel('夸克上映年份', { exact: true }).selectOption('2025'); await p.getByRole('button', { name: '查看 夸克电影样例', exact: true }).waitFor();
-      await p.getByLabel('夸克上映年份', { exact: true }).selectOption(''); await p.getByRole('button', { name: '加载更多影片', exact: true }).click(); await p.getByRole('button', { name: '查看 夸克下一页样例', exact: true }).waitFor();
+      await p.getByLabel('夸克上映年份', { exact: true }).selectOption(''); await p.getByRole('button', { name: '查看 夸克下一页样例', exact: true }).waitFor();
       for (const category of ['电视剧', '动漫', '综艺']) { await p.locator('.category-tabs').getByRole('button', { name: category, exact: true }).click(); await p.getByRole('button', { name: `查看 ${cloudFilm.title}`, exact: true }).waitFor(); }
       await p.getByRole('button', { name: `查看 ${cloudFilm.title}`, exact: true }).click();
       await until(() => p.locator('.detail-poster').evaluate(image => image.complete && image.naturalWidth > 0).catch(() => false), '同源详情海报实际完成解码'); assert.match(await p.locator('.detail-poster').getAttribute('src'), /\/api\/quark\/library\/poster\?id=1234567$/);
@@ -2655,11 +2655,20 @@ try {
     assert.ok(resumeRequests.slice(1).every(([page, resume]) => page === '1' && resume === null), '只有首个请求提交续查，其后轮询同一页');
 
     const cloud = p.locator('#quark-library-results'), more = p.getByRole('button', { name: '加载更多影片', exact: true });
-    const pages = [];
+    const pages = [], batchPages = [];
+    const batchFilms = Array.from({ length: 64 }, (_, index) => ({ ...cloudMovie, id: String(7800000 + index), title: `奈飞分页样例 ${index + 1}`, netflix: true }));
     await p.route('**/api/quark/library?*', route => {
       const params = new URL(route.request().url()).searchParams;
       if (params.get('platform') !== 'netflix') return route.fallback();
       const page = Number(params.get('page')), country = params.get('country') || '';
+      if (params.get('genre') === '喜剧') {
+        batchPages.push(page);
+        if (page === 3 && batchPages.filter(value => value === 3).length === 1) {
+          return route.fulfill({ json: { items: [], hasMore: false, unavailable: true, facets: fixtureFacets, errors: ['模拟目录暂时不可用'] } });
+        }
+        const filmPages = [batchFilms.slice(0, 20), batchFilms.slice(19, 40), batchFilms.slice(40, 60), batchFilms.slice(60)];
+        return route.fulfill({ json: { items: filmPages[page - 1], hasMore: page < filmPages.length, facets: fixtureFacets, errors: [] } });
+      }
       pages.push([country, page]);
       const matchPage = country === '日本' ? 0 : country === '美国' ? 2 : 3;
       const hasMore = page < matchPage;
@@ -2669,12 +2678,9 @@ try {
     });
     await p.locator('nav a[href="#quark"]').click();
     await p.getByLabel('夸克影片平台').selectOption('netflix');
-    await until(() => pages.length >= 2 && more.isEnabled(), '第1页无命中时自动查第2页，完成后可手动翻页');
-    await cloud.getByRole('heading', { name: '本页暂无匹配影片' }).waitFor();
-    assert.deepEqual(pages, [['', 1], ['', 2]], '连续两页空后停止自动翻页');
-    await more.click();
     await cloud.getByRole('button', { name: '查看 夸克电影样例', exact: true }).waitFor();
-    assert.deepEqual(pages, [['', 1], ['', 2], ['', 3]], '手动继续查询第3页并保留奈飞筛选');
+    assert.deepEqual(pages, [['', 1], ['', 2], ['', 3]], '自动跳过空页并保留奈飞筛选');
+    assert.ok(await more.isHidden(), '不足30部且目录已结束时隐藏加载更多');
     await p.getByLabel('夸克制片国家/地区').selectOption('美国');
     await until(() => pages.at(-1)[0] === '美国' && pages.at(-1)[1] === 2, '新组合筛选自动查到第2页');
     await cloud.getByRole('button', { name: '查看 夸克电影样例', exact: true }).waitFor();
@@ -2685,6 +2691,23 @@ try {
     await cloud.getByRole('heading', { name: /没有符合条件的影片/ }).waitFor();
     assert.ok(await more.isHidden(), '确认无更多候选时结束分页');
     assert.deepEqual(pages.slice(5), [['日本', 1], ['日本', 1]], '元信息未核实时重试同一页');
+    await p.getByLabel('夸克影片类型').selectOption('喜剧');
+    await more.waitFor();
+    const titles = cloud.locator('.card-title');
+    assert.deepEqual(await titles.allTextContents(), batchFilms.slice(0, 30).map(row => row.title), '首批恰好显示30部，跨页去重并保留溢出片目');
+    assert.deepEqual(batchPages, [1, 2]);
+    await more.click();
+    const retryMore = p.getByRole('button', { name: '重试加载更多', exact: true });
+    await retryMore.waitFor();
+    assert.equal(await titles.count(), 40, '请求失败时保留已读取的影片');
+    await retryMore.click();
+    await more.waitFor();
+    assert.deepEqual(await titles.allTextContents(), batchFilms.slice(0, 60).map(row => row.title), '重试同一页后补齐第二批30部');
+    assert.deepEqual(batchPages, [1, 2, 3, 3]);
+    await more.click();
+    await cloud.getByRole('button', { name: '查看 奈飞分页样例 64', exact: true }).waitFor();
+    assert.equal(await titles.count(), 64);
+    assert.ok(await more.isHidden(), '最后不足30部时显示剩余影片并隐藏加载更多');
   }
 
   async function verifyCatalogFilters() {
@@ -2716,14 +2739,15 @@ try {
 
         await p.locator('nav a[href="#quark"]').click();
         const cloudYear = p.getByLabel('夸克上映年份'), cloudCountry = p.getByLabel('夸克制片国家/地区');
-        await p.getByRole('button', { name: '加载更多影片', exact: true }).click();
         await p.getByRole('button', { name: '查看 夸克下一页样例', exact: true }).waitFor();
         assert.deepEqual(await cloudYear.locator('option').evaluateAll(options => options.map(option => option.value)), ['', '2026', '2025']);
         await cloudCountry.selectOption('日本'); await p.getByLabel('夸克影片平台').selectOption('netflix');
         await until(() => p.locator('#quark-library-results .card-title').allTextContents().then(titles => titles.join() === '夸克新片样例'), '夸克影院按合拍地区和Netflix取交集');
+        const previousRequests = quarkRequests.length;
         await cloudYear.selectOption('2026');
-        await until(() => quarkRequests.filter(r => r.path === '/api/quark/library').at(-1)?.query.year === '2026', '夸克组合筛选重置页码');
-        const query = quarkRequests.filter(r => r.path === '/api/quark/library').at(-1).query;
+        const yearRequest = () => quarkRequests.slice(previousRequests).find(r => r.path === '/api/quark/library' && r.query.year === '2026');
+        await until(yearRequest, '夸克组合筛选重置页码');
+        const { query } = yearRequest();
         assert.deepEqual([query.country, query.platform, query.page], ['日本', 'netflix', '1']);
         await p.setViewportSize({ width: 390, height: 844 });
         assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '手机组合筛选不溢出');

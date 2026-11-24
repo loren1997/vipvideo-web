@@ -589,7 +589,8 @@ async function renderQuarkLibrary(params, stamp) {
   const sortNote = node('p', undefined, 'filter-note muted'); page.append(sortNote);
   const listing = node('div'); listing.id = 'quark-library-results'; page.append(listing);
   const more = button('加载更多影片', () => void load(), 'button subtle load-more'); more.hidden = true; page.append(more); content.replaceChildren(page);
-  let items = [], nextPage = 1, loading = false;
+  const batchSize = 30;
+  let items = [], nextPage = 1, displayLimit = batchSize, hasNextPage = true, loadError = '', loading = false;
   const pageWarnings = new Map();
   const valid = () => stamp === routeVersion && content.contains(page);
   async function readPage(pageNumber) {
@@ -599,30 +600,44 @@ async function renderQuarkLibrary(params, stamp) {
     sortNote.textContent = `${data.sortLabel || (filters.sort === 'score' ? '已上映片目，豆瓣高分优先' : filters.sort === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先')}；排序针对当前已加载片目。`;
     items = [...new Map([...items, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
     pageWarnings.set(pageNumber, (data.errors || []).map(error => typeof error === 'string' ? error : error.error || error.message || '目录暂时不可用'));
-    nextPage = pageNumber + 1;
     return data;
   }
-  async function load(pageNumber = nextPage) {
+  async function load(restart = false) {
     if (loading || !valid()) return; loading = true; more.disabled = true;
-    if (pageNumber === 1) pageWarnings.clear();
-    if (!items.length) listing.replaceChildren(node('p', '正在加载夸克影院…', 'loading'));
+    if (restart) { nextPage = 1; hasNextPage = true; pageWarnings.clear(); }
+    const progress = node('p', '正在加载夸克影院…', 'loading'); progress.setAttribute('role', 'status');
+    if (!items.length) listing.replaceChildren(progress);
+    more.textContent = '正在加载影片…';
     try {
-      let data = await readPage(pageNumber);
-      if (!data) return;
-      if (pageNumber === 1 && !items.length && data.hasMore && (filters.genre || filters.year || filters.country || filters.platform)) {
-        listing.replaceChildren(node('p', '首批片目暂无匹配，正在检查下一页…', 'loading'));
-        pageNumber = nextPage;
-        data = await readPage(pageNumber);
+      while (hasNextPage && (items.length < displayLimit || loadError)) {
+        const data = await readPage(nextPage);
         if (!data) return;
+        if (data.unavailable) throw new Error(pageWarnings.get(nextPage).join('；') || '目录暂时不可用');
+        loadError = '';
+        hasNextPage = data.hasMore && nextPage < 25;
+        nextPage++;
+        if (hasNextPage && items.length < displayLimit) {
+          const found = Math.max(0, items.length - (displayLimit - batchSize));
+          progress.textContent = more.textContent = `正在查找影片… 已找到 ${found}/${batchSize} 部`;
+        }
       }
-      const warnings = [...new Set(items.length ? pageWarnings.get(pageNumber) : [...pageWarnings.values()].flat())];
-      const hasMore = data.hasMore && pageNumber < 25;
-      listing.replaceChildren(items.length ? grid(items, { priorityCount: 6 }) : emptyCatalogPage(filters, hasMore, warnings.length,
-        warnings.length && button('重新加载', () => void load(1))));
-      if (warnings.length) listing.append(node('p', warnings.join('；'), 'muted'));
-      more.hidden = !hasMore; more.textContent = '加载更多影片';
-    } catch (error) { if (valid()) { if (!items.length) listing.replaceChildren(empty('夸克影院暂时不可用', error.message, button('重新加载', () => void load(pageNumber)))); else { more.textContent = '重试加载更多'; notify(error.message, true); } } }
+    } catch (error) { if (!valid()) return; loadError = error.message || '目录暂时不可用'; }
     finally { loading = false; if (valid()) more.disabled = false; }
+    if (!valid()) return;
+    const displayed = items.slice(0, displayLimit);
+    const hasMore = hasNextPage || items.length > displayed.length;
+    const warnings = [...new Set([...pageWarnings.values()].flat())];
+    if (loadError && !displayed.length) {
+      listing.replaceChildren(empty('夸克影院暂时不可用', loadError, button('重新加载', () => void load())));
+      more.hidden = true;
+      return;
+    }
+    listing.replaceChildren(displayed.length ? grid(displayed, { priorityCount: 6 }) : emptyCatalogPage(filters, hasMore, warnings.length,
+      warnings.length && button('重新加载', () => void load(true))));
+    if (warnings.length) listing.append(node('p', warnings.join('；'), 'muted'));
+    if (loadError) notify(loadError, true);
+    else if (displayed.length) displayLimit += batchSize;
+    more.hidden = !hasMore; more.textContent = loadError ? '重试加载更多' : '加载更多影片';
   }
   await load();
 }

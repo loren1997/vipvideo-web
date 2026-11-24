@@ -98,14 +98,14 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
   if (typeof saved === 'string' && saved.length <= 2 * 1024 * 1024) {
     try {
       const data = JSON.parse(saved);
-      const withFacets = data.version === 5 || data.version === 6;
+      const withFacets = [5, 6, 7].includes(data.version);
       for (const [id, entry] of Array.isArray(data.subjects) ? data.subjects.slice(-300) : []) {
         const item = restoreItem(entry?.item, now());
         if (item && item.id === id && Number.isFinite(entry.at) && entry.at <= now() && entry.at > now() - 7 * 24 * HOUR) subjects.set(id, { item, at: entry.at, detailed: withFacets && entry.detailed === true });
       }
       for (const [key, entry] of withFacets && Array.isArray(data.pages) ? data.pages.slice(-32) : []) {
         if (typeof key !== 'string' || key.length > 200 || !Number.isFinite(entry?.at) || entry.at > now() || entry.at <= now() - 7 * 24 * HOUR || !Array.isArray(entry.items)) continue;
-        if (data.version === 5 && key.includes('"platform":"netflix"')) continue;
+        if (data.version < 7 && key.includes('"platform":"netflix"')) continue;
         const items = entry.items.slice(0, 40).map(id => subjects.get(idOf(id))?.item).filter(Boolean);
         if (items.length === entry.items.length) pages.set(key, { at: entry.at, category: entry.category, items, hasMore: entry.hasMore === true,
           errors: Array.isArray(entry.errors) ? entry.errors.slice(0, 2).map(value => text(value, 200)).filter(Boolean) : [], stale: entry.stale === true });
@@ -117,7 +117,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
     while (pages.size > 32) pages.delete(pages.keys().next().value);
     while (subjects.size > 300) subjects.delete(subjects.keys().next().value);
     const serialize = () => JSON.stringify({
-      version: 6,
+      version: 7,
       pages: [...pages].map(([key, entry]) => [key, { ...entry, items: entry.items.map(item => item.id) }]),
       subjects: [...subjects].map(([id, entry]) => { const { lines, ...item } = entry.item; return [id, { ...entry, item }]; }),
     });
@@ -252,7 +252,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
       const values = filters(options), key = JSON.stringify(values), cached = pages.get(key);
       if (cached && cached.at + (cached.errors?.length ? 60000 : HOUR) > now()) return result(cached, values);
       const recentFailure = failures.get(key);
-      if (recentFailure && recentFailure.until > now()) return result(cached || { items: [], hasMore: false }, values, recentFailure.errors, !!cached);
+      if (recentFailure && recentFailure.until > now()) return { ...result(cached || { items: [], hasMore: false }, values, recentFailure.errors, !!cached), unavailable: true };
       return load(`browse:${key}`, async signal => {
         const started = Date.now();
         const kinds = values.category === 'anime' ? ['movie', 'tv'] : [values.category === 'movie' ? 'movie' : 'tv'];
@@ -265,7 +265,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
             const data = await fetchJson(`${kind}/recommend?${query}`, signal);
             if (!Array.isArray(data.items) || data.items.length > 100) throw failure('豆瓣目录格式暂不可读取，请稍后再试');
             successes++;
-            const total = Number(data.total);
+            const total = Number(data.total ?? NaN);
             hasMore ||= Number.isFinite(total) && total >= 0 ? values.page * PAGE_SIZE < total : data.items.length >= PAGE_SIZE;
             for (const raw of data.items) {
               const item = metadata(raw, values.category, false, now());
@@ -288,17 +288,18 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
           } catch (error) { failedKinds.add(kind); errors.push(error.status ? error.message : '豆瓣目录暂不可读取，请稍后再试'); }
         }));
         signal.throwIfAborted();
-        const budget = Math.max(0, Math.min(2000, 7000 - (Date.now() - started)));
-        let unverified = [...unconfirmed.values()].filter(row => row.releaseUnknown).length;
-        let pendingFilters = unconfirmed.size - unverified;
-        if (unconfirmed.size && budget >= 250) {
+        const budget = Math.min(values.platform ? 6000 : 2000, 7000 - (Date.now() - started));
+        const candidates = [...unconfirmed.values()];
+        let unverified = candidates.filter(row => row.releaseUnknown).length;
+        let pendingFilters = candidates.filter(row => row.needsCountry || row.needsPlatform).length;
+        if (candidates.length && budget >= 250) {
           const verification = AbortSignal.any([signal, AbortSignal.timeout(budget)]);
-          await Promise.all([...unconfirmed.values()].slice(0, 4).map(async ({ item, kind, releaseUnknown, needsCountry, needsPlatform, freshDetail }) => {
+          async function verify({ item, kind, releaseUnknown, needsCountry, needsPlatform, freshDetail }) {
             try {
               // 推荐列表和详情上的 tags 是精选标签，逐片标签接口才包含用户标注的平台。
               let tagsRead = false;
               if (needsPlatform) {
-                const labels = await fetchJson(`${kind}/${item.id}/tags`, verification).catch(() => null);
+                const labels = await fetchJson(`${kind}/${item.id}/tags?count=50`, verification).catch(() => null);
                 tagsRead = Array.isArray(labels?.tags);
                 item.netflix = tagsRead && hasNetflixLabel(labels.tags);
               }
@@ -314,10 +315,14 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
                 if (checked.releaseStatus === 'unknown' && !releaseUnknown) checked.releaseStatus = item.releaseStatus;
               }
               if (releaseUnknown && checked.releaseStatus !== 'unknown') unverified--;
-              if (!releaseUnknown && (!needsPlatform || tagsRead || checked.netflix)) pendingFilters--;
+              if ((needsCountry || needsPlatform) && (!needsCountry || checked.countries.length) && (!needsPlatform || tagsRead || checked.netflix)) pendingFilters--;
               if (checked.releaseStatus === 'upcoming') register(checked, true);
               if (['released', 'screened'].includes(checked.releaseStatus) && (!values.year || checked.year === values.year) && (!values.genre || checked.genres.includes(values.genre)) && (values.category !== 'anime' || checked.category === 'anime') && (values.category !== 'tv' || checked.category === 'tv') && (values.category !== 'variety' || checked.category === 'variety')) rows.push(register(checked, detailed));
             } catch { /* 汇总到下方可重试提示，不让单条核验失败阻塞已确认的片目。 */ }
+          }
+          const limit = values.platform ? candidates.length : Math.min(candidates.length, 4);
+          await Promise.all([0, 1].map(async start => {
+            for (let i = start; i < limit && !verification.aborted; i += 2) await verify(candidates[i]);
           }));
         }
         signal.throwIfAborted();
@@ -326,7 +331,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
         if (!successes) {
           failures.set(key, { until: now() + 60000, errors: [...new Set(errors)] });
           while (failures.size > 32) failures.delete(failures.keys().next().value);
-          return result(cached || { items: [], hasMore: false }, values, [...new Set(errors)], !!cached);
+          return { ...result(cached || { items: [], hasMore: false }, values, [...new Set(errors)], !!cached), unavailable: true };
         }
         if (cached && failedKinds.size) {
           rows.push(...cached.items.filter(item => ['released', 'screened'].includes(item.releaseStatus) && failedKinds.has(item.type === 'movie' ? 'movie' : 'tv')));
@@ -343,7 +348,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
         return result(entry, values, [...new Set(errors)]);
       }).catch(error => {
         if (stopped) throw error;
-        return result(cached || { items: [], hasMore: false }, values, [error.status ? error.message : '豆瓣目录暂不可读取，请稍后再试'], !!cached);
+        return { ...result(cached || { items: [], hasMore: false }, values, [error.status ? error.message : '豆瓣目录暂不可读取，请稍后再试'], !!cached), unavailable: true };
       });
     },
 
