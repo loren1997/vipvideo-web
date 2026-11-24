@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -120,6 +120,60 @@ test('Netflix retains the complete saved union across restart and failed region 
   assert.match(stale.errors[0], /请求受限/);
   assert.deepEqual(stale.items.map(item => item.id), ['tmdb:movie:111']);
   assert.equal(stale.updatedAt, NOW);
+});
+
+test('Netflix exposes the staged first load and resumes only failed markets across retry and restart', async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vipvideo-netflix-resume-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const countries = ['DE', 'JP', 'US'];
+  const first = mockRequest({ countries, discover(url) {
+    const region = url.searchParams.get('watch_region'), page = Number(url.searchParams.get('page'));
+    if (region === 'JP') return response(url, { message: TOKEN }, 404);
+    const rows = url.pathname.endsWith('/tv') ? [] : region === 'DE' ? Array.from({ length: 35 }, (_, index) => movie(index + 1))
+      : Array.from({ length: 31 }, (_, index) => movie(index + 35));
+    return response(url, list(rows, page));
+  } });
+  let now = NOW;
+  const catalog = createNetflixCatalog({ token: TOKEN, request: first.request, dataDir, now: () => now });
+  t.after(() => catalog.stop());
+  const partial = await settled(catalog);
+  assert.ok(partial.provisional);
+  assert.equal(partial.unavailable, false);
+  assert.equal(partial.updatedAt, NOW);
+  assert.deepEqual(partial.coverageRegions, ['DE', 'US']);
+  assert.deepEqual(partial.syncProgress, { completed: 2, total: 3 });
+  assert.match(partial.errors[0], /JP 电影第 1 页/);
+  assert.ok(!partial.errors[0].includes(TOKEN));
+  assert.equal(partial.items.length, 30);
+  assert.ok(partial.hasMore);
+  assert.equal(catalog.browse(query({ page: 2 })).items.length, 30);
+  assert.equal(catalog.browse(query({ page: 3 })).items.length, 5);
+  assert.equal(catalog.poster('tmdb:movie:62'), 'https://image.tmdb.org/t/p/w342/title.jpg');
+  const before = first.calls.length;
+  assert.equal(catalog.browse(query()).syncing, false);
+  assert.equal(first.calls.length, before);
+  now += 11 * 60000;
+  assert.ok((await settled(catalog)).provisional);
+  assert.deepEqual(first.calls.slice(before).map(url => url.searchParams.get('watch_region')).filter(Boolean), ['JP']);
+  await catalog.stop();
+
+  const restart = mockRequest({ countries, discover(url) {
+    assert.equal(url.searchParams.get('watch_region'), 'JP');
+    return response(url, list(url.pathname.endsWith('/movie') ? [movie(66)] : [], 1));
+  } });
+  const resumed = createNetflixCatalog({ token: TOKEN, request: restart.request, dataDir, now: () => now });
+  t.after(() => resumed.stop());
+  const restored = resumed.browse(query());
+  assert.ok(restored.syncing && restored.provisional);
+  assert.deepEqual(restored.syncProgress, { completed: 2, total: 3 });
+  assert.equal(restored.total, 65);
+  const complete = await settled(resumed);
+  assert.equal(complete.provisional, false);
+  assert.deepEqual(complete.coverageRegions, ['DE', 'JP', 'US']);
+  assert.equal(complete.total, 66);
+  assert.deepEqual(complete.errors, []);
+  assert.deepEqual(restart.calls.map(url => url.searchParams.get('watch_region')).filter(Boolean), ['JP', 'JP']);
+  await assert.rejects(access(join(dataDir, 'netflix-tmdb-v1.pending.json')), { code: 'ENOENT' });
 });
 
 test('Netflix partitions a capped TMDB result and retries a region whose pages shift', async t => {

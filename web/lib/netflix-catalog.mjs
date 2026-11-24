@@ -9,7 +9,7 @@ import { request as networkRequest, readText } from './network.mjs';
 const API = 'https://api.themoviedb.org/3/';
 const ATTRIBUTION = 'TMDB · JustWatch';
 const PAGE_SIZE = 30, TMDB_PAGE_LIMIT = 500;
-const DAY = 24 * 60 * 60000, RETRY_AFTER = 10 * 60000;
+const DAY = 24 * 60 * 60000, RETRY_AFTER = 10 * 60000, CHECKPOINT_AGE = 3 * DAY;
 const SNAPSHOT_LIMIT = 64 * 1024 * 1024;
 const ID = /^tmdb:(movie|tv):([1-9]\d{0,9})$/;
 const REGION = /^[A-Z]{2}$/;
@@ -66,25 +66,48 @@ function itemOf(summary, regions) {
   };
 }
 
-function restore(path, now) {
+function viewOf(data) {
+  return { at: data.at, coverageRegions: data.coverageRegions, items: new Map(data.rows.map(row => {
+    const item = itemOf(row, row.regions);
+    return [item.id, item];
+  })) };
+}
+
+function restore(path, now, pending = false) {
   if (!path) return;
   try {
     if (statSync(path).size > SNAPSHOT_LIMIT) throw new Error('oversized Netflix catalog');
     const saved = JSON.parse(readFileSync(path, 'utf8'));
     const coverageRegions = regionCodes(saved.coverageRegions);
     if (saved.version !== 1 || !Number.isSafeInteger(saved.at) || saved.at > now || !coverageRegions.length || !Array.isArray(saved.rows)) throw new Error('invalid Netflix catalog');
-    const countries = new Set(coverageRegions), items = new Map();
+    const countries = new Set(coverageRegions), rows = [];
+    const targetRegions = regionCodes(saved.targetRegions);
+    if (pending && (!Number.isSafeInteger(saved.startedAt) || saved.startedAt > saved.at || now - saved.startedAt > CHECKPOINT_AGE
+      || !coverageRegions.every(region => targetRegions.includes(region)) || !/^\d+(?:\|\d+)*:\d+(?:\|\d+)*$/.test(saved.providers || ''))) return;
     for (const row of saved.rows) {
       const summary = ['movie', 'tv'].includes(row?.kind) && summarize(row, row.kind);
       const regions = regionCodes(row?.regions).filter(region => countries.has(region));
       if (!summary || !regions.length) throw new Error('invalid Netflix catalog row');
-      const item = itemOf(summary, regions);
-      items.set(item.id, item);
+      rows.push({ ...summary, regions });
     }
-    return { at: saved.at, coverageRegions, items };
+    const data = { at: saved.at, coverageRegions, rows };
+    return pending ? { ...data, startedAt: saved.startedAt, targetRegions, providers: saved.providers, view: viewOf(data) } : viewOf(data);
   } catch (error) {
     if (error.code !== 'ENOENT') console.warn('奈飞片库缓存无法读取，将重新同步。');
   }
+}
+
+async function save(path, data, signal) {
+  signal.throwIfAborted();
+  if (!path) return;
+  const file = `${path}.${randomUUID()}.tmp`;
+  try {
+    const encoded = JSON.stringify({ version: 1, ...data });
+    if (Buffer.byteLength(encoded) > SNAPSHOT_LIMIT) throw failure('奈飞片库超出当前缓存容量。');
+    await writeFile(file, encoded, { flag: 'wx', mode: 0o600, signal });
+    signal.throwIfAborted();
+    await rename(file, path);
+  } finally { await rm(file, { force: true }); }
 }
 
 function episodesOf(kind, raw) {
@@ -103,9 +126,13 @@ function episodesOf(kind, raw) {
 export function createNetflixCatalog({ token, request = networkRequest, now = Date.now, dataDir } = {}) {
   const accessToken = typeof token === 'string' && /^[A-Za-z0-9._~-]{1,4096}$/.test(token.trim()) ? token.trim() : '';
   const snapshotPath = dataDir && join(dataDir, 'netflix-tmdb-v1.json');
+  const checkpointPath = dataDir && join(dataDir, 'netflix-tmdb-v1.pending.json');
   const shutdown = new AbortController(), details = new Map(), detailJobs = new Map();
   let snapshot = accessToken ? restore(snapshotPath, now()) : undefined;
+  let checkpoint = accessToken ? restore(checkpointPath, now(), true) : undefined;
+  if (snapshot && checkpoint?.at <= snapshot.at) checkpoint = undefined;
   let job, nextAttempt = 0, warning = '', throttledUntil = 0, progress;
+  const visible = () => snapshot || checkpoint?.view;
 
   async function fetchJson(path, params, signal = shutdown.signal) {
     const url = new URL(path, API);
@@ -121,7 +148,9 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
           accept: 'application/json', 'accept-encoding': 'gzip, br', authorization: `Bearer ${accessToken}` } });
         response.on('error', () => {});
         if (response.finalUrl && response.finalUrl !== url.href) throw failure('TMDB 请求地址异常。');
-        if (response.statusCode === 401 || response.statusCode === 403) throw failure('TMDB API Read Access Token 无效或没有访问权限。', 503);
+        if (response.statusCode === 401 || response.statusCode === 403) {
+          throw Object.assign(failure('TMDB API Read Access Token 无效或没有访问权限。', 503), { credential: true });
+        }
         if (response.statusCode === 404) throw failure('TMDB 找不到这部影片。', 404);
         if (response.statusCode === 429) {
           const raw = response.headers?.['retry-after'];
@@ -130,7 +159,10 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
           if (throttledUntil > Date.now() + 60000 || attempt === 3) throw failure('TMDB 请求受限，稍后重试同步。', 429);
           continue;
         }
-        if (response.statusCode !== 200) throw failure('TMDB 片单暂不可用，请稍后重试。', response.statusCode >= 500 ? 502 : 503);
+        if (response.statusCode !== 200) {
+          const status = response.statusCode;
+          throw Object.assign(failure(Number.isInteger(status) && status >= 100 && status <= 599 ? `TMDB 返回 HTTP ${status}。` : 'TMDB 响应状态异常。', status >= 500 ? 502 : 503), { responseStatus: true });
+        }
         abort = () => response.destroy(signal.reason);
         signal.addEventListener('abort', abort, { once: true });
         signal.throwIfAborted();
@@ -141,7 +173,10 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
       } catch (error) {
         signal.throwIfAborted();
         if ([404, 429, 503].includes(error.status)) throw error;
-        if (attempt === 3) throw failure('TMDB 片单暂不可用，请稍后重试。');
+        if (attempt === 3) {
+          if (error.responseStatus) throw error;
+          throw failure(error.code === 'MEDIA_SOURCE_TIMEOUT' ? 'TMDB 连接或读取超时。' : 'TMDB 连接或响应失败，请稍后重试。');
+        }
       } finally {
         if (abort) signal.removeEventListener('abort', abort);
         response?.destroy();
@@ -151,7 +186,7 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
   }
 
   async function sync(signal) {
-    const activeProgress = { completed: 0, total: 0 };
+    const activeProgress = { completed: checkpoint?.coverageRegions.length || 0, total: checkpoint?.targetRegions.length || 0 };
     progress = activeProgress;
     const { results: rawRegions } = await fetchJson('watch/providers/regions', {}, signal);
     const coverageRegions = regionCodes(Array.isArray(rawRegions) ? rawRegions.map(region => region?.iso_3166_1) : []);
@@ -165,21 +200,33 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
       if (!providers.length) throw failure('TMDB 片库中找不到 Netflix 平台。');
       byKind.set(kind, providers.join('|'));
     }
+    const providers = [...byKind.values()].map(ids => ids.split('|').sort().join('|')).join(':');
+    if (checkpoint && (checkpoint.providers !== providers || checkpoint.targetRegions.join(',') !== coverageRegions.join(',')
+      || now() - checkpoint.startedAt > CHECKPOINT_AGE)) checkpoint = undefined;
+    const startedAt = checkpoint?.startedAt ?? now();
+    const completed = new Set(checkpoint?.coverageRegions);
+    const remaining = coverageRegions.filter(region => !completed.has(region));
+    activeProgress.completed = completed.size;
     activeProgress.total = coverageRegions.length;
-    const rows = new Map();
+    const rows = new Map(checkpoint?.rows.map(row => [`${row.kind}:${row.id}`, { ...row, regions: new Set(row.regions) }]));
     async function scan(kind, region, regional, bounds = {}) {
       const query = { language: 'zh-CN', include_adult: 'false', watch_region: region,
         with_watch_providers: byKind.get(kind), with_watch_monetization_types: 'flatrate|free|ads',
         sort_by: kind === 'movie' ? 'title.asc' : 'name.asc', ...(kind === 'tv' ? { include_null_first_air_dates: 'true' } : {}), ...bounds };
       async function page(number) {
-        const result = await fetchJson(`discover/${kind}`, { ...query, page: number }, signal);
-        if (result.page !== number || !Array.isArray(result.results) || result.results.length > 20
-          || !Number.isSafeInteger(result.total_results) || result.total_results < 0 || !Number.isSafeInteger(result.total_pages) || result.total_pages < 0
-          || result.total_results > 0 && (result.total_pages < number || !result.results.length || result.total_pages * 20 < Math.min(result.total_results, TMDB_PAGE_LIMIT * 20))
-          || result.total_results === 0 && (number !== 1 || result.total_pages > 1 || result.results.length > 0)) {
-          throw failure('TMDB 返回的地区片单页格式异常。');
+        try {
+          const result = await fetchJson(`discover/${kind}`, { ...query, page: number }, signal);
+          if (result.page !== number || !Array.isArray(result.results) || result.results.length > 20
+            || !Number.isSafeInteger(result.total_results) || result.total_results < 0 || !Number.isSafeInteger(result.total_pages) || result.total_pages < 0
+            || result.total_results > 0 && (result.total_pages < number || !result.results.length || result.total_pages * 20 < Math.min(result.total_results, TMDB_PAGE_LIMIT * 20))
+            || result.total_results === 0 && (number !== 1 || result.total_pages > 1 || result.results.length > 0)) {
+            throw failure('TMDB 返回的地区片单页格式异常。');
+          }
+          return result;
+        } catch (error) {
+          signal.throwIfAborted();
+          throw Object.assign(error, { page: number });
         }
-        return result;
       }
       const first = await page(1);
       if (first.total_pages > TMDB_PAGE_LIMIT || first.total_results > TMDB_PAGE_LIMIT * 20) {
@@ -205,47 +252,59 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
       if (regional.size - previous !== first.total_results) throw failure('TMDB 地区片单在同步中发生变化，请稍后重试。', 409);
       return first.total_results;
     }
-    let regionIndex = 0;
+    function records() { return [...rows.values()].map(row => ({ ...row, regions: [...row.regions].sort() })); }
+    const regionErrors = [];
+    let regionIndex = 0, fatal, writing = Promise.resolve();
     await Promise.all([0, 1].map(async () => {
-      while (regionIndex < coverageRegions.length) {
-        const region = coverageRegions[regionIndex++];
-        for (const kind of byKind.keys()) {
-          const regional = new Map();
-          try { await scan(kind, region, regional); }
-          catch (error) {
-            if (error.status !== 409) throw error;
-            regional.clear();
-            await scan(kind, region, regional);
+      while (!fatal && regionIndex < remaining.length) {
+        signal.throwIfAborted();
+        const region = remaining[regionIndex++], next = [];
+        let kind;
+        try {
+          for (kind of byKind.keys()) {
+            const regional = new Map();
+            try { await scan(kind, region, regional); }
+            catch (error) {
+              if (error.status !== 409) throw error;
+              regional.clear();
+              await scan(kind, region, regional);
+            }
+            for (const row of regional.values()) if (row) next.push(row);
           }
-          for (const row of regional.values()) {
-            if (!row) continue;
-            const key = `${kind}:${row.id}`;
+        } catch (error) {
+          signal.throwIfAborted();
+          const part = `${region} ${kind === 'movie' ? '电影' : '剧集'}${error.page ? `第 ${error.page} 页` : ''}`;
+          regionErrors.push(`${part} · ${error.status ? error.message : '暂时无法读取。'}`);
+          if (error.status === 429 || error.credential) fatal = error;
+          continue;
+        }
+        // 两个下载任务共享一个写入队列，每个地区完整写入后才公开进度。
+        writing = writing.then(async () => {
+          for (const row of next) {
+            const key = `${row.kind}:${row.id}`;
             if (rows.has(key)) rows.get(key).regions.add(region);
             else rows.set(key, { ...row, regions: new Set([region]) });
           }
-        }
-        activeProgress.completed++;
+          completed.add(region);
+          const stage = { at: now(), startedAt, providers, targetRegions: coverageRegions, coverageRegions: [...completed].sort(), rows: records() };
+          await save(checkpointPath, stage, signal);
+          checkpoint = { ...stage, view: snapshot ? undefined : viewOf(stage) };
+          activeProgress.completed = completed.size;
+        });
+        await writing;
       }
     }));
     signal.throwIfAborted();
-    const records = [...rows.values()].map(row => ({ ...row, regions: [...row.regions].sort() }));
-    const at = now();
-    if (snapshotPath) {
-      const file = `${snapshotPath}.${randomUUID()}.tmp`;
-      try {
-        const encoded = JSON.stringify({ version: 1, at, coverageRegions, rows: records });
-        if (Buffer.byteLength(encoded) > SNAPSHOT_LIMIT) throw failure('奈飞片库超出当前缓存容量。');
-        await writeFile(file, encoded, { flag: 'wx', mode: 0o600, signal });
-        signal.throwIfAborted();
-        await rename(file, snapshotPath);
-      } finally { await rm(file, { force: true }); }
+    if (completed.size !== coverageRegions.length) {
+      const diagnostics = regionErrors.slice(0, 3).join('；');
+      throw failure(`奈飞片库已同步 ${completed.size}/${coverageRegions.length} 个地区，剩余地区将重试。${diagnostics ? ` ${diagnostics}` : ''}`, fatal?.status);
     }
-    const items = new Map(records.map(row => {
-      const item = itemOf(row, row.regions);
-      return [item.id, item];
-    }));
-    snapshot = { at, coverageRegions, items };
+    const complete = { at: now(), coverageRegions, rows: records() };
+    await save(snapshotPath, complete, signal);
+    snapshot = viewOf(complete);
+    checkpoint = undefined;
     warning = '';
+    if (checkpointPath) await rm(checkpointPath, { force: true }).catch(() => console.warn('奈飞片库旧同步缓存暂时无法清理。'));
   }
 
   function startSync() {
@@ -254,7 +313,7 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
       controller.abort(error);
       if (!shutdown.signal.aborted) {
         warning = error.status ? error.message : '奈飞片库暂时无法缓存或同步，请稍后重试。';
-        nextAttempt = now() + RETRY_AFTER;
+        nextAttempt = now() + Math.max(RETRY_AFTER, throttledUntil - Date.now());
       }
     }).finally(() => { job = undefined; progress = undefined; });
   }
@@ -264,10 +323,13 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
       shutdown.signal.throwIfAborted();
       const at = snapshot?.at;
       const expired = at === undefined || now() - at >= DAY;
+      if (!job && checkpoint && now() - checkpoint.startedAt > CHECKPOINT_AGE) checkpoint = undefined;
       if (accessToken && expired && !job && now() >= nextAttempt) startSync();
+      const current = visible(), provisional = !snapshot && !!current;
+      const syncProgress = progress || (checkpoint && { completed: checkpoint.coverageRegions.length, total: checkpoint.targetRegions.length });
       const matching = [];
       const genres = new Set(), years = new Set(), countries = new Set();
-      for (const item of snapshot?.items.values() || []) {
+      for (const item of current?.items.values() || []) {
         if (values.category === 'movie' ? item.type !== 'movie' : item.category !== values.category) continue;
         for (const genre of item.genres) genres.add(genre);
         if (values.genre && !item.genres.includes(values.genre)) continue;
@@ -285,12 +347,12 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
       return { ...values, items: structuredClone(matching.slice(start, start + PAGE_SIZE)), total: matching.length, hasMore: start + PAGE_SIZE < matching.length,
         facets: { genres: [...genres].sort((a, b) => a.localeCompare(b, 'zh-CN')), years: [...years].sort().reverse(), countries: [...countries].sort((a, b) => a.localeCompare(b, 'zh-CN')) },
         errors: accessToken ? warning ? [warning] : [] : ['请先在 NAS 配置 TMDB API Read Access Token。'], unconfigured: !accessToken,
-        unavailable: !!accessToken && !snapshot && !job, syncing: !!job, ...(progress ? { syncProgress: { ...progress } } : {}),
-        stale: !!snapshot && expired, coverageRegions: [...(snapshot?.coverageRegions || [])], updatedAt: at, attribution: ATTRIBUTION, sortLabel,
+        unavailable: !!accessToken && !current && !job, syncing: !!job, ...(syncProgress ? { syncProgress: { ...syncProgress } } : {}),
+        stale: !!snapshot && expired, provisional, coverageRegions: [...(current?.coverageRegions || [])], updatedAt: current?.at, attribution: ATTRIBUTION, sortLabel,
       };
     },
     poster(id) {
-      return details.get(id)?.item.poster || snapshot?.items.get(id)?.poster || undefined;
+      return details.get(id)?.item.poster || visible()?.items.get(id)?.poster || undefined;
     },
     async detail(id) {
       shutdown.signal.throwIfAborted();
@@ -305,7 +367,7 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
         const raw = await fetchJson(`${kind}/${externalId}`, { language: 'zh-CN' });
         const summary = raw.id === Number(externalId) && summarize(raw, kind);
         if (!summary) throw failure('此 TMDB 条目不在夸克影院展示范围。', 404);
-        const listed = snapshot?.items.get(id);
+        const listed = visible()?.items.get(id);
         const item = itemOf(summary, listed?.availabilityRegions || []);
         const episodes = episodesOf(kind, raw);
         const overview = text(raw.overview, 1600), chinese = /\p{Script=Han}/u.test(overview);

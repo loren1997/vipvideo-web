@@ -2669,8 +2669,14 @@ try {
       if (params.get('platform') !== 'netflix') return route.fallback();
       const page = Number(params.get('page')), country = params.get('country') || '';
       if (params.get('sort') === 'score') {
-        const state = syncState === 'unconfigured' ? { unconfigured: true } : syncState === 'syncing' ? { syncing: true, syncProgress: { completed: 1, total: 3 } }
-          : { ...coverage, items: batchFilms.slice(0, 5), stale: true, errors: ['后台更新暂时失败'] };
+        const state = syncState === 'unconfigured' ? { unconfigured: true }
+          : syncState === 'syncing' ? { syncing: true, syncProgress: { completed: 0, total: 3 } }
+            : syncState === 'partial' ? { ...coverage, coverageRegions: ['JP'], provisional: true, syncing: true, syncProgress: { completed: 1, total: 3 },
+              items: batchFilms.slice((page - 1) * 30, page * 30), hasMore: page < 3 }
+              : syncState === 'backoff' ? { ...coverage, coverageRegions: ['GB', 'JP'], provisional: true, syncProgress: { completed: 2, total: 3 },
+                items: batchFilms.slice(0, 30), errors: ['同步暂缓，稍后可继续'] }
+                : syncState === 'unavailable' ? { unavailable: true, errors: ['检查同步进度失败'] }
+                  : { ...coverage, items: batchFilms.slice(0, 5), syncing: true, stale: true, errors: ['后台更新暂时失败'] };
         return route.fulfill({ json: { items: [], hasMore: false, facets: fixtureFacets, ...state } });
       }
       if (params.get('sort') === 'release') {
@@ -2748,12 +2754,30 @@ try {
     await firstPoster.waitFor();
     await cloudSort.selectOption('score');
     await cloud.getByRole('heading', { name: '正在同步奈飞片库' }).waitFor();
-    assert.ok(await p.getByText(/同步进度 1\/3 个地区/).isVisible());
+    assert.ok(await p.getByText(/同步进度 0\/3 个地区/).isVisible());
+    const checkProgress = p.getByRole('button', { name: '检查同步进度', exact: true });
+    syncState = 'partial';
+    await checkProgress.click();
+    await more.waitFor();
+    assert.equal(await titles.count(), 30, '首次同步汇总部分地区后即可浏览');
+    assert.ok(await p.getByText(/首次同步尚未完成.*已覆盖 1 个国家和地区.*同步进度 1\/3 个地区/).isVisible());
+    await more.click();
+    await until(() => titles.count().then(count => count === 60), '首次同步未完成也能按30部继续浏览');
+    syncState = 'backoff';
+    await checkProgress.click();
+    await p.getByText('同步暂缓，稍后可继续', { exact: true }).waitFor();
+    assert.ok(await p.getByText(/首次同步尚未完成.*已覆盖 2 个国家和地区.*同步进度 2\/3 个地区/).isVisible());
+    assert.equal(await titles.count(), 30, '上游暂缓时保留已汇总的影片');
+    assert.ok(await checkProgress.isEnabled());
+    syncState = 'unavailable';
+    await checkProgress.click();
+    await p.locator('.filter-note[role="status"]').filter({ hasText: '检查同步进度失败' }).waitFor();
+    assert.equal(await titles.count(), 30, '检查同步状态失败时保留已展示的影片');
     syncState = 'stale';
-    await cloud.getByRole('button', { name: '检查同步进度', exact: true }).click();
-    await firstPoster.waitFor();
+    await checkProgress.click();
+    await p.getByText(/显示上次成功同步的片单/).waitFor();
     assert.equal(await titles.count(), 5);
-    assert.ok(await p.getByText(/显示上次成功同步的片单/).isVisible());
+    assert.equal(await p.getByText(/首次同步尚未完成/).count(), 0);
     await p.route('**/api/quark/library/detail?*', route => new URL(route.request().url()).searchParams.get('id') === batchFilms[0].id ? route.fulfill({ json: batchFilms[0] }) : route.fallback());
     await p.route('**/api/ratings?*', route => new URL(route.request().url()).searchParams.get('id') === batchFilms[0].id ? route.fulfill({ json: { tmdb: batchFilms[0].tmdb } }) : route.fallback());
     await firstPoster.click();

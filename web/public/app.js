@@ -594,46 +594,56 @@ async function renderQuarkLibrary(params, stamp) {
   const filterBar = catalogFilterRow(filters, true, next => goto('quark', { category, ...next }));
   page.append(filterBar.row);
   const sortNote = node('p', undefined, 'filter-note muted'); page.append(sortNote);
-  const coverage = node('p', undefined, 'filter-note muted');
-  if (netflix) { coverage.setAttribute('role', 'status'); page.append(coverage); }
+  const coverage = node('span'), syncWarning = node('p', undefined, 'filter-note muted');
+  const checkSync = button('检查同步进度', () => void load(true), 'button subtle small');
+  checkSync.hidden = syncWarning.hidden = true;
+  if (netflix) {
+    coverage.setAttribute('role', 'status'); syncWarning.setAttribute('role', 'status');
+    const coverageRow = node('p', undefined, 'filter-note muted');
+    coverageRow.append(coverage, ' ', checkSync); page.append(coverageRow, syncWarning);
+  }
   const listing = node('div'); listing.id = 'quark-library-results'; page.append(listing);
   const more = button('加载更多影片', () => void load(), 'button subtle load-more'); more.hidden = true; page.append(more); content.replaceChildren(page);
   const batchSize = 30;
   let items = [], nextPage = 1, displayLimit = batchSize, hasNextPage = true, loadError = '', loading = false;
-  let updatedAt, status;
+  let snapshot, status;
   const pageWarnings = new Map();
   const valid = () => stamp === routeVersion && content.contains(page);
   async function load(restart = false) {
-    if (loading || !valid()) return; loading = true; more.disabled = true;
-    if (restart) { items = []; nextPage = 1; displayLimit = batchSize; hasNextPage = true; pageWarnings.clear(); }
+    if (loading || !valid()) return; loading = true; more.disabled = checkSync.disabled = true;
     const progress = node('p', '正在加载夸克影院…', 'loading'); progress.setAttribute('role', 'status');
     if (!items.length) listing.replaceChildren(progress);
     more.textContent = '正在加载影片…';
     try {
-      while (hasNextPage && (items.length < displayLimit || loadError)) {
-        const data = await api(`/api/quark/library?${new URLSearchParams({ category, ...filters, page: nextPage })}`);
+      while (restart || hasNextPage && (items.length < displayLimit || loadError)) {
+        const pageNumber = restart ? 1 : nextPage;
+        const data = await api(`/api/quark/library?${new URLSearchParams({ category, ...filters, page: pageNumber })}`);
         if (!valid()) return;
-        status = data;
-        if (netflix && nextPage > 1 && updatedAt && data.updatedAt && data.updatedAt !== updatedAt) {
-          items = []; nextPage = 1; displayLimit = batchSize; pageWarnings.clear();
+        const errors = (data.errors || []).map(error => typeof error === 'string' ? error : error.error || error.message || '目录暂时不可用');
+        if (data.unavailable) throw new Error(errors.join('；') || '目录暂时不可用');
+        const version = data.updatedAt ? `${data.updatedAt}:${Boolean(data.provisional)}` : '';
+        if (netflix && pageNumber > 1 && snapshot && version && version !== snapshot) {
+          items = []; nextPage = 1; pageWarnings.clear();
+          if (!status?.provisional && !data.provisional) displayLimit = batchSize;
           continue;
         }
-        if (data.updatedAt) updatedAt = data.updatedAt;
-        filterBar.update(data.facets, netflix ? 1 : nextPage);
+        if (restart) { items = []; displayLimit = batchSize; pageWarnings.clear(); restart = false; }
+        status = data;
+        if (version) snapshot = version;
+        filterBar.update(data.facets, netflix ? 1 : pageNumber);
         sortNote.textContent = netflix ? (data.sortLabel || '') : `${data.sortLabel || (filters.sort === 'score' ? '已上映片目，豆瓣高分优先' : filters.sort === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先')}；排序针对当前已加载片目。`;
         items = [...new Map([...items, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
-        pageWarnings.set(nextPage, (data.errors || []).map(error => typeof error === 'string' ? error : error.error || error.message || '目录暂时不可用'));
-        if (data.unavailable) throw new Error(pageWarnings.get(nextPage).join('；') || '目录暂时不可用');
+        pageWarnings.set(pageNumber, errors);
         loadError = '';
-        hasNextPage = data.hasMore && (netflix || nextPage < 25);
-        nextPage++;
+        hasNextPage = data.hasMore && (netflix || pageNumber < 25);
+        nextPage = pageNumber + 1;
         if (hasNextPage && items.length < displayLimit) {
           const found = Math.max(0, items.length - (displayLimit - batchSize));
           progress.textContent = more.textContent = `正在查找影片… 已找到 ${found}/${batchSize} 部`;
         }
       }
     } catch (error) { if (!valid()) return; loadError = error.message || '目录暂时不可用'; }
-    finally { loading = false; if (valid()) more.disabled = false; }
+    finally { loading = false; if (valid()) more.disabled = checkSync.disabled = false; }
     if (!valid()) return;
     const displayed = items.slice(0, displayLimit);
     const hasMore = hasNextPage || items.length > displayed.length;
@@ -641,13 +651,18 @@ async function renderQuarkLibrary(params, stamp) {
     if (netflix) {
       const regions = status?.coverageRegions?.length;
       const progress = status?.syncProgress;
-      coverage.textContent = ['数据来源 TMDB / JustWatch', regions && `覆盖 ${regions} 个国家和地区`,
-        status?.updatedAt && `同步于 ${new Date(status.updatedAt).toLocaleString('zh-CN')}`,
-        status?.syncing && (progress?.total ? `同步进度 ${progress.completed}/${progress.total} 个地区` : status.updatedAt && '正在更新片单'),
-        status?.stale && !status.syncing && '显示上次成功同步的片单'].filter(Boolean).join(' · ');
-      if (!displayed.length && (status?.unconfigured || status?.syncing && !status.updatedAt)) {
+      coverage.textContent = ['数据来源 TMDB / JustWatch', status?.provisional && '首次同步尚未完成，显示已汇总的片目',
+        regions && `${status.provisional ? '已覆盖' : '覆盖'} ${regions} 个国家和地区`,
+        status?.updatedAt && `${status.provisional ? '进度更新于' : '同步于'} ${new Date(status.updatedAt).toLocaleString('zh-CN')}`,
+        (status?.syncing || status?.provisional) && (progress?.total ? `同步进度 ${progress.completed}/${progress.total} 个地区` : status.updatedAt && '正在更新片单'),
+        status?.stale && !status.provisional && '显示上次成功同步的片单'].filter(Boolean).join(' · ');
+      checkSync.hidden = !(status?.syncing || status?.provisional || status?.stale);
+      syncWarning.textContent = [...new Set([...warnings, displayed.length && loadError].filter(Boolean))].join('；');
+      syncWarning.hidden = !syncWarning.textContent;
+      if (!displayed.length && !loadError && (status?.unconfigured || status?.provisional || status?.syncing && !status.updatedAt)) {
         listing.replaceChildren(status.unconfigured ? empty('奈飞片库尚未配置', '请在 NAS 上配置 TMDB API 读访问令牌，重启服务后重新打开片库。')
-          : empty('正在同步奈飞片库', '首次同步需要汇总各地区片目。完成后即可浏览。', button('检查同步进度', () => void load(true))));
+          : status.provisional ? empty('已汇总的片库暂无匹配影片', '可在同步进度更新后继续查找。')
+            : empty('正在同步奈飞片库', '同步完成部分地区后即可浏览相应影片。'));
         more.hidden = true;
         return;
       }
@@ -659,7 +674,7 @@ async function renderQuarkLibrary(params, stamp) {
     }
     listing.replaceChildren(displayed.length ? grid(displayed, { priorityCount: 6 }) : emptyCatalogPage(filters, hasMore, warnings.length,
       warnings.length && button('重新加载', () => void load(true))));
-    if (warnings.length) listing.append(node('p', warnings.join('；'), 'muted'));
+    if (!netflix && warnings.length) listing.append(node('p', warnings.join('；'), 'muted'));
     if (loadError) notify(loadError, true);
     else if (displayed.length) displayLimit += batchSize;
     more.hidden = !hasMore; more.textContent = loadError ? '重试加载更多' : '加载更多影片';
