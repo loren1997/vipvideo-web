@@ -2617,6 +2617,76 @@ try {
     } finally { await isolated?.value.close(); app.store.setConfig(before); Object.assign(quarkSettings, savedQuark); channels.splice(channels.indexOf(tvChannel), 1); }
   }
 
+  async function verifyCatalogFilterStates(p) {
+    const home = p.locator('#browse-results'), progress = home.locator('.resource-progress');
+    let showMatch = false, complete = false, resumeComplete = false;
+    const resumeRequests = [], remaining = [{ source: 'second', name: '第二源' }];
+    await p.route('**/api/browse?*', route => {
+      const params = new URL(route.request().url()).searchParams;
+      if (params.get('category') !== 'tv' || params.get('platform') !== 'netflix') return route.fallback();
+      if (params.get('resume') || resumeRequests.length) {
+        resumeRequests.push([params.get('page'), params.get('resume')]);
+        return route.fulfill({ json: { category: 'tv', page: 1, groups: resumeComplete ? [facetNew] : [], complete: resumeComplete,
+          pendingSources: resumeComplete ? [] : remaining, deferredSources: [], failedSources: [], hasMore: false, facets: fixtureFacets } });
+      }
+      return route.fulfill({ json: { category: 'tv', page: 1, groups: showMatch ? [facetEarly] : [], complete,
+        pendingSources: complete ? [] : remaining, deferredSources: complete ? remaining : [], failedSources: [], hasMore: false, facets: fixtureFacets } });
+    });
+    await p.locator('nav a[href="#home"]').click();
+    await home.waitFor();
+    await p.getByRole('button', { name: '电视剧', exact: true }).click();
+    await p.getByRole('button', { name: '电视剧', exact: true, pressed: true }).waitFor();
+    await p.getByLabel('影片平台', { exact: true }).selectOption('netflix');
+    await progress.waitFor();
+    assert.doesNotMatch(await home.innerText(), /已显示|没有符合条件的影片/, '等待剩余源时不宣称已有结果或全无匹配');
+    assert.equal(await home.locator('.empty-state').count(), 0);
+    showMatch = true;
+    await home.getByRole('button', { name: '播放 喜剧春日样例', exact: true }).waitFor();
+    assert.ok(await progress.isVisible(), '部分影视源返回后即可显示匹配卡片');
+    complete = true;
+    await progress.waitFor({ state: 'hidden' });
+    await p.getByRole('button', { name: '继续检查剩余影视源', exact: true }).click();
+    await until(() => resumeRequests.length !== 0, '在当前页继续检查');
+    assert.ok(await home.getByRole('button', { name: '播放 喜剧春日样例', exact: true }).isVisible(), '续查时保留已有结果');
+    resumeComplete = true;
+    await home.getByRole('button', { name: '播放 喜剧新片样例', exact: true }).waitFor();
+    assert.ok(await home.getByRole('button', { name: '播放 喜剧春日样例', exact: true }).isVisible());
+    assert.deepEqual(resumeRequests[0], ['1', '1']);
+    assert.ok(resumeRequests.slice(1).every(([page, resume]) => page === '1' && resume === null), '只有首个请求提交续查，其后轮询同一页');
+
+    const cloud = p.locator('#quark-library-results'), more = p.getByRole('button', { name: '加载更多影片', exact: true });
+    const pages = [];
+    await p.route('**/api/quark/library?*', route => {
+      const params = new URL(route.request().url()).searchParams;
+      if (params.get('platform') !== 'netflix') return route.fallback();
+      const page = Number(params.get('page')), country = params.get('country') || '';
+      pages.push([country, page]);
+      const matchPage = country === '日本' ? 0 : country === '美国' ? 2 : 3;
+      const hasMore = page < matchPage;
+      const unverified = country === '日本' && pages.filter(([name]) => name === '日本').length === 1;
+      return route.fulfill({ json: { items: page === matchPage ? [{ ...cloudMovie, netflix: true }] : [],
+        hasMore, facets: fixtureFacets, errors: unverified ? ['部分片目暂未核实国家或平台信息'] : [] } });
+    });
+    await p.locator('nav a[href="#quark"]').click();
+    await p.getByLabel('夸克影片平台').selectOption('netflix');
+    await until(() => pages.length >= 2 && more.isEnabled(), '第1页无命中时自动查第2页，完成后可手动翻页');
+    await cloud.getByRole('heading', { name: '本页暂无匹配影片' }).waitFor();
+    assert.deepEqual(pages, [['', 1], ['', 2]], '连续两页空后停止自动翻页');
+    await more.click();
+    await cloud.getByRole('button', { name: '查看 夸克电影样例', exact: true }).waitFor();
+    assert.deepEqual(pages, [['', 1], ['', 2], ['', 3]], '手动继续查询第3页并保留奈飞筛选');
+    await p.getByLabel('夸克制片国家/地区').selectOption('美国');
+    await until(() => pages.at(-1)[0] === '美国' && pages.at(-1)[1] === 2, '新组合筛选自动查到第2页');
+    await cloud.getByRole('button', { name: '查看 夸克电影样例', exact: true }).waitFor();
+    assert.deepEqual(pages.slice(3), [['美国', 1], ['美国', 2]], '第2页已有匹配后直接渲染');
+    await p.getByLabel('夸克制片国家/地区').selectOption('日本');
+    await cloud.getByRole('heading', { name: '暂未找到可确认的影片' }).waitFor();
+    await cloud.getByRole('button', { name: '重新加载' }).click();
+    await cloud.getByRole('heading', { name: /没有符合条件的影片/ }).waitFor();
+    assert.ok(await more.isHidden(), '确认无更多候选时结束分页');
+    assert.deepEqual(pages.slice(5), [['日本', 1], ['日本', 1]], '元信息未核实时重试同一页');
+  }
+
   async function verifyCatalogFilters() {
     const wasEnabled = facetScenario; facetScenario = true;
     try {
@@ -2664,6 +2734,7 @@ try {
         assert.ok(await tvPlatform.evaluate(el => el === document.activeElement), '遥控右键从国家到平台');
         await tv.keyboard.press('ArrowDown');
         await until(() => tvPlatform.evaluate(el => el.value === 'netflix' && el === document.activeElement), '遥控切换Netflix后焦点留在平台');
+        await verifyCatalogFilterStates(p);
       });
     } finally { facetScenario = wasEnabled; }
     console.log('PASS 首页和夸克影院真实年份、国家/地区和Netflix组合筛选、换源分页与刷新');
@@ -2760,6 +2831,8 @@ try {
   assert.equal(await page.getByLabel('浏览影视源', { exact: true }).locator('option[value="third"]').count(), 0, '尚无成功API结果的源不显示');
   assert.equal(await page.getByLabel('浏览影视源', { exact: true }).locator('option[value="fourth"]').count(), 0);
   await page.evaluate(() => { location.hash = '#home?category=movie&source=third'; });
+  await page.getByRole('heading', { name: '本页暂无匹配影片', exact: true }).waitFor();
+  await page.getByRole('button', { name: '加载更多', exact: true }).click();
   await page.getByRole('heading', { name: '这个分类暂时没有影片', exact: true }).waitFor();
   await page.evaluate(() => { location.hash = '#home?category=movie&source=fourth'; });
   await page.getByRole('heading', { name: '分类内容暂时不可用', exact: true }).waitFor();

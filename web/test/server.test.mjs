@@ -413,6 +413,8 @@ test('progressive browsing/search forward their flag and private API responses s
   assert.equal((await browse.json()).complete, false);
   await call('/api/search?q=sample&progressive=1', undefined, cookie);
   assert.equal(received[0].progressive, true); assert.deepEqual(received[1], { q: 'sample', progressive: true });
+  assert.equal((await call('/api/browse?progressive=1&resume=1', undefined, cookie)).status, 200);
+  assert.equal(received[2].resume, true);
 });
 
 test('pending browse/search responses are rejected when their configured sources change', async t => {

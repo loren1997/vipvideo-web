@@ -154,15 +154,27 @@ function metadata(video, source, categoryHint) {
     ...(category ? { category } : {}), ...(Object.keys(douban).length ? { douban } : {}), lines };
 }
 
+function catalogItems(result, category, source = result.source) {
+  if (result.items) return result.items;
+  result.items = [];
+  for (const video of result.videos || []) {
+    const item = metadata(video, source, category);
+    if (item) {
+      const { lines, ...summary } = item;
+      result.items.push(summary);
+    }
+  }
+  delete result.videos;
+  return result.items;
+}
+
 function aggregate(results, category) {
   const groups = new Map();
   const failedSources = [];
   for (const result of results) {
     if (result.error) failedSources.push({ source: result.source.id, name: result.source.name, error: result.error.message });
-    for (const video of result.videos || []) {
-      const item = metadata(video, result.source, category);
-      if (!item) continue;
-      const { lines, source, id, ...fields } = item;
+    for (const item of catalogItems(result, category)) {
+      const { source, id, ...fields } = item;
       if (!groups.has(item.key)) groups.set(item.key, { ...fields, items: [] });
       const group = groups.get(item.key);
       if (item.category === 'adult') group.category = 'adult';
@@ -178,11 +190,15 @@ function aggregate(results, category) {
   return { groups: [...groups.values()], failedSources };
 }
 
-async function fromSources(sources, load, completed) {
+function browseSnapshot(entry, category) {
+  return entry.snapshot ??= aggregate(entry.results.filter(Boolean), category);
+}
+
+async function fromSources(sources, load, completed, signal) {
   const results = new Array(sources.length);
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(3, sources.length) }, async () => {
-    while (next < sources.length) {
+    while (next < sources.length && !signal?.aborted) {
       const index = next++;
       const source = sources[index];
       try { results[index] = { source, ...await load(source) }; }
@@ -193,22 +209,39 @@ async function fromSources(sources, load, completed) {
   return results;
 }
 
+function untilAborted(promise, signal) {
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
 export function createCatalog({ request = networkRequest } = {}) {
   const typeCache = new Map();
   const browseCache = new Map();
   const searchCache = new Map();
   const detailCache = new Map();
   let configSignature, typeSignature;
+  const browseAttempts = new Map();
+  let recentBrowseSuccess;
   let active = 0;
   const waiting = [];
   const urgent = [];
-  function limited(operation, priority = false) {
+  function limited(operation, priority = false, signal) {
     return new Promise((resolve, reject) => {
+      signal?.throwIfAborted();
+      const queue = priority ? urgent : waiting;
+      const cancel = () => { queue.splice(queue.indexOf(run), 1); reject(signal.reason); };
       const run = () => {
+        signal?.removeEventListener('abort', cancel);
         active++;
         operation().then(resolve, reject).finally(() => { active--; (urgent.shift() || waiting.shift())?.(); });
       };
-      if (active < 3) run(); else (priority ? urgent : waiting).push(run);
+      if (active < 3) run();
+      else { queue.push(run); signal?.addEventListener('abort', cancel, { once: true }); }
     });
   }
   async function cached(cache, key, ttl, load) {
@@ -225,10 +258,10 @@ export function createCatalog({ request = networkRequest } = {}) {
     const sources = JSON.stringify(config.sources.map(source => [source.id, source.api, source.name, source.enabled]));
     const value = JSON.stringify([config.showAdult === true, sources]);
     if (sources !== typeSignature) { typeCache.clear(); typeSignature = sources; }
-    if (value !== configSignature) { browseCache.clear(); searchCache.clear(); configSignature = value; }
+    if (value !== configSignature) { browseCache.clear(); searchCache.clear(); browseAttempts.clear(); recentBrowseSuccess = undefined; configSignature = value; }
     return value;
   }
-  async function batch(cache, key, ttl, sources, load, format, progressive) {
+  async function batch(cache, key, ttl, sources, load, format, progressive, resume = false) {
     let entry = cache.get(key);
     if (!entry || (entry.done && entry.expires <= Date.now())) {
       if (cache.size >= 128) {
@@ -236,38 +269,71 @@ export function createCatalog({ request = networkRequest } = {}) {
         if (!oldest) throw failure('正在加载的请求过多，请稍后重试', 503);
         cache.delete(oldest[0]);
       }
-      let first;
-      entry = { results: new Array(sources.length), done: false, firstReady: new Promise(resolve => { first = resolve; }) };
+      entry = { results: new Array(sources.length), done: false };
       cache.set(key, entry);
-      entry.promise = fromSources(sources, load, (result, index) => { entry.results[index] = result; first(); }).then(results => {
-        entry.results = results; entry.done = true;
-        entry.expires = Date.now() + (results.some(result => result.error) ? 15000 : ttl);
-      });
+    }
+    if (!entry.promise || (resume && entry.done && entry.results.some(result => result.deferred))) {
+      const isBrowse = cache === browseCache;
+      const indices = sources.map((_, i) => i).filter(i => !entry.results[i] || entry.results[i].deferred);
+      const controller = isBrowse ? new AbortController() : null;
+      const signal = controller?.signal;
+      let timer;
+      if (isBrowse) {
+        entry.attempts ??= Array(sources.length).fill(0);
+        indices.sort((a, b) => entry.attempts[a] - entry.attempts[b] || (browseAttempts.get(sources[a].id) || 0) - (browseAttempts.get(sources[b].id) || 0));
+        const recent = indices.findIndex(i => sources[i].id === recentBrowseSuccess);
+        if (!resume && recent > 0) indices.unshift(...indices.splice(recent, 1));
+        timer = setTimeout(() => controller.abort(Object.assign(new Error('本轮片库查询时间已到'), { code: 'BROWSE_DEFERRED' })), 16000);
+      }
+      let first;
+      entry.done = false;
+      entry.firstReady = new Promise(resolve => { first = resolve; });
+      entry.promise = fromSources(indices, async i => {
+        const source = sources[i];
+        if (isBrowse) { entry.attempts[i]++; browseAttempts.set(source.id, Date.now()); }
+        return load(source, signal, entry.results[i]?.partialPages);
+      }, (result, position) => {
+        const i = indices[position];
+        result.source = sources[i];
+        if (result.error?.code === 'BROWSE_DEFERRED') result = entry.results[i] || { source: sources[i], deferred: true };
+        else if (result.error && entry.results[i]?.partialPages && !result.items) result = { ...entry.results[i], error: result.error };
+        if (isBrowse && !result.error && result.items?.length) recentBrowseSuccess = sources[i].id;
+        entry.results[i] = result;
+        entry.snapshot = undefined;
+        first();
+      }, signal).then(() => {
+        for (const i of indices) entry.results[i] ??= { source: sources[i], deferred: true };
+        entry.done = true;
+        const retryFailed = entry.results.some(result => result.error) && !entry.results.some(result => result.deferred);
+        entry.expires = Date.now() + (retryFailed ? 15000 : ttl);
+      }).finally(() => clearTimeout(timer));
     }
     if (progressive && !entry.done) {
       let timer;
       try { await Promise.race([entry.promise, entry.firstReady, new Promise(resolve => { timer = setTimeout(resolve, 150); })]); }
       finally { clearTimeout(timer); }
     } else await entry.promise;
-    const result = format(entry.results.filter(Boolean));
+    const result = format(entry.results.filter(Boolean), entry);
+    if (cache === browseCache) result.deferredSources = entry.results.filter(row => row?.deferred).map(row => ({ source: row.source.id, name: row.source.name }));
     if (progressive) {
       result.complete = entry.done;
-      result.pendingSources = sources.filter((_, index) => !entry.results[index]).map(source => ({ source: source.id, name: source.name }));
-    } else if (result.failedSources.length && cache.get(key) === entry) cache.delete(key);
+      result.pendingSources = entry.done ? [] : sources.filter((_, index) => !entry.results[index] || entry.results[index].deferred).map(source => ({ source: source.id, name: source.name }));
+    } else if (result.failedSources.length && !result.deferredSources?.length && cache.get(key) === entry) cache.delete(key);
     return structuredClone(result);
   }
-  async function query(source, parameters, priority = false) {
+  async function query(source, parameters, priority = false, signal) {
     const url = validateUrl(source.api);
     for (const key of ['wd', 'ids', 't', 'pg', 'ac', 'year', 'class', 'sort_direction']) url.searchParams.delete(key);
     url.searchParams.set('ac', 'videolist');
     for (const [key, value] of Object.entries(parameters)) url.searchParams.set(key, value);
     return limited(async () => {
       let response;
-      let timer;
-      let timedOut = false;
+      const controller = new AbortController();
+      const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+      const timer = setTimeout(() => controller.abort(failure('影视源请求超时')), 8000);
       const operation = (async () => {
-        response = await request(url, { timeout: 8000, headers: { accept: 'application/json' } });
-        if (timedOut) { response.destroy(); throw failure('影视源请求超时'); }
+        response = await request(url, { timeout: 8000, headers: { accept: 'application/json' }, signal: requestSignal });
+        if (requestSignal.aborted) { response.destroy(); throw requestSignal.reason; }
         if (response.statusCode < 200 || response.statusCode >= 300) {
           response.destroy();
           throw failure(`影视源返回 HTTP ${response.statusCode}`);
@@ -279,13 +345,12 @@ export function createCatalog({ request = networkRequest } = {}) {
         return body;
       })();
       try {
-        return await Promise.race([operation, new Promise((_, reject) => {
-          timer = setTimeout(() => { timedOut = true; response?.destroy(); reject(failure('影视源请求超时')); }, 8000);
-        })]);
+        return await untilAborted(operation, requestSignal);
       } catch (cause) {
+        if (requestSignal.aborted) { response?.destroy(); throw requestSignal.reason; }
         throw cause.status ? cause : failure('影视源请求失败', 502, cause);
       } finally { clearTimeout(timer); }
-    }, priority);
+    }, priority, signal);
   }
   function videos(body) {
     if (!Array.isArray(body.list)) throw failure('影视源返回的数据格式不兼容');
@@ -300,21 +365,32 @@ export function createCatalog({ request = networkRequest } = {}) {
     if (body.total != null && body.limit != null && Number.isInteger(total) && total >= 0 && Number.isInteger(limit) && limit > 0) return page * limit < total;
     return body.list.length > 0;
   }
-  async function sourceTypes(source, priority = false) {
-    return cached(typeCache, JSON.stringify([source.id, source.api]), 180000, async () => {
-      const body = await query(source, { ac: 'list' }, priority);
-      return classifyTypes(Array.isArray(body.class) ? body.class : []);
-    });
+  async function sourceTypes(source, priority = false, signal) {
+    const key = JSON.stringify([source.id, source.api]);
+    for (;;) {
+      signal?.throwIfAborted();
+      try {
+        return await untilAborted(cached(typeCache, key, 180000, async () => {
+          const body = await query(source, { ac: 'list' }, priority, signal);
+          return classifyTypes(Array.isArray(body.class) ? body.class : []);
+        }), signal);
+      } catch (error) {
+        // Another browse batch may own the shared in-flight classification and reach its deadline.
+        if (error.code !== 'BROWSE_DEFERRED' || signal?.aborted) throw error;
+      }
+    }
   }
   async function classifiedVideos(source, body, priority = false) {
     const list = videos(body);
     const types = Array.isArray(body.class) ? classifyTypes(body.class) : list.some(video => video?.type_id != null) ? await sourceTypes(source, priority) : undefined;
     return types ? list.map(video => types.categories.get(String(video?.type_id)) === 'adult' ? { ...video, _catalogAdult: true } : video) : list;
   }
-  async function sourceBrowse(source, category, page, { genre, year }) {
-    const types = await sourceTypes(source);
+  async function sourceBrowse(source, category, page, { genre, year }, signal, partialPages = new Map()) {
+    const types = await sourceTypes(source, false, signal);
     const readPage = async type => {
-      const body = await query(source, { pg: page, ...(type ? { t: type.id } : {}), ...(year ? { year } : {}) });
+      const saved = partialPages.get(type?.id);
+      if (saved) return saved;
+      const body = await query(source, { pg: page, ...(type ? { t: type.id } : {}), ...(year ? { year } : {}) }, false, signal);
       const list = videos(body);
       let recognized = false;
       const filtered = list.filter(video => {
@@ -327,8 +403,11 @@ export function createCatalog({ request = networkRequest } = {}) {
           vod_class: [video.vod_class, typeName].filter(Boolean).join(',') };
       });
       if (list.length && !recognized) throw failure('影视源未提供可识别的影片分类');
-      return { videos: filtered.filter(video => (!year || String(video.vod_year || '').trim() === year) && (!genre || genres(video).includes(genre))),
+      const result = { videos: filtered.filter(video => (!year || String(video.vod_year || '').trim() === year) && (!genre || genres(video).includes(genre))),
         categoryCount: filtered.length, hasMore: hasMore(body, page) };
+      catalogItems(result, category, source);
+      partialPages.set(type?.id, result);
+      return result;
     };
     const { root, leaves, matching } = selectTypes(types, category);
     // 子分类 ID 由每个源自己提供，不能把喜剧等类别固定成某个数字。
@@ -341,17 +420,29 @@ export function createCatalog({ request = networkRequest } = {}) {
       if (!matching.length && types.categories.size && category !== 'adult') return { videos: [], hasMore: false };
       return readPage();
     }
-    const result = { videos: [], hasMore: false };
+    const result = { items: [], hasMore: false };
     const errors = [];
-    const pages = await Promise.all((genreTypes.length ? genreTypes : leaves).map(async leaf => {
-      try { return await readPage(leaf); } catch (error) { return { error }; }
-    }));
-    for (const pageResult of pages) {
-      if (pageResult.error) { errors.push(pageResult.error.message); continue; }
-      result.videos.push(...pageResult.videos);
-      result.hasMore ||= pageResult.hasMore;
+    const children = genreTypes.length ? genreTypes : leaves;
+    const remaining = children.filter(child => !partialPages.get(child.id));
+    // Finish unvisited subcategories before retrying those interrupted in an earlier round.
+    remaining.sort((a, b) => Number(partialPages.has(a.id)) - Number(partialPages.has(b.id)));
+    await fromSources(remaining, child => {
+      partialPages.set(child.id, null);
+      return readPage(child);
+    }, row => {
+      if (row.error && row.error.code !== 'BROWSE_DEFERRED') partialPages.set(row.source.id, { error: row.error.message });
+    }, signal);
+    for (const child of children) {
+      const pageResult = partialPages.get(child.id);
+      if (!pageResult) result.deferred = true;
+      else if (pageResult.error) errors.push(pageResult.error);
+      else {
+        result.items.push(...pageResult.items);
+        result.hasMore ||= pageResult.hasMore;
+      }
     }
     if (errors.length) result.error = failure(errors.join('；'));
+    if (result.deferred) result.partialPages = partialPages;
     return result;
   }
 
@@ -366,7 +457,7 @@ export function createCatalog({ request = networkRequest } = {}) {
         results => aggregate(results), progressive);
     },
 
-    async browse(config, { category = 'movie', page = 1, source: sourceId, progressive = false, genre = '', year = '', country = '', platform = '', sort = 'updated' } = {}) {
+    async browse(config, { category = 'movie', page = 1, source: sourceId, progressive = false, resume = false, genre = '', year = '', country = '', platform = '', sort = 'updated' } = {}) {
       if (typeof category !== 'string' || !Object.hasOwn(ROOT_NAMES, category)) throw failure('分类必须为 movie、tv、anime、variety 或 adult', 400);
       if (category === 'adult' && config.showAdult !== true) throw failure('三级内容已隐藏，请先在设置中开启显示', 403);
       if (!((typeof page === 'number' && Number.isInteger(page)) || (typeof page === 'string' && /^[1-9]\d{0,2}$/.test(page))) || Number(page) < 1 || Number(page) > 100) throw failure('页码必须为 1 到 100 的整数', 400);
@@ -382,14 +473,14 @@ export function createCatalog({ request = networkRequest } = {}) {
       const filters = { genre, year, country, platform, sort };
       const scope = JSON.stringify([signature(config), category, sourceId, genre]);
       const key = JSON.stringify([scope, page, year]);
-      return batch(browseCache, key, 180000, sources, source => sourceBrowse(source, category, page, filters), results => {
-        const result = aggregate(results, category);
-        const entry = browseCache.get(key);
-        const observed = result.groups.map(({ year, countries, netflix }) => ({ year, countries, netflix }));
+      return batch(browseCache, key, 180000, sources, (source, signal, partialPages) => sourceBrowse(source, category, page, filters, signal, partialPages), (results, entry) => {
+        const snapshot = browseSnapshot(entry, category);
         const facets = { genres: Object.keys(GENRES), years: new Set(), countries: new Set() };
         const matches = item => (!year || item.year === year) && (!country || item.countries.includes(country)) && (!platform || item.netflix);
-        result.groups = result.groups.filter(matches);
-        const cachedResults = [];
+        const result = { ...snapshot, groups: snapshot.groups.filter(matches) };
+        const includeKnown = page === 1 && (country || platform || year);
+        const seen = new Set(result.groups.map(group => group.key));
+        const known = [];
         const collect = rows => {
           for (const item of rows) {
             if (platform && !item.netflix) continue;
@@ -397,29 +488,32 @@ export function createCatalog({ request = networkRequest } = {}) {
             if (!year || year === item.year) for (const name of item.countries) facets.countries.add(name);
           }
         };
-        collect(observed);
+        collect(snapshot.groups);
         // Keep options from loaded pages and other year selections for the lifetime of their source responses.
-        if (entry) {
-          entry.facetScope = scope;
-          entry.facetRows = observed;
-          for (const other of browseCache.values()) {
-            if (other === entry || other.facetScope !== scope || other.done && other.expires <= Date.now()) continue;
-            collect(other.facetRows);
-            if (page === 1 && !result.groups.length && !cachedResults.length && (country || platform || year) && other.facetRows.some(matches)) {
-              cachedResults.push(...other.results.filter(Boolean));
-            }
+        entry.facetScope = scope;
+        for (const other of browseCache.values()) {
+          if (other === entry || other.facetScope !== scope || other.done && other.expires <= Date.now()) continue;
+          const rows = browseSnapshot(other, category).groups;
+          collect(rows);
+          if (!includeKnown || known.length >= 100) continue;
+          for (const row of rows) {
+            if (seen.has(row.key) || !matches(row)) continue;
+            seen.add(row.key);
+            known.push(row);
+            if (known.length === 100) break;
           }
         }
         // The client merges these known matches by film key without skipping subsequent source pages.
-        if (cachedResults.length) result.cachedMatches = aggregate(cachedResults, category).groups.filter(matches);
+        if (known.length) result.cachedMatches = known;
         // 采集 API 按资源更新时间分页；上映顺序只适用于已加载的影片。
-        if (sort !== 'updated') (result.cachedMatches || result.groups).sort((a, b) => {
+        if (sort !== 'updated') {
           const value = item => sort === 'release' ? item.releaseDate : /^\d{4}$/.test(item.year) ? item.year : '';
-          return value(b).localeCompare(value(a)) || a.title.localeCompare(b.title, 'zh-CN');
-        });
+          const compare = (a, b) => value(b).localeCompare(value(a)) || a.title.localeCompare(b.title, 'zh-CN');
+          result.groups.sort(compare); known.sort(compare);
+        }
         return { category, page, ...result, filters, facets: { genres: facets.genres, years: [...facets.years].sort().reverse(), countries: [...facets.countries].sort((a, b) => a.localeCompare(b, 'zh-CN')) },
           sortScope: 'loaded', hasMore: results.some(result => result.hasMore === true) };
-      }, progressive);
+      }, progressive, resume);
     },
 
     async detail(config, sourceId, id) {

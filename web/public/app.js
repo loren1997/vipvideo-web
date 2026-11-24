@@ -88,11 +88,11 @@ function resourceSnapshot(path) {
   return saved && Date.now() - saved.at < 30000 ? saved.data : null;
 }
 
-function resourceRequest(path, force = false) {
+function resourceRequest(path, force = false, resume = false) {
   const key = resourceKey(path), saved = resourceSnapshot(path);
   if (!force && saved && saved.complete !== false) return Promise.resolve(saved);
   if (resourceRequests.has(key)) return resourceRequests.get(key);
-  const request = api(path).then(data => {
+  const request = api(resume ? `${path}&resume=1` : path).then(data => {
     resourceSnapshots.set(key, { at: Date.now(), data });
     if (resourceSnapshots.size > 24) resourceSnapshots.delete(resourceSnapshots.keys().next().value);
     return data;
@@ -100,10 +100,10 @@ function resourceRequest(path, force = false) {
   resourceRequests.set(key, request); return request;
 }
 
-async function progressiveResults(path, valid, draw, force = false) {
+async function progressiveResults(path, valid, draw, force = false, resume = false) {
   let data;
   do {
-    try { data = await resourceRequest(path, force); }
+    try { data = await resourceRequest(path, force, resume); }
     catch (error) {
       if (error.status === 409 && valid()) {
         const latest = await api('/api/config');
@@ -113,6 +113,7 @@ async function progressiveResults(path, valid, draw, force = false) {
       throw error;
     }
     if (!valid()) return null;
+    resume = false;
     draw(data); content.setAttribute('aria-busy', 'false');
     if (data.complete !== false) break;
     await new Promise(resolve => setTimeout(resolve, 1000));
@@ -123,7 +124,7 @@ async function progressiveResults(path, valid, draw, force = false) {
 
 function pendingSources(data) {
   const pending = data.pendingSources || [];
-  return data.complete === false ? `已显示先返回的影片，${pending.length ? `${pending.length} 个影视源` : '其他影视源'}仍在加载…` : '';
+  return `${pending.length ? `${pending.length} 个影视源` : '其他影视源'}仍在加载…`;
 }
 
 function ensureHls() {
@@ -398,6 +399,14 @@ function failuresList(sources, label = '影视源') {
   return failures;
 }
 
+function emptyCatalogPage(filters, hasMore, hasErrors, retry) {
+  if (hasMore) return empty('本页暂无匹配影片', '可加载下一页继续查找。');
+  if (hasErrors) return empty('暂未找到可确认的影片', '部分片目信息尚未取得，可以稍后重试。', retry);
+  const filtered = filters.genre || filters.year || filters.country || filters.platform;
+  return filtered ? empty('没有符合条件的影片', '可调整年份、国家或平台。')
+    : empty('这个分类暂时没有影片', '试试其他分类或稍后重新加载。', retry);
+}
+
 const browseGenres = ['喜剧', '惊悚', '恐怖', '动作', '爱情', '科幻', '悬疑', '犯罪', '战争', '剧情', '动画', '冒险', '奇幻', '家庭', '历史', '纪录', '武侠', '古装', '音乐', '运动', '青春'];
 
 function browseParams(category, source = '', filters = {}) {
@@ -529,31 +538,37 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
   let nextPage = 1;
   const sourcesAtEntry = resourceVersion, hashAtEntry = location.hash;
   const valid = () => stamp === routeVersion && hashAtEntry === location.hash && sourcesAtEntry === resourceVersion;
-  async function loadPage(force = false) {
+  async function loadPage(force = false, pageNumber = nextPage, resume = false) {
+    if (more.disabled) return;
     more.disabled = true;
-    if (nextPage === 1 && !groups.length) listing.replaceChildren(node('div', `正在加载${categories[category]}…`, 'loading'));
+    if (pageNumber === 1 && !groups.length) listing.replaceChildren(node('div', `正在加载${categories[category]}…`, 'loading'));
     else more.textContent = '正在加载…';
     try {
-      const path = `/api/browse?${new URLSearchParams({ ...browseParams(category, selectedSource, filters), page: nextPage, progressive: '1' })}`;
+      const path = `/api/browse?${new URLSearchParams({ ...browseParams(category, selectedSource, filters), page: pageNumber, progressive: '1' })}`;
       const draw = result => {
-      updateSourceChoices(); filterBar.update(result.facets, nextPage);
+      updateSourceChoices(); filterBar.update(result.facets, pageNumber);
       const rows = [...(result.groups || []), ...(result.cachedMatches || [])];
       const incoming = rows.filter(group => category === 'adult' ? group.category === 'adult' : group.category !== 'adult').map(group => ({ ...group, items: group.items.filter(item => category === 'adult' ? item.category === 'adult' : item.category !== 'adult') }));
       groups = sortBrowseGroups(mergeGroups(groups, incoming.filter(group => group.items.length)), filters.sort); browseGroups = mergeGroups(browseGroups, groups);
       listing.replaceChildren(); const failures = failuresList(result.failedSources); if (failures) listing.append(failures);
       if (result.complete === false) listing.append(node('p', pendingSources(result), 'resource-progress muted'));
-      listing.append(groups.length ? grid(groupCards(groups), { priorityCount: 6, releaseDates: filters.sort === 'release' }) : result.complete === false ? node('p', '正在等待影视源返回影片…', 'muted') : empty('这个分类暂时没有影片', '试试切换影视源或稍后重新加载。', button('重新加载', () => void loadPage(true))));
+      if (groups.length) listing.append(grid(groupCards(groups), { priorityCount: 6, releaseDates: filters.sort === 'release' }));
+      else if (result.complete !== false && !result.deferredSources?.length) listing.append(emptyCatalogPage(filters, result.hasMore, result.failedSources?.length, button('重新加载', () => void loadPage(true, pageNumber))));
+      if (result.complete !== false && result.deferredSources?.length) {
+        listing.append(node('p', `本轮还有 ${result.deferredSources.length} 个影视源待检查。`, 'muted'),
+          button('继续检查剩余影视源', () => void loadPage(true, pageNumber, true), 'button subtle'));
+      }
       more.hidden = !result.hasMore; more.textContent = '加载更多';
       };
       const cached = resourceSnapshot(path); if (cached && !force) draw(cached);
-      const result = await progressiveResults(path, valid, draw, force);
+      const result = await progressiveResults(path, valid, draw, force, resume);
       if (!valid() || !result) return;
-      nextPage++;
+      nextPage = pageNumber + 1;
     } catch (error) {
       if (!valid()) return;
       if (error.adultHidden) { leaveAdultScreen(); return; }
       if (selectedSource) { sourceSuccess.delete(selectedSource); updateSourceChoices(); }
-      if (nextPage === 1 && !groups.length) listing.replaceChildren(empty('分类内容暂时不可用', error.message, button('重新加载', () => void loadPage(true))));
+      if (pageNumber === 1 && !groups.length) listing.replaceChildren(empty('分类内容暂时不可用', error.message, button('重新加载', () => void loadPage(true, pageNumber, resume))));
       else { more.textContent = '重试加载更多'; notify(error.message, true); }
     } finally { more.disabled = false; }
   }
@@ -575,19 +590,38 @@ async function renderQuarkLibrary(params, stamp) {
   const listing = node('div'); listing.id = 'quark-library-results'; page.append(listing);
   const more = button('加载更多影片', () => void load(), 'button subtle load-more'); more.hidden = true; page.append(more); content.replaceChildren(page);
   let items = [], nextPage = 1, loading = false;
+  const pageWarnings = new Map();
   const valid = () => stamp === routeVersion && content.contains(page);
-  async function load() {
+  async function readPage(pageNumber) {
+    const data = await api(`/api/quark/library?${new URLSearchParams({ category, ...filters, page: pageNumber })}`);
+    if (!valid()) return null;
+    filterBar.update(data.facets, pageNumber);
+    sortNote.textContent = `${data.sortLabel || (filters.sort === 'score' ? '已上映片目，豆瓣高分优先' : filters.sort === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先')}；排序针对当前已加载片目。`;
+    items = [...new Map([...items, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
+    pageWarnings.set(pageNumber, (data.errors || []).map(error => typeof error === 'string' ? error : error.error || error.message || '目录暂时不可用'));
+    nextPage = pageNumber + 1;
+    return data;
+  }
+  async function load(pageNumber = nextPage) {
     if (loading || !valid()) return; loading = true; more.disabled = true;
+    if (pageNumber === 1) pageWarnings.clear();
     if (!items.length) listing.replaceChildren(node('p', '正在加载夸克影院…', 'loading'));
     try {
-      const data = await api(`/api/quark/library?${new URLSearchParams({ category, ...filters, page: nextPage })}`); if (!valid()) return;
-      filterBar.update(data.facets, nextPage);
-      sortNote.textContent = `${data.sortLabel || (filters.sort === 'score' ? '已上映片目，豆瓣高分优先' : filters.sort === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先')}；排序针对当前已加载片目。`;
-      items = [...new Map([...items, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
-      listing.replaceChildren(items.length ? grid(items, { priorityCount: 6 }) : empty('这个分类暂时没有影片', '试试其他类型、年份或稍后重试。'));
-      if (data.errors?.length) listing.append(node('p', data.errors.map(error => typeof error === 'string' ? error : error.error || error.message || '目录暂时不可用').join('；'), 'muted'));
-      more.hidden = !data.hasMore; more.textContent = '加载更多影片'; nextPage++;
-    } catch (error) { if (valid()) { if (!items.length) listing.replaceChildren(empty('夸克影院暂时不可用', error.message, button('重新加载', () => void load()))); else { more.textContent = '重试加载更多'; notify(error.message, true); } } }
+      let data = await readPage(pageNumber);
+      if (!data) return;
+      if (pageNumber === 1 && !items.length && data.hasMore && (filters.genre || filters.year || filters.country || filters.platform)) {
+        listing.replaceChildren(node('p', '首批片目暂无匹配，正在检查下一页…', 'loading'));
+        pageNumber = nextPage;
+        data = await readPage(pageNumber);
+        if (!data) return;
+      }
+      const warnings = [...new Set(items.length ? pageWarnings.get(pageNumber) : [...pageWarnings.values()].flat())];
+      const hasMore = data.hasMore && pageNumber < 25;
+      listing.replaceChildren(items.length ? grid(items, { priorityCount: 6 }) : emptyCatalogPage(filters, hasMore, warnings.length,
+        warnings.length && button('重新加载', () => void load(1))));
+      if (warnings.length) listing.append(node('p', warnings.join('；'), 'muted'));
+      more.hidden = !hasMore; more.textContent = '加载更多影片';
+    } catch (error) { if (valid()) { if (!items.length) listing.replaceChildren(empty('夸克影院暂时不可用', error.message, button('重新加载', () => void load(pageNumber)))); else { more.textContent = '重试加载更多'; notify(error.message, true); } } }
     finally { loading = false; if (valid()) more.disabled = false; }
   }
   await load();

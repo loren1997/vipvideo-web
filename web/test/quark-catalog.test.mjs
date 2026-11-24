@@ -102,6 +102,7 @@ test('Netflix filter verifies provider metadata or an official title URL even wh
     film({ id: '4', countries: ['英国'], vendors: [{ title: 'Netflix' }] })];
   const { catalog, calls } = fixture(url => {
     if (url.pathname.endsWith('/recommend')) return response({ items: rows, total: 4 }, 200, url.href);
+    if (url.pathname.endsWith('/tags')) return response({ tags: [] }, 200, url.href);
     const id = url.pathname.split('/').at(-1);
     return response({ ...rows.find(i => i.id === id), website: id === '3' ? 'https://www.netflix.com/title/80123456' : 'https://www.netflix.com.evil.test/title/80123456' }, 200, url.href);
   });
@@ -110,7 +111,52 @@ test('Netflix filter verifies provider metadata or an official title URL even wh
   assert.equal(calls[0].url.searchParams.get('tags'), '美国,Netflix');
   assert.deepEqual(new Set(filtered.items.map(i => i.id)), new Set(['1', '3']));
   assert.ok(filtered.items.every(i => i.netflix && i.countries.includes('美国')));
-  assert.equal(calls.length, 3);
+  assert.equal(calls.filter(call => call.url.pathname.endsWith('/tags')).length, 2);
+  assert.equal(calls.length, 5);
+});
+
+test('Netflix uses tags of the exact movie or TV subject and retains its release and region checks', async t => {
+  for (const kind of ['movie', 'tv']) {
+    const rows = [
+      film({ id: '11', type: kind, countries: ['韩国'], tags: [{ name: '校园 爱情' }] }),
+      film({ id: '12', type: kind, countries: ['韩国'], title: 'Netflix故事', alg_json: '{"tags_mk":"Netflix"}' }),
+      film({ id: '13', type: kind, countries: ['韩国'], is_released: undefined, rating: { count: 0 } }),
+      film({ id: '14', type: kind, countries: ['法国'] }),
+    ];
+    const { catalog, calls } = fixture(url => {
+      if (url.pathname.endsWith('/recommend')) return response({ items: rows, total: rows.length }, 200, url.href);
+      const [, id, tags] = url.pathname.match(new RegExp('/'+kind+'/(\\d+)(/tags)?$')) || [];
+      if (!id) return response('', 404);
+      if (tags) return response({ tags: id === '12' ? ['电影', 'Netflix幕后花絮'] : ['剧情', 'Netflix'] }, 200, url.href);
+      return response({ ...rows.find(item => item.id === id), ...(id === '13' ? { is_released: false } : {}) }, 200, url.href);
+    });
+    t.after(() => catalog.stop());
+    if (kind === 'movie') await catalog.detail('11'); // Previously cached details can omit provider tags.
+    const selected = await catalog.browse({ category: kind, country: '韩国', platform: 'netflix' });
+    assert.deepEqual(selected.items.map(row => [row.id, row.netflix]), [['11', true]]);
+    assert.deepEqual(calls.filter(call => call.url.pathname.endsWith('/tags')).map(call => call.url.pathname.split('/').at(-2)).sort(), ['11','12','13']);
+    await catalog.browse({ category: kind, platform: 'netflix' });
+    assert.equal(calls.filter(call => call.url.pathname.endsWith('/11/tags')).length, 1);
+  }
+});
+
+test('an upgrade keeps regular catalog pages and rechecks old empty Netflix pages against subject tags', async t => {
+  const { catalog, store } = fixture();
+  t.after(() => catalog.stop());
+  await catalog.browse();
+  const saved = JSON.parse(store.values.get(CACHE_KEY));
+  const [oldKey, entry] = saved.pages[0];
+  saved.version = 5;
+  saved.pages.push([JSON.stringify({ ...JSON.parse(oldKey), platform: 'netflix' }), { ...entry, items: [] }]);
+  store.setMeta(CACHE_KEY, JSON.stringify(saved));
+  const restored = fixture(url => response(url.pathname.endsWith('/tags') ? { tags: ['Netflix'] } :
+    { items: [film({ is_released: undefined, rating: { count: 0 } })], total: 1 }, 200, url.href), { store });
+  t.after(() => restored.catalog.stop());
+  assert.equal((await restored.catalog.browse()).items.length, 1);
+  assert.equal(restored.calls.length, 0);
+  const updated = await restored.catalog.browse({ platform: 'netflix' });
+  assert.deepEqual(updated.items.map(item => item.id), ['123456']);
+  assert.deepEqual(restored.calls.map(call => call.url.pathname), ['/rexxar/api/v2/movie/recommend', '/rexxar/api/v2/movie/123456/tags']);
 });
 
 test('popular released candidates sort by year or real score without pretending popularity is premiere order', async t => {
@@ -394,7 +440,7 @@ test('old cached aliases refresh from the same official subject while poster IDs
   assert.equal(refreshed.id, item.id);
   assert.deepEqual(refreshed.aliases.slice(0, 2), ['Resident Evil', '生化危机9']);
   assert.equal(fresh.catalog.poster('37068446'), item.poster);
-  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 5);
+  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 6);
   for (const key of ['quark-settings-v1', 'history-marker', 'favorites-marker']) assert.equal(old.store.values.get(key), key + '-preserved');
 });
 

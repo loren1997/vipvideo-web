@@ -198,6 +198,130 @@ test('progressive request returns its loading state after 150ms even when all so
   release(); await catalog.search(config, '搜索');
 });
 
+test('browse stops at its shared deadline and resumes skipped sources without refetching finished sources', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000 });
+  const sources = Array.from({length: 10}, (_, i) => ({id: String(i), name: String(i), api: 'https://s'+i+'.example/api'}));
+  const calls = [], active = new Set();
+  let peak = 0, fast = false;
+  const catalog = createCatalog({request: async (url, {signal}) => {
+    calls.push(url.hostname);
+    if (!fast && url.hostname !== 's0.example') await new Promise((resolve, reject) => {
+      active.add(signal); peak = Math.max(peak, active.size);
+      const finish = () => { active.delete(signal); signal.removeEventListener('abort', cancel); };
+      const timer = setTimeout(() => { finish(); resolve(); }, 6000);
+      const cancel = () => { clearTimeout(timer); finish(); reject(signal.reason); };
+      signal.addEventListener('abort', cancel, {once:true});
+    });
+    if (url.searchParams.get('ac') === 'list') return response([], {class:[{type_id:1, type_name:'连续剧'}]});
+    return response([video(1, url.hostname, '2025', {type_id:1})], {pagecount:1});
+  }});
+  const browse = (options={}) => catalog.browse({sources},{category:'tv', progressive:true, ...options});
+  const first = await browse();
+  assert.equal(first.complete,false);
+  assert.deepEqual(first.groups.map(g=>g.title),['s0.example']);
+  for (const interval of [6000,6000,4000]) {
+    t.mock.timers.tick(interval);
+    await new Promise(resolve=>setImmediate(resolve));
+  }
+  const partial = await browse();
+  assert.equal(partial.complete,true); assert.equal(active.size,0); assert.equal(peak,3);
+  assert.deepEqual(partial.failedSources,[]); assert.deepEqual(partial.pendingSources,[]);
+  assert.equal(partial.groups.length,4);
+  assert.deepEqual(partial.deferredSources.map(s=>s.source), ['4','5','6','7','8','9']);
+  const count = calls.length;
+  assert.equal((await browse()).complete,true); assert.equal(calls.length,count);
+  fast = true;
+  await browse({resume:true});
+  const done = await catalog.browse({sources},{category:'tv'});
+  assert.equal(done.groups.length,sources.length); assert.deepEqual(done.deferredSources,[]);
+  assert(!calls.slice(count).some(host=>/^s[0-3]\./.test(host)));
+  assert.match(calls[count],/^s[7-9]\./,'never-attempted sources get the next slots on resume');
+});
+
+test('country, year and Netflix combine matching cached pages with current results while a slow source is pending', async () => {
+  let release;
+  const slow = new Promise(resolve=>{release=resolve;});
+  const catalog = createCatalog({request: async url=>{
+    if (url.searchParams.get('ac')==='list') return response([], {class:[{type_id:1,type_name:'电影'}]});
+    const page = url.searchParams.get('pg');
+    if (url.searchParams.has('year') && url.hostname==='b.example') await slow;
+    return response([video(page, '第'+page+'页', '2024', {type_id:1, vod_area:'日本',vod_tag:'Netflix Original'})],{pagecount:3});
+  }});
+  await catalog.browse(config,{page:2}); await catalog.browse(config,{page:3});
+  const options={year:'2024',country:'日本',platform:'netflix'};
+  const partial = await catalog.browse(config,{...options,progressive:true});
+  assert.equal(partial.complete,false);
+  assert.deepEqual(partial.groups.map(g=>g.title),['第1页']);
+  assert.deepEqual(partial.cachedMatches.map(g=>g.title),['第2页','第3页']);
+  release(); await catalog.browse(config, options);
+});
+
+test('resuming a partial source keeps completed subcategories and cancels queued subcategory reads', async t => {
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:1000});
+  const sources = ['a','b','c'].map(id=>({id,name:id,api:'https://'+id+'.example/api'}));
+  const classes = Array.from({length:10},(_,i)=>({type_id:i+1,type_name:'国产剧'}));
+  let fast = false;
+  const completed = [], afterDeadline = [];
+  const parsed = [];
+  const split = String.prototype.split;
+  t.mock.method(String.prototype, 'split', function (separator, ...args) {
+    if (separator === '$$$' && this.startsWith('正片$https://leaf.example/')) parsed.push(String(this));
+    return split.call(this, separator, ...args);
+  });
+  const catalog = createCatalog({request: async (url,{signal})=>{
+    if (url.searchParams.get('ac')==='list') return response([], {class:classes});
+    const id = url.searchParams.get('t');
+    const title = url.hostname + '/' + id;
+    if (fast) afterDeadline.push(title);
+    else await new Promise((resolve,reject)=>{
+      const timer = setTimeout(resolve,6000);
+      signal.addEventListener('abort',()=>{clearTimeout(timer);reject(signal.reason);},{once:true});
+    });
+    completed.push(title);
+    return response([video(id,title,'2024',{type_id:id, vod_play_url:'正片$https://leaf.example/'+title, vod_content:'long-description'.repeat(1000)})],{pagecount:1});
+  }});
+  const first = catalog.browse({sources},{category:'tv'});
+  await new Promise(resolve=>setImmediate(resolve));
+  for (const interval of [6000,6000,4000]) {
+    t.mock.timers.tick(interval); await new Promise(resolve=>setImmediate(resolve));
+  }
+  const partial = await first;
+  const known = [...completed];
+  assert.equal(partial.groups.length,6); assert.deepEqual(partial.failedSources,[]); assert.equal(partial.deferredSources.length,3);
+  assert.equal(parsed.length,6);
+  fast = true;
+  const done = await catalog.browse({sources},{category:'tv',resume:true});
+  assert.equal(done.groups.length,30); assert.deepEqual(done.deferredSources,[]);
+  assert.equal(afterDeadline.length,24); assert(!afterDeadline.some(title=>known.includes(title)));
+  assert.equal(parsed.length,30,'successful leaves reuse compact catalog items without parsing playback addresses again');
+  assert(!JSON.stringify(done).includes('long-description')); assert(!JSON.stringify(done).includes('https://leaf.example/'));
+});
+
+test('a continued non-progressive browse reaches healthy leaves beyond failed and interrupted leaves', async t => {
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:1000});
+  const state = {sources:[config.sources[0]]};
+  const attempted = [];
+  const classes = Array.from({length:9},(_,i)=>({type_id:i+1,type_name:'国产剧'}));
+  const catalog = createCatalog({request: async (url,{signal})=>{
+    if (url.searchParams.get('ac')==='list') return response([],{class:classes});
+    const id = Number(url.searchParams.get('t')); attempted.push(id);
+    if (id<=6) await new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));
+    return response([video(id,'可读'+id,'2024',{type_id:id})],{pagecount:1});
+  }});
+  const turn = () => new Promise(resolve=>setImmediate(resolve));
+  const first = catalog.browse(state,{category:'tv'}); await turn();
+  t.mock.timers.tick(8000); await turn(); t.mock.timers.tick(8000); await turn();
+  const partial = await first;
+  assert.deepEqual(attempted,[1,2,3,4,5,6]); assert.equal(partial.failedSources.length,1); assert.equal(partial.deferredSources.length,1);
+  t.mock.timers.tick(16000);
+  const second = catalog.browse(state,{category:'tv',resume:true}); await turn();
+  assert.deepEqual(attempted.slice(6,9),[7,8,9]);
+  t.mock.timers.tick(8000); await turn();
+  const done = await second;
+  assert.deepEqual(done.groups.map(g=>g.title),['可读7','可读8','可读9']);
+  assert.equal(done.failedSources.length,1); assert.deepEqual(done.deferredSources,[]);
+});
+
 test('search deduplicates in-flight requests and short cache, then invalidates expiry and configuration', async t => {
   let now = 1000, calls = 0;
   t.mock.method(Date, 'now', () => now);
