@@ -64,6 +64,7 @@ iOSInjectionProject/
 
 # VipVideo Web local state
 .env
+.tmdb.env
 backup-*
 **/node_modules/
 web/data/

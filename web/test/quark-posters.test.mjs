@@ -27,6 +27,25 @@ test('registered poster lookup uses fixed Douban headers and returns verified by
   } finally { await service.stop(); }
 });
 
+test('namespaced Quark titles use only the registered TMDB poster CDN and never send an API credential', async t => {
+  const id = 'tmdb:movie:42', target = 'https://image.tmdb.org/t/p/w342/Poster_1.png';
+  let poster = target, reads = 0;
+  const service = createQuarkPosters({ catalog: { poster: () => poster }, request: async (address, options) => {
+    reads++;
+    assert.equal(address, target);
+    assert.equal(options.followRedirects, false);
+    assert.equal(options.headers.authorization, undefined);
+    return image();
+  } });
+  t.after(() => service.stop());
+  assert.deepEqual((await service.get(id)).body, png);
+  await assert.rejects(service.get('42'), { status: 404 });
+  for (poster of [url('42'), target + '?x=1', target.replace('image.tmdb.org', 'image.tmdb.org.example')]) {
+    await assert.rejects(service.get(id), { status: 404 });
+  }
+  assert.equal(reads, 1);
+});
+
 test('IDs and registered image hosts are constrained before any transport call', async () => {
   let calls = 0;
   const request = async () => { calls++; return image(); };

@@ -1,13 +1,16 @@
 import { createHash } from 'node:crypto';
 import { request as networkRequest, validateUrl } from './network.mjs';
+import { isNetflixId } from './netflix-catalog.mjs';
+import { validQuarkTitleId } from './quark-catalog.mjs';
 
 const HOSTS = new Set(['img1.doubanio.com', 'img2.doubanio.com', 'img3.doubanio.com', 'img5.doubanio.com', 'img9.doubanio.com']);
 const MAX_IMAGE = 2 * 1024 * 1024, MAX_CACHE = 16 * 1024 * 1024, CACHE_TTL = 6 * 60 * 60 * 1000;
 const failure = (message, status = 502) => Object.assign(new Error(message), { status });
-function posterUrl(value) {
+function posterUrl(value, id) {
   let url;
   try { url = validateUrl(value); } catch { throw failure('海报地址不可读取', 404); }
-  if (url.protocol !== 'https:' || url.port || !HOSTS.has(url.hostname) || url.href.length > 2048) throw failure('海报地址不可读取', 404);
+  const allowed = isNetflixId(id) ? url.hostname === 'image.tmdb.org' && /^\/t\/p\/w342\/[a-z0-9_-]+\.(?:jpg|jpeg|png|webp)$/i.test(url.pathname) && !url.search && !url.hash : HOSTS.has(url.hostname);
+  if (url.protocol !== 'https:' || url.port || !allowed || url.href.length > 2048) throw failure('海报地址不可读取', 404);
   return url.href;
 }
 function imageType(body) {
@@ -20,7 +23,7 @@ function imageType(body) {
 }
 
 export function createQuarkPosters({ catalog, request = networkRequest, now = Date.now, timeout = 8000 } = {}) {
-  if (!catalog || typeof catalog !== 'object') throw new Error('海报代理需要已登记的豆瓣目录');
+  if (!catalog || typeof catalog !== 'object') throw new Error('海报代理需要已登记的影片目录');
   const cache = new Map(), flights = new Map(), waiting = [];
   let bytes = 0, active = 0, stopped = false;
   function discard(key) { const entry = cache.get(key); if (entry) { bytes -= entry.result.body.length; cache.delete(key); } }
@@ -45,9 +48,10 @@ export function createQuarkPosters({ catalog, request = networkRequest, now = Da
       signal.throwIfAborted();
       response = await request(url, { followRedirects: false, timeout: Math.max(1, deadline - now()), signal,
         headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          referer: 'https://movie.douban.com/', accept: 'image/webp,image/png,image/jpeg;q=0.9,image/*;q=0.8', 'accept-encoding': 'identity' } });
+         ...(new URL(url).hostname === 'image.tmdb.org' ? {} : { referer: 'https://movie.douban.com/' }),
+         accept: 'image/webp,image/png,image/jpeg;q=0.9,image/*;q=0.8', 'accept-encoding': 'identity' } });
       signal.throwIfAborted();
-      if (response.statusCode !== 200) throw failure('豆瓣海报暂不可读取', response.statusCode === 404 ? 404 : 502);
+      if (response.statusCode !== 200) throw failure('海报暂不可读取', response.statusCode === 404 ? 404 : 502);
       const type = String(response.headers?.['content-type'] || '').split(';')[0].trim().toLowerCase();
       if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'].includes(type) || !['', 'identity'].includes(String(response.headers?.['content-encoding'] || '').toLowerCase())) throw failure('海报响应不是可用图片');
       const length = response.headers?.['content-length'];
@@ -58,7 +62,7 @@ export function createQuarkPosters({ catalog, request = networkRequest, now = Da
       signal.throwIfAborted(); const body = Buffer.concat(chunks);
       if (imageType(body) !== type) throw failure('海报内容不是有效图片');
       return { body, type, etag: '"' + createHash('sha256').update(body).digest('base64url') + '"' };
-    } catch (error) { if (signal.aborted) throw signal.reason; throw error.status ? error : failure('豆瓣海报暂不可读取'); }
+    } catch (error) { if (signal.aborted) throw signal.reason; throw error.status ? error : failure('海报暂不可读取'); }
     finally { if (abort) signal.removeEventListener('abort', abort); response?.destroy(); release(); }
   }
   async function consume(job, signal) {
@@ -84,7 +88,7 @@ export function createQuarkPosters({ catalog, request = networkRequest, now = Da
       if (String(detail?.id) !== id) throw failure('此影片暂无已登记海报', 404);
       const registered = typeof catalog.poster === 'function' ? catalog.poster(id) : undefined;
       if (!registered) throw failure('此影片暂无已登记海报', 404);
-      return posterUrl(registered);
+      return posterUrl(registered, id);
     } finally { if (abort) signal.removeEventListener('abort', abort); }
   }
   function remembered(url) {
@@ -97,12 +101,12 @@ export function createQuarkPosters({ catalog, request = networkRequest, now = Da
       if (stopped) throw failure('海报服务已停止', 503);
       signal?.throwIfAborted();
       const id = String(value ?? '');
-      if (!/^[1-9]\d{0,15}$/.test(id) || !Number.isSafeInteger(Number(id))) throw failure('豆瓣条目标识无效', 400);
+      if (!validQuarkTitleId(id)) throw failure('影片标识无效', 400);
       const restoring = flights.get(`id:${id}`);
       if (restoring) return consume(restoring, signal);
       const registered = typeof catalog.poster === 'function' ? catalog.poster(id) : undefined;
       if (!registered && typeof catalog.detail !== 'function') throw failure('此影片暂无已登记海报', 404);
-      const url = registered ? posterUrl(registered) : undefined, cached = url && remembered(url);
+      const url = registered ? posterUrl(registered, id) : undefined, cached = url && remembered(url);
       if (cached) return cached;
       const key = url || `id:${id}`;
       let job = flights.get(key);

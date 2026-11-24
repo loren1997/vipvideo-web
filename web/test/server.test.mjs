@@ -273,6 +273,38 @@ test('standalone Quark library uses trusted public metadata without a VOD source
   const unrated = await (await call('/api/ratings?source=quark-library&id=12345', undefined, cookie)).json(); assert.equal(unrated.douban, null); assert.match(unrated.errors.join(''), /暂无评分/);
 });
 
+test('TMDB Netflix titles keep their independent identity across the authenticated Quark endpoints', async t => {
+  const id = 'tmdb:tv:12345', tmdb = { id: 12345, score: 8.3, attribution: 'TMDB' };
+  const episode = { name: '第2季 第1集', season: 2, seasonYear: '2025' };
+  const title = { source: 'quark-library', id, key: `quark-library:${id}`, title: '奈飞剧集', type: 'series', category: 'tv', year: '2023',
+    tmdb, lines: [{ name: '夸克网盘', episodes: [episode] }] };
+  const netflixCatalog = {
+    async browse(options) { assert.equal(options.page, 26); return { items: [title], hasMore: true, coverageRegions: ['JP', 'US'] }; },
+    async detail(value) { assert.equal(value, id); return title; },
+  };
+  const { app, call, login } = await running(t, { initialConfig: empty, netflixCatalog, quark: {
+    async resources(detail, options) {
+      assert.equal(detail.id, id);
+      assert.deepEqual(detail.lines[options.line].episodes[options.episode], episode);
+      return { resources: [] };
+    },
+  } });
+  const params = new URLSearchParams({ source: 'quark-library', id });
+  const listingPath = '/api/quark/library?category=tv&platform=netflix&page=26';
+  assert.equal((await call(listingPath)).status, 401);
+  const cookie = await login();
+  const listing = await (await call(listingPath, undefined, cookie)).json();
+  assert.deepEqual(listing.coverageRegions, ['JP', 'US']);
+  assert.equal(listing.items[0].id, id);
+  assert.equal((await call('/api/quark/library/detail?' + new URLSearchParams({ id }), undefined, cookie)).status, 200);
+  assert.equal((await call('/api/quark/library/detail?id=tmdb:people:12345', undefined, cookie)).status, 400);
+  assert.equal((await call('/api/quark/resources?' + params, undefined, cookie)).status, 200);
+  const scores = await (await call('/api/ratings?' + params, undefined, cookie)).json();
+  assert.deepEqual(scores, { douban: null, tmdb, configured: true, errors: [] });
+  assert.equal((await call('/api/favorites', title, cookie)).status, 200);
+  assert.equal(app.store.list('favorites')[0].id, id);
+});
+
 test('registered cloud posters require login, support private caching and never accept a target URL', async t => {
   const body = Buffer.from([0xff, 0xd8, 0xff, 0xe0]), calls = [];
   let resolvePoster, started;

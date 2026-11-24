@@ -1,5 +1,6 @@
 import { request as networkRequest, readText } from './network.mjs';
-import { normalizeCountries, hasNetflixLabel, validCountryFilter } from './catalog-filters.mjs';
+import { normalizeCountries, validCountryFilter } from './catalog-filters.mjs';
+import { isNetflixId, NETFLIX_GENRES } from './netflix-catalog.mjs';
 
 const ORIGIN = 'https://m.douban.com';
 const API = `${ORIGIN}/rexxar/api/v2/`;
@@ -12,6 +13,7 @@ const ADULT = /^(?:情色|色情|成人|伦理|倫理|三级|三級|限制级|�
 const failure = (message, status = 502) => Object.assign(new Error(message), { status });
 const clone = value => JSON.parse(JSON.stringify(value));
 const idOf = value => /^[1-9]\d{0,15}$/.test(String(value ?? '')) && Number.isSafeInteger(Number(value)) ? String(value) : '';
+export const validQuarkTitleId = value => Boolean(idOf(value) || isNetflixId(value));
 const text = (value, limit = 300) => typeof value === 'string' ? value.replace(/<[^>]*>/g, '').trim().slice(0, limit) : '';
 const normalized = value => value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 const scoreOf = value => (typeof value === 'number' || typeof value === 'string' && value.trim()) && Number.isFinite(Number(value)) && Number(value) > 0 && Number(value) <= 10 ? Number(value) : null;
@@ -49,9 +51,6 @@ function metadata(raw, hint, detailed = false, now = Date.now()) {
   const year = [String(raw.year ?? ''), card[0]].find(y => /^(?:18|19|20)\d{2}$/.test(y)) || '';
   let countries = normalizeCountries(raw.countries || raw.production_countries);
   if (!countries.length && /^\d{4}$/.test(card[0])) countries = normalizeCountries(card[1]);
-  const vendors = Array.isArray(raw.vendors) ? raw.vendors.slice(0, 30) : [];
-  const netflix = hasNetflixLabel(raw.platform, raw.platforms, raw.networks, raw.tags, raw.production_companies, vendors.map(v => v?.title || v?.name || v)) ||
-    [raw.website, raw.official_site, raw.site, ...vendors.map(v => v?.url)].some(url => typeof url === 'string' && /^https?:\/\/(?:www\.)?netflix\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?(?:title|watch)\/\d+(?:[/?#]|$)/i.test(url));
   const releaseDate = dateOf([...(Array.isArray(raw.pubdate) ? raw.pubdate : [raw.pubdate]), raw.release_date]);
   const aliases = [], seen = new Set([normalized(title)]);
   for (const value of [raw.original_title, ...names].map(value => text(value))) {
@@ -73,7 +72,7 @@ function metadata(raw, hint, detailed = false, now = Date.now()) {
   const description = chineseSynopsis ? synopsis : `豆瓣暂无中文剧情简介。${year ? `${year}年` : ''}${typeName}${genres.length ? `，类型：${genres.join('、')}` : ''}。`;
   const count = [raw.episodes_count, raw.last_episode_number].find(value => Number.isSafeInteger(value) && value > 0 && value <= 1000);
   const episodes = type === 'movie' ? [{ name: '正片' }] : Array.from({ length: count || 1 }, (_, index) => ({ name: `第${index + 1}集` }));
-  return { source: 'quark-library', id, key: `quark-library:${id}`, title, year, type, category, countries, netflix,
+  return { source: 'quark-library', id, key: `quark-library:${id}`, title, year, type, category, countries,
     poster: [raw.pic?.large, raw.pic?.normal, raw.cover].map(posterOf).find(Boolean) || '', genres, releaseDate, aliases, originalTitle: text(raw.original_title),
     description, descriptionLanguage: chineseSynopsis ? 'zh' : 'unavailable', ...(synopsis && !chineseSynopsis ? { originalDescription: synopsis } : {}), typeName, releaseStatus,
     episodeCount: type === 'movie' ? 1 : count || null,
@@ -84,13 +83,13 @@ function metadata(raw, hint, detailed = false, now = Date.now()) {
 function restoreItem(item, now) {
   if (!item || item.source !== 'quark-library' || !['movie', 'tv', 'anime', 'variety'].includes(item.category)) return null;
   const normalized = metadata({ id: item.id, title: item.title, type: item.type === 'movie' ? 'movie' : item.type === 'series' ? 'tv' : '',
-    year: item.year, countries: item.countries, platform: item.netflix === true ? 'Netflix' : '', genres: item.genres, pubdate: item.releaseDate, aka: item.aliases, original_title: item.originalTitle, intro: item.originalDescription || (item.descriptionLanguage === 'unavailable' ? '' : item.description),
+    year: item.year, countries: item.countries, genres: item.genres, pubdate: item.releaseDate, aka: item.aliases, original_title: item.originalTitle, intro: item.originalDescription || (item.descriptionLanguage === 'unavailable' ? '' : item.description),
     is_released: item.releaseStatus === 'released' ? true : item.releaseStatus === 'upcoming' ? false : undefined,
     pic: { large: item.poster }, rating: { value: item.douban?.score, count: item.douban?.votes }, episodes_count: item.episodeCount }, item.category, item.douban?.attribution === '豆瓣公开条目', now);
   return normalized;
 }
 
-export function createQuarkCatalog({ store, request = networkRequest, now = Date.now } = {}) {
+export function createQuarkCatalog({ store, request = networkRequest, now = Date.now, netflix } = {}) {
   if (!store?.meta || !store?.setMeta) throw new Error('夸克影院需要 SQLite 存储');
   const pages = new Map(), subjects = new Map(), flights = new Map(), controllers = new Set(), waiting = [], failures = new Map();
   let active = 0, stopped = false;
@@ -105,7 +104,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
       }
       for (const [key, entry] of withFacets && Array.isArray(data.pages) ? data.pages.slice(-32) : []) {
         if (typeof key !== 'string' || key.length > 200 || !Number.isFinite(entry?.at) || entry.at > now() || entry.at <= now() - 7 * 24 * HOUR || !Array.isArray(entry.items)) continue;
-        if (data.version < 7 && key.includes('"platform":"netflix"')) continue;
+        if (key.includes('"platform":"netflix"')) continue;
         const items = entry.items.slice(0, 40).map(id => subjects.get(idOf(id))?.item).filter(Boolean);
         if (items.length === entry.items.length) pages.set(key, { at: entry.at, category: entry.category, items, hasMore: entry.hasMore === true,
           errors: Array.isArray(entry.errors) ? entry.errors.slice(0, 2).map(value => text(value, 200)).filter(Boolean) : [], stale: entry.stale === true });
@@ -136,7 +135,6 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
     const merged = !detailed && old?.detailed ? { ...old.item, poster: item.poster || old.item.poster, douban: item.douban.score === null ? old.item.douban : item.douban } : item;
     if (old && old.at + 6 * HOUR > now()) {
       if (!merged.countries.length) merged.countries = item.countries.length ? item.countries : old.item.countries;
-      merged.netflix ||= item.netflix || old.item.netflix;
     }
     if (!detailed && item.releaseStatus === 'unknown' && ['released', 'screened'].includes(old?.item.releaseStatus)) merged.releaseStatus = old.item.releaseStatus;
     subjects.delete(item.id);
@@ -217,9 +215,11 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
   function filters(options) {
     if (!options || typeof options !== 'object' || Array.isArray(options)) throw failure('夸克影院筛选条件无效', 400);
     const category = options.category || 'movie', genre = options.genre || '', year = String(options.year || ''), sort = options.sort || 'release', page = Number(options.page ?? 1);
-    if (!['movie', 'tv', 'anime', 'variety'].includes(category) || genre && !GENRES.includes(genre) || year && !validYear(year, now()) || !['release', 'release-score', 'score'].includes(sort) || !Number.isSafeInteger(page) || page < 1 || page > 25) throw failure('夸克影院筛选条件无效', 400);
     const { country = '', platform = '' } = options;
     if (!validCountryFilter(country) || !['', 'netflix'].includes(platform)) throw failure('夸克影院国家或平台筛选条件无效', 400);
+    const validGenre = !genre || (platform ? NETFLIX_GENRES.has(genre) : GENRES.includes(genre));
+    const maxPage = platform ? Math.floor(Number.MAX_SAFE_INTEGER / 30) : 25;
+    if (!['movie', 'tv', 'anime', 'variety'].includes(category) || !validGenre || year && !validYear(year, now()) || !['release', 'release-score', 'score'].includes(sort) || !Number.isSafeInteger(page) || page < 1 || page > maxPage) throw failure('夸克影院筛选条件无效', 400);
     return { category, genre, year, country: normalizeCountries(country)[0] || '', platform, sort, page };
   }
 
@@ -227,7 +227,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
     const resolve = item => subjects.get(item.id)?.item || item;
     const eligible = item => ['released', 'screened'].includes(item.releaseStatus) &&
       (values.category === 'movie' ? item.type === 'movie' : item.category === values.category) &&
-      (!values.genre || item.genres.includes(values.genre)) && (!values.platform || item.netflix);
+      (!values.genre || item.genres.includes(values.genre));
     const inCountry = item => !values.country || item.countries.includes(values.country);
     const inYear = item => !values.year || item.year === values.year;
     const items = entry.items.map(resolve).filter(item => eligible(item) && inYear(item) && inCountry(item));
@@ -241,15 +241,22 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
 
   return {
     poster(value) {
+      if (stopped) return undefined;
+      if (isNetflixId(value)) return netflix?.poster?.(value);
       const id = idOf(value);
-      if (stopped || !id) return undefined;
+      if (!id) return undefined;
       const item = subjects.get(id)?.item || [...pages.values()].flatMap(page => page.items).find(item => item.id === id);
       return item?.poster || undefined;
     },
 
     async browse(options = {}) {
       if (stopped) throw failure('夸克影院已停止', 503);
-      const values = filters(options), key = JSON.stringify(values), cached = pages.get(key);
+      const values = filters(options);
+      if (values.platform) {
+        const selected = netflix ? await netflix.browse(values) : { items: [], hasMore: false, unconfigured: true };
+        return { ...values, ...selected };
+      }
+      const key = JSON.stringify(values), cached = pages.get(key);
       if (cached && cached.at + (cached.errors?.length ? 60000 : HOUR) > now()) return result(cached, values);
       const recentFailure = failures.get(key);
       if (recentFailure && recentFailure.until > now()) return { ...result(cached || { items: [], hasMore: false }, values, recentFailure.errors, !!cached), unavailable: true };
@@ -259,7 +266,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
         const errors = [], rows = [], failedKinds = new Set(), unconfirmed = new Map();
         let hasMore = false, successes = 0;
         await Promise.all(kinds.map(async kind => {
-          const tags = [...new Set([values.category === 'anime' ? '动画' : values.category === 'variety' ? '综艺' : kind === 'tv' ? '电视剧' : '', values.genre, values.year, values.country, values.platform && 'Netflix'].filter(Boolean))];
+          const tags = [...new Set([values.category === 'anime' ? '动画' : values.category === 'variety' ? '综艺' : kind === 'tv' ? '电视剧' : '', values.genre, values.year, values.country].filter(Boolean))];
           const query = new URLSearchParams({ refresh: '0', start: String((values.page - 1) * PAGE_SIZE), count: String(PAGE_SIZE), uncollect: 'false', tags: tags.join(','), sort: values.sort === 'score' ? 'S' : 'U' });
           try {
             const data = await fetchJson(`${kind}/recommend?${query}`, signal);
@@ -276,58 +283,40 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
               const releaseUnknown = item.releaseStatus === 'unknown' && (!known || !['released', 'screened'].includes(known.item.releaseStatus));
               const fresh = known && known.at + 6 * HOUR > now();
               if (fresh) {
-                item.netflix ||= known.item.netflix;
                 if (!item.countries.length) item.countries = known.item.countries;
                 if (item.releaseStatus === 'unknown') item.releaseStatus = known.item.releaseStatus;
               }
               const needsCountry = values.country && !item.countries.length && !(fresh && known.detailed);
-              const needsPlatform = values.platform && !item.netflix && (!values.country || !item.countries.length || item.countries.includes(values.country));
-              if (releaseUnknown || needsCountry || needsPlatform) unconfirmed.set(item.id, { item, kind, releaseUnknown, needsCountry, needsPlatform, freshDetail: fresh && known.detailed });
+              if (releaseUnknown || needsCountry) unconfirmed.set(item.id, { item, kind, releaseUnknown, needsCountry });
               else { const registered = register(item, false); if (['released', 'screened'].includes(registered.releaseStatus)) rows.push(registered); }
             }
           } catch (error) { failedKinds.add(kind); errors.push(error.status ? error.message : '豆瓣目录暂不可读取，请稍后再试'); }
         }));
         signal.throwIfAborted();
-        const budget = Math.min(values.platform ? 6000 : 2000, 7000 - (Date.now() - started));
+        const budget = Math.min(2000, 7000 - (Date.now() - started));
         const candidates = [...unconfirmed.values()];
         let unverified = candidates.filter(row => row.releaseUnknown).length;
-        let pendingFilters = candidates.filter(row => row.needsCountry || row.needsPlatform).length;
+        let pendingFilters = candidates.filter(row => row.needsCountry).length;
         if (candidates.length && budget >= 250) {
           const verification = AbortSignal.any([signal, AbortSignal.timeout(budget)]);
-          async function verify({ item, kind, releaseUnknown, needsCountry, needsPlatform, freshDetail }) {
+          await Promise.all(candidates.slice(0, 4).map(async ({ item, kind, releaseUnknown, needsCountry }) => {
             try {
-              // 推荐列表和详情上的 tags 是精选标签，逐片标签接口才包含用户标注的平台。
-              let tagsRead = false;
-              if (needsPlatform) {
-                const labels = await fetchJson(`${kind}/${item.id}/tags?count=50`, verification).catch(() => null);
-                tagsRead = Array.isArray(labels?.tags);
-                item.netflix = tagsRead && hasNetflixLabel(labels.tags);
-              }
-              const detailed = releaseUnknown || needsCountry || (needsPlatform && !item.netflix && !freshDetail);
-              let checked = item;
-              if (detailed) {
-                const raw = await fetchJson(`${kind}/${item.id}`, verification);
-                if (idOf(raw.id) !== item.id || raw.type !== kind) return;
-                checked = metadata(raw, values.category, true, now());
-                if (!checked) return;
-                if (!checked.countries.length) checked.countries = item.countries;
-                checked.netflix ||= item.netflix;
-                if (checked.releaseStatus === 'unknown' && !releaseUnknown) checked.releaseStatus = item.releaseStatus;
-              }
+              const raw = await fetchJson(`${kind}/${item.id}`, verification);
+              if (idOf(raw.id) !== item.id || raw.type !== kind) return;
+              const checked = metadata(raw, values.category, true, now());
+              if (!checked) return;
+              if (!checked.countries.length) checked.countries = item.countries;
+              if (checked.releaseStatus === 'unknown' && !releaseUnknown) checked.releaseStatus = item.releaseStatus;
               if (releaseUnknown && checked.releaseStatus !== 'unknown') unverified--;
-              if ((needsCountry || needsPlatform) && (!needsCountry || checked.countries.length) && (!needsPlatform || tagsRead || checked.netflix)) pendingFilters--;
+              if (needsCountry && checked.countries.length) pendingFilters--;
               if (checked.releaseStatus === 'upcoming') register(checked, true);
-              if (['released', 'screened'].includes(checked.releaseStatus) && (!values.year || checked.year === values.year) && (!values.genre || checked.genres.includes(values.genre)) && (values.category !== 'anime' || checked.category === 'anime') && (values.category !== 'tv' || checked.category === 'tv') && (values.category !== 'variety' || checked.category === 'variety')) rows.push(register(checked, detailed));
+              if (['released', 'screened'].includes(checked.releaseStatus) && (!values.year || checked.year === values.year) && (!values.genre || checked.genres.includes(values.genre)) && (values.category !== 'anime' || checked.category === 'anime') && (values.category !== 'tv' || checked.category === 'tv') && (values.category !== 'variety' || checked.category === 'variety')) rows.push(register(checked, true));
             } catch { /* 汇总到下方可重试提示，不让单条核验失败阻塞已确认的片目。 */ }
-          }
-          const limit = values.platform ? candidates.length : Math.min(candidates.length, 4);
-          await Promise.all([0, 1].map(async start => {
-            for (let i = start; i < limit && !verification.aborted; i += 2) await verify(candidates[i]);
           }));
         }
         signal.throwIfAborted();
         if (unverified) errors.push('部分未评分片目暂未核实上映状态，已隐藏；可稍后重试或继续翻页');
-        if (pendingFilters) errors.push('部分片目暂未核实国家或平台信息，可继续翻页');
+        if (pendingFilters) errors.push('部分片目暂未核实制作国家或地区，可继续翻页');
         if (!successes) {
           failures.set(key, { until: now() + 60000, errors: [...new Set(errors)] });
           while (failures.size > 32) failures.delete(failures.keys().next().value);
@@ -354,6 +343,10 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
 
     async detail(value) {
       if (stopped) throw failure('夸克影院已停止', 503);
+      if (isNetflixId(value)) {
+        if (!netflix) throw failure('奈飞片库未配置', 503);
+        return netflix.detail(value);
+      }
       const id = idOf(value);
       if (!id) throw failure('豆瓣条目标识无效', 400);
       const cached = subjects.get(id);
@@ -387,7 +380,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
     async stop() {
       stopped = true;
       for (const controller of controllers) controller.abort(failure('夸克影院已停止', 503));
-      await Promise.allSettled([...flights.values()]);
+      await Promise.allSettled([...flights.values(), netflix?.stop?.()]);
     },
   };
 }

@@ -271,13 +271,14 @@ try {
           if (parsed.searchParams.get('sort') === 'release-score') rows = rows.sort((a, b) => Number(b.year) - Number(a.year) || b.douban.score - a.douban.score);
           if (parsed.searchParams.get('year')) rows = rows.filter(row => row.year === parsed.searchParams.get('year'));
           if (parsed.searchParams.get('country')) rows = rows.filter(row => (row === newer ? ['美国', '日本'] : ['日本']).includes(parsed.searchParams.get('country')));
-          if (parsed.searchParams.get('platform') === 'netflix') rows = rows.filter(row => row === newer);
-          return route.fulfill({ json: { items: rows, hasMore: category === 'movie' && page === 1, facets: { genres: ['剧情', '喜剧'], years: page === 1 ? ['2026', '2025'] : ['2025'], countries: page === 1 ? ['美国', '日本'] : ['日本'] }, sortLabel: parsed.searchParams.get('sort') === 'score' ? '已上映片目，豆瓣高分优先' : parsed.searchParams.get('sort') === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先', errors: [] } });
+          const netflix = parsed.searchParams.get('platform') === 'netflix';
+          if (netflix) rows = rows.filter(row => row === newer);
+          return route.fulfill({ json: { items: rows, hasMore: category === 'movie' && page === 1, facets: { genres: ['剧情', '喜剧'], years: netflix || page === 1 ? ['2026', '2025'] : ['2025'], countries: netflix || page === 1 ? ['美国', '日本'] : ['日本'] }, sortLabel: parsed.searchParams.get('sort') === 'score' ? '已上映片目，豆瓣高分优先' : parsed.searchParams.get('sort') === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先', errors: [] } });
         }
         if (parsed.pathname === '/api/quark/library/detail') return route.fulfill({ json: parsed.searchParams.get('id') === cloudMovie.id ? cloudMovie : cloudFilm });
         if (parsed.pathname === '/api/quark/library/poster') {
           assert.deepEqual([...parsed.searchParams.keys()], ['id']); const id = parsed.searchParams.get('id'); cloudPosterReads.push(id);
-          return route.fulfill({ status: [cloudFilm.id, cloudMovie.id, '7654322', '7654323', '7654324'].includes(id) ? 200 : 404, contentType: 'image/png', body: cloudPosterPng });
+          return route.fulfill({ status: [cloudFilm.id, cloudMovie.id, '7654322', '7654323', '7654324'].includes(id) || /^tmdb:movie:78000\d\d$/.test(id) ? 200 : 404, contentType: 'image/png', body: cloudPosterPng });
         }
         if (parsed.pathname === '/api/quark/settings') {
           if (body) {
@@ -2655,19 +2656,36 @@ try {
     assert.ok(resumeRequests.slice(1).every(([page, resume]) => page === '1' && resume === null), '只有首个请求提交续查，其后轮询同一页');
 
     const cloud = p.locator('#quark-library-results'), more = p.getByRole('button', { name: '加载更多影片', exact: true });
-    const pages = [], batchPages = [];
-    const batchFilms = Array.from({ length: 64 }, (_, index) => ({ ...cloudMovie, id: String(7800000 + index), title: `奈飞分页样例 ${index + 1}`, netflix: true }));
+    const pages = [], batchPages = [], extendedPages = [];
+    const coverage = { coverageRegions: ['JP', 'GB', 'US'], updatedAt: Date.UTC(2026, 10, 24), sortLabel: '按 TMDB 评分排序' };
+    const batchFilms = Array.from({ length: 64 }, (_, index) => {
+      const id = 7800000 + index, libraryId = `tmdb:movie:${id}`;
+      return { ...cloudMovie, id: libraryId, key: `quark-library:${libraryId}`, title: `奈飞分页样例 ${index + 1}`, netflix: true,
+        tmdb: { id, score: 8.2, url: `https://www.themoviedb.org/movie/${id}` } };
+    });
+    let syncState = 'unconfigured';
     await p.route('**/api/quark/library?*', route => {
       const params = new URL(route.request().url()).searchParams;
       if (params.get('platform') !== 'netflix') return route.fallback();
       const page = Number(params.get('page')), country = params.get('country') || '';
+      if (params.get('sort') === 'score') {
+        const state = syncState === 'unconfigured' ? { unconfigured: true } : syncState === 'syncing' ? { syncing: true, syncProgress: { completed: 1, total: 3 } }
+          : { ...coverage, items: batchFilms.slice(0, 5), stale: true, errors: ['后台更新暂时失败'] };
+        return route.fulfill({ json: { items: [], hasMore: false, facets: fixtureFacets, ...state } });
+      }
+      if (params.get('sort') === 'release') {
+        extendedPages.push(page);
+        if (extendedPages.includes(27)) return route.fulfill({ json: { ...coverage, updatedAt: coverage.updatedAt + 1,
+          items: page === 1 ? [batchFilms[0], batchFilms.at(-1)] : [], hasMore: false, facets: fixtureFacets } });
+        return route.fulfill({ json: { ...coverage, items: page === 26 ? batchFilms.slice(0, 30) : [], hasMore: page < 27, facets: fixtureFacets } });
+      }
       if (params.get('genre') === '喜剧') {
         batchPages.push(page);
         if (page === 3 && batchPages.filter(value => value === 3).length === 1) {
           return route.fulfill({ json: { items: [], hasMore: false, unavailable: true, facets: fixtureFacets, errors: ['模拟目录暂时不可用'] } });
         }
         const filmPages = [batchFilms.slice(0, 20), batchFilms.slice(19, 40), batchFilms.slice(40, 60), batchFilms.slice(60)];
-        return route.fulfill({ json: { items: filmPages[page - 1], hasMore: page < filmPages.length, facets: fixtureFacets, errors: [] } });
+        return route.fulfill({ json: { ...coverage, items: filmPages[page - 1], hasMore: page < filmPages.length, facets: fixtureFacets, errors: [] } });
       }
       pages.push([country, page]);
       const matchPage = country === '日本' ? 0 : country === '美国' ? 2 : 3;
@@ -2695,6 +2713,10 @@ try {
     await more.waitFor();
     const titles = cloud.locator('.card-title');
     assert.deepEqual(await titles.allTextContents(), batchFilms.slice(0, 30).map(row => row.title), '首批恰好显示30部，跨页去重并保留溢出片目');
+    const firstPoster = cloud.getByRole('button', { name: '查看 奈飞分页样例 1', exact: true });
+    assert.equal(new URL(await firstPoster.locator('img').getAttribute('src')).searchParams.get('id'), batchFilms[0].id, 'TMDB 影片海报使用同源接口并保留目录 ID');
+    assert.equal(await firstPoster.locator('.rating-badge').textContent(), 'TMDB 8.2');
+    assert.match(await p.getByRole('status').filter({ hasText: 'TMDB / JustWatch' }).textContent(), /覆盖 3 个国家和地区/);
     assert.deepEqual(batchPages, [1, 2]);
     await more.click();
     const retryMore = p.getByRole('button', { name: '重试加载更多', exact: true });
@@ -2708,6 +2730,35 @@ try {
     await cloud.getByRole('button', { name: '查看 奈飞分页样例 64', exact: true }).waitFor();
     assert.equal(await titles.count(), 64);
     assert.ok(await more.isHidden(), '最后不足30部时显示剩余影片并隐藏加载更多');
+
+    const cloudSort = p.getByLabel('夸克影片排序');
+    await cloudSort.selectOption('release');
+    await until(() => extendedPages.length === 26, '检查奈飞片库第26页');
+    await firstPoster.waitFor();
+    assert.deepEqual(extendedPages, Array.from({ length: 26 }, (_, index) => index + 1), '奈飞跨地区片库可继续至第26页');
+    await more.click();
+    await until(() => extendedPages.length === 28, '同步完成后重新读取新片单第一页');
+    await cloud.getByRole('button', { name: '查看 奈飞分页样例 64', exact: true }).waitFor();
+    assert.deepEqual(extendedPages.slice(-2), [27, 1]);
+    assert.deepEqual(await titles.allTextContents(), [batchFilms[0].title, batchFilms.at(-1).title], '重新同步完成后不拼接两个版本的片单');
+    await cloudSort.selectOption('score');
+    await cloud.getByRole('heading', { name: '奈飞片库尚未配置' }).waitFor();
+    syncState = 'syncing';
+    await cloudSort.selectOption('release');
+    await firstPoster.waitFor();
+    await cloudSort.selectOption('score');
+    await cloud.getByRole('heading', { name: '正在同步奈飞片库' }).waitFor();
+    assert.ok(await p.getByText(/同步进度 1\/3 个地区/).isVisible());
+    syncState = 'stale';
+    await cloud.getByRole('button', { name: '检查同步进度', exact: true }).click();
+    await firstPoster.waitFor();
+    assert.equal(await titles.count(), 5);
+    assert.ok(await p.getByText(/显示上次成功同步的片单/).isVisible());
+    await p.route('**/api/quark/library/detail?*', route => new URL(route.request().url()).searchParams.get('id') === batchFilms[0].id ? route.fulfill({ json: batchFilms[0] }) : route.fallback());
+    await p.route('**/api/ratings?*', route => new URL(route.request().url()).searchParams.get('id') === batchFilms[0].id ? route.fulfill({ json: { tmdb: batchFilms[0].tmdb } }) : route.fallback());
+    await firstPoster.click();
+    await p.getByRole('heading', { name: batchFilms[0].title, exact: true }).waitFor();
+    await p.getByRole('link', { name: 'TMDB 8.2', exact: true }).waitFor();
   }
 
   async function verifyCatalogFilters() {
@@ -2742,13 +2793,14 @@ try {
         await p.getByRole('button', { name: '查看 夸克下一页样例', exact: true }).waitFor();
         assert.deepEqual(await cloudYear.locator('option').evaluateAll(options => options.map(option => option.value)), ['', '2026', '2025']);
         await cloudCountry.selectOption('日本'); await p.getByLabel('夸克影片平台').selectOption('netflix');
-        await until(() => p.locator('#quark-library-results .card-title').allTextContents().then(titles => titles.join() === '夸克新片样例'), '夸克影院按合拍地区和Netflix取交集');
+        await until(() => p.locator('#quark-library-results .card-title').allTextContents().then(titles => titles.join() === '夸克新片样例'), '夸克影院进入奈飞片库');
+        assert.equal(await cloudCountry.inputValue(), '', '切换奈飞时重置制片地区筛选');
         const previousRequests = quarkRequests.length;
         await cloudYear.selectOption('2026');
         const yearRequest = () => quarkRequests.slice(previousRequests).find(r => r.path === '/api/quark/library' && r.query.year === '2026');
         await until(yearRequest, '夸克组合筛选重置页码');
         const { query } = yearRequest();
-        assert.deepEqual([query.country, query.platform, query.page], ['日本', 'netflix', '1']);
+        assert.deepEqual([query.country, query.platform, query.page], ['', 'netflix', '1']);
         await p.setViewportSize({ width: 390, height: 844 });
         assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '手机组合筛选不溢出');
         const { page: tv } = await open({ hash: '#quark', tv: true, viewport: { width: 1280, height: 720 } });

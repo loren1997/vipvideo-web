@@ -247,7 +247,7 @@ function sourceName(id) { return id === 'quark-library' ? '夸克影院' : confi
 function posterFor(item) {
   if (item.source !== 'quark-library') return httpUrl(item.poster);
   const id = String(item.id ?? '');
-  return /^[1-9]\d{0,15}$/.test(id) && Number.isSafeInteger(Number(id)) ? new URL(`/api/quark/library/poster?${new URLSearchParams({ id })}`, location.origin).href : null;
+  return /^(?:tmdb:(?:movie|tv):)?[1-9]\d{0,15}$/.test(id) && Number.isSafeInteger(Number(id.split(':').at(-1))) ? new URL(`/api/quark/library/poster?${new URLSearchParams({ id })}`, location.origin).href : null;
 }
 function fieldsOf(item) {
   return { key: item.key, title: item.title, year: item.year || '', type: item.type || 'movie', poster: item.poster || '', source: item.source || '', id: String(item.id ?? ''), ...(item.category ? { category: item.category } : {}) };
@@ -316,8 +316,10 @@ function card(item, options = {}) {
     cover.append(image);
   }
   cover.append(node('span', item.title, 'poster-fallback'));
-  if (item.douban?.id && Number.isFinite(item.douban.score) && item.douban.score >= 0 && item.douban.score <= 10) {
-    const badge = node('span', `豆瓣 ${item.douban.score.toFixed(1)}`, 'rating-badge'); badge.title = '豆瓣评分由影视源提供，可能存在更新延迟。'; cover.append(badge);
+  const rating = item.tmdb || item.douban;
+  if (rating?.id && Number.isFinite(rating.score) && rating.score >= 0 && rating.score <= 10) {
+    const badge = node('span', `${item.tmdb ? 'TMDB' : '豆瓣'} ${rating.score.toFixed(1)}`, 'rating-badge');
+    badge.title = item.tmdb ? 'TMDB 评分' : '豆瓣评分由影视源提供，可能存在更新延迟。'; cover.append(badge);
   }
   cover.append(node('span', options.resume ? `继续 · ${formatTime(item.position || 0)}` : item.remarks || `${item.year || '年份未知'} · ${item.typeName || typeLabel(item.type)}`, 'poster-tag'));
   if (item.duration > 0 && options.resume) {
@@ -418,15 +420,17 @@ function catalogFilterRow(filters, quark, onChange) {
   function field(key, label, aria) {
     const wrapper = node('label', undefined, 'browse-filter'), select = node('select');
     select.setAttribute('aria-label', (quark ? '夸克' : '') + aria);
-    select.addEventListener('change', () => onChange({ ...filters, [key]: select.value }));
+    select.addEventListener('change', () => onChange({ ...filters, [key]: select.value,
+      ...(quark && key === 'platform' && select.value === 'netflix' ? { country: '' } : {}) }));
     wrapper.append(node('span', label), select); row.append(wrapper);
     return select;
   }
   const genre = field('genre', '类型', '影片类型'), year = field('year', '上映年份', '上映年份');
-  const country = field('country', '国家/地区', '制片国家/地区'), platform = field('platform', '平台', '影片平台'), sort = field('sort', '排列', '影片排序');
-  for (const [value, label] of [['', '全部平台'], ['netflix', '奈飞（Netflix）']]) platform.add(new Option(label, value));
+  const country = field('country', quark ? '制片国家/地区' : '国家/地区', '制片国家/地区'), platform = field('platform', '平台', '影片平台'), sort = field('sort', '排列', '影片排序');
+  for (const [value, label] of [['', '全部平台'], ['netflix', quark ? '奈飞（跨地区片库）' : '奈飞（Netflix）']]) platform.add(new Option(label, value));
   platform.value = filters.platform;
-  const sorts = quark ? [['release', '热门片目 · 年份优先'], ['score', '豆瓣高分'], ['release-score', '热门片目 · 年份+评分']] : [['updated', '默认顺序'], ['release', '上映时间（已加载）'], ['year', '年份（已加载）']];
+  const netflix = quark && filters.platform === 'netflix';
+  const sorts = quark ? [['release', '热门片目 · 年份优先'], ['score', netflix ? 'TMDB 高分' : '豆瓣高分'], ['release-score', '热门片目 · 年份+评分']] : [['updated', '默认顺序'], ['release', '上映时间（已加载）'], ['year', '年份（已加载）']];
   for (const [value, label] of sorts) sort.add(new Option(label, value));
   sort.value = filters.sort;
   const pages = new Map();
@@ -447,7 +451,9 @@ function catalogFilterRow(filters, quark, onChange) {
     const values = key => [...new Set([...pages.values()].flatMap(set => set[key] || []).map(String).filter(Boolean))];
     choices(genre, facets.genres ? values('genres') : quark ? [] : browseGenres, '全部类型', filters.genre);
     choices(year, values('years').sort((a, b) => Number(b) - Number(a)), '全部年份', filters.year);
-    choices(country, values('countries').sort((a, b) => a.localeCompare(b, 'zh')), '全部国家/地区', filters.country);
+    const countries = values('countries');
+    if (netflix) country.parentElement.hidden = !countries.length && !filters.country;
+    choices(country, countries.sort((a, b) => a.localeCompare(b, 'zh')), '全部国家/地区', filters.country);
   }
   update();
   return { row, update };
@@ -580,6 +586,7 @@ async function renderQuarkLibrary(params, stamp) {
   const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺' };
   const category = Object.hasOwn(categories, params.get('category')) ? params.get('category') : 'movie';
   const filters = { genre: params.get('genre') || '', year: params.get('year') || '', country: params.get('country') || '', platform: params.get('platform') === 'netflix' ? 'netflix' : '', sort: ['release', 'score', 'release-score'].includes(params.get('sort')) ? params.get('sort') : 'release-score' };
+  const netflix = filters.platform === 'netflix';
   const page = section('夸克影院', '发现影片，自动准备当前影片或剧集，选择版本后播放');
   const tabs = node('div', undefined, 'category-tabs');
   for (const [id, title] of Object.entries(categories)) { const tab = button(title, () => goto('quark', { category: id, ...filters, genre: '' }), `button${category === id ? ' selected' : ''}`); tab.setAttribute('aria-pressed', String(category === id)); tabs.append(tab); }
@@ -587,34 +594,38 @@ async function renderQuarkLibrary(params, stamp) {
   const filterBar = catalogFilterRow(filters, true, next => goto('quark', { category, ...next }));
   page.append(filterBar.row);
   const sortNote = node('p', undefined, 'filter-note muted'); page.append(sortNote);
+  const coverage = node('p', undefined, 'filter-note muted');
+  if (netflix) { coverage.setAttribute('role', 'status'); page.append(coverage); }
   const listing = node('div'); listing.id = 'quark-library-results'; page.append(listing);
   const more = button('加载更多影片', () => void load(), 'button subtle load-more'); more.hidden = true; page.append(more); content.replaceChildren(page);
   const batchSize = 30;
   let items = [], nextPage = 1, displayLimit = batchSize, hasNextPage = true, loadError = '', loading = false;
+  let updatedAt, status;
   const pageWarnings = new Map();
   const valid = () => stamp === routeVersion && content.contains(page);
-  async function readPage(pageNumber) {
-    const data = await api(`/api/quark/library?${new URLSearchParams({ category, ...filters, page: pageNumber })}`);
-    if (!valid()) return null;
-    filterBar.update(data.facets, pageNumber);
-    sortNote.textContent = `${data.sortLabel || (filters.sort === 'score' ? '已上映片目，豆瓣高分优先' : filters.sort === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先')}；排序针对当前已加载片目。`;
-    items = [...new Map([...items, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
-    pageWarnings.set(pageNumber, (data.errors || []).map(error => typeof error === 'string' ? error : error.error || error.message || '目录暂时不可用'));
-    return data;
-  }
   async function load(restart = false) {
     if (loading || !valid()) return; loading = true; more.disabled = true;
-    if (restart) { nextPage = 1; hasNextPage = true; pageWarnings.clear(); }
+    if (restart) { items = []; nextPage = 1; displayLimit = batchSize; hasNextPage = true; pageWarnings.clear(); }
     const progress = node('p', '正在加载夸克影院…', 'loading'); progress.setAttribute('role', 'status');
     if (!items.length) listing.replaceChildren(progress);
     more.textContent = '正在加载影片…';
     try {
       while (hasNextPage && (items.length < displayLimit || loadError)) {
-        const data = await readPage(nextPage);
-        if (!data) return;
+        const data = await api(`/api/quark/library?${new URLSearchParams({ category, ...filters, page: nextPage })}`);
+        if (!valid()) return;
+        status = data;
+        if (netflix && nextPage > 1 && updatedAt && data.updatedAt && data.updatedAt !== updatedAt) {
+          items = []; nextPage = 1; displayLimit = batchSize; pageWarnings.clear();
+          continue;
+        }
+        if (data.updatedAt) updatedAt = data.updatedAt;
+        filterBar.update(data.facets, netflix ? 1 : nextPage);
+        sortNote.textContent = netflix ? (data.sortLabel || '') : `${data.sortLabel || (filters.sort === 'score' ? '已上映片目，豆瓣高分优先' : filters.sort === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先')}；排序针对当前已加载片目。`;
+        items = [...new Map([...items, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
+        pageWarnings.set(nextPage, (data.errors || []).map(error => typeof error === 'string' ? error : error.error || error.message || '目录暂时不可用'));
         if (data.unavailable) throw new Error(pageWarnings.get(nextPage).join('；') || '目录暂时不可用');
         loadError = '';
-        hasNextPage = data.hasMore && nextPage < 25;
+        hasNextPage = data.hasMore && (netflix || nextPage < 25);
         nextPage++;
         if (hasNextPage && items.length < displayLimit) {
           const found = Math.max(0, items.length - (displayLimit - batchSize));
@@ -627,8 +638,22 @@ async function renderQuarkLibrary(params, stamp) {
     const displayed = items.slice(0, displayLimit);
     const hasMore = hasNextPage || items.length > displayed.length;
     const warnings = [...new Set([...pageWarnings.values()].flat())];
+    if (netflix) {
+      const regions = status?.coverageRegions?.length;
+      const progress = status?.syncProgress;
+      coverage.textContent = ['数据来源 TMDB / JustWatch', regions && `覆盖 ${regions} 个国家和地区`,
+        status?.updatedAt && `同步于 ${new Date(status.updatedAt).toLocaleString('zh-CN')}`,
+        status?.syncing && (progress?.total ? `同步进度 ${progress.completed}/${progress.total} 个地区` : status.updatedAt && '正在更新片单'),
+        status?.stale && !status.syncing && '显示上次成功同步的片单'].filter(Boolean).join(' · ');
+      if (!displayed.length && (status?.unconfigured || status?.syncing && !status.updatedAt)) {
+        listing.replaceChildren(status.unconfigured ? empty('奈飞片库尚未配置', '请在 NAS 上配置 TMDB API 读访问令牌，重启服务后重新打开片库。')
+          : empty('正在同步奈飞片库', '首次同步需要汇总各地区片目。完成后即可浏览。', button('检查同步进度', () => void load(true))));
+        more.hidden = true;
+        return;
+      }
+    }
     if (loadError && !displayed.length) {
-      listing.replaceChildren(empty('夸克影院暂时不可用', loadError, button('重新加载', () => void load())));
+      listing.replaceChildren(empty(netflix ? '奈飞片库暂时不可用' : '夸克影院暂时不可用', loadError, button('重新加载', () => void load())));
       more.hidden = true;
       return;
     }
@@ -1141,22 +1166,24 @@ function renderDetail(data, candidates) {
 }
 
 async function renderRatings(data, host) {
-  const searchUrl = `https://search.douban.com/movie/subject_search?${new URLSearchParams({ search_text: data.title, cat: '1002' })}`;
+  const provider = data.tmdb ? 'TMDB' : '豆瓣';
+  const searchUrl = data.tmdb ? httpUrl(data.tmdb.url) : `https://search.douban.com/movie/subject_search?${new URLSearchParams({ search_text: data.title, cat: '1002' })}`;
+  const lookup = () => externalLink(data.tmdb ? '在 TMDB 查看 ↗' : '在豆瓣查找 ↗', searchUrl, 'rating-search');
   try {
     const result = await (data.ratingsPromise ||= api(`/api/ratings?${new URLSearchParams({ source: data.source, id: data.id })}`));
     if (detail !== data || !host.isConnected) return;
     host.replaceChildren();
     const scores = node('div', undefined, 'rating-scores');
-    const value = result.douban;
+    const value = data.tmdb ? result.tmdb : result.douban;
     const valid = Number.isFinite(value?.score) && value.score >= 0 && value.score <= 10;
-    const badge = valid && httpUrl(value.url) ? externalLink(`豆瓣 ${value.score.toFixed(1)}`, value.url, 'rating-score') : node('span', valid ? `豆瓣 ${value.score.toFixed(1)}` : '暂无豆瓣评分', 'rating-score');
+    const badge = valid && httpUrl(value.url) ? externalLink(`${provider} ${value.score.toFixed(1)}`, value.url, 'rating-score') : node('span', valid ? `${provider} ${value.score.toFixed(1)}` : `暂无${provider}评分`, 'rating-score');
     if (valid && Number.isFinite(value.votes) && value.votes > 0) badge.title = `${Math.floor(value.votes).toLocaleString('zh-CN')} 人评分`;
-    scores.append(badge); if (!valid) scores.append(externalLink('在豆瓣查找 ↗', searchUrl, 'rating-search'));
+    scores.append(badge); if (!valid && searchUrl) scores.append(lookup());
     host.append(scores);
-    if (valid) host.append(node('small', value.attribution || '豆瓣评分由影视源提供，可能存在更新延迟。', 'rating-attribution'));
+    if (valid) host.append(node('small', value.attribution || (data.tmdb ? '评分由 TMDB 提供' : '豆瓣评分由影视源提供，可能存在更新延迟。'), 'rating-attribution'));
     if (result.errors?.length) host.append(node('small', result.errors.map(error => typeof error === 'string' ? error : error.error || error.message || '评分来源暂时不可用').join('；'), 'muted'));
   } catch (error) {
-    if (detail === data && host.isConnected) host.replaceChildren(node('span', `暂无豆瓣评分：${error.message}`, 'muted'), externalLink('在豆瓣查找 ↗', searchUrl, 'rating-search'));
+    if (detail === data && host.isConnected) host.replaceChildren(node('span', `暂无${provider}评分：${error.message}`, 'muted'), ...(searchUrl ? [lookup()] : []));
   }
 }
 
@@ -3001,6 +3028,15 @@ function renderSettings() {
     };
     drawRows(); sections.append(panel);
   }
+  const credits = node('section', undefined, 'settings-note');
+  credits.append(node('h3', '关于数据来源'));
+  const tmdbLink = externalLink('', 'https://www.themoviedb.org', 'rating-search');
+  const logo = node('img'); logo.alt = 'TMDB'; logo.loading = 'lazy'; logo.width = 72; logo.referrerPolicy = 'no-referrer';
+  logo.src = 'https://www.themoviedb.org/assets/v4/logos/v2/blue_short-8e7b30f73a4020692ccca9c88bafe5dcb6f8a62a4c6bc55cd9ba82bb2cd95f6c.svg';
+  tmdbLink.append(logo);
+  credits.append(tmdbLink, node('p', 'This product uses the TMDB API but is not endorsed or certified by TMDB.'), node('span', '奈飞片库的上架数据由 '),
+    externalLink('JustWatch', 'https://www.justwatch.com/', 'rating-search'), node('span', ' 提供。'));
+  page.append(credits);
   content.replaceChildren(page);
 }
 

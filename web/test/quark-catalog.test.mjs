@@ -95,85 +95,44 @@ test('facets follow released upstream pages, normalized co-productions and the c
   assert.deepEqual((await catalog.browse()).facets.years, ['2024']);
 });
 
-test('Netflix filter verifies provider metadata or an official title URL even when Douban ignores the tag', async t => {
-  const rows = [film({ id: '1', countries: ['美国', '法国'], tags: [{ name: 'Netflix' }] }),
-    film({ id: '2', countries: ['美国'], title: 'Netflix故事' }),
-    film({ id: '3', card_subtitle: '2025 / 美国 / 剧情' }),
-    film({ id: '4', countries: ['英国'], vendors: [{ title: 'Netflix' }] })];
-  const { catalog, calls } = fixture(url => {
-    if (url.pathname.endsWith('/recommend')) return response({ items: rows, total: 4 }, 200, url.href);
-    if (url.pathname.endsWith('/tags')) return response({ tags: [] }, 200, url.href);
-    const id = url.pathname.split('/').at(-1);
-    return response({ ...rows.find(i => i.id === id), website: id === '3' ? 'https://www.netflix.com/title/80123456' : 'https://www.netflix.com.evil.test/title/80123456' }, 200, url.href);
-  });
+test('Netflix routes supported-market pages, posters and namespaced details to the availability catalog', async t => {
+  const id = 'tmdb:movie:11', item = { id, title: '跨地区影片', availabilityRegions: ['JP', 'US'] };
+  const reads = [], poster = 'https://image.tmdb.org/t/p/w342/example.jpg';
+  const netflix = {
+    async browse(options) { reads.push(options); return { items: [item], hasMore: true, coverageRegions: ['JP', 'US'] }; },
+    poster(value) { assert.equal(value, id); return poster; },
+    async detail(value) { assert.equal(value, id); return item; },
+  };
+  const { catalog, calls } = fixture(undefined, { netflix });
   t.after(() => catalog.stop());
-  const filtered = await catalog.browse({ platform: 'netflix', country: 'US' });
-  assert.equal(calls[0].url.searchParams.get('tags'), '美国,Netflix');
-  assert.deepEqual(new Set(filtered.items.map(i => i.id)), new Set(['1', '3']));
-  assert.ok(filtered.items.every(i => i.netflix && i.countries.includes('美国')));
-  assert.equal(calls.filter(call => call.url.pathname.endsWith('/tags')).length, 2);
-  assert.equal(calls.length, 5);
-});
-
-test('Netflix uses tags of the exact movie or TV subject and retains its release and region checks', async t => {
-  for (const kind of ['movie', 'tv']) {
-    const rows = [
-      film({ id: '11', type: kind, countries: ['韩国'], tags: [{ name: '校园 爱情' }] }),
-      film({ id: '12', type: kind, countries: ['韩国'], title: 'Netflix故事', alg_json: '{"tags_mk":"Netflix"}' }),
-      film({ id: '13', type: kind, countries: ['韩国'], is_released: undefined, rating: { count: 0 } }),
-      film({ id: '14', type: kind, countries: ['法国'] }),
-    ];
-    const { catalog, calls } = fixture(url => {
-      if (url.pathname.endsWith('/recommend')) return response({ items: rows, total: rows.length }, 200, url.href);
-      const [, id, tags] = url.pathname.match(new RegExp('/'+kind+'/(\\d+)(/tags)?$')) || [];
-      if (!id) return response('', 404);
-      if (tags) return response({ tags: id === '12' ? ['电影', 'Netflix幕后花絮'] : ['剧情', 'Netflix'] }, 200, url.href);
-      return response({ ...rows.find(item => item.id === id), ...(id === '13' ? { is_released: false } : {}) }, 200, url.href);
-    });
-    t.after(() => catalog.stop());
-    if (kind === 'movie') await catalog.detail('11'); // Previously cached details can omit provider tags.
-    const selected = await catalog.browse({ category: kind, country: '韩国', platform: 'netflix' });
-    assert.deepEqual(selected.items.map(row => [row.id, row.netflix]), [['11', true]]);
-    assert.deepEqual(calls.filter(call => call.url.pathname.endsWith('/tags')).map(call => call.url.pathname.split('/').at(-2)).sort(), ['11','12','13']);
-    await catalog.browse({ category: kind, platform: 'netflix' });
-    assert.equal(calls.filter(call => call.url.pathname.endsWith('/11/tags')).length, 1);
-  }
-});
-
-test('Netflix verifies later candidates and tags outside Douban’s default tag window', async t => {
-  const rows = Array.from({ length: 20 }, (_, i) => film({ id: String(i + 1) }));
-  const { catalog, calls } = fixture(url => {
-    if (url.pathname.endsWith('/recommend')) return response({ items: rows, total: null }, 200, url.href);
-    const [, id, tags] = url.pathname.match(/movie\/(\d+)(\/tags)?$/);
-    if (!tags) return response(rows[Number(id) - 1], 200, url.href);
-    const labels = Array(44).fill('剧情').concat(Number(id) > 4 ? 'Netflix' : 'Netflix幕后花絮');
-    return response({ tags: labels.slice(0, Number(url.searchParams.get('count') || 20)) }, 200, url.href);
-  });
-  t.after(() => catalog.stop());
-  const result = await catalog.browse({ platform: 'netflix' });
-  assert.deepEqual(result.items.map(item => Number(item.id)).sort((a, b) => a - b), Array.from({ length: 16 }, (_, i) => i + 5));
-  assert.equal(calls.filter(call => call.url.pathname.endsWith('/tags')).length, 20);
+  const result = await catalog.browse({ platform: 'netflix', genre: '儿童', country: 'JP', page: 26 });
+  assert.deepEqual(result.items, [item]);
+  assert.deepEqual(result.coverageRegions, ['JP', 'US']);
   assert.equal(result.hasMore, true);
-  assert.deepEqual(result.errors, []);
+  assert.deepEqual(reads, [{ category: 'movie', genre: '儿童', year: '', country: '日本', platform: 'netflix', sort: 'release', page: 26 }]);
+  assert.equal(catalog.poster(id), poster);
+  assert.deepEqual(await catalog.detail(id), item);
+  await assert.rejects(catalog.detail('tmdb:movie:../11'), { status: 400 });
+  await assert.rejects(catalog.browse({ page: 26 }), { status: 400 });
+  assert.equal(calls.length, 0);
 });
 
-test('an upgrade keeps regular catalog pages and rechecks old empty Netflix pages against subject tags', async t => {
+test('an upgrade keeps regular catalog pages and ignores old tag-only Netflix pages', async t => {
   const { catalog, store } = fixture();
   t.after(() => catalog.stop());
   await catalog.browse();
   const saved = JSON.parse(store.values.get(CACHE_KEY));
   const [oldKey, entry] = saved.pages[0];
-  saved.pages.push([JSON.stringify({ ...JSON.parse(oldKey), platform: 'netflix' }), { ...entry, items: [] }]);
-  for (const version of [5, 6]) {
+  saved.pages.push([JSON.stringify({ ...JSON.parse(oldKey), platform: 'netflix' }), entry]);
+  for (const version of [5, 6, 7]) {
     store.setMeta(CACHE_KEY, JSON.stringify({ ...saved, version }));
-    const restored = fixture(url => response(url.pathname.endsWith('/tags') ? { tags: ['Netflix'] } :
-      { items: [film({ is_released: undefined, rating: { count: 0 } })], total: 1 }, 200, url.href), { store });
+    const restored = fixture(undefined, { store });
     t.after(() => restored.catalog.stop());
     assert.equal((await restored.catalog.browse()).items.length, 1);
+    const unconfigured = await restored.catalog.browse({ platform: 'netflix' });
+    assert.equal(unconfigured.unconfigured, true);
+    assert.deepEqual(unconfigured.items, []);
     assert.equal(restored.calls.length, 0);
-    const updated = await restored.catalog.browse({ platform: 'netflix' });
-    assert.deepEqual(updated.items.map(item => item.id), ['123456']);
-    assert.deepEqual(restored.calls.map(call => call.url.pathname), ['/rexxar/api/v2/movie/recommend', '/rexxar/api/v2/movie/123456/tags']);
   }
 });
 

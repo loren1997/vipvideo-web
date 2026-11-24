@@ -140,7 +140,8 @@ function detailInfo(detail, options = {}) {
   const aliases = [...new Set([...(searchTitle !== rawTitle ? [rawTitle] : []), ...(Array.isArray(detail.aliases) ? detail.aliases.slice(0, 10) : [])].filter(value => typeof value === 'string' && value.trim().length >= 2 && value.length <= 300 && !/[\u0000-\u001f\u007f]/.test(value) && episodeNumber(value) === undefined && !/更新至/.test(value)).map(value => value.trim()).filter(value => normalized(value) !== normalized(searchTitle)))].slice(0, 2);
   const line = options.line ?? 0, index = options.episode ?? 0;
   const selected = Number.isInteger(line) && line >= 0 && Number.isInteger(index) && index >= 0 ? detail.lines?.[line]?.episodes?.[index] : undefined;
-  return { title, searchTitle: searchTitle.length >= 2 ? searchTitle : title, aliases, series, titleSeason: seasonNumber(rawTitle), year: /^(?:19|20)\d{2}$/.test(year) ? year : '', key, selected, line, index, season: detail.season };
+  const selectedYear = [selected?.seasonYear, year].find(value => /^(?:19|20)\d{2}$/.test(value)) || '';
+  return { title, searchTitle: searchTitle.length >= 2 ? searchTitle : title, aliases, series, titleSeason: seasonNumber(rawTitle), year: selectedYear, key, selected, line, index, season: selected?.season ?? detail.season };
 }
 
 function videoRename(info, file) {

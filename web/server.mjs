@@ -20,7 +20,8 @@ import { repairImport } from './lib/import-repair.mjs';
 import { createTranscoder, supportsDolbyMapping } from './lib/transcode.mjs';
 import { createAdMarkers } from './lib/ad-markers.mjs';
 import { createQuark } from './lib/quark.mjs';
-import { createQuarkCatalog } from './lib/quark-catalog.mjs';
+import { createQuarkCatalog, validQuarkTitleId } from './lib/quark-catalog.mjs';
+import { createNetflixCatalog } from './lib/netflix-catalog.mjs';
 import { createQuarkPosters } from './lib/quark-posters.mjs';
 import { createQuarkSearchPool } from './lib/quark-search-pool.mjs';
 import { createQuarkBrowserSearch } from './lib/quark-browser-client.mjs';
@@ -56,9 +57,16 @@ function tokenFrom(req) {
   return /(?:^|;\s*)vipvideo_session=([A-Za-z0-9_-]{43})(?:;|$)/.exec(req.headers.cookie ?? '')?.[1] ?? '';
 }
 
+function quarkTitleId(value) {
+  const id = text(value, '影片标识', 40);
+  if (!validQuarkTitleId(id)) throw badRequest('影片标识无效');
+  return id;
+}
+
 export function createApp({ password = process.env.APP_PASSWORD, dataDir = process.env.DATA_DIR ?? resolve(root, 'data'),
   catalog = createCatalog(), media = createMedia(), initialConfig = defaults, cookieSecure = process.env.COOKIE_SECURE === 'true',
-  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder, adMarkers, quark, quarkMedia, quarkSearchPool, quarkCatalog, quarkPosters } = {}) {
+  logger = console, maintenance, live, ratings, danmaku, playability, discovery, transcoder, adMarkers, quark, quarkMedia, quarkSearchPool, quarkCatalog, quarkPosters,
+  netflixCatalog, tmdbToken = process.env.TMDB_API_READ_TOKEN } = {}) {
   if (typeof password !== 'string' || password.length < 8 || password.length > 1024) throw new Error('APP_PASSWORD 必须设置，且长度为 8–1024 个字符');
   const initial = validateConfig(initialConfig);
   const store = createStore(dataDir, initial);
@@ -83,7 +91,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
   const transcodeService = transcoder ?? createTranscoder({ media, logger });
   const searchPool = quarkSearchPool ?? createQuarkSearchPool({ store, getSearchApi: async () => (await quarkService.settings()).searchApi, telegramSearch: createQuarkTelegramSearch({ resolveChannels: createQuarkChannelCatalog({ store }).resolve }), ...(process.env.QUARK_BROWSER_URL === 'http://quark-browser:3020' ? { renderSearch: createQuarkBrowserSearch() } : {}) });
   const quarkService = quark ?? createQuark({ store, dataDir, searchRequest: searchPool.request, defaultSearchApi: process.env.QUARK_SEARCH_API || '' });
-  const cloudCatalog = quarkCatalog ?? createQuarkCatalog({ store });
+  const cloudCatalog = quarkCatalog ?? createQuarkCatalog({ store, netflix: netflixCatalog ?? createNetflixCatalog({ token: tmdbToken, dataDir }) });
   const cloudPosters = quarkPosters ?? createQuarkPosters({ catalog: cloudCatalog });
   const cloudMedia = quarkMedia ?? createQuarkMedia({ quark: quarkService, visible: category => ensureVisible(category), probeColor: input => transcodeService.inspectColor(input) });
   const salt = store.meta('password-salt') ?? randomBytes(16).toString('hex');
@@ -112,7 +120,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
     const snapshot = store.config(), line = Number(input?.line ?? 0), episode = Number(input?.episode ?? 0);
     if (!Number.isSafeInteger(line) || line < 0 || !Number.isSafeInteger(episode) || episode < 0) throw badRequest('请选择有效的剧集');
     if (input?.source === 'quark-library') {
-      const detail = await cloudCatalog.detail(text(input.id, '豆瓣影片标识', 16));
+      const detail = await cloudCatalog.detail(quarkTitleId(input.id));
       const valid = () => { requireSession(owner); ensureVisible(detail.category); return true; };
       valid();
       if (!detail.lines[line]?.episodes[episode]) throw badRequest('请选择有效的影片');
@@ -200,7 +208,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           return json(res, 200, result);
         }
         if (path === '/api/quark/library/detail' && method === 'GET') {
-          const detail = await cloudCatalog.detail(text(url.searchParams.get('id'), '豆瓣影片标识', 16));
+          const detail = await cloudCatalog.detail(quarkTitleId(url.searchParams.get('id')));
           requireSession(hashToken(token)); ensureVisible(detail.category);
           return json(res, 200, detail);
         }
@@ -209,7 +217,7 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
           const controller = new AbortController(), cancel = () => controller.abort(Object.assign(new Error('海报请求已取消'), { status: 499 }));
           res.once('close', cancel);
           try {
-            const poster = await cloudPosters.get(text(url.searchParams.get('id'), '豆瓣影片标识', 16), { signal: controller.signal });
+            const poster = await cloudPosters.get(quarkTitleId(url.searchParams.get('id')), { signal: controller.signal });
             requireSession(hashToken(token));
             res.setHeader('Cache-Control', 'private, max-age=3600');
             res.setHeader('ETag', poster.etag);
@@ -405,8 +413,9 @@ export function createApp({ password = process.env.APP_PASSWORD, dataDir = proce
         }
         if (path === '/api/ratings' && method === 'GET') {
           if (url.searchParams.get('source') === 'quark-library') {
-            const detail = await cloudCatalog.detail(text(url.searchParams.get('id'), '豆瓣影片标识', 16));
+            const detail = await cloudCatalog.detail(quarkTitleId(url.searchParams.get('id')));
             requireSession(hashToken(token)); ensureVisible(detail.category);
+            if (String(detail.id).startsWith('tmdb:')) return json(res, 200, { douban: null, tmdb: detail.tmdb ?? null, configured: true, errors: detail.errors || [] });
             const score = detail.douban?.score;
             return json(res, 200, { douban: Number.isFinite(score) && score > 0 && score <= 10 ? { ...detail.douban, url: `https://movie.douban.com/subject/${detail.id}/`, attribution: detail.douban.attribution || '豆瓣公开条目' } : null,
               tmdb: null, configured: true, errors: [...(Array.isArray(detail.errors) ? detail.errors : []), ...(Number.isFinite(score) && score > 0 && score <= 10 ? [] : ['豆瓣公开条目暂无评分'])] });
