@@ -346,14 +346,42 @@ test('cached cards respect a newly verified unreleased detail immediately', asyn
   assert.equal((await catalog.browse()).items.length, 0);
 });
 
-test('animation merges movie and television identities, genres and categories without confusing film with series', async t => {
-  const { catalog, calls } = fixture(url => response({ items: [film({ type: url.pathname.includes('/tv/') ? 'tv' : 'movie', id: url.pathname.includes('/tv/') ? '2' : '1', card_subtitle: '2025 / 日本 / 喜剧 动画 / 导演' }), film({ id: '4', type: 'playlist' }), film({ id: '5', card_subtitle: '2025 / 美国 / 动作' })], total: 3 }, 200, url.href));
+test('animated films belong to Movies while Anime uses only television animation', async t => {
+  const animated = { card_subtitle: '2025 / 日本 / 喜剧 动画 / 导演' };
+  const entries = [film({ id: '1', ...animated }), film({ id: '2', type: 'tv', ...animated }), film({ id: '3', type: 'tv' }), film({ id: '5' })];
+  const { catalog, calls } = fixture(url => response({ items: entries, total: entries.length }, 200, url.href));
   t.after(() => catalog.stop());
-  const result = await catalog.browse({ category: 'anime' });
-  assert.equal(calls.length, 2);
-  assert.ok(calls.every(call => call.url.searchParams.get('tags') === '动画'));
-  assert.deepEqual(new Set(result.items.map(item => item.type)), new Set(['movie', 'series']));
-  assert.ok(result.items.every(item => item.category === 'anime'));
+  const anime = await catalog.browse({ category: 'anime' });
+  assert.deepEqual(anime.items.map(item => [item.id, item.type, item.category]), [['2', 'series', 'anime']]);
+  assert.deepEqual(calls.map(({ url }) => [url.pathname, url.searchParams.get('tags')]), [['/rexxar/api/v2/tv/recommend', '动画']]);
+  const movie = await catalog.browse({ category: 'movie', genre: '动画' });
+  assert.deepEqual(movie.items.map(item => [item.id, item.type, item.category, item.typeName]), [['1', 'movie', 'movie', '电影']]);
+  assert.deepEqual(movie.items[0].lines[0].episodes, [{ name: '正片' }]);
+  assert.deepEqual((await catalog.browse({ category: 'tv' })).items.map(item => item.id), ['3']);
+});
+
+test('old mixed anime pages are refreshed and cached animated films are reclassified without refetching Movies', async t => {
+  const animated = { genres: ['动画'] };
+  const handler = url => response({ items: [film({ id: '1', ...animated }), film({ id: '2', type: 'tv', ...animated })], total: 2 }, 200, url.href);
+  const original = fixture(handler);
+  await original.catalog.browse({ category: 'movie' });
+  await original.catalog.browse({ category: 'anime' });
+  await original.catalog.stop();
+  const saved = JSON.parse(original.store.meta(CACHE_KEY));
+  saved.version = 7;
+  saved.subjects.find(([id]) => id === '1')[1].item.category = 'anime';
+  const animePage = saved.pages.find(([, value]) => value.category === 'anime')[1];
+  animePage.items.push('1');
+  animePage.hasMore = true;
+  original.store.setMeta(CACHE_KEY, JSON.stringify(saved));
+  const { catalog, calls } = fixture(handler, { store: original.store });
+  t.after(() => catalog.stop());
+  assert.deepEqual((await catalog.browse({ category: 'movie' })).items.map(item => [item.id, item.category]), [['1', 'movie']]);
+  assert.equal(calls.length, 0);
+  const anime = await catalog.browse({ category: 'anime' });
+  assert.deepEqual(anime.items.map(item => item.id), ['2']);
+  assert.equal(anime.hasMore, false);
+  assert.equal(calls.length, 1);
 });
 
 test('a film directory rejects TV records even if an upstream recommendation mixes its response kinds', async t => {
@@ -362,30 +390,31 @@ test('a film directory rejects TV records even if an upstream recommendation mix
   assert.deepEqual((await catalog.browse()).items.map(item => item.id), ['123456']);
 });
 
-test('a partially unavailable animation feed keeps cached matching titles and exposes its error until a short retry', async t => {
+test('an unavailable animation feed keeps cached matching series and exposes its error until a short retry', async t => {
   let time = Date.now(), failed = false;
   const { catalog, calls } = fixture(url => {
-    if (failed && url.pathname.includes('/tv/')) return response('', 403, url.href);
-    return response({ items: [film({ id: url.pathname.includes('/tv/') ? '2' : '1', type: url.pathname.includes('/tv/') ? 'tv' : 'movie', card_subtitle: '2025 / 日本 / 动画' })], total: 30 }, 200, url.href);
+    if (failed) return response('', 403, url.href);
+    return response({ items: [film({ id: '2', type: 'tv', genres: ['动画'] })], total: 30 }, 200, url.href);
   }, { now: () => time });
   t.after(() => catalog.stop());
-  assert.equal((await catalog.browse({ category: 'anime' })).items.length, 2);
+  assert.equal((await catalog.browse({ category: 'anime' })).items.length, 1);
   time += HOUR + 1;
   failed = true;
   const partial = await catalog.browse({ category: 'anime' });
-  assert.equal(partial.items.length, 2);
+  assert.deepEqual(partial.items.map(item => item.id), ['2']);
+  assert.equal(partial.unavailable, undefined);
   assert.equal(partial.stale, true);
   assert.equal(partial.errors.length, 1);
   assert.equal(partial.hasMore, true);
   const cached = await catalog.browse({ category: 'anime' });
   assert.deepEqual(cached.errors, partial.errors);
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 2);
   time += 60001;
   failed = false;
   const retried = await catalog.browse({ category: 'anime' });
   assert.deepEqual(retried.errors, []);
   assert.equal(retried.stale, false);
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, 3);
 });
 
 test('television and variety filters stay distinct and require recognizable official identities', async t => {
@@ -475,7 +504,7 @@ test('old cached aliases refresh from the same official subject while poster IDs
   assert.equal(refreshed.id, item.id);
   assert.deepEqual(refreshed.aliases.slice(0, 2), ['Resident Evil', '生化危机9']);
   assert.equal(fresh.catalog.poster('37068446'), item.poster);
-  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 7);
+  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 8);
   for (const key of ['quark-settings-v1', 'history-marker', 'favorites-marker']) assert.equal(old.store.values.get(key), key + '-preserved');
 });
 
@@ -602,7 +631,7 @@ test('duplicate catalog requests share work and at most two outbound reads run a
   const { catalog, calls } = fixture(async url => {
     active++; peak = Math.max(peak, active);
     await new Promise(resolve => releases.push(() => { active--; resolve(); }));
-    return response({ items: [film({ type: url.pathname.includes('/tv/') ? 'tv' : 'movie', card_subtitle: '2025 / 日本 / 喜剧 动画' })], total: 1 }, 200, url.href);
+    return response({ items: [film({ ...(url.pathname.includes('/tv/') ? { id: '2', type: 'tv' } : {}), genres: ['动画'] })], total: 1 }, 200, url.href);
   });
   t.after(() => catalog.stop());
   const first = catalog.browse({ category: 'anime' }), duplicate = catalog.browse({ category: 'anime' }), third = catalog.browse({ category: 'movie' });
@@ -613,7 +642,7 @@ test('duplicate catalog requests share work and at most two outbound reads run a
   releases.splice(0).forEach(release => release());
   const [a, b] = await Promise.all([first, duplicate, third]);
   assert.deepEqual(a, b);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 2);
   assert.equal(peak, 2);
   a.items[0].title = 'mutated';
   assert.equal((await catalog.browse({ category: 'anime' })).items[0].title, '海风来信');

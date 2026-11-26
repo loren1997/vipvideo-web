@@ -45,7 +45,8 @@ function metadata(raw, hint, detailed = false, now = Date.now()) {
   const parts = Array.isArray(raw.genres) ? raw.genres.map(value => text(value, 40)) : (subtitle.split(' / ')[2] || '').split(/\s+/);
   if (parts.some(value => ADULT.test(value))) return null;
   const genres = [...new Set(parts.filter(value => GENRES.includes(value)))];
-  const category = genres.includes('动画') ? 'anime' : hint === 'variety' || raw.is_show === true || genres.some(value => ['真人秀', '脱口秀'].includes(value)) ? 'variety' : raw.type === 'movie' ? 'movie' : 'tv';
+  const category = raw.type === 'movie' ? 'movie' : genres.includes('动画') ? 'anime'
+    : hint === 'variety' || raw.is_show === true || genres.some(value => ['真人秀', '脱口秀'].includes(value)) ? 'variety' : 'tv';
   const type = raw.type === 'movie' ? 'movie' : 'series';
   const card = subtitle.split(/\s+\/\s+/);
   const year = [String(raw.year ?? ''), card[0]].find(y => /^(?:18|19|20)\d{2}$/.test(y)) || '';
@@ -100,7 +101,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
   if (typeof saved === 'string' && saved.length <= 2 * 1024 * 1024) {
     try {
       const data = JSON.parse(saved);
-      const withFacets = [5, 6, 7].includes(data.version);
+      const withFacets = [5, 6, 7, 8].includes(data.version);
       for (const [id, entry] of Array.isArray(data.subjects) ? data.subjects.slice(-300) : []) {
         const item = restoreItem(entry?.item, now());
         if (item && item.id === id && Number.isFinite(entry.at) && entry.at <= now() && entry.at > now() - 7 * 24 * HOUR) subjects.set(id, { item, at: entry.at, detailed: withFacets && entry.detailed === true });
@@ -108,6 +109,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
       for (const [key, entry] of withFacets && Array.isArray(data.pages) ? data.pages.slice(-32) : []) {
         if (typeof key !== 'string' || key.length > 200 || !Number.isFinite(entry?.at) || entry.at > now() || entry.at <= now() - 7 * 24 * HOUR || !Array.isArray(entry.items)) continue;
         if (key.includes('"platform":"netflix"')) continue;
+        if (data.version < 8 && key.includes('"category":"anime"')) continue;
         const items = entry.items.slice(0, 40).map(id => subjects.get(idOf(id))?.item).filter(Boolean);
         if (items.length === entry.items.length) pages.set(key, { at: entry.at, category: entry.category, items, hasMore: entry.hasMore === true,
           errors: Array.isArray(entry.errors) ? entry.errors.slice(0, 3).map(value => text(value, 200)).filter(Boolean) : [], stale: entry.stale === true, unavailable: entry.unavailable === true });
@@ -119,7 +121,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
     while (pages.size > 32) pages.delete(pages.keys().next().value);
     while (subjects.size > 300) subjects.delete(subjects.keys().next().value);
     const serialize = () => JSON.stringify({
-      version: 7,
+      version: 8,
       pages: [...pages].map(([key, entry]) => [key, { ...entry, items: entry.items.map(item => item.id) }]),
       subjects: [...subjects].map(([id, entry]) => { const { lines, ...item } = entry.item; return [id, { ...entry, item }]; }),
     });
@@ -231,7 +233,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
   function result(entry, values, errors = entry.errors || [], stale = entry.stale === true) {
     const resolve = item => subjects.get(item.id)?.item || item;
     const eligible = item => ['released', 'screened'].includes(item.releaseStatus) &&
-      (values.category === 'movie' ? item.type === 'movie' : item.category === values.category) &&
+      item.category === values.category &&
       (!values.genre || item.genres.includes(values.genre));
     const inCountry = item => !values.country || item.countries.includes(values.country);
     const inYear = item => !values.year || item.year === values.year;
@@ -245,6 +247,13 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
     return { ...values, items: clone(items), hasMore: entry.hasMore, facets: { genres: [...GENRES], years, countries, languages }, errors: [...errors], stale,
       ...(entry.unavailable ? { unavailable: true } : {}),
       attribution: '豆瓣公开目录', sortLabel: values.sort === 'score' ? '已上映片目，豆瓣高分优先' : values.sort === 'release-score' ? '热门已上映片目，年份优先、同年高分优先' : '热门已上映片目，上映年份优先' };
+  }
+
+  function fallback(entry, values, errors) {
+    const response = result(entry || { items: [], hasMore: false }, values, errors, !!entry);
+    if (response.items.length) delete response.unavailable;
+    else response.unavailable = true;
+    return response;
   }
 
   return {
@@ -268,41 +277,44 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
       const key = JSON.stringify({ ...values, language: filterLanguage ? values.language : undefined }), cached = pages.get(key);
       if (cached && cached.at + (cached.unavailable ? 15000 : cached.errors?.length ? 60000 : HOUR) > now()) return result(cached, values);
       const recentFailure = failures.get(key);
-      if (recentFailure && recentFailure.until > now()) return { ...result(cached || { items: [], hasMore: false }, values, recentFailure.errors, !!cached), unavailable: true };
+      if (recentFailure && recentFailure.until > now()) return fallback(cached, values, recentFailure.errors);
       return load(`browse:${key}`, async signal => {
         const started = Date.now();
-        const kinds = values.category === 'anime' ? ['movie', 'tv'] : [values.category === 'movie' ? 'movie' : 'tv'];
-        const errors = [], rows = [], failedKinds = new Set(), unconfirmed = new Map();
-        let hasMore = false, successes = 0;
-        await Promise.all(kinds.map(async kind => {
-          const tags = [...new Set([values.category === 'anime' ? '动画' : values.category === 'variety' ? '综艺' : kind === 'tv' ? '电视剧' : '', values.genre, values.year, values.country, values.language === 'zh' ? '华语' : ''].filter(Boolean))];
-          const query = new URLSearchParams({ refresh: '0', start: String((values.page - 1) * PAGE_SIZE), count: String(PAGE_SIZE), uncollect: 'false', tags: tags.join(','), sort: values.sort === 'score' ? 'S' : 'U' });
-          try {
-            const data = await fetchJson(`${kind}/recommend?${query}`, signal);
-            if (!Array.isArray(data.items) || data.items.length > 100) throw failure('豆瓣目录格式暂不可读取，请稍后再试');
-            successes++;
-            const total = Number(data.total ?? NaN);
-            hasMore ||= Number.isFinite(total) && total >= 0 ? values.page * PAGE_SIZE < total : data.items.length >= PAGE_SIZE;
-            for (const raw of data.items) {
-              const item = metadata(raw, values.category, false, now());
-              if (!item || item.type !== (kind === 'movie' ? 'movie' : 'series') || values.category === 'anime' && item.category !== 'anime' || values.category === 'tv' && item.category !== 'tv' || values.category === 'variety' && item.category !== 'variety' || values.year && item.year !== values.year || values.genre && !item.genres.includes(values.genre)) continue;
-              if (item.releaseStatus === 'upcoming') continue;
-              const known = subjects.get(item.id);
-              if (item.releaseStatus === 'unknown' && known?.item.releaseStatus === 'upcoming' && known.at + 6 * HOUR > now()) continue;
-              const releaseUnknown = item.releaseStatus === 'unknown' && (!known || !['released', 'screened'].includes(known.item.releaseStatus));
-              const fresh = known && known.at + 6 * HOUR > now();
-              if (fresh) {
-                if (!item.countries.length) item.countries = known.item.countries;
-                item.languages ??= known.item.languages;
-                if (item.releaseStatus === 'unknown') item.releaseStatus = known.item.releaseStatus;
-              }
-              const needsCountry = values.country && !item.countries.length && !(fresh && known.detailed);
-              const needsLanguage = filterLanguage && (!item.languages?.length && !(fresh && known.detailed && item.languages));
-              if (releaseUnknown || needsCountry || needsLanguage) unconfirmed.set(item.id, { item, kind, releaseUnknown, needsCountry, needsLanguage });
-              else { const registered = register(item, false); if (['released', 'screened'].includes(registered.releaseStatus)) rows.push(registered); }
-            }
-          } catch (error) { failedKinds.add(kind); errors.push(error.status ? error.message : '豆瓣目录暂不可读取，请稍后再试'); }
-        }));
+        const kind = values.category === 'movie' ? 'movie' : 'tv';
+        const errors = [], rows = [], unconfirmed = new Map();
+        const tags = [...new Set([values.category === 'anime' ? '动画' : values.category === 'variety' ? '综艺' : kind === 'tv' ? '电视剧' : '', values.genre, values.year, values.country, values.language === 'zh' ? '华语' : ''].filter(Boolean))];
+        const query = new URLSearchParams({ refresh: '0', start: String((values.page - 1) * PAGE_SIZE), count: String(PAGE_SIZE), uncollect: 'false', tags: tags.join(','), sort: values.sort === 'score' ? 'S' : 'U' });
+        let data;
+        try {
+          data = await fetchJson(`${kind}/recommend?${query}`, signal);
+          if (!Array.isArray(data.items) || data.items.length > 100) throw failure('豆瓣目录格式暂不可读取，请稍后再试');
+        } catch (error) {
+          signal.throwIfAborted();
+          errors.push(error.status ? error.message : '豆瓣目录暂不可读取，请稍后再试');
+          failures.set(key, { until: now() + 60000, errors });
+          while (failures.size > 32) failures.delete(failures.keys().next().value);
+          return fallback(cached, values, errors);
+        }
+        const total = Number(data.total ?? NaN);
+        const hasMore = Number.isFinite(total) && total >= 0 ? values.page * PAGE_SIZE < total : data.items.length >= PAGE_SIZE;
+        for (const raw of data.items) {
+          const item = metadata(raw, values.category, false, now());
+          if (!item || item.category !== values.category || values.year && item.year !== values.year || values.genre && !item.genres.includes(values.genre)) continue;
+          if (item.releaseStatus === 'upcoming') continue;
+          const known = subjects.get(item.id);
+          if (item.releaseStatus === 'unknown' && known?.item.releaseStatus === 'upcoming' && known.at + 6 * HOUR > now()) continue;
+          const releaseUnknown = item.releaseStatus === 'unknown' && (!known || !['released', 'screened'].includes(known.item.releaseStatus));
+          const fresh = known && known.at + 6 * HOUR > now();
+          if (fresh) {
+            if (!item.countries.length) item.countries = known.item.countries;
+            item.languages ??= known.item.languages;
+            if (item.releaseStatus === 'unknown') item.releaseStatus = known.item.releaseStatus;
+          }
+          const needsCountry = values.country && !item.countries.length && !(fresh && known.detailed);
+          const needsLanguage = filterLanguage && (!item.languages?.length && !(fresh && known.detailed && item.languages));
+          if (releaseUnknown || needsCountry || needsLanguage) unconfirmed.set(item.id, { item, releaseUnknown, needsCountry, needsLanguage });
+          else { const registered = register(item, false); if (['released', 'screened'].includes(registered.releaseStatus)) rows.push(registered); }
+        }
         signal.throwIfAborted();
         const budget = Math.min(filterLanguage ? 6000 : 2000, 7000 - (Date.now() - started));
         const queued = [...unconfirmed.values()];
@@ -312,7 +324,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
         let pendingLanguages = queued.filter(row => row.needsLanguage).length;
         if (candidates.length && budget >= 250) {
           const verification = AbortSignal.any([signal, AbortSignal.timeout(budget)]);
-          async function verify({ item, kind, releaseUnknown, needsCountry, needsLanguage }) {
+          async function verify({ item, releaseUnknown, needsCountry, needsLanguage }) {
             try {
               const raw = await fetchJson(`${kind}/${item.id}`, verification);
               if (idOf(raw.id) !== item.id || raw.type !== kind) return;
@@ -325,7 +337,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
               if (needsCountry && checked.countries.length) pendingCountries--;
               if (needsLanguage) pendingLanguages--;
               if (checked.releaseStatus === 'upcoming') register(checked, true);
-              if (['released', 'screened'].includes(checked.releaseStatus) && (!values.year || checked.year === values.year) && (!values.genre || checked.genres.includes(values.genre)) && (values.category !== 'anime' || checked.category === 'anime') && (values.category !== 'tv' || checked.category === 'tv') && (values.category !== 'variety' || checked.category === 'variety')) rows.push(register(checked, true));
+              if (['released', 'screened'].includes(checked.releaseStatus) && checked.category === values.category && (!values.year || checked.year === values.year) && (!values.genre || checked.genres.includes(values.genre))) rows.push(register(checked, true));
             } catch { /* 汇总到下方可重试提示，不让单条核验失败阻塞已确认的片目。 */ }
           }
           await Promise.all([0, 1].map(async offset => {
@@ -337,27 +349,18 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
         if (pendingCountries) errors.push('部分片目暂未核实制作国家或地区，可继续翻页');
         const retryLanguage = pendingLanguages > 0 && !cached?.unavailable;
         if (pendingLanguages) errors.push(retryLanguage ? '部分片目暂未核实原声语言，可稍后重试' : '部分片目暂未核实原声语言，可继续翻页');
-        if (!successes) {
-          failures.set(key, { until: now() + 60000, errors: [...new Set(errors)] });
-          while (failures.size > 32) failures.delete(failures.keys().next().value);
-          return { ...result(cached || { items: [], hasMore: false }, values, [...new Set(errors)], !!cached), unavailable: true };
-        }
-        if (cached && failedKinds.size) {
-          rows.push(...cached.items.filter(item => ['released', 'screened'].includes(item.releaseStatus) && failedKinds.has(item.type === 'movie' ? 'movie' : 'tv')));
-          hasMore ||= cached.hasMore;
-        }
         const items = [...new Map(rows.map(item => [item.id, item])).values()];
         // 热门候选按真实上映年份排序，不拿上线日期或未上映排期冒充首映时间。
         if (values.sort === 'score') items.sort((a, b) => (b.douban.score ?? -1) - (a.douban.score ?? -1));
         else items.sort((a, b) => b.year.localeCompare(a.year) || Number(b.douban.score !== null) - Number(a.douban.score !== null) || Number(/\p{Script=Han}/u.test(b.title)) - Number(/\p{Script=Han}/u.test(a.title)) || (values.sort === 'release-score' ? (b.douban.score ?? -1) - (a.douban.score ?? -1) : 0));
-        const entry = { at: now(), category: values.category, items, hasMore, errors: [...new Set(errors)], stale: !!cached && failedKinds.size > 0, ...(retryLanguage ? { unavailable: true } : {}) };
+        const entry = { at: now(), category: values.category, items, hasMore, errors, ...(retryLanguage ? { unavailable: true } : {}) };
         pages.delete(key);
         pages.set(key, entry);
         persist();
         return result(entry, values, [...new Set(errors)]);
       }).catch(error => {
         if (stopped) throw error;
-        return { ...result(cached || { items: [], hasMore: false }, values, [error.status ? error.message : '豆瓣目录暂不可读取，请稍后再试'], !!cached), unavailable: true };
+        return fallback(cached, values, [error.status ? error.message : '豆瓣目录暂不可读取，请稍后再试']);
       });
     },
 

@@ -64,7 +64,7 @@ test('Netflix library unions every discovered region, excludes non-Netflix provi
     discover(url) {
       const region = url.searchParams.get('watch_region'), page = Number(url.searchParams.get('page'));
       const rows = url.pathname.endsWith('/tv') ? region === 'JP' ? [tv(1), tv(2, { genre_ids: [16] }), tv(3, { genre_ids: [10764] })] : []
-        : region === 'JP' ? [movie(1), movie(760, { title: '日本限定', origin_country: ['JP'], release_date: '2026-01-01' })]
+        : region === 'JP' ? [movie(1), movie(760, { title: '日本限定', genre_ids: [16], origin_country: ['JP'], release_date: '2026-01-01' })]
           : [...Array.from({ length: 759 }, (_, index) => movie(index + 1, { origin_country: ['US'] })), movie(761, { adult: true })];
       return response(url, list(rows, page, 1));
     },
@@ -100,7 +100,7 @@ test('Netflix library unions every discovered region, excludes non-Netflix provi
   assert.deepEqual(catalog.browse(query({ category: 'tv' })).items.map(item => item.id), ['tmdb:tv:1']);
   assert.deepEqual(catalog.browse(query({ category: 'anime' })).items.map(item => item.id), ['tmdb:tv:2']);
   assert.deepEqual(catalog.browse(query({ category: 'variety' })).items.map(item => item.id), ['tmdb:tv:3']);
-  assert.equal(catalog.browse(query({ genre: '剧情', year: '2026', country: '日本' })).total, 1);
+  assert.deepEqual(catalog.browse(query({ genre: '动画', year: '2026', country: '日本' })).items.map(item => [item.id, item.type, item.category, item.typeName]), [['tmdb:movie:760', 'movie', 'movie', '电影']]);
   assert.equal(catalog.poster('tmdb:movie:760'), 'https://image.tmdb.org/t/p/w342/title.jpg');
   assert.equal(source.calls.filter(url => url.pathname.endsWith('/regions')).length, 1);
 });

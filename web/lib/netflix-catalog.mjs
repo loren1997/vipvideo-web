@@ -57,7 +57,8 @@ function summarize(raw, kind) {
 function itemOf(summary, regions) {
   const { kind, id: externalId, title, original_title: originalTitle, genre_ids: genreIds, release_date: releaseDate } = summary;
   const id = `tmdb:${kind}:${externalId}`, type = kind === 'movie' ? 'movie' : 'series';
-  const category = genreIds.includes(16) ? 'anime' : kind === 'tv' && genreIds.some(genre => VARIETY.has(genre)) ? 'variety' : kind;
+  const category = kind === 'movie' ? 'movie' : genreIds.includes(16) ? 'anime'
+    : genreIds.some(genre => VARIETY.has(genre)) ? 'variety' : 'tv';
   const typeName = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺' }[category];
   return { source: 'quark-library', id, key: `quark-library:${id}`, title, originalTitle, aliases: originalTitle && originalTitle !== title ? [originalTitle] : [],
     type, typeName, category, language: summary.original_language, year: releaseDate.slice(0, 4), releaseDate, releaseStatus: 'released', countries: normalizeCountries(summary.origin_country),
@@ -335,7 +336,7 @@ export function createNetflixCatalog({ token, request = networkRequest, now = Da
       const matching = [], language = catalogLanguage(values.language);
       const genres = new Set(), years = new Set(), countries = new Set(), languages = new Set();
       for (const item of current?.items.values() || []) {
-        if (values.category === 'movie' ? item.type !== 'movie' : item.category !== values.category) continue;
+        if (item.category !== values.category) continue;
         for (const genre of item.genres) genres.add(genre);
         if (values.genre && !item.genres.includes(values.genre)) continue;
         const inYear = !values.year || item.year === values.year, inCountry = !values.country || item.countries.includes(values.country);
