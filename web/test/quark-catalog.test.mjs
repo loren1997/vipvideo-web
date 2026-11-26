@@ -418,14 +418,35 @@ test('an unavailable animation feed keeps cached matching series and exposes its
 });
 
 test('television and variety filters stay distinct and require recognizable official identities', async t => {
-  const entries = [film({ id: '1', type: 'tv', card_subtitle: '2025 / 中国大陆 / 剧情 喜剧' }), film({ id: '2', type: 'tv', card_subtitle: '2025 / 中国大陆 / 真人秀 音乐' }), film({ id: '3', type: 'tv', card_subtitle: '2025 / 日本 / 动画' })];
-  const { catalog, calls } = fixture(url => response({ items: entries, total: 3 }, 200, url.href));
+  const entries = [film({ id: '1', type: 'tv', genres: ['剧情', '喜剧'] }), film({ id: '2', type: 'tv', genres: ['真人秀', '音乐'] }),
+    film({ id: '3', type: 'tv', genres: ['动画'] }), film({ id: '4', type: 'tv', genres: ['喜剧'] })];
+  const handler = url => {
+    if (url.pathname.endsWith('/recommend')) return response({ items: entries, total: 4 }, 200, url.href);
+    const id = url.pathname.split('/').at(-1);
+    return response({ ...entries.find(item => item.id === id), is_show: id === '4' }, 200, url.href);
+  };
+  const { catalog, calls, store } = fixture(handler);
   t.after(() => catalog.stop());
-  assert.deepEqual((await catalog.browse({ category: 'tv' })).items.map(item => item.id), ['1']);
+  assert.deepEqual((await catalog.browse({ category: 'tv' })).items.map(item => item.id), ['1', '4']);
   const variety = await catalog.browse({ category: 'variety' });
-  assert.ok(variety.items.find(item => item.id === '2'));
-  assert.equal(variety.items.find(item => item.id === '2').category, 'variety');
+  assert.deepEqual(variety.items.map(item => [item.id, item.category]), [['2', 'variety'], ['4', 'variety']]);
+  assert.deepEqual((await catalog.browse({ category: 'tv' })).items.map(item => item.id), ['1']);
   assert.equal(calls[1].url.searchParams.get('tags'), '综艺');
+  assert.deepEqual(calls.slice(2).map(({ url }) => url.pathname.split('/').at(-1)).sort(), ['1', '4']);
+
+  const restored = fixture(() => assert.fail('fresh verified cache should not refetch'), { store });
+  t.after(() => restored.catalog.stop());
+  assert.deepEqual((await restored.catalog.browse({ category: 'variety' })).items.map(item => item.id), ['2', '4']);
+
+  const legacy = JSON.parse(store.meta(CACHE_KEY));
+  legacy.version = 8;
+  legacy.subjects.find(([id]) => id === '1')[1].item.category = 'variety';
+  legacy.pages.find(([, entry]) => entry.category === 'variety')[1].items.push('1');
+  store.setMeta(CACHE_KEY, JSON.stringify(legacy));
+  const upgraded = fixture(handler, { store });
+  t.after(() => upgraded.catalog.stop());
+  assert.deepEqual((await upgraded.catalog.browse({ category: 'variety' })).items.map(item => item.id), ['2', '4']);
+  assert.deepEqual(upgraded.calls.map(({ url }) => url.pathname.split('/').at(-1)).sort(), ['1', '4', 'recommend']);
 });
 
 test('adult, invalid identity, unrelated object kinds and untrusted poster hosts are filtered safely', async t => {
@@ -504,7 +525,7 @@ test('old cached aliases refresh from the same official subject while poster IDs
   assert.equal(refreshed.id, item.id);
   assert.deepEqual(refreshed.aliases.slice(0, 2), ['Resident Evil', '生化危机9']);
   assert.equal(fresh.catalog.poster('37068446'), item.poster);
-  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 8);
+  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 9);
   for (const key of ['quark-settings-v1', 'history-marker', 'favorites-marker']) assert.equal(old.store.values.get(key), key + '-preserved');
 });
 
