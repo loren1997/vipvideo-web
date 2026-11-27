@@ -84,7 +84,7 @@ function metadata(raw, detailed = false, now = Date.now(), confirmedComic = fals
   const count = [raw.episodes_count, raw.last_episode_number].find(value => Number.isSafeInteger(value) && value > 0 && value <= 1000);
   const episodes = type === 'movie' ? [{ name: '正片' }] : Array.from({ length: count || 1 }, (_, index) => ({ name: `第${index + 1}集` }));
   return { source: 'quark-library', id, key: `quark-library:${id}`, title, year, type, category, countries, ...(languages ? { languages } : {}),
-    ...(type === 'series' ? catalogSeason(title) : undefined),
+    ...(type === 'series' ? catalogSeason(title, id) : undefined),
     poster: [raw.pic?.large, raw.pic?.normal, raw.cover].map(posterOf).find(Boolean) || '', genres, releaseDate, aliases, originalTitle: text(raw.original_title),
     description, descriptionLanguage: chineseSynopsis ? 'zh' : 'unavailable', ...(synopsis && !chineseSynopsis ? { originalDescription: synopsis } : {}), typeName, releaseStatus,
     episodeCount: type === 'movie' ? 1 : count || null,

@@ -6,7 +6,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createQuarkCatalog } from '../lib/quark-catalog.mjs';
-import { MOTION_COMIC_SEEDS } from '../lib/catalog-filters.mjs';
+import { catalogSeason, MOTION_COMIC_SEEDS } from '../lib/catalog-filters.mjs';
 import { createStore } from '../lib/store.mjs';
 import { createRequest } from '../lib/network.mjs';
 
@@ -451,6 +451,13 @@ test('a confirmed series absent from recommendation lists is available by its ve
   const page = await catalog.browse({ category: 'motion-comic', language: 'zh' });
   assert.deepEqual(page.items.map(item => item.id).sort(), MOTION_COMIC_SEEDS.map(([, id]) => id).sort());
   assert.ok(page.items.every(item => item.category === 'motion-comic' && item.episodeCount === 24));
+  for (const [title, id, label] of MOTION_COMIC_SEEDS.filter(([, , label]) => label)) {
+    const base = page.items.find(item => item.id === id);
+    assert.equal(base.seasonLabel, '未标季');
+    assert.equal(base.seriesKey, catalogSeason(`${title}第二季`).seriesKey);
+    assert.equal(catalogSeason(title, '123'), undefined);
+    assert.equal(catalogSeason(`${title}特别版`, id), undefined);
+  }
   assert.equal(calls.filter(({ url }) => /\/tv\/\d+$/.test(url.pathname)).length, MOTION_COMIC_SEEDS.length);
 });
 
