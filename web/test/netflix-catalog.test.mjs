@@ -63,7 +63,7 @@ test('Netflix library unions every discovered region, excludes non-Netflix provi
   const source = mockRequest({
     discover(url) {
       const region = url.searchParams.get('watch_region'), page = Number(url.searchParams.get('page'));
-      const rows = url.pathname.endsWith('/tv') ? region === 'JP' ? [tv(1), tv(2, { genre_ids: [16] }), tv(3, { genre_ids: [10764] }), tv(4, { name: '幻想录（AI 漫剧）', genre_ids: [16] })] : []
+      const rows = url.pathname.endsWith('/tv') ? region === 'JP' ? [tv(1), tv(2, { genre_ids: [16] }), tv(3, { genre_ids: [10764] }), tv(4, { name: '幻想录（AI 漫剧）', genre_ids: [16] }), tv(5, { name: '万妖图录传第三季', genre_ids: [16] })] : []
         : region === 'JP' ? [movie(1), movie(760, { title: '日本限定', genre_ids: [16], origin_country: ['JP'], release_date: '2026-01-01' })]
           : [...Array.from({ length: 759 }, (_, index) => movie(index + 1, { origin_country: ['US'] })), movie(761, { adult: true })];
       return response(url, list(rows, page, 1));
@@ -99,7 +99,7 @@ test('Netflix library unions every discovered region, excludes non-Netflix provi
   assert.ok(!collected.has('tmdb:movie:761'));
   assert.deepEqual(catalog.browse(query({ category: 'tv' })).items.map(item => item.id), ['tmdb:tv:1']);
   assert.deepEqual(catalog.browse(query({ category: 'anime' })).items.map(item => item.id), ['tmdb:tv:2']);
-  assert.deepEqual(catalog.browse(query({ category: 'motion-comic' })).items.map(item => item.id), ['tmdb:tv:4']);
+  assert.deepEqual(catalog.browse(query({ category: 'motion-comic' })).items.map(item => [item.id, item.seriesKey, item.seasonLabel]), [['tmdb:tv:4', undefined, undefined], ['tmdb:tv:5', '万妖图录传', '第三季']]);
   assert.deepEqual(catalog.browse(query({ category: 'variety' })).items.map(item => item.id), ['tmdb:tv:3']);
   assert.deepEqual(catalog.browse(query({ genre: '动画', year: '2026', country: '日本' })).items.map(item => [item.id, item.type, item.category, item.typeName]), [['tmdb:movie:760', 'movie', 'movie', '电影']]);
   assert.equal(catalog.poster('tmdb:movie:760'), 'https://image.tmdb.org/t/p/w342/title.jpg');

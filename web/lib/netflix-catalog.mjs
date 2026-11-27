@@ -3,7 +3,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { catalogLanguage, motionComicTitle, normalizeCountries } from './catalog-filters.mjs';
+import { catalogLanguage, catalogSeason, knownMotionComicSeries, motionComicTitle, normalizeCountries } from './catalog-filters.mjs';
 import { request as networkRequest, readText } from './network.mjs';
 
 const API = 'https://api.themoviedb.org/3/';
@@ -57,11 +57,13 @@ function summarize(raw, kind) {
 function itemOf(summary, regions) {
   const { kind, id: externalId, title, original_title: originalTitle, genre_ids: genreIds, release_date: releaseDate } = summary;
   const id = `tmdb:${kind}:${externalId}`, type = kind === 'movie' ? 'movie' : 'series';
-  const category = kind === 'movie' ? 'movie' : motionComicTitle(title) || motionComicTitle(originalTitle) ? 'motion-comic' : genreIds.includes(16) ? 'anime'
+  const animated = genreIds.includes(16);
+  const comic = [title, originalTitle].some(motionComicTitle) || animated && [title, originalTitle].some(knownMotionComicSeries);
+  const category = kind === 'movie' ? 'movie' : comic ? 'motion-comic' : animated ? 'anime'
     : genreIds.some(genre => VARIETY.has(genre)) ? 'variety' : 'tv';
   const typeName = { movie: '电影', tv: '电视剧', anime: '动漫', 'motion-comic': '漫剧', variety: '综艺' }[category];
   return { source: 'quark-library', id, key: `quark-library:${id}`, title, originalTitle, aliases: originalTitle && originalTitle !== title ? [originalTitle] : [],
-    type, typeName, category, language: summary.original_language, year: releaseDate.slice(0, 4), releaseDate, releaseStatus: 'released', countries: normalizeCountries(summary.origin_country),
+    type, typeName, category, ...(type === 'series' ? catalogSeason(title) : undefined), language: summary.original_language, year: releaseDate.slice(0, 4), releaseDate, releaseStatus: 'released', countries: normalizeCountries(summary.origin_country),
     genres: [...new Set(genreIds.map(genre => GENRE[genre]))], netflix: true, availabilityRegions: regions,
     poster: summary.poster_path ? `https://image.tmdb.org/t/p/w342${summary.poster_path}` : '',
     tmdb: { id: externalId, score: summary.vote_average, votes: summary.vote_count, url: `https://www.themoviedb.org/${kind}/${externalId}`, attribution: 'TMDB' },

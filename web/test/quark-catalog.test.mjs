@@ -6,6 +6,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createQuarkCatalog } from '../lib/quark-catalog.mjs';
+import { MOTION_COMIC_SEEDS } from '../lib/catalog-filters.mjs';
 import { createStore } from '../lib/store.mjs';
 import { createRequest } from '../lib/network.mjs';
 
@@ -28,6 +29,8 @@ function fixture(handler, options = {}) {
   const catalog = createQuarkCatalog({ store, ...options, request: async (value, settings) => {
     const url = new URL(value);
     if (!options.comicIndex && url.searchParams.get('count') === '100' && url.searchParams.get('tags') === '漫剧') return response({ items: [], total: 0 }, 200, url.href);
+    if (!options.comicDiscovery && /^动画,(?:\d{4}|短剧)$/u.test(url.searchParams.get('tags') || '') && ['50', '100'].includes(url.searchParams.get('count'))) return response({ items: [], total: 0 }, 200, url.href);
+    if (!options.comicDiscovery && MOTION_COMIC_SEEDS.some(([, id]) => url.pathname.endsWith(`/tv/${id}`))) return response({}, 404, url.href);
     calls.push({ url, settings });
     return handler ? handler(url, settings, calls.length) : response({ items: [film()], total: 1 }, 200, url.href);
   } });
@@ -416,6 +419,41 @@ test('motion comics discovered outside the tagged feed remain pageable and visib
   assert.equal(second.hasMore, false);
 });
 
+test('screenshot comic seasons move together, with new families corroborated by exact subject tags', async t => {
+  const titles = ['万妖图录传 第三季', '万妖图录传第十一季', '聚宝仙盆之杂灵根才是真BOSS 第十六季', '满院亲戚全是上古大妖第七季',
+    '重生！丑小鸭逆袭成了万人迷 第三季', '糯糯下山，师兄们都慌了', '急诊摸鱼王', '发配边关，罪妻开荒养出战神第一季', '发配边关，罪妻开荒养出战神 第二季',
+    '有兽焉 第六季', '万妖图录传外传 第三季'];
+  const rows = titles.map((title, i) => film({ id: String(100 + i), type: 'tv', title, genres: ['动画', '短片'], languages: ['普通话'] }));
+  const { catalog, calls } = fixture(url => {
+    if (url.pathname.endsWith('/tags')) return response({ tags: url.pathname.includes('/107/') ? [{ name: 'AI漫剧' }] : [{ name: '短剧' }, { name: '动画' }] }, 200, url.href);
+    const tags = url.searchParams.get('tags');
+    const items = tags === '漫剧' ? [] : tags === '动画,短剧' ? [rows[0], rows[7], rows[9]] : rows;
+    return response({ items, total: items.length }, 200, url.href);
+  }, { comicDiscovery: true, now: () => Date.UTC(2026, 10, 27) });
+  t.after(() => catalog.stop());
+  assert.deepEqual((await catalog.browse({ category: 'anime' })).items.map(item => item.id), ['107', '108', '109', '110']);
+  const comics = await catalog.browse({ category: 'motion-comic', language: 'zh' });
+  assert.deepEqual(comics.items.map(item => item.id), rows.slice(0, 9).map(row => row.id));
+  const seasons = comics.items.filter(item => item.seriesKey === '万妖图录传');
+  assert.deepEqual(seasons.map(item => [item.id, item.seriesTitle, item.seasonLabel]), [['100', '万妖图录传', '第三季'], ['101', '万妖图录传', '第十一季']]);
+  assert.deepEqual((await catalog.browse({ category: 'anime' })).items.map(item => item.id), ['109', '110']);
+  assert.deepEqual(calls.filter(({ url }) => url.pathname.endsWith('/tags')).map(({ url }) => url.pathname).sort(), ['/rexxar/api/v2/tv/107/tags', '/rexxar/api/v2/tv/109/tags']);
+});
+
+test('a confirmed series absent from recommendation lists is available by its verified subject ID', async t => {
+  const { catalog, calls } = fixture(url => {
+    if (url.pathname.endsWith('/recommend')) return response({ items: [], total: 0 }, 200, url.href);
+    const id = url.pathname.split('/').at(-1);
+    const title = MOTION_COMIC_SEEDS.find(([, key]) => key === id)?.[0];
+    return response(film({ id, title, type: 'tv', languages: ['国语'], genres: ['动画'], episodes_count: 24 }), 200, url.href);
+  }, { comicDiscovery: true });
+  t.after(() => catalog.stop());
+  const page = await catalog.browse({ category: 'motion-comic', language: 'zh' });
+  assert.deepEqual(page.items.map(item => item.id).sort(), MOTION_COMIC_SEEDS.map(([, id]) => id).sort());
+  assert.ok(page.items.every(item => item.category === 'motion-comic' && item.episodeCount === 24));
+  assert.equal(calls.filter(({ url }) => /\/tv\/\d+$/.test(url.pathname)).length, MOTION_COMIC_SEEDS.length);
+});
+
 test('old mixed anime pages are refreshed and cached animated films are reclassified without refetching Movies', async t => {
   const animated = { genres: ['动画'] };
   const handler = url => response({ items: [film({ id: '1', ...animated }), film({ id: '2', type: 'tv', ...animated })], total: 2 }, 200, url.href);
@@ -581,7 +619,7 @@ test('old cached aliases refresh from the same official subject while poster IDs
   assert.equal(refreshed.id, item.id);
   assert.deepEqual(refreshed.aliases.slice(0, 2), ['Resident Evil', '生化危机9']);
   assert.equal(fresh.catalog.poster('37068446'), item.poster);
-  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 10);
+  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 11);
   for (const key of ['quark-settings-v1', 'history-marker', 'favorites-marker']) assert.equal(old.store.values.get(key), key + '-preserved');
 });
 

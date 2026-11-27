@@ -76,6 +76,35 @@ export function motionComicTitle(value) {
   return [parts[0], parts.at(-1), /[\[(【]([^()[\]【】]+)[)\]】]\s*$/u.exec(title)?.[1]].some(motionComicLabel);
 }
 
+export function catalogSeason(value) {
+  if (typeof value !== 'string') return undefined;
+  const match = /^(.+?)(?:\s*(第\s*[零〇一二两兩三四五六七八九十百\d]{1,6}\s*季)|\s+(Season\s+\d{1,3}))$/iu.exec(value.normalize('NFKC').trim());
+  if (!match) return undefined;
+  const seriesTitle = match[1].trim();
+  return { seriesKey: seriesTitle.toLowerCase().replace(/\s+/gu, ''), seriesTitle, seasonLabel: match[2]?.replace(/\s+/gu, '') || match[3] };
+}
+
+export function motionComicSeriesKey(value) {
+  return typeof value === 'string' ? (catalogSeason(value)?.seriesTitle || value).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '') : '';
+}
+
+// Public Douban subject tags corroborate these series, even when neither recommendation feed contains the title.
+export const MOTION_COMIC_SEEDS = [
+  ['万妖图录传', '38436722'],
+  ['满院亲戚全是上古大妖', '38623432'],
+  ['聚宝仙盆之杂灵根才是真BOSS', '38397487'],
+  ['重生！丑小鸭逆袭成了万人迷', '39060505'],
+  ['糯糯下山，师兄们都慌了', '38636616'],
+  ['急诊摸鱼王', '38650036'],
+];
+const motionComicSeries = new Set(MOTION_COMIC_SEEDS.map(([title]) => motionComicSeriesKey(title)));
+
+export const knownMotionComicSeries = value => motionComicSeries.has(motionComicSeriesKey(value));
+
+export function motionComicTags(values, animated) {
+  return values.some(motionComicLabel) || (animated && values.some(value => /^AI(?:GC)?[剧劇]$/iu.test(value)) && values.some(value => /^短[剧劇]$/u.test(value)));
+}
+
 export function catalogLanguage(value) {
   if (typeof value !== 'string' || value.length > 80) return '';
   const label = value.normalize('NFKC').trim().toLowerCase();

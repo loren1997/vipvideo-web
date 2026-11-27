@@ -328,6 +328,20 @@ function card(item, options = {}) {
   }
   const metadata = node('p', options.resume ? sourceName(item.source) : item.source === 'quark-library' ? `${item.year || '年份未知'} · ${(item.genres || []).slice(0, 2).join(' · ') || item.typeName || typeLabel(item.type)}` : `${item.year || '年份未知'} · ${item.typeName || typeLabel(item.type)} · ${item.items?.length || 1} 个来源`, 'card-meta'); metadata.title = (item.genres || []).join(' · ');
   element.append(cover, node('h3', item.title, 'card-title'), metadata);
+  if (item.seasonChoices?.length > 1) {
+    const seasons = node('details', undefined, 'card-seasons');
+    seasons.dataset.seriesKey = item.seriesKey;
+    seasons.open = options.openSeasons?.has(item.seriesKey) || false;
+    const summary = node('summary', `选季（${item.seasonChoices.length}）`); summary.tabIndex = 0;
+    summary.setAttribute('aria-label', `${item.seriesTitle || item.title} · 选季`);
+    seasons.append(summary);
+    for (const season of item.seasonChoices) {
+      const title = [season.seasonLabel, season.year].filter(Boolean).join(' · ');
+      const choice = button(title, () => openItem(season), 'button subtle small');
+      seasons.append(choice);
+    }
+    element.append(seasons);
+  }
   if (options.releaseDates) element.append(node('p', browseReleaseDate(item) || '上映日期未知', 'card-date'));
   if (options.remove) {
     const remove = button('×', options.remove, 'card-delete'); remove.setAttribute('aria-label', `移除 ${item.title}`); element.append(remove);
@@ -591,6 +605,24 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
   if (config.sources.some(source => source.enabled !== false)) await loadPage();
 }
 
+function groupQuarkTitles(rows) {
+  const cards = [], series = new Map(), seen = new Set();
+  const normalize = value => String(value || '').normalize('NFKC').toLowerCase().replace(/\s+/g, '');
+  for (const item of rows) {
+    const title = normalize(item.title);
+    const origin = item.seriesKey || normalize(item.originalTitle || item.title);
+    const key = title && /^\d{4}$/.test(item.year) && item.type ? JSON.stringify([title, String(item.year), item.type, origin]) : '';
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    if (item.type !== 'series' || !item.seriesKey || !item.seasonLabel) { cards.push(item); continue; }
+    const existing = series.get(item.seriesKey);
+    if (existing) { existing.seasonChoices.push(item); continue; }
+    const card = { ...item, seasonChoices: [item] };
+    series.set(item.seriesKey, card); cards.push(card);
+  }
+  return cards;
+}
+
 async function renderQuarkLibrary(params, stamp) {
   quarkLibraryHash = location.hash;
   const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺', 'motion-comic': '动态漫 / AI 漫剧' };
@@ -618,7 +650,7 @@ async function renderQuarkLibrary(params, stamp) {
   const listing = node('div'); listing.id = 'quark-library-results'; page.append(listing);
   const more = button('加载更多影片', () => void load(), 'button subtle load-more'); more.hidden = true; page.append(more); content.replaceChildren(page);
   const batchSize = 30;
-  let items = [], nextPage = 1, displayLimit = batchSize, hasNextPage = true, loadError = '', loading = false;
+  let rows = [], items = [], nextPage = 1, displayLimit = batchSize, hasNextPage = true, loadError = '', loading = false;
   let snapshot, status;
   const pageWarnings = new Map();
   const valid = () => stamp === routeVersion && content.contains(page);
@@ -637,27 +669,17 @@ async function renderQuarkLibrary(params, stamp) {
         if (data.unavailable) throw new Error(errors.join('；') || '目录暂时不可用');
         const version = data.updatedAt ? `${data.updatedAt}:${Boolean(data.provisional)}` : '';
         if (netflix && pageNumber > 1 && snapshot && version && version !== snapshot) {
-          items = []; nextPage = 1; pageWarnings.clear();
+          rows = items = []; nextPage = 1; pageWarnings.clear();
           if (!status?.provisional && !data.provisional) displayLimit = batchSize;
           continue;
         }
-        if (restart) { items = []; displayLimit = batchSize; pageWarnings.clear(); restart = false; }
+        if (restart) { rows = items = []; displayLimit = batchSize; pageWarnings.clear(); restart = false; }
         status = data;
         if (version) snapshot = version;
         filterBar.update(data.facets, netflix ? 1 : pageNumber);
         sortNote.textContent = netflix ? (data.sortLabel || '') : `${data.sortLabel || (filters.sort === 'score' ? '已上映片目，豆瓣高分优先' : filters.sort === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先')}；排序针对当前已加载片目。`;
-        items = [...new Map([...items, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
-        if (dedupeTitles) {
-          const seen = new Set();
-          items = items.filter(item => {
-            const title = String(item.title || '').normalize('NFKC').toLowerCase().replace(/\s+/g, '');
-            if (!title || !/^\d{4}$/.test(item.year) || !item.type) return true;
-            const key = JSON.stringify([title, String(item.year), item.type]);
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          });
-        }
+        rows = [...new Map([...rows, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
+        items = dedupeTitles ? groupQuarkTitles(rows) : rows;
         pageWarnings.set(pageNumber, errors);
         loadError = '';
         hasNextPage = data.hasMore && (netflix || pageNumber < 25);
@@ -698,7 +720,8 @@ async function renderQuarkLibrary(params, stamp) {
       more.hidden = true;
       return;
     }
-    listing.replaceChildren(displayed.length ? grid(displayed, { priorityCount: 6 }) : emptyCatalogPage(filters, hasMore, warnings.length,
+    const openSeasons = new Set([...listing.querySelectorAll('.card-seasons[open]')].map(seasons => seasons.dataset.seriesKey));
+    listing.replaceChildren(displayed.length ? grid(displayed, { priorityCount: 6, openSeasons }) : emptyCatalogPage(filters, hasMore, warnings.length,
       warnings.length && button('重新加载', () => void load(true))));
     if (!netflix && warnings.length) listing.append(node('p', warnings.join('；'), 'muted'));
     if (loadError) notify(loadError, true);

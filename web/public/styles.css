@@ -72,6 +72,9 @@ main { min-height:calc(100vh - 220px); }
 .poster-tag { position:absolute; bottom:9px; left:9px; color:#eaf4fa; font-size:10px; background:#121b27da; border:1px solid #7c91982e; border-radius:4px; padding:2px 7px; max-width:calc(100% - 18px); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .card-title { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:14px; margin:10px 0 2px; font-weight:600; }
 .card-meta { color:#8293a9; font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.card-seasons { margin-top:6px; font-size:12px; }
+.card-seasons summary { cursor:pointer; min-height:30px; padding:6px 2px; }
+.card-seasons .button { width:100%; margin-bottom:4px; white-space:normal; overflow-wrap:anywhere; }
 .browse-controls { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-bottom:21px; }
 .category-tabs { display:flex; flex-wrap:wrap; gap:8px; }
 .category-tabs .button { padding:8px 20px; }
