@@ -684,7 +684,7 @@ async function renderQuarkLibrary(params, stamp) {
         loadError = '';
         hasNextPage = data.hasMore && (netflix || pageNumber < 25);
         nextPage = pageNumber + 1;
-        if (!netflix && language !== 'all' && performance.now() >= scanUntil) break;
+        if (!netflix && (language !== 'all' || dedupeTitles) && performance.now() >= scanUntil) break;
         if (hasNextPage && items.length < displayLimit) {
           const found = Math.max(0, items.length - (displayLimit - batchSize));
           progress.textContent = more.textContent = `正在查找影片… 已找到 ${found}/${batchSize} 部`;

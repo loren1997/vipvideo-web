@@ -1,5 +1,5 @@
 import { request as networkRequest, readText } from './network.mjs';
-import { catalogLanguage, catalogSeason, knownMotionComicSeries, MOTION_COMIC_SEEDS, motionComicSeriesKey, motionComicTags, motionComicTitle, normalizeCountries, validCountryFilter } from './catalog-filters.mjs';
+import { catalogLanguage, catalogSeason, knownMotionComicSeries, MOTION_COMIC_SEEDS, motionComicSeriesKey, motionComicTags, motionComicTitle, normalizeCountries, shortDramaGenre, validCountryFilter } from './catalog-filters.mjs';
 import { isNetflixId, NETFLIX_GENRES } from './netflix-catalog.mjs';
 
 const ORIGIN = 'https://m.douban.com';
@@ -8,6 +8,7 @@ const CACHE_KEY = 'quark-library-douban-v1';
 const HOUR = 3600000;
 const PAGE_SIZE = 20;
 const LANGUAGE_WARNING = '部分片目暂未核实原声语言，已暂时隐藏';
+const COMIC_WARNING = '部分动画暂未核实节目形态，已暂时隐藏';
 const CATEGORY_NAME = { movie: '电影', tv: '电视剧', anime: '动漫', 'motion-comic': '漫剧', variety: '综艺' };
 const markComic = item => Object.assign(item, { category: 'motion-comic', typeName: CATEGORY_NAME['motion-comic'] });
 const POSTER_HOSTS = new Set(['img1.doubanio.com', 'img2.doubanio.com', 'img3.doubanio.com', 'img5.doubanio.com', 'img9.doubanio.com']);
@@ -51,7 +52,7 @@ function metadata(raw, detailed = false, now = Date.now(), confirmedComic = fals
   const tags = Array.isArray(raw.tags) ? raw.tags.slice(0, 24).map(tag => tag?.name || tag?.title || tag) : [];
   const animated = genres.includes('动画');
   const comic = confirmedComic || motionComicTitle(title) || motionComicTitle(raw.original_title) || motionComicTags([...parts, ...tags], animated)
-    || animated && [title, raw.original_title].some(knownMotionComicSeries);
+    || animated && (parts.some(shortDramaGenre) || [title, raw.original_title].some(knownMotionComicSeries));
   const category = raw.type === 'movie' ? 'movie' : comic ? 'motion-comic' : animated ? 'anime'
     : raw.is_show === true || genres.some(value => ['真人秀', '脱口秀'].includes(value)) ? 'variety' : 'tv';
   const type = raw.type === 'movie' ? 'movie' : 'series';
@@ -106,22 +107,22 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
   const pages = new Map(), subjects = new Map(), flights = new Map(), controllers = new Set(), waiting = [], failures = new Map();
   const learnedComicFamilies = new Set(), checkedComicTags = new Map(), comicDiscoveryUntil = new Map();
   let active = 0, stopped = false;
-  let comicIds = new Set(), comicIndexUntil = -Infinity;
+  let comicIds = new Set(), shortComicItems = [], shortComicFamilies = new Set(), comicIndexUntil = -Infinity;
   const saved = store.meta(CACHE_KEY);
   if (typeof saved === 'string' && saved.length <= 2 * 1024 * 1024) {
     try {
       const data = JSON.parse(saved);
-      const withFacets = [5, 6, 7, 8, 9, 10, 11].includes(data.version);
+      const withFacets = [5, 6, 7, 8, 9, 10, 11, 12].includes(data.version);
       for (const [id, entry] of Array.isArray(data.subjects) ? data.subjects.slice(-300) : []) {
         const oldCategory = entry?.item?.category;
         const item = restoreItem(entry?.item, now(), data.version);
         if (item && item.id === id && Number.isFinite(entry.at) && entry.at <= now() && entry.at > now() - 7 * 24 * HOUR) subjects.set(id, { item, at: entry.at, detailed: withFacets && entry.detailed === true && (oldCategory !== 'variety' || item.category === 'variety'), comicDiscovery: data.version >= 10 && (entry.comicDiscovery === true || oldCategory === 'anime' && item.category === 'motion-comic') });
-        if (data.version === 11 && item?.category === 'motion-comic' && subjects.has(id)) learnedComicFamilies.add(motionComicSeriesKey(item.title));
+        if (data.version >= 11 && item?.category === 'motion-comic' && subjects.has(id)) learnedComicFamilies.add(motionComicSeriesKey(item.title));
       }
       for (const [key, entry] of withFacets && Array.isArray(data.pages) ? data.pages.slice(-32) : []) {
         if (typeof key !== 'string' || key.length > 200 || !Number.isFinite(entry?.at) || entry.at > now() || entry.at <= now() - 7 * 24 * HOUR || !Array.isArray(entry.items)) continue;
         if (key.includes('"platform":"netflix"')) continue;
-        if (data.version < 11 && (key.includes('"category":"anime"') || key.includes('"category":"motion-comic"'))) continue;
+        if (data.version < 12 && (key.includes('"category":"anime"') || key.includes('"category":"motion-comic"'))) continue;
         if (data.version < 9 && key.includes('"category":"variety"')) continue;
         const items = entry.items.slice(0, 40).map(id => subjects.get(idOf(id))?.item).filter(Boolean);
         const errors = Array.isArray(entry.errors) ? entry.errors.slice(0, 4).map(value => text(value, 200)).filter(Boolean) : [];
@@ -136,7 +137,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
     while (pages.size > 32) pages.delete(pages.keys().next().value);
     while (subjects.size > 300) subjects.delete(subjects.keys().next().value);
     const serialize = () => JSON.stringify({
-      version: 11,
+      version: 12,
       pages: [...pages].map(([key, entry]) => [key, { ...entry, items: entry.items.map(item => item.id) }]),
       subjects: [...subjects].map(([id, entry]) => { const { lines, ...item } = entry.item; return [id, { ...entry, item }]; }),
     });
@@ -235,16 +236,73 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
     }, signal);
   }
 
+  async function comicChart(tags, count, signal) {
+    const query = new URLSearchParams({ refresh: '0', start: '0', count, uncollect: 'false', tags, sort: 'U' });
+    const { items } = await fetchJson(`tv/recommend?${query}`, signal);
+    if (!Array.isArray(items) || items.length > 100) throw failure('豆瓣动画目录格式暂不可读取');
+    return items.map(raw => metadata(raw, false, now())).filter(item => item?.type === 'series' && item.releaseStatus !== 'upcoming');
+  }
+
+  function learnComicFamily(item) {
+    const family = motionComicSeriesKey(item.title);
+    if (family) learnedComicFamilies.add(family);
+    while (learnedComicFamilies.size > 300) learnedComicFamilies.delete(learnedComicFamilies.values().next().value);
+  }
+
+  async function resolveComicTags(item, signal) {
+    const family = motionComicSeriesKey(item.title);
+    if (learnedComicFamilies.has(family)) return true;
+    const known = checkedComicTags.get(item.id);
+    if (known?.until > now()) return known.comic;
+    try {
+      const { tags } = await fetchJson(`tv/${item.id}/tags?count=50`, AbortSignal.any([signal, AbortSignal.timeout(1400)]));
+      if (!Array.isArray(tags) || !tags.length) return undefined;
+      const comic = motionComicTags(tags.slice(0, 50).map(tag => text(tag?.name || tag?.title || tag)), true);
+      checkedComicTags.set(item.id, { comic, until: now() + 6 * HOUR });
+      while (checkedComicTags.size > 200) checkedComicTags.delete(checkedComicTags.keys().next().value);
+      if (comic) learnComicFamily(item);
+      return comic;
+    } catch { return undefined; }
+  }
+
+  function saveComicDiscoveries(items, detailed = false) {
+    let changed = false;
+    for (const entry of subjects.values()) {
+      if (entry.item.category !== 'anime' || !learnedComicFamilies.has(motionComicSeriesKey(entry.item.title))) continue;
+      markComic(entry.item);
+      entry.comicDiscovery = changed = true;
+    }
+    for (const item of items) {
+      const old = subjects.get(item.id);
+      if (!old?.comicDiscovery || detailed && !old.detailed) {
+        register(markComic(item), detailed, true);
+        changed = true;
+      }
+    }
+    if (changed) {
+      for (const [key, page] of pages) if (page.category === 'motion-comic') pages.delete(key);
+      persist();
+    }
+  }
+
   async function refreshComicIndex() {
     if (comicIndexUntil > now()) return;
     try {
       await load('motion-comic-index', async signal => {
-        // shortcut: index the first 100 tagged subjects for Anime exclusion; later tagged pages also classify titles when browsed.
-        const query = new URLSearchParams({ refresh: '0', start: '0', count: '100', uncollect: 'false', tags: '漫剧', sort: 'U' });
-        const data = await fetchJson(`tv/recommend?${query}`, AbortSignal.any([signal, AbortSignal.timeout(2500)]));
-        if (!Array.isArray(data.items) || data.items.length > 100) throw failure('豆瓣漫剧目录暂不可读取');
-        comicIds = new Set(data.items.map(raw => metadata(raw, false, now())).filter(item => item?.category === 'anime' || item?.category === 'motion-comic').map(item => item.id));
-        comicIndexUntil = now() + HOUR;
+        // shortcut: index the first 100 entries per source; Anime browse also verifies candidate subjects on later pages.
+        const probe = AbortSignal.any([signal, AbortSignal.timeout(2500)]);
+        const [tagged, distributor, short] = await Promise.allSettled([comicChart('漫剧', '100', probe), comicChart('动画,红果短剧', '100', probe), comicChart('动画,短剧', '100', probe)]);
+        signal.throwIfAborted();
+        const animated = item => item.category === 'anime' || item.category === 'motion-comic';
+        if (tagged.status === 'fulfilled') comicIds = new Set(tagged.value.filter(animated).map(item => item.id));
+        if (short.status === 'fulfilled') {
+          shortComicItems = short.value;
+          shortComicFamilies = new Set(shortComicItems.filter(animated).map(item => motionComicSeriesKey(item.title)));
+        }
+        const distributed = (distributor.value || []).filter(animated);
+        for (const item of distributed) learnComicFamily(item);
+        saveComicDiscoveries(distributed);
+        comicIndexUntil = now() + ([tagged, distributor, short].every(result => result.status === 'fulfilled') ? HOUR : 60000);
         return true;
       });
     } catch { comicIndexUntil = now() + 60000; }
@@ -256,65 +314,42 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
     try {
       fresh = await load(`motion-comic-discovery:${year}`, async signal => {
         const probe = AbortSignal.any([signal, AbortSignal.timeout(5000)]);
-        async function chart(tags, count) {
-          const query = new URLSearchParams({ refresh: '0', start: '0', count, uncollect: 'false', tags, sort: 'U' });
-          const { items } = await fetchJson(`tv/recommend?${query}`, probe);
-          if (!Array.isArray(items) || items.length > 100) throw failure('豆瓣动画目录格式暂不可读取');
-          return items.map(raw => metadata(raw, false, now())).filter(item => item?.type === 'series' && item.releaseStatus !== 'upcoming');
-        }
-        const [recent, short] = await Promise.allSettled([chart(`动画,${year}`, '100'), chart('动画,短剧', '50')]);
-        const listed = [...(recent.value || []), ...(short.value || [])];
+        const recent = await comicChart(`动画,${year}`, '100', probe).catch(() => null);
+        const listed = [...(recent || []), ...shortComicItems];
+        signal.throwIfAborted();
+        for (const item of listed) if (item.category === 'motion-comic') learnComicFamily(item);
         const families = new Set([...listed, ...[...subjects.values()].map(({ item }) => item)]
           .filter(item => item.category === 'motion-comic').map(item => motionComicSeriesKey(item.title)));
-        let changed = false;
         const missing = MOTION_COMIC_SEEDS.filter(([title]) => !families.has(motionComicSeriesKey(title)));
         const seeded = await Promise.allSettled(missing.map(async ([title, id]) => {
           const raw = await fetchJson(`tv/${id}`, probe);
           if (idOf(raw.id) !== id || raw.type !== 'tv') return false;
           const item = metadata(raw, true, now(), true);
           if (!item || item.releaseStatus === 'upcoming' || motionComicSeriesKey(item.title) !== motionComicSeriesKey(title)) return false;
+          signal.throwIfAborted();
           register(item, true, true);
-          changed = true;
           return true;
         }));
         const candidates = new Map();
-        for (const item of short.value || []) {
+        for (const item of shortComicItems) {
           const family = motionComicSeriesKey(item.title);
-          if (item.category === 'anime' && family && !learnedComicFamilies.has(family) && !candidates.has(family) && !(checkedComicTags.get(item.id) > now())) candidates.set(family, item.id);
+          if (item.category === 'anime' && family && !learnedComicFamilies.has(family) && !candidates.has(family) && !(checkedComicTags.get(item.id)?.until > now())) candidates.set(family, item);
         }
         // shortcut: corroborate at most six new families per discovery; known families and explicit labels need no additional calls.
-        const checks = [...candidates].slice(0, 6);
+        const checks = [...candidates.values()].slice(0, 6);
+        let finished = 0;
         await Promise.all([0, 1].map(async offset => {
           for (let i = offset; i < checks.length && !probe.aborted; i += 2) {
-            const [family, id] = checks[i];
-            try {
-              const { tags } = await fetchJson(`tv/${id}/tags?count=50`, probe);
-              if (!Array.isArray(tags)) continue;
-              checkedComicTags.set(id, now() + 6 * HOUR);
-              if (motionComicTags(tags.slice(0, 50).map(tag => text(tag?.name || tag?.title || tag)), true)) learnedComicFamilies.add(family);
-            } catch { /* Keep the verified films even if one source tag is unavailable. */ }
+            if (await resolveComicTags(checks[i], probe) !== undefined) finished++;
           }
         }));
-        while (learnedComicFamilies.size > 300) learnedComicFamilies.delete(learnedComicFamilies.values().next().value);
-        while (checkedComicTags.size > 100) checkedComicTags.delete(checkedComicTags.keys().next().value);
         signal.throwIfAborted();
-        for (const entry of subjects.values()) {
-          if (entry.item.category !== 'anime' || !learnedComicFamilies.has(motionComicSeriesKey(entry.item.title))) continue;
-          markComic(entry.item);
-          entry.comicDiscovery = changed = true;
-        }
-        for (const item of listed) {
-          if (item.category !== 'motion-comic' && (item.category !== 'anime' || !learnedComicFamilies.has(motionComicSeriesKey(item.title)))) continue;
-          if (!subjects.get(item.id)?.comicDiscovery) {
-            register(markComic(item), false, true);
-            changed = true;
-          }
-        }
-        if (changed) {
+        if (seeded.some(row => row.value === true)) {
           for (const [key, page] of pages) if (page.category === 'motion-comic') pages.delete(key);
           persist();
         }
-        return recent.status === 'fulfilled' && short.status === 'fulfilled' && seeded.every(row => row.value === true);
+        saveComicDiscoveries(listed.filter(item => item.category === 'motion-comic' || item.category === 'anime' && learnedComicFamilies.has(motionComicSeriesKey(item.title))));
+        return recent !== null && finished === candidates.size && seeded.every(row => row.value === true);
       });
     } catch { /* The already known motion comics and dedicated feed remain usable. */ }
     comicDiscoveryUntil.set(year, now() + (fresh ? HOUR : 60000));
@@ -374,7 +409,10 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
         const selected = netflix ? await netflix.browse(values) : { items: [], hasMore: false, unconfigured: true };
         return { ...values, ...selected };
       }
-      if (values.category === 'motion-comic') await discoverComics(values.year || String(new Date(now()).getUTCFullYear()));
+      if (values.category === 'motion-comic') {
+        await refreshComicIndex();
+        await discoverComics(values.year || String(new Date(now()).getUTCFullYear()));
+      }
       const filterLanguage = values.language !== 'all';
       const key = JSON.stringify({ ...values, language: filterLanguage ? values.language : undefined }), cached = pages.get(key);
       const comicIndex = values.category === 'anime' ? refreshComicIndex() : undefined;
@@ -444,13 +482,54 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
           if (releaseUnknown || needsCountry || needsLanguage || needsCategory) unconfirmed.set(item.id, { item, releaseUnknown, needsCountry, needsLanguage, needsCategory });
           else { const registered = register(item, false); if (['released', 'screened'].includes(registered.releaseStatus)) rows.push(registered); }
         }
+        const entries = [];
         for (const raw of data.items) {
           if (raw?.type !== kind) continue;
           const id = idOf(raw.id), known = subjects.get(id);
           const item = metadata(raw, false, now(), comicIds.has(id) || known?.item.category === 'motion-comic');
-          if (item?.category === 'anime' && learnedComicFamilies.has(motionComicSeriesKey(item.title))) markComic(item);
-          if (values.category === 'motion-comic' && item?.category === 'anime') markComic(item);
-          consider(item, known, typeof raw.is_show === 'boolean');
+          if (!item || item.releaseStatus === 'upcoming') continue;
+          if (item.category === 'anime' && (values.category === 'motion-comic' || learnedComicFamilies.has(motionComicSeriesKey(item.title)))) markComic(item);
+          entries.push({ item, hasShowFlag: typeof raw.is_show === 'boolean' });
+        }
+        const pendingComic = new Set();
+        if (values.category === 'anime') {
+          const recentYear = new Date(now()).getUTCFullYear() - 2;
+          const checks = [];
+          for (const { item } of entries) {
+            if (item.category !== 'anime' || values.year && item.year !== values.year || values.genre && !item.genres.includes(values.genre)) continue;
+            const recentDomestic = Number(item.year) >= recentYear && item.countries.includes('中国大陆');
+            const uncertain = shortComicFamilies.has(motionComicSeriesKey(item.title)) || recentDomestic && !item.douban.votes;
+            if (!uncertain && !recentDomestic && !item.genres.includes('短片')) continue;
+            if (uncertain) pendingComic.add(item.id);
+            checks.push({ item, uncertain });
+          }
+          const probeBudget = Math.min(2500, 7000 - (Date.now() - started));
+          if (checks.length && probeBudget >= 250) {
+            const probe = AbortSignal.any([signal, AbortSignal.timeout(probeBudget)]);
+            checks.sort((a, b) => Number(b.uncertain) - Number(a.uncertain));
+            await Promise.all([0, 1].map(async offset => {
+              for (let i = offset; i < checks.length && !probe.aborted; i += 2) {
+                const { item } = checks[i], comic = await resolveComicTags(item, probe);
+                if (comic === true) markComic(item);
+                if (comic !== undefined) pendingComic.delete(item.id);
+              }
+            }));
+          }
+          signal.throwIfAborted();
+          for (const { item } of entries) if (item.category === 'motion-comic') learnComicFamily(item);
+          const discovered = [];
+          for (const { item } of entries) {
+            if (item.category === 'anime' && learnedComicFamilies.has(motionComicSeriesKey(item.title))) markComic(item);
+            if (item.category === 'motion-comic') {
+              pendingComic.delete(item.id);
+              if (!comicIds.has(item.id)) discovered.push(item);
+            }
+          }
+          saveComicDiscoveries(discovered);
+          if (pendingComic.size) errors.push(COMIC_WARNING);
+        }
+        for (const { item, hasShowFlag } of entries) {
+          if (!pendingComic.has(item.id)) consider(item, subjects.get(item.id), hasShowFlag);
         }
         for (const entry of extraPage) consider({ ...entry.item }, entry, false);
         signal.throwIfAborted();
@@ -462,11 +541,13 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
         let pendingCountries = queued.filter(row => row.needsCountry).length;
         let pendingLanguages = queued.filter(row => row.needsLanguage).length;
         let pendingCategories = queued.filter(row => row.needsCategory).length;
+        const verifiedComics = [];
         if (candidates.length && budget >= 250) {
           const verification = AbortSignal.any([signal, AbortSignal.timeout(budget)]);
           async function verify({ item, releaseUnknown, needsCountry, needsLanguage, needsCategory }) {
             try {
               const raw = await fetchJson(`${kind}/${item.id}`, verification);
+              signal.throwIfAborted();
               if (idOf(raw.id) !== item.id || raw.type !== kind) return;
               const checked = metadata(raw, true, now(), item.category === 'motion-comic');
               if (!checked) return;
@@ -477,6 +558,7 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
               if (needsCountry && checked.countries.length) pendingCountries--;
               if (needsLanguage) pendingLanguages--;
               if (needsCategory) pendingCategories--;
+              if (values.category !== 'motion-comic' && checked.category === 'motion-comic' && checked.releaseStatus !== 'upcoming') verifiedComics.push(checked);
               const matches = ['released', 'screened'].includes(checked.releaseStatus) && checked.category === values.category && (!values.year || checked.year === values.year) && (!values.genre || checked.genres.includes(values.genre));
               if (matches || needsCategory || checked.releaseStatus === 'upcoming') register(checked, true);
               if (matches) rows.push(checked);
@@ -487,6 +569,10 @@ export function createQuarkCatalog({ store, request = networkRequest, now = Date
           }));
         }
         signal.throwIfAborted();
+        if (verifiedComics.length) {
+          for (const item of verifiedComics) learnComicFamily(item);
+          saveComicDiscoveries(verifiedComics, true);
+        }
         if (unverified) errors.push('部分未评分片目暂未核实上映状态，已隐藏；可稍后重试或继续翻页');
         if (pendingCountries) errors.push('部分片目暂未核实制作国家或地区，可继续翻页');
         if (pendingCategories) errors.push('部分片目暂未核实是否为综艺，可稍后重试或继续翻页');

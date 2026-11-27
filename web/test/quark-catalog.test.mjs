@@ -29,7 +29,7 @@ function fixture(handler, options = {}) {
   const catalog = createQuarkCatalog({ store, ...options, request: async (value, settings) => {
     const url = new URL(value);
     if (!options.comicIndex && url.searchParams.get('count') === '100' && url.searchParams.get('tags') === '漫剧') return response({ items: [], total: 0 }, 200, url.href);
-    if (!options.comicDiscovery && /^动画,(?:\d{4}|短剧)$/u.test(url.searchParams.get('tags') || '') && ['50', '100'].includes(url.searchParams.get('count'))) return response({ items: [], total: 0 }, 200, url.href);
+    if (!options.comicDiscovery && /^动画,(?:\d{4}|短剧|红果短剧)$/u.test(url.searchParams.get('tags') || '') && url.searchParams.get('count') === '100') return response({ items: [], total: 0 }, 200, url.href);
     if (!options.comicDiscovery && MOTION_COMIC_SEEDS.some(([, id]) => url.pathname.endsWith(`/tv/${id}`))) return response({}, 404, url.href);
     calls.push({ url, settings });
     return handler ? handler(url, settings, calls.length) : response({ items: [film()], total: 1 }, 200, url.href);
@@ -419,25 +419,73 @@ test('motion comics discovered outside the tagged feed remain pageable and visib
   assert.equal(second.hasMore, false);
 });
 
-test('screenshot comic seasons move together, with new families corroborated by exact subject tags', async t => {
+test('opening Anime first diverts verified short drama families without guessing from ordinary short animation tags', async t => {
   const titles = ['万妖图录传 第三季', '万妖图录传第十一季', '聚宝仙盆之杂灵根才是真BOSS 第十六季', '满院亲戚全是上古大妖第七季',
     '重生！丑小鸭逆袭成了万人迷 第三季', '糯糯下山，师兄们都慌了', '急诊摸鱼王', '发配边关，罪妻开荒养出战神第一季', '发配边关，罪妻开荒养出战神 第二季',
-    '有兽焉 第六季', '万妖图录传外传 第三季'];
-  const rows = titles.map((title, i) => film({ id: String(100 + i), type: 'tv', title, genres: ['动画', '短片'], languages: ['普通话'] }));
+    '有兽焉 第六季', '万妖图录传外传 第三季', '武极天尊 神界篇', '武极天尊 神界篇 第二季', '帐中香 第二季', '第一部传统动画短片'];
+  const rows = titles.map((title, i) => film({ id: String(100 + i), type: 'tv', title, countries: i === 13 ? ['CN'] : ['JP'],
+    genres: i === 14 ? ['动画', '短片'] : ['动画'], languages: ['普通话'] }));
   const { catalog, calls } = fixture(url => {
-    if (url.pathname.endsWith('/tags')) return response({ tags: url.pathname.includes('/107/') ? [{ name: 'AI漫剧' }] : [{ name: '短剧' }, { name: '动画' }] }, 200, url.href);
+    if (url.pathname.endsWith('/tags')) {
+      const marker = url.pathname.includes('/107/') ? 'AI漫剧' : url.pathname.includes('/113/') ? '短剧(AI)' : '动画短片';
+      return response({ tags: [{ name: marker }, { name: '短剧' }] }, 200, url.href);
+    }
     const tags = url.searchParams.get('tags');
-    const items = tags === '漫剧' ? [] : tags === '动画,短剧' ? [rows[0], rows[7], rows[9]] : rows;
+    if (!url.pathname.endsWith('/recommend')) return response({}, 404, url.href);
+    const items = tags === '漫剧' ? [] : tags === '动画,红果短剧' ? [rows[11]] : tags === '动画,短剧' ? [rows[0], rows[7], rows[9], rows[14]] : rows;
     return response({ items, total: items.length }, 200, url.href);
   }, { comicDiscovery: true, now: () => Date.UTC(2026, 10, 27) });
   t.after(() => catalog.stop());
-  assert.deepEqual((await catalog.browse({ category: 'anime' })).items.map(item => item.id), ['107', '108', '109', '110']);
+  assert.deepEqual((await catalog.browse({ category: 'anime' })).items.map(item => item.id), ['109', '110', '114']);
   const comics = await catalog.browse({ category: 'motion-comic', language: 'zh' });
-  assert.deepEqual(comics.items.map(item => item.id), rows.slice(0, 9).map(row => row.id));
+  assert.deepEqual(comics.items.map(item => item.id), [...rows.slice(0, 9), ...rows.slice(11, 14)].map(row => row.id));
   const seasons = comics.items.filter(item => item.seriesKey === '万妖图录传');
   assert.deepEqual(seasons.map(item => [item.id, item.seriesTitle, item.seasonLabel]), [['100', '万妖图录传', '第三季'], ['101', '万妖图录传', '第十一季']]);
-  assert.deepEqual((await catalog.browse({ category: 'anime' })).items.map(item => item.id), ['109', '110']);
-  assert.deepEqual(calls.filter(({ url }) => url.pathname.endsWith('/tags')).map(({ url }) => url.pathname).sort(), ['/rexxar/api/v2/tv/107/tags', '/rexxar/api/v2/tv/109/tags']);
+  assert.deepEqual((await catalog.browse({ category: 'anime' })).items.map(item => item.id), ['109', '110', '114']);
+  const tagIds = calls.filter(({ url }) => url.pathname.endsWith('/tags')).map(({ url }) => url.pathname.split('/').at(-2));
+  assert.ok(['107', '109', '113', '114'].every(id => tagIds.includes(id)));
+  assert.ok(!tagIds.includes('111') && !tagIds.includes('112'));
+});
+
+test('unfinished short drama checks keep known Anime visible and can recover without opening the comic tab', async t => {
+  let at = Date.UTC(2026, 10, 27), sourceReady = false;
+  const regular = film({ id: '201', type: 'tv', title: '正常动画', countries: ['JP'], genres: ['动画'] });
+  const candidate = film({ id: '202', type: 'tv', title: '尚待核实的动画条目', countries: ['CN'], genres: ['动画'], rating: { count: 0 } });
+  const movie = film({ id: '203', title: '另一个真实动画电影', genres: ['动画', '短剧'] });
+  const { catalog } = fixture(url => {
+    if (url.pathname.endsWith('/tags')) return response({ tags: sourceReady ? [{ name: '竖屏短剧' }] : [] }, 200, url.href);
+    const tags = url.searchParams.get('tags');
+    const items = tags === '动画,短剧' ? [candidate] : tags === '动画' ? [regular, candidate] : url.pathname.includes('/movie/') ? [movie] : [];
+    return response({ items, total: tags === '动画' ? 40 : items.length }, 200, url.href);
+  }, { comicDiscovery: true, now: () => at });
+  t.after(() => catalog.stop());
+  const partial = await catalog.browse({ category: 'anime' });
+  assert.equal(partial.unavailable, undefined);
+  assert.equal(partial.hasMore, true);
+  assert.deepEqual(partial.items.map(item => item.id), ['201']);
+  assert.match(partial.errors.join(''), /暂未核实节目形态/);
+  at += HOUR; sourceReady = true;
+  const retried = await catalog.browse({ category: 'anime' });
+  assert.deepEqual(retried.items.map(item => item.id), ['201']);
+  assert.deepEqual(retried.errors, []);
+  assert.deepEqual((await catalog.browse({ category: 'motion-comic' })).items.map(item => item.id), ['202']);
+  assert.deepEqual((await catalog.browse({ category: 'movie' })).items.map(item => item.id), ['203']);
+});
+
+test('confirmed short drama metadata saves its siblings even when proof first appears in the detail response', async t => {
+  const tv = { type: 'tv', countries: ['JP'], genres: ['动画'] };
+  const first = film({ ...tv, id: '301', title: '节目甲 第一季', is_released: undefined, rating: undefined });
+  const rows = [first, film({ ...tv, id: '302', title: '节目甲 第二季' }), film({ ...tv, id: '303', title: '节目乙 第一季', genres: ['动画', '短剧'] }),
+    film({ ...tv, id: '304', title: '节目乙 第二季' }), film({ ...tv, id: '305', title: '常规动画' })];
+  const { catalog } = fixture(url => {
+    if (url.pathname.endsWith('/301')) return response({ ...first, is_released: true, genres: ['动画', '短剧'] }, 200, url.href);
+    const items = url.searchParams.get('tags') === '动画' ? rows : [];
+    return response({ items, total: items.length }, 200, url.href);
+  });
+  t.after(() => catalog.stop());
+  assert.deepEqual((await catalog.browse({ category: 'anime' })).items.map(item => item.id), ['305']);
+  assert.deepEqual((await catalog.browse({ category: 'motion-comic' })).items.map(item => item.id).sort(), ['301', '302', '303', '304']);
+  assert.equal((await catalog.detail('301')).category, 'motion-comic');
 });
 
 test('a confirmed series absent from recommendation lists is available by its verified subject ID', async t => {
@@ -462,7 +510,7 @@ test('a confirmed series absent from recommendation lists is available by its ve
 });
 
 test('old mixed anime pages are refreshed and cached animated films are reclassified without refetching Movies', async t => {
-  const animated = { genres: ['动画'] };
+  const animated = { genres: ['动画'], countries: ['JP'] };
   const handler = url => response({ items: [film({ id: '1', ...animated }), film({ id: '2', type: 'tv', ...animated })], total: 2 }, 200, url.href);
   const original = fixture(handler);
   await original.catalog.browse({ category: 'movie' });
@@ -495,7 +543,7 @@ test('an unavailable animation feed keeps cached matching series and exposes its
   let time = Date.now(), failed = false;
   const { catalog, calls } = fixture(url => {
     if (failed) return response('', 403, url.href);
-    return response({ items: [film({ id: '2', type: 'tv', genres: ['动画'] })], total: 30 }, 200, url.href);
+    return response({ items: [film({ id: '2', type: 'tv', genres: ['动画'], countries: ['JP'] })], total: 30 }, 200, url.href);
   }, { now: () => time });
   t.after(() => catalog.stop());
   assert.equal((await catalog.browse({ category: 'anime' })).items.length, 1);
@@ -626,7 +674,7 @@ test('old cached aliases refresh from the same official subject while poster IDs
   assert.equal(refreshed.id, item.id);
   assert.deepEqual(refreshed.aliases.slice(0, 2), ['Resident Evil', '生化危机9']);
   assert.equal(fresh.catalog.poster('37068446'), item.poster);
-  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 11);
+  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 12);
   for (const key of ['quark-settings-v1', 'history-marker', 'favorites-marker']) assert.equal(old.store.values.get(key), key + '-preserved');
 });
 
@@ -753,7 +801,7 @@ test('duplicate catalog requests share work and at most two outbound reads run a
   const { catalog, calls } = fixture(async url => {
     active++; peak = Math.max(peak, active);
     await new Promise(resolve => releases.push(() => { active--; resolve(); }));
-    return response({ items: [film({ ...(url.pathname.includes('/tv/') ? { id: '2', type: 'tv' } : {}), genres: ['动画'] })], total: 1 }, 200, url.href);
+    return response({ items: [film({ ...(url.pathname.includes('/tv/') ? { id: '2', type: 'tv' } : {}), genres: ['动画'], countries: ['JP'] })], total: 1 }, 200, url.href);
   });
   t.after(() => catalog.stop());
   const first = catalog.browse({ category: 'anime' }), duplicate = catalog.browse({ category: 'anime' }), third = catalog.browse({ category: 'movie' });

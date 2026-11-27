@@ -67,7 +67,9 @@ const languageAliases = new Map(Object.entries({
 const unknownLanguages = new Set(['all', 'und', 'mul', 'mis', 'zxx', 'unk', 'xx', 'zz']);
 
 export const motionComicLabel = value => typeof value === 'string' &&
-  /^(?:动态漫[画畫]?|動態漫[画畫]?|(?:AI(?:GC)?\s*)?漫[剧劇]|motion comic)$/iu.test(value.normalize('NFKC').trim());
+  /^(?:动态漫[画畫]?|動態漫[画畫]?|(?:AI(?:GC)?\s*)?漫[剧劇]|[动動][画畫]短[剧劇]|AI(?:GC)?\s*(?:微)?短[剧劇]|短[剧劇]\(AI(?:GC)?\)|motion comic)$/iu.test(value.normalize('NFKC').trim());
+
+export const shortDramaGenre = value => typeof value === 'string' && /^(?:(?:微|[竖豎][屏熒])?短[剧劇]|[红紅]果短[剧劇])$/u.test(value);
 
 export function motionComicTitle(value) {
   if (typeof value !== 'string') return false;
@@ -92,7 +94,7 @@ export function motionComicSeriesKey(value) {
   return typeof value === 'string' ? (catalogSeason(value)?.seriesTitle || value).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '') : '';
 }
 
-// Public Douban subject tags corroborate these series, even when neither recommendation feed contains the title.
+// Public subject tags or distributor catalogues corroborate these series.
 export const MOTION_COMIC_SEEDS = [
   ['万妖图录传', '38436722'],
   ['满院亲戚全是上古大妖', '38623432', '未标季'],
@@ -100,6 +102,9 @@ export const MOTION_COMIC_SEEDS = [
   ['重生！丑小鸭逆袭成了万人迷', '39060505'],
   ['糯糯下山，师兄们都慌了', '38636616'],
   ['急诊摸鱼王', '38650036'],
+  ['废物垫底皇子，反倒成为千古一帝', '38645867'],
+  ['末世度假酒店', '39037636'],
+  ['全球死考：刚下刑场你让我去考试', '39001835'],
 ];
 const unnumberedMotionComicSeasons = new Map(MOTION_COMIC_SEEDS.filter(([, , label]) => label).map(([title, id, label]) => [id, { title, label }]));
 const motionComicSeries = new Set(MOTION_COMIC_SEEDS.map(([title]) => motionComicSeriesKey(title)));
@@ -107,7 +112,11 @@ const motionComicSeries = new Set(MOTION_COMIC_SEEDS.map(([title]) => motionComi
 export const knownMotionComicSeries = value => motionComicSeries.has(motionComicSeriesKey(value));
 
 export function motionComicTags(values, animated) {
-  return values.some(motionComicLabel) || (animated && values.some(value => /^AI(?:GC)?[剧劇]$/iu.test(value)) && values.some(value => /^短[剧劇]$/u.test(value)));
+  if (values.some(motionComicLabel)) return true;
+  if (!animated) return false;
+  const labels = values.filter(value => typeof value === 'string').map(value => value.normalize('NFKC').trim());
+  return labels.some(value => shortDramaGenre(value) && !/^短[剧劇]$/u.test(value))
+    || labels.some(value => /^AI(?:GC)?[剧劇]$/iu.test(value)) && labels.some(value => /^短[剧劇]$/u.test(value));
 }
 
 export function catalogLanguage(value) {
