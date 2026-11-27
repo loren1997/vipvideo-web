@@ -1318,6 +1318,49 @@ try {
     });
   }
 
+  async function verifyQuarkMotionComics() {
+    await withCloudFixture(async open => {
+      const { page: p } = await open({ hash: '#quark' });
+      const item = (id, title, category, year = '2025', type = 'series') => ({ ...cloudFilm, id, key: `quark-library:${id}`, title, category, year, type });
+      const first = item('9100000', '远星档案 第一季', 'anime');
+      const firstPage = [first, ...Array.from({ length: 28 }, (_, index) => item(String(9100001 + index), `动漫分页样例 ${index + 1}`, 'anime'))];
+      const season = item('9100030', '远星档案 第二季', 'anime');
+      const older = item('9100031', first.title, 'anime', '2024'), movie = item('9100032', first.title, 'anime', '2025', 'movie');
+      const comic = item('9200000', '星船日志', 'motion-comic'), comicSeason = item('9200002', '星船日志 第二季', 'motion-comic');
+      const requests = [];
+      await p.route('**/api/quark/library?*', route => {
+        const params = new URL(route.request().url()).searchParams;
+        const category = params.get('category'), page = Number(params.get('page'));
+        if (category !== 'anime' && category !== 'motion-comic') return route.fallback();
+        requests.push(Object.fromEntries(params));
+        const items = category === 'anime' ? page === 1 ? firstPage : [item('9100029', '远星档案　第一季', category), season, older, movie]
+          : page === 1 ? [comic] : [item('9200001', '星船 日志', category), comicSeason];
+        return route.fulfill({ json: { items, hasMore: page === 1, updatedAt: Date.UTC(2026, 10, 27), coverageRegions: ['JP'],
+          facets: { genres: ['动画'], countries: ['中国大陆'], years: ['2025'], languages: ['zh'] }, errors: [] } });
+      });
+      const filters = new URLSearchParams({ category: 'anime', platform: 'netflix', language: 'all', country: '中国大陆', sort: 'score' });
+      await p.evaluate(hash => { location.hash = hash; }, `#quark?${filters}`);
+      const cards = p.locator('#quark-library-results .card-title');
+      await until(() => cards.count().then(count => count === 30), '动漫去重后继续查到首批30部');
+      assert.deepEqual(await cards.allTextContents(), [...firstPage, season].map(row => row.title));
+      assert.equal(await p.locator('#quark-library-results article').first().getAttribute('data-focus-scope'), `film:${first.key}`, '重复标题保留在先的播放标识');
+      await p.getByRole('button', { name: '加载更多影片', exact: true }).click();
+      await until(() => cards.count().then(count => count === 32), '同名不同年份及不同类型保留');
+      assert.deepEqual(await cards.allTextContents(), [...firstPage, season, older, movie].map(row => row.title));
+      const tab = p.locator('.category-tabs').getByRole('button', { name: '动态漫 / AI 漫剧', exact: true });
+      await tab.click();
+      await p.getByRole('button', { name: `查看 ${comicSeason.title}`, exact: true }).waitFor();
+      const selected = requests.filter(row => row.category === 'motion-comic');
+      assert.deepEqual(selected.map(row => [row.page, row.platform, row.language, row.country, row.sort]),
+        [['1', 'netflix', 'all', '中国大陆', 'score'], ['2', 'netflix', 'all', '中国大陆', 'score']]);
+      assert.deepEqual(await cards.allTextContents(), [comic.title, comicSeason.title]);
+      assert.equal(await tab.getAttribute('aria-pressed'), 'true');
+      await p.setViewportSize({ width: 390, height: 844 });
+      assert.ok(await p.evaluate(() => document.documentElement.scrollWidth - innerWidth) <= 1, '第五个分类不造成手机横向溢出');
+    });
+    console.log('PASS 夸克影院独立动态漫/AI漫剧分类、跨页去重、30部批次、独立季和播放标识、保留筛选及手机布局');
+  }
+
   async function verifyQuarkSearchRetry() {
     await withCloudFixture(async open => {
       Object.assign(quarkSettings, { configured: false, enabled: false, account: { connected: false } }); quarkMode = 'search-empty';
@@ -2836,6 +2879,42 @@ try {
     await firstPoster.click();
     await p.getByRole('heading', { name: batchFilms[0].title, exact: true }).waitFor();
     await p.getByRole('link', { name: 'TMDB 8.2', exact: true }).waitFor();
+
+    const doubanFilms = Array.from({ length: 64 }, (_, index) => ({ ...cloudMovie, id: String(7900000 + index), title: `豆瓣分页样例 ${index + 1}` }));
+    const doubanPages = [doubanFilms.slice(0, 15), [], doubanFilms.slice(15, 31), doubanFilms.slice(31, 49), doubanFilms.slice(49)];
+    const requestedPages = [];
+    await p.evaluate(() => {
+      const now = performance.now.bind(performance);
+      window.catalogScanTime = 0;
+      performance.now = () => now() + window.catalogScanTime;
+    });
+    await p.route('**/api/quark/library?*', async route => {
+      const params = new URL(route.request().url()).searchParams;
+      if (params.get('platform')) return route.fallback();
+      assert.equal(params.get('language'), 'zh');
+      const page = Number(params.get('page'));
+      requestedPages.push(page);
+      if (page === 1) await p.evaluate(() => { window.catalogScanTime = 11000; });
+      return route.fulfill({ json: { items: doubanPages[page - 1], hasMore: page < doubanPages.length, facets: fixtureFacets,
+        errors: page <= 2 ? ['部分片目暂未核实原声语言，已暂时隐藏'] : [] } });
+    });
+    await p.evaluate(() => { location.hash = '#quark'; });
+    await more.waitFor();
+    assert.deepEqual(requestedPages, [1], '豆瓣核验耗时较长时直接显示已确认的影片');
+    assert.equal(await titles.count(), 15);
+    assert.equal(await retryMore.count(), 0);
+    await cloud.getByText('部分片目暂未核实原声语言，已暂时隐藏', { exact: true }).waitFor();
+    await more.click();
+    await more.waitFor();
+    assert.deepEqual(requestedPages, [1, 2, 3]);
+    assert.deepEqual(await titles.allTextContents(), doubanFilms.slice(0, 30).map(row => row.title), '自动跳过无已核实影片的源页并补齐首批30部');
+    await more.click();
+    await more.waitFor();
+    assert.deepEqual(await titles.allTextContents(), doubanFilms.slice(0, 60).map(row => row.title), '下一批继续加载30部且保留已有影片');
+    await more.click();
+    await until(() => titles.count().then(count => count === 64), '继续显示最后4部影片');
+    assert.ok(await more.isHidden());
+    assert.deepEqual(requestedPages, [1, 2, 3, 4, 5]);
   }
 
   async function verifyCatalogFilters() {
@@ -2921,8 +3000,8 @@ try {
     console.log('PASS 首页和夸克影院真实年份、国家/地区和Netflix组合筛选、换源分页与刷新');
   }
   if (process.argv.includes('--catalog-filters-only')) await verifyCatalogFilters();
-  else if (process.argv.includes('--quark-library-only')) await verifyQuarkPublicSearch();
-  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkPublicSearch, verifyQuarkSearchRetry, verifyQuarkAutomaticWebFallback, verifyQuarkPendingSearch, verifyQuarkTelegramSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkPlaybackRecovery, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
+  else if (process.argv.includes('--quark-library-only')) { await verifyQuarkPublicSearch(); await verifyQuarkMotionComics(); }
+  else if (process.argv.includes('--quark-only')) { for (const verify of [verifyQuarkAutomaticTransfer, verifyQuarkPublicSearch, verifyQuarkMotionComics, verifyQuarkSearchRetry, verifyQuarkAutomaticWebFallback, verifyQuarkPendingSearch, verifyQuarkTelegramSearch, verifyQuarkChoices, verifyQuarkAutoplay, verifyQuarkFlow, verifyQuarkProgressReadiness, verifyQuarkPictureReadiness, verifyQuarkPlaybackRecovery, verifyQuarkStartupFailure, verifyQuarkSubtitles]) await verify(); }
   else if (process.argv.includes('--quark-qas-only')) await verifyQuarkTelegramSearch();
   else if (process.argv.includes('--quark-web-fallback-only')) await verifyQuarkAutomaticWebFallback();
   else if (process.argv.includes('--quark-auto-transfer-only')) await verifyQuarkAutomaticTransfer();
@@ -3908,6 +3987,7 @@ try {
   await verifyQuarkProgressReadiness();
   await verifyQuarkPictureReadiness();
   await verifyQuarkPublicSearch();
+  await verifyQuarkMotionComics();
   await verifyCatalogFilters();
   await verifyQuarkSearchRetry();
   await verifyQuarkAutomaticWebFallback();

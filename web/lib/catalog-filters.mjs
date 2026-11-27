@@ -66,6 +66,16 @@ const languageAliases = new Map(Object.entries({
 }).flatMap(([code, aliases]) => aliases.map(alias => [alias, code])));
 const unknownLanguages = new Set(['all', 'und', 'mul', 'mis', 'zxx', 'unk', 'xx', 'zz']);
 
+export const motionComicLabel = value => typeof value === 'string' &&
+  /^(?:动态漫[画畫]?|動態漫[画畫]?|(?:AI(?:GC)?\s*)?漫[剧劇]|motion comic)$/iu.test(value.normalize('NFKC').trim());
+
+export function motionComicTitle(value) {
+  if (typeof value !== 'string') return false;
+  const title = value.normalize('NFKC').trim();
+  const parts = title.split(/[·:]/u);
+  return [parts[0], parts.at(-1), /[\[(【]([^()[\]【】]+)[)\]】]\s*$/u.exec(title)?.[1]].some(motionComicLabel);
+}
+
 export function catalogLanguage(value) {
   if (typeof value !== 'string' || value.length > 80) return '';
   const label = value.normalize('NFKC').trim().toLowerCase();

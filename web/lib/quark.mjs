@@ -129,7 +129,7 @@ function detailInfo(detail, options = {}) {
   const rawTitle = name(detail?.title || detail?.name), year = String(detail?.year || '').slice(0, 4);
   if (!rawTitle) throw failure('影片详情缺少名称', 400);
   const key = hash(JSON.stringify([String(detail.source || ''), String(detail.id || ''), rawTitle, year]));
-  const series = detail.type !== 'movie' && (detail.type === 'series' || ['tv', 'anime'].includes(detail.category) || Array.isArray(detail.lines) && detail.lines.some(line => line.episodes?.length > 1));
+  const series = detail.type !== 'movie' && (detail.type === 'series' || ['tv', 'anime', 'motion-comic'].includes(detail.category) || Array.isArray(detail.lines) && detail.lines.some(line => line.episodes?.length > 1));
   let title = rawTitle.normalize('NFKC');
   if (series) for (let count = 0; count < 6; count++) {
     const cleaned = title.replace(/(?:\s*[(\[【]?\s*(?:更新至\s*第?\s*[零〇一二两三四五六七八九十百\d]+\s*[集话]?|第[零〇一二两三四五六七八九十百\d]+[集话季]|(?:全|共)\d+集|\d+集全|完结季|国语|粤语|普通话|双语|中字|中英字幕)|[\s._-]+[(\[【]?\s*(?:s\d{1,2}(?:[ ._-]*e\d{1,3})?|(?:episode|ep|e)[ ._-]*\d{1,3}|\d{1,2}x\d{1,3}|完结|全集|高清|超清|日语|英语|1080p|2160p|4k|HD))\s*[)\]】]?\s*$/i, '').trim();
@@ -808,7 +808,7 @@ export function createQuark({ store, dataDir, request = networkRequest, searchRe
     const videos = listing.list.filter(video), stem = asset.name.replace(/\.[^.]+$/, '');
     if (videos.filter(row => normalized(row.file_name.replace(/\.[^.]+$/, '')) === normalized(stem)).length !== 1) return rows;
     const title = name(asset.subtitleTitle) || stem.split(/[ ._-]+(?:s\d{1,2}[ ._-]*)?(?:episode|ep|e)[ ._-]*\d{1,3}(?!\d)/i)[0];
-    const info = { title, searchTitle: title, series: typeof asset.series === 'boolean' ? asset.series : ['tv', 'anime'].includes(asset.category) || episodeNumber(stem) !== undefined, titleSeason: seasonNumber(stem), season: asset.subtitleSeason };
+    const info = { title, searchTitle: title, series: typeof asset.series === 'boolean' ? asset.series : ['tv', 'anime', 'motion-comic'].includes(asset.category) || episodeNumber(stem) !== undefined, titleSeason: seasonNumber(stem), season: asset.subtitleSeason };
     const selected = { name: asset.name, path: [] }, original = { name: asset.sourceName || asset.name, path: [] }, episode = episodeNumber(stem), uniqueMovie = listing.complete && videos.length === 1;
     const episodeScope = listing.complete && Number.isInteger(episode) && videos.filter(row => episodeNumber(row.file_name.replace(/\.[^.]+$/, '')) === episode).length === 1;
     const lists = [{ parent: folder.fid, list: listing.list, path: [] }];

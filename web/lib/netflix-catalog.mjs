@@ -3,7 +3,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { catalogLanguage, normalizeCountries } from './catalog-filters.mjs';
+import { catalogLanguage, motionComicTitle, normalizeCountries } from './catalog-filters.mjs';
 import { request as networkRequest, readText } from './network.mjs';
 
 const API = 'https://api.themoviedb.org/3/';
@@ -57,9 +57,9 @@ function summarize(raw, kind) {
 function itemOf(summary, regions) {
   const { kind, id: externalId, title, original_title: originalTitle, genre_ids: genreIds, release_date: releaseDate } = summary;
   const id = `tmdb:${kind}:${externalId}`, type = kind === 'movie' ? 'movie' : 'series';
-  const category = kind === 'movie' ? 'movie' : genreIds.includes(16) ? 'anime'
+  const category = kind === 'movie' ? 'movie' : motionComicTitle(title) || motionComicTitle(originalTitle) ? 'motion-comic' : genreIds.includes(16) ? 'anime'
     : genreIds.some(genre => VARIETY.has(genre)) ? 'variety' : 'tv';
-  const typeName = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺' }[category];
+  const typeName = { movie: '电影', tv: '电视剧', anime: '动漫', 'motion-comic': '漫剧', variety: '综艺' }[category];
   return { source: 'quark-library', id, key: `quark-library:${id}`, title, originalTitle, aliases: originalTitle && originalTitle !== title ? [originalTitle] : [],
     type, typeName, category, language: summary.original_language, year: releaseDate.slice(0, 4), releaseDate, releaseStatus: 'released', countries: normalizeCountries(summary.origin_country),
     genres: [...new Set(genreIds.map(genre => GENRE[genre]))], netflix: true, availabilityRegions: regions,

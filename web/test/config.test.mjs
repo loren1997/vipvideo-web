@@ -89,6 +89,7 @@ test('VipVideo platform/line config is compatible and keeps original-address mod
 test('progress validates numbers, caps to duration and supports link-only history', () => {
   const base = { key: 'film', title: '影片', source: 'site', id: '42', year: 2025, type: 'movie' };
   assert.equal(validateRecord({ ...base, category: 'adult' }, true).category, 'adult');
+  assert.equal(validateRecord({ ...base, category: 'motion-comic' }, true).category, 'motion-comic');
   assert.throws(() => validateRecord({ ...base, category: 'unknown' }, true), { status: 400 });
   assert.equal(validateRecord({ ...base, duration: 100, position: 105 }, true).position, 100);
   for (const position of [-1, Infinity, '10', NaN]) assert.throws(() => validateRecord({ ...base, position }, true), { status: 400 });

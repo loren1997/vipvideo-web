@@ -593,8 +593,9 @@ async function renderHome(category = 'movie', selectedSource = '', stamp = route
 
 async function renderQuarkLibrary(params, stamp) {
   quarkLibraryHash = location.hash;
-  const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺' };
+  const categories = { movie: '电影', tv: '电视剧', anime: '动漫', variety: '综艺', 'motion-comic': '动态漫 / AI 漫剧' };
   const category = Object.hasOwn(categories, params.get('category')) ? params.get('category') : 'movie';
+  const dedupeTitles = category === 'anime' || category === 'motion-comic';
   const requestedLanguage = params.get('language') || '';
   const language = /^(?:all|[a-z]{2,3})$/.test(requestedLanguage) ? requestedLanguage : 'zh';
   const filters = { genre: params.get('genre') || '', year: params.get('year') || '', country: params.get('country') || '', platform: params.get('platform') === 'netflix' ? 'netflix' : '', sort: ['release', 'score', 'release-score'].includes(params.get('sort')) ? params.get('sort') : 'release-score', language };
@@ -623,6 +624,7 @@ async function renderQuarkLibrary(params, stamp) {
   const valid = () => stamp === routeVersion && content.contains(page);
   async function load(restart = false) {
     if (loading || !valid()) return; loading = true; more.disabled = checkSync.disabled = true;
+    const scanUntil = performance.now() + 10000;
     const progress = node('p', '正在加载夸克影院…', 'loading'); progress.setAttribute('role', 'status');
     if (!items.length) listing.replaceChildren(progress);
     more.textContent = '正在加载影片…';
@@ -645,10 +647,22 @@ async function renderQuarkLibrary(params, stamp) {
         filterBar.update(data.facets, netflix ? 1 : pageNumber);
         sortNote.textContent = netflix ? (data.sortLabel || '') : `${data.sortLabel || (filters.sort === 'score' ? '已上映片目，豆瓣高分优先' : filters.sort === 'release' ? '热门已上映片目，上映年份优先' : '热门已上映片目，年份优先、同年高分优先')}；排序针对当前已加载片目。`;
         items = [...new Map([...items, ...(Array.isArray(data.items) ? data.items : [])].map(item => [String(item.id), { ...item, id: String(item.id), source: 'quark-library', category: item.category || category }])).values()];
+        if (dedupeTitles) {
+          const seen = new Set();
+          items = items.filter(item => {
+            const title = String(item.title || '').normalize('NFKC').toLowerCase().replace(/\s+/g, '');
+            if (!title || !/^\d{4}$/.test(item.year) || !item.type) return true;
+            const key = JSON.stringify([title, String(item.year), item.type]);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+        }
         pageWarnings.set(pageNumber, errors);
         loadError = '';
         hasNextPage = data.hasMore && (netflix || pageNumber < 25);
         nextPage = pageNumber + 1;
+        if (!netflix && language !== 'all' && performance.now() >= scanUntil) break;
         if (hasNextPage && items.length < displayLimit) {
           const found = Math.max(0, items.length - (displayLimit - batchSize));
           progress.textContent = more.textContent = `正在查找影片… 已找到 ${found}/${batchSize} 部`;
@@ -688,7 +702,7 @@ async function renderQuarkLibrary(params, stamp) {
       warnings.length && button('重新加载', () => void load(true))));
     if (!netflix && warnings.length) listing.append(node('p', warnings.join('；'), 'muted'));
     if (loadError) notify(loadError, true);
-    else if (displayed.length) displayLimit += batchSize;
+    else if (displayed.length === displayLimit) displayLimit += batchSize;
     more.hidden = !hasMore; more.textContent = loadError ? '重试加载更多' : '加载更多影片';
   }
   await load();

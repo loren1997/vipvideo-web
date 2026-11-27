@@ -27,6 +27,7 @@ function fixture(handler, options = {}) {
   const store = options.store || memoryStore(), calls = [];
   const catalog = createQuarkCatalog({ store, ...options, request: async (value, settings) => {
     const url = new URL(value);
+    if (!options.comicIndex && url.searchParams.get('count') === '100' && url.searchParams.get('tags') === '漫剧') return response({ items: [], total: 0 }, 200, url.href);
     calls.push({ url, settings });
     return handler ? handler(url, settings, calls.length) : response({ items: [film()], total: 1 }, 200, url.href);
   } });
@@ -150,29 +151,42 @@ test('audio language uses verified detail rather than translated titles, country
   assert.equal(restored.calls.length, 0);
 });
 
-test('unfinished language checks keep confirmed cards and allow the same page to be retried', async t => {
+test('unfinished language checks keep confirmed cards and pagination on new and cached pages', async t => {
   let at = Date.now(), working = false;
   const rows = [film({ id: '1', languages: ['国语'] }), film({ id: '2' })];
-  const { catalog, calls } = fixture(url => url.pathname.endsWith('/recommend')
-    ? response({ items: rows, total: 40 }, 200, url.href)
-    : working ? response(film({ id: '2', languages: ['粤语'] }), 200, url.href) : response({}, 403, url.href), { now: () => at });
+  const handler = url => url.pathname.endsWith('/recommend')
+    ? response({ items: url.searchParams.get('start') === '0' ? rows : [film({ id: '3' })], total: 60 }, 200, url.href)
+    : working ? response(film({ id: '2', languages: ['粤语'] }), 200, url.href) : response({}, 403, url.href);
+  const { catalog, calls, store } = fixture(handler, { now: () => at });
   t.after(() => catalog.stop());
   const first = await catalog.browse({ language: 'zh' });
   assert.deepEqual(first.items.map(row => row.id), ['1']);
-  assert.equal(first.unavailable, true);
-  assert.match(first.errors.join(''), /核实原声语言/);
-  await catalog.browse({ language: 'zh' });
+  assert.equal(first.unavailable, undefined);
+  assert.equal(first.hasMore, true);
+  assert.deepEqual(first.errors, ['部分片目暂未核实原声语言，已暂时隐藏']);
+  assert.deepEqual(await catalog.browse({ language: 'zh' }), first);
   assert.equal(calls.length, 2);
-  at += 15001;
-  const partial = await catalog.browse({ language: 'zh' });
-  assert.equal(partial.unavailable, undefined);
-  assert.equal(partial.hasMore, true);
-  assert.deepEqual(partial.items.map(row => row.id), ['1']);
-  at += 60001; working = true;
-  const fresh = await catalog.browse({ language: 'zh' });
+  const emptyPage = await catalog.browse({ language: 'zh', page: 2 });
+  assert.deepEqual(emptyPage.items, []);
+  assert.equal(emptyPage.unavailable, undefined);
+  assert.equal(emptyPage.hasMore, true);
+
+  const saved = JSON.parse(store.meta(CACHE_KEY));
+  const oldPage = saved.pages[0][1];
+  delete oldPage.languageIncomplete;
+  oldPage.unavailable = true;
+  oldPage.errors = ['部分片目暂未核实原声语言，可稍后重试'];
+  store.setMeta(CACHE_KEY, JSON.stringify(saved));
+  const restored = fixture(handler, { store, now: () => at });
+  t.after(() => restored.catalog.stop());
+  assert.deepEqual(await restored.catalog.browse({ language: 'zh' }), first);
+  assert.equal(restored.calls.length, 0);
+  at += 15001; working = true;
+  const fresh = await restored.catalog.browse({ language: 'zh' });
   assert.deepEqual(fresh.items.map(row => row.id).sort(), ['1', '2']);
   assert.equal(fresh.unavailable, undefined);
   assert.equal(fresh.hasMore, true);
+  assert.deepEqual(fresh.errors, []);
 });
 
 test('an upgrade keeps regular catalog pages and ignores old tag-only Netflix pages', async t => {
@@ -360,6 +374,48 @@ test('animated films belong to Movies while Anime uses only television animation
   assert.deepEqual((await catalog.browse({ category: 'tv' })).items.map(item => item.id), ['3']);
 });
 
+test('motion comics use explicit evidence or the dedicated animation feed and keep their details after restart', async t => {
+  const animation = { type: 'tv', genres: ['动画'], languages: ['国语'], episodes_count: 4 };
+  const regular = film({ ...animation, id: '1', title: '传统动画短篇', genres: ['动画', '短片'] });
+  const tagged = film({ ...animation, id: '2', title: '漫剧片单中的作品', languages: undefined, is_released: false });
+  const marked = film({ ...animation, id: '3', title: '望天楼（动态漫画）' });
+  const drama = film({ ...animation, id: '4', title: '普通短剧', genres: ['剧情'] });
+  const handler = url => {
+    if (!url.pathname.endsWith('/recommend')) return response({ ...tagged, languages: ['粤语'], is_released: true }, 200, url.href);
+    const items = url.searchParams.get('tags') === '漫剧' ? [{ ...tagged, is_released: undefined, rating: undefined }, drama] : [regular, { ...tagged, is_released: true }, marked];
+    return response({ items, total: items.length }, 200, url.href);
+  };
+  const { catalog, calls, store } = fixture(handler, { comicIndex: true });
+  t.after(() => catalog.stop());
+  assert.deepEqual((await catalog.browse({ category: 'anime' })).items.map(item => item.id), ['1']);
+  const comics = await catalog.browse({ category: 'motion-comic', language: 'zh' });
+  assert.deepEqual(comics.items.map(item => item.id).sort(), ['2', '3']);
+  assert.ok(comics.items.every(item => item.category === 'motion-comic' && item.type === 'series' && item.typeName === '漫剧'));
+  assert.equal((await catalog.detail('2')).episodeCount, 4);
+  assert.equal((await catalog.detail('2')).category, 'motion-comic');
+  assert.equal(calls.filter(({ url }) => url.searchParams.get('count') === '100').length, 1);
+
+  const restored = fixture(() => assert.fail('fresh comic results should be restored'), { store });
+  t.after(() => restored.catalog.stop());
+  assert.deepEqual((await restored.catalog.browse({ category: 'motion-comic', language: 'zh' })).items.map(item => item.id).sort(), ['2', '3']);
+});
+
+test('motion comics discovered outside the tagged feed remain pageable and visible during a feed outage', async t => {
+  const rows = Array.from({ length: 21 }, (_, i) => film({ id: String(100 + i), type: 'tv', genres: ['动画'], title: `故事 ${i}【动态漫】` }));
+  const { catalog } = fixture(url => url.searchParams.get('tags') === '漫剧' ? response('', 403, url.href)
+    : response({ items: rows, total: rows.length }, 200, url.href));
+  t.after(() => catalog.stop());
+  assert.deepEqual((await catalog.browse({ category: 'anime' })).items, []);
+  const first = await catalog.browse({ category: 'motion-comic' });
+  assert.equal(first.hasMore, true);
+  assert.equal(first.unavailable, undefined);
+  assert.equal(first.items.length, 20);
+  assert.equal((await catalog.browse({ category: 'motion-comic' })).items.length, 20);
+  const second = await catalog.browse({ category: 'motion-comic', page: 2 });
+  assert.deepEqual(second.items.map(item => item.id), ['120']);
+  assert.equal(second.hasMore, false);
+});
+
 test('old mixed anime pages are refreshed and cached animated films are reclassified without refetching Movies', async t => {
   const animated = { genres: ['动画'] };
   const handler = url => response({ items: [film({ id: '1', ...animated }), film({ id: '2', type: 'tv', ...animated })], total: 2 }, 200, url.href);
@@ -525,7 +581,7 @@ test('old cached aliases refresh from the same official subject while poster IDs
   assert.equal(refreshed.id, item.id);
   assert.deepEqual(refreshed.aliases.slice(0, 2), ['Resident Evil', '生化危机9']);
   assert.equal(fresh.catalog.poster('37068446'), item.poster);
-  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 9);
+  assert.equal(JSON.parse(old.store.values.get(CACHE_KEY)).version, 10);
   for (const key of ['quark-settings-v1', 'history-marker', 'favorites-marker']) assert.equal(old.store.values.get(key), key + '-preserved');
 });
 

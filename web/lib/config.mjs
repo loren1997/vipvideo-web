@@ -123,7 +123,7 @@ export function validateRecord(input, history = false) {
     poster: input.poster ? address(input.poster, '海报') : '',
   };
   if (input.category !== undefined) {
-    if (!['movie', 'tv', 'anime', 'adult', 'variety'].includes(input.category)) throw badRequest('影片分类格式不正确');
+    if (!['movie', 'tv', 'anime', 'motion-comic', 'adult', 'variety'].includes(input.category)) throw badRequest('影片分类格式不正确');
     row.category = input.category;
   }
   if (input.url) row.url = address(input.url, '播放链接');
